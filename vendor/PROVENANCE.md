@@ -5,6 +5,7 @@ Each entry records the source path and the DXC commit it was copied from.
 
 | File | Source in DXC | DXC commit | License |
 |---|---|---|---|
+| `dxc/gen_intrin_main.txt` | `utils/hct/gen_intrin_main.txt` | 55a61aa79 | University of Illinois/NCSA (DXC) |
 | `dxc/HLSLOptions.td` | `include/dxc/Support/HLSLOptions.td` | d02056da2 | University of Illinois/NCSA (DXC) |
 | `hlsl-headers/` (all files) | `tools/clang/lib/Headers/hlsl/` | ecb18fb18 | Apache-2.0 WITH LLVM-exception (`hlsl-headers/LICENSE.txt`) |
 

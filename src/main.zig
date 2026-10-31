@@ -29,6 +29,7 @@ const Options = struct {
     error_limit: u32 = 20,
     parse: bool = false,
     dump_ast: bool = false,
+    sema: bool = false,
     /// -O0..-O3 / -Od (default -O3, as in dxc).
     opt_level: enum { od, o0, o1, o2, o3 } = .o3,
     /// Accepted options with no effect yet, reported once each.
@@ -91,6 +92,7 @@ fn parseArgs(cli: Cli, arena: std.mem.Allocator, argv: []const [:0]const u8, std
                     opts.parse = true;
                     opts.dump_ast = true;
                 },
+                .zdxc_sema => opts.sema = true,
                 .fcolor_diagnostics => opts.color = true,
                 .fno_color_diagnostics => opts.color = false,
             },
@@ -211,7 +213,9 @@ fn run(cli: Cli, arena: std.mem.Allocator, args: []const [:0]const u8, stdout: *
     else
         null;
 
-    if (opts.preprocess or opts.parse) {
+    // The front end: everything except the development modes that work on
+    // containers or raw tokens.
+    if (!opts.empty) {
         const input = opts.input orelse return cli.fail("no input file", .{});
         var disk: front.source.DiskFs = .{ .io = cli.io };
         var sm = front.source.SourceManager.init(arena, disk.fileSystem());
@@ -231,20 +235,36 @@ fn run(cli: Cli, arena: std.mem.Allocator, args: []const [:0]const u8, stdout: *
         });
         var out: Io.Writer.Allocating = .init(arena);
         if (try pp.enterMainFile(input)) {
-            if (opts.parse) {
+            if (opts.preprocess) {
+                try front.pp_print.print(&pp, &out.writer);
+            } else {
                 var parser = try front.parser.Parser.fromPreprocessor(arena, &diags, &pp);
                 const tu = try parser.parseTranslationUnit();
                 if (opts.dump_ast) try front.ast_dump.dumpUnit(stdout, tu);
-            } else try front.pp_print.print(&pp, &out.writer);
+                if (!opts.parse) {
+                    const is_lib = if (profile) |p| p.kind == .library else true;
+                    var sema = try zdxc.sema.Sema.init(arena, &diags, .{
+                        .entry = if (opts.sema or is_lib) null else opts.entry,
+                        .spirv = opts.spirv,
+                        .enable_16bit = opts.enable_16bit,
+                    });
+                    try sema.checkUnit(tu);
+                }
+            }
         }
         const color = opts.color orelse (Io.File.stderr().supportsAnsiEscapeCodes(cli.io) catch false);
         try diags.render(&sm, cli.stderr, .{ .format = opts.diag_format, .color = color });
         try cli.stderr.flush();
         if (diags.hasErrors()) return error.CompileFailed;
-        if (opts.pp_output) |path| {
-            try Io.Dir.cwd().writeFile(cli.io, .{ .sub_path = path, .data = out.written() });
-        } else try stdout.writeAll(out.written());
-        return;
+        if (opts.preprocess) {
+            if (opts.pp_output) |path| {
+                try Io.Dir.cwd().writeFile(cli.io, .{ .sub_path = path, .data = out.written() });
+            } else try stdout.writeAll(out.written());
+            return;
+        }
+        if (opts.parse or opts.sema) return;
+        if (profile == null) return cli.fail("missing -T <profile>", .{});
+        return cli.fail("code generation is not implemented yet: the input was checked but no output was written (use -zdxc-empty for a placeholder shader)", .{});
     }
 
     const prof = profile orelse return cli.fail("missing -T <profile>", .{});

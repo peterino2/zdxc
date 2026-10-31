@@ -305,7 +305,8 @@ pub const Lexer = struct {
                 }
                 break;
             }
-            if (isIdentChar(c) or c == '.') {
+            // dxc also takes '#' (for `1.#INF`).
+            if (isIdentChar(c) or c == '.' or c == '#') {
                 l.pos += 1;
                 continue;
             }
@@ -342,6 +343,7 @@ test "punctuators and literals" {
     try expectKinds("a+=b<<=c>>1.5e-3f", &.{ .identifier, .plus_equal, .identifier, .less_less_equal, .identifier, .greater_greater, .number });
     try expectKinds("x::y->z...", &.{ .identifier, .colon_colon, .identifier, .arrow, .identifier, .ellipsis });
     try expectKinds("\"a\\\"b\" 'c' .5h 0x1Fu", &.{ .string, .char, .number, .number });
+    try expectKinds("1.#INF.xxx -1.#INF", &.{ .number, .minus, .number });
     try expectKinds("# ## #x", &.{ .hash, .hash_hash, .hash, .identifier });
 }
 

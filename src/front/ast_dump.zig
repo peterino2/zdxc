@@ -37,6 +37,11 @@ fn templateArgs(w: *W, args: []const ast.TemplateArg) W.Error!void {
 
 pub fn typeRef(w: *W, t: *const ast.TypeRef) W.Error!void {
     if (t.norm != .none) try w.print("{s} ", .{@tagName(t.norm)});
+    if (t.decltype) |e| {
+        try w.writeAll("__decltype(");
+        try expr(w, e);
+        return w.writeByte(')');
+    }
     try name(w, t.name);
     if (t.args.len > 0) try templateArgs(w, t.args);
     try dims(w, t.array_dims);
@@ -216,7 +221,7 @@ pub fn decl(w: *W, d: *const ast.Decl, depth: usize) W.Error!void {
         },
         .pragma => |p| try w.print("(pragma {s})", .{p}),
         .static_assert => |s| {
-            try w.writeAll("(static_assert ");
+            try w.writeAll("(_Static_assert ");
             try expr(w, s.cond);
             try w.writeByte(')');
         },
@@ -403,6 +408,13 @@ pub fn expr(w: *W, e: *const ast.Expr) W.Error!void {
         .sizeof_type => |t| {
             try w.writeAll("(sizeof ");
             try typeRef(w, t);
+            try w.writeByte(')');
+        },
+        .is_same => |x| {
+            try w.writeAll("(is_same ");
+            try typeRef(w, x.a);
+            try w.writeAll(", ");
+            try typeRef(w, x.b);
             try w.writeByte(')');
         },
         .sizeof_expr => |x| {

@@ -22,6 +22,18 @@ pub fn build(b: *std.Build) void {
     gen_options_run.addFileArg(b.path("vendor/dxc/HLSLOptions.td"));
     const options_table = gen_options_run.addOutputFileArg("options_table.zig");
 
+    // dxc's intrinsic declarations, likewise generated at build time.
+    const gen_intrinsics = b.addExecutable(.{
+        .name = "gen_intrinsics",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/gen_intrinsics.zig"),
+            .target = b.graph.host,
+        }),
+    });
+    const gen_intrinsics_run = b.addRunArtifact(gen_intrinsics);
+    gen_intrinsics_run.addFileArg(b.path("vendor/dxc/gen_intrin_main.txt"));
+    const intrinsics_table = gen_intrinsics_run.addOutputFileArg("intrinsics_table.zig");
+
     const mod = b.addModule("zdxc", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
@@ -29,6 +41,7 @@ pub fn build(b: *std.Build) void {
         .imports = &.{.{ .name = "hlsl_headers", .module = hlsl_headers }},
     });
     mod.addAnonymousImport("options_table", .{ .root_source_file = options_table });
+    mod.addAnonymousImport("intrinsics_table", .{ .root_source_file = intrinsics_table });
 
     const exe = b.addExecutable(.{
         .name = "zdxc",
@@ -67,6 +80,21 @@ pub fn build(b: *std.Build) void {
     oracle_parse.setCwd(b.path("."));
     oracle_parse.has_side_effects = true;
     oracle_parse_step.dependOn(&oracle_parse.step);
+
+    const oracle_sema_step = b.step("oracle-sema", "Check that Sema accepts every dxc-valid corpus file");
+    const oracle_sema = b.addSystemCommand(&.{ "sh", "test/oracle/sema.sh" });
+    oracle_sema.addArtifactArg(exe);
+    oracle_sema.setCwd(b.path("."));
+    oracle_sema.has_side_effects = true;
+    oracle_sema.step.dependOn(&oracle_parse.step); // builds the corpus list
+    oracle_sema_step.dependOn(&oracle_sema.step);
+
+    const oracle_verify_step = b.step("oracle-verify", "Compare Sema errors with dxc's SemaHLSL -verify expectations");
+    const oracle_verify = b.addSystemCommand(&.{ "sh", "test/oracle/verify.sh" });
+    oracle_verify.addArtifactArg(exe);
+    oracle_verify.setCwd(b.path("."));
+    oracle_verify.has_side_effects = true;
+    oracle_verify_step.dependOn(&oracle_verify.step);
 
     const oracle_cli_step = b.step("oracle-cli", "Parse every dxc command line in the DXC test corpus");
     const oracle_cli = b.addSystemCommand(&.{ "sh", "test/oracle/cli.sh" });

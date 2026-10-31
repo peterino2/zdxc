@@ -35,6 +35,10 @@ pub const Parser = struct {
     /// Name of the struct most recently parsed by parseStructDeclInto
     /// (synthesized for anonymous structs), for `typedef struct ...`.
     last_struct_name: []const u8 = "",
+    /// The qualifier words read by the last parseQualifiers call.
+    last_quals: []const ast.QualWord = &.{},
+    /// Qualifier words for the next parseDeclaratorsInto call.
+    decl_quals: []const ast.QualWord = &.{},
     /// Set while parsing template arguments: a top-level `>` ends the
     /// argument instead of being a comparison.
     no_greater: bool = false,
@@ -295,6 +299,9 @@ pub const Parser = struct {
             if (p.toks[i].kind == .identifier and isBuiltinType(p.toks[i].text)) i += 1;
             return i;
         }
+        if (p.toks[i].isIdent("__decltype") and p.toks[i + 1].kind == .l_paren) {
+            return p.skipTypeAttrs(p.skipParens(i + 1) orelse return null);
+        }
         if (p.toks[i].kind == .colon_colon) i += 1;
         while (true) {
             const t = p.toks[i];
@@ -342,6 +349,23 @@ pub const Parser = struct {
                     if (depth == 0) return i + 1;
                 },
                 .eof => return start,
+                else => {},
+            }
+        }
+    }
+
+    /// Index just past the `)` matching the `(` at `start`, or null.
+    fn skipParens(p: *const Parser, start: usize) ?usize {
+        var i = start;
+        var depth: u32 = 0;
+        while (true) : (i += 1) {
+            switch (p.toks[i].kind) {
+                .l_paren => depth += 1,
+                .r_paren => {
+                    depth -= 1;
+                    if (depth == 0) return i + 1;
+                },
+                .semi, .l_brace, .r_brace, .eof => return null,
                 else => {},
             }
         }
@@ -425,6 +449,8 @@ pub const Parser = struct {
     /// `line`, ...) count only when a type or another qualifier follows.
     fn parseQualifiers(p: *Parser) ast.Qualifiers {
         var q: ast.Qualifiers = .{};
+        var words: std.ArrayList(ast.QualWord) = .empty;
+        defer p.last_quals = words.items;
         while (p.at(.identifier)) {
             const word = p.tok().text;
             const field = qualifierField(word) orelse break;
@@ -433,6 +459,7 @@ pub const Parser = struct {
                 const next_is_qual = n.kind == .identifier and qualifierField(n.text) != null;
                 if (!next_is_qual and !p.isTypeStartAt(p.pos + 1)) break;
             }
+            words.append(p.arena, .{ .loc = p.tok().loc, .word = word }) catch {};
             _ = p.advance();
             if (std.mem.eql(u8, word, "inout")) {
                 q.in = true;
@@ -464,6 +491,16 @@ pub const Parser = struct {
             // Dependent name: `typename X<T>::type`.
             const n = try p.parseNameWithFinalArgs();
             return p.mk(ast.TypeRef, .{ .loc = start.loc, .name = n.name, .args = n.args });
+        }
+        if (p.atIdent("__decltype")) {
+            _ = p.advance();
+            _ = try p.expect(.l_paren, "'('");
+            const saved = p.no_greater;
+            p.no_greater = false;
+            const e = try p.parseExpr();
+            p.no_greater = saved;
+            _ = try p.expect(.r_paren, "')'");
+            return p.mk(ast.TypeRef, .{ .loc = start.loc, .name = try p.simpleName(start.loc, "__decltype"), .decltype = e });
         }
         if (p.atIdent("unsigned") or p.atIdent("signed")) {
             const signed = p.advance().isIdent("signed");
@@ -663,14 +700,16 @@ pub const Parser = struct {
         if (t.isIdent("using")) return out.append(p.arena, try p.parseUsing(template_params));
         if (t.isIdent("namespace")) return out.append(p.arena, try p.parseNamespace());
         if (t.isIdent("enum")) return p.parseEnumInto(out);
-        if (t.isIdent("static_assert")) {
+        if (t.isIdent("_Static_assert")) {
             const d = try p.parseStaticAssert();
             _ = try p.expect(.semi, "';'");
             return out.append(p.arena, d);
         }
 
         const quals = p.parseQualifiers();
+        const words = p.last_quals;
         const ty = try p.parseType();
+        p.decl_quals = words;
         try p.parseDeclaratorsInto(out, attrs, quals, template_params, ty, ctx);
     }
 
@@ -848,6 +887,7 @@ pub const Parser = struct {
     fn parseTypedefInto(p: *Parser, out: *std.ArrayList(*ast.Decl)) Error!void {
         const kw = p.advance();
         _ = p.parseQualifiers();
+        const words = p.last_quals;
         var ty: *ast.TypeRef = undefined;
         if (p.atIdent("struct") or p.atIdent("class")) {
             // `typedef struct { ... } Name;`
@@ -858,7 +898,7 @@ pub const Parser = struct {
             const name = try p.expectIdent("typedef name");
             const dims = try p.parseArrayDims();
             try p.declareName(name.text, .type);
-            try out.append(p.arena, try p.mk(ast.Decl, .{ .loc = kw.loc, .kind = .{ .typedef = .{ .name = name.text, .type = ty, .array_dims = dims } } }));
+            try out.append(p.arena, try p.mk(ast.Decl, .{ .loc = kw.loc, .kind = .{ .typedef = .{ .name = name.text, .type = ty, .array_dims = dims, .qual_words = words } } }));
             if (!p.eat(.comma)) break;
         }
         _ = try p.expect(.semi, "';'");
@@ -935,14 +975,17 @@ pub const Parser = struct {
         try p.parseDeclaratorsInto(out, &.{}, .{}, &.{}, ty, .global);
     }
 
+    /// `_Static_assert(cond, "message")`: C11's spelling, accepted by dxc in
+    /// every language version (`static_assert` is an identifier in 2021).
     fn parseStaticAssert(p: *Parser) Error!*ast.Decl {
-        // Parsed for recovery, but not part of HLSL 2021 (dxc rejects it).
-        _ = p.reportAt(p.pos, .@"error", "'static_assert' requires HLSL 202x; zdxc implements HLSL 2021", .{});
         const kw = p.advance();
         _ = try p.expect(.l_paren, "'('");
         const cond = try p.parseAssign();
         var message: ?[]const u8 = null;
-        if (p.eat(.comma)) message = (try p.expect(.string, "string literal")).text;
+        if (p.eat(.comma)) {
+            if (!p.at(.string)) return p.fail("expected string literal", .{});
+            message = (try p.parsePrimary()).kind.string_lit; // adjacent literals concatenate
+        }
         _ = try p.expect(.r_paren, "')'");
         return p.mk(ast.Decl, .{ .loc = kw.loc, .kind = .{ .static_assert = .{ .cond = cond, .message = message } } });
     }
@@ -957,6 +1000,8 @@ pub const Parser = struct {
         ty: *ast.TypeRef,
         ctx: DeclContext,
     ) Error!void {
+        const words = p.decl_quals;
+        p.decl_quals = &.{};
         // Function names may be qualified (`S::method`) or operators;
         // variables may be qualified for out-of-line static members.
         const name_loc = p.tok().loc;
@@ -988,7 +1033,11 @@ pub const Parser = struct {
                 } else p.pos = save;
             }
         }
-        if (fname) |n| return out.append(p.arena, try p.parseFunctionRest(attrs, quals, template_params, ty, n, name_loc, ctx));
+        if (fname) |n| {
+            const d = try p.parseFunctionRest(attrs, quals, template_params, ty, n, name_loc, ctx);
+            if (d.kind == .func) d.kind.func.qual_words = words;
+            return out.append(p.arena, d);
+        }
 
         var first = true;
         while (true) {
@@ -1010,6 +1059,7 @@ pub const Parser = struct {
                 .attrs = attrs,
                 .template_params = template_params,
                 .quals = quals,
+                .qual_words = words,
                 .type = ty,
                 .name = name.text,
                 .name_loc = name.loc,
@@ -1080,6 +1130,7 @@ pub const Parser = struct {
         while (!p.at(.r_paren)) {
             const pattrs = try p.parseAttributes();
             const pquals = p.parseQualifiers();
+            const pwords = p.last_quals;
             const pty = try p.parseType();
             var pname: []const u8 = "";
             var pname_loc = p.tok().loc;
@@ -1097,6 +1148,7 @@ pub const Parser = struct {
             try params.append(p.arena, .{
                 .attrs = pattrs,
                 .quals = pquals,
+                .qual_words = pwords,
                 .type = pty,
                 .name = pname,
                 .name_loc = pname_loc,
@@ -1342,7 +1394,7 @@ pub const Parser = struct {
         if (t.kind == .identifier) {
             const w = t.text;
             if (std.mem.eql(u8, w, "struct") or std.mem.eql(u8, w, "class") or std.mem.eql(u8, w, "typedef") or
-                std.mem.eql(u8, w, "using") or std.mem.eql(u8, w, "enum") or std.mem.eql(u8, w, "static_assert"))
+                std.mem.eql(u8, w, "using") or std.mem.eql(u8, w, "enum") or std.mem.eql(u8, w, "_Static_assert"))
                 return true;
             if (qualifierField(w) != null) {
                 if (!isContextualQualifier(w)) return true;
@@ -1579,6 +1631,12 @@ pub const Parser = struct {
         switch (t.kind) {
             .number => {
                 _ = p.advance();
+                // HLSL allows swizzles on literals (`0x04.xxx`, `1.0.xxxx`);
+                // the lexer reads them as one pp-number.
+                if (splitLiteralSwizzle(t.text)) |split| {
+                    const lit = try p.mkExpr(t.loc, if (isFloatLiteral(split.literal)) .{ .float_lit = split.literal } else .{ .int_lit = split.literal });
+                    return p.mkExpr(t.loc, .{ .member = .{ .base = lit, .name = split.swizzle, .name_loc = t.loc.advance(@intCast(split.literal.len + 1)) } });
+                }
                 return p.mkExpr(t.loc, if (isFloatLiteral(t.text)) .{ .float_lit = t.text } else .{ .int_lit = t.text });
             },
             .string => {
@@ -1616,6 +1674,16 @@ pub const Parser = struct {
             _ = p.advance();
             return p.mkExpr(t.loc, .this);
         }
+        if (t.isIdent("std") and p.peek(1).kind == .colon_colon and p.peek(2).isIdent("is_same") and p.peek(3).kind == .less) {
+            p.pos += 3;
+            const args = try p.parseTemplateArgs();
+            _ = try p.expect(.colon_colon, "'::'");
+            const v = try p.expect(.identifier, "'value'");
+            if (args.len != 2 or args[0] != .type or args[1] != .type or !v.isIdent("value")) {
+                return p.fail("expected 'std::is_same<type, type>::value'", .{});
+            }
+            return p.mkExpr(t.loc, .{ .is_same = .{ .a = args[0].type, .b = args[1].type } });
+        }
         if (t.kind == .identifier and isReserved(t.text)) {
             return p.fail("expected expression, found '{s}'", .{t.text});
         }
@@ -1652,6 +1720,22 @@ fn describe(t: Token) []const u8 {
     return if (t.kind == .eof) "end of file" else t.text;
 }
 
+/// `0x04.xxx` -> literal `0x04`, swizzle `xxx`; `1.0.xy` -> `1.0`, `xy`.
+fn splitLiteralSwizzle(text: []const u8) ?struct { literal: []const u8, swizzle: []const u8 } {
+    const dot = std.mem.lastIndexOfScalar(u8, text, '.') orelse return null;
+    const sw = text[dot + 1 ..];
+    if (sw.len == 0 or sw.len > 4) return null;
+    for (sw) |c| if (std.mem.indexOfScalar(u8, "xyzwrgba", c) == null) return null;
+    const lit = text[0..dot];
+    if (lit.len == 0) return null;
+    // `1.xx`: the literal must not end in an exponent marker.
+    if (std.ascii.isAlphabetic(lit[lit.len - 1]) and !(lit.len > 1 and lit[0] == '0' and (lit[1] == 'x' or lit[1] == 'X'))) {
+        const last = lit[lit.len - 1];
+        if (last != 'f' and last != 'F' and last != 'h' and last != 'H' and last != 'u' and last != 'U' and last != 'l' and last != 'L') return null;
+    }
+    return .{ .literal = lit, .swizzle = sw };
+}
+
 fn isFloatLiteral(text: []const u8) bool {
     if (text.len > 1 and text[0] == '0' and (text[1] == 'x' or text[1] == 'X')) return false;
     if (std.mem.indexOfAny(u8, text, ".eE") != null) return true;
@@ -1660,14 +1744,7 @@ fn isFloatLiteral(text: []const u8) bool {
 }
 
 /// Words that can never be identifiers.
-const reserved_words = [_][]const u8{
-    "if",            "else",    "for",      "while",       "do",        "switch", "case",
-    "default",       "break",   "continue", "return",      "discard",   "struct", "class",
-    "interface",     "cbuffer", "tbuffer",  "typedef",     "namespace", "enum",   "template",
-    "typename",      "true",    "false",    "this",        "sizeof",    "static", "const",
-    "uniform",       "extern",  "volatile", "groupshared", "inline",    "using",  "operator",
-    "static_assert", "inout",   "in",       "out",
-};
+const reserved_words = [_][]const u8{ "if", "else", "for", "while", "do", "switch", "case", "default", "break", "continue", "return", "discard", "struct", "class", "interface", "cbuffer", "tbuffer", "typedef", "namespace", "enum", "template", "typename", "true", "false", "this", "sizeof", "static", "const", "uniform", "extern", "volatile", "groupshared", "inline", "using", "operator", "_Static_assert", "inout", "in", "out", "__decltype" };
 
 /// Qualifier keywords and their ast.Qualifiers field names.
 const qualifier_words = [_][2][]const u8{
@@ -1681,7 +1758,7 @@ const qualifier_words = [_][2][]const u8{
     .{ "export", "export" },                     .{ "point", "point" },                     .{ "line", "line" },
     .{ "triangle", "triangle" },                 .{ "lineadj", "lineadj" },                 .{ "triangleadj", "triangleadj" },
     .{ "vertices", "vertices" },                 .{ "indices", "indices" },                 .{ "primitives", "primitives" },
-    .{ "payload", "payload" },
+    .{ "payload", "payload" },                   .{ "center", "center" },
 };
 
 /// Qualifiers that are ordinary identifiers unless a type follows.
@@ -1689,6 +1766,7 @@ const contextual_words = [_][]const u8{
     "precise",  "shared",        "row_major",        "column_major",    "nointerpolation", "linear",     "centroid",
     "sample",   "noperspective", "globallycoherent", "reordercoherent", "export",          "point",      "line",
     "triangle", "lineadj",       "triangleadj",      "vertices",        "indices",         "primitives", "payload",
+    "center",
 };
 
 fn isReserved(w: []const u8) bool {

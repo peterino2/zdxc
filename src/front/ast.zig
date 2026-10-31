@@ -41,6 +41,8 @@ pub const TypeRef = struct {
     attrs: []const Attribute = &.{},
     /// `unorm` / `snorm` inside resource element types.
     norm: enum { none, unorm, snorm } = .none,
+    /// `__decltype(expr)`: the type of `expr` (`name` is `__decltype`).
+    decltype: ?*Expr = null,
 };
 
 /// Storage classes, type qualifiers and parameter / interpolation
@@ -78,8 +80,13 @@ pub const Qualifiers = packed struct(u64) {
     indices: bool = false,
     primitives: bool = false,
     payload: bool = false,
-    _: u34 = 0,
+    center: bool = false,
+    _: u33 = 0,
 };
+
+/// A qualifier keyword as written: some diagnostics depend on the order
+/// and position of qualifiers, which `Qualifiers` does not keep.
+pub const QualWord = struct { loc: Loc, word: []const u8 };
 
 /// `[name(args)]` or `[[ns::name(args)]]`.
 pub const Attribute = struct {
@@ -130,6 +137,10 @@ pub const AssignOp = enum { assign, mul, div, rem, add, sub, shl, shr, bit_and, 
 pub const Expr = struct {
     loc: Loc,
     kind: Kind,
+    /// Filled in by Sema: the expression's type (a sema TypeId; 0 is the
+    /// error type) and an index into Sema's per-expression information.
+    ty: u32 = 0,
+    info: u32 = 0,
 
     pub const Kind = union(enum) {
         int_lit: []const u8,
@@ -154,6 +165,8 @@ pub const Expr = struct {
         init_list: []const *Expr,
         sizeof_type: *TypeRef,
         sizeof_expr: *Expr,
+        /// `std::is_same<A, B>::value` (a dxc builtin).
+        is_same: struct { a: *TypeRef, b: *TypeRef },
     };
 };
 
@@ -190,6 +203,8 @@ pub const VarDecl = struct {
     /// Qualified out-of-line definitions (`int S::x = 1;`) keep the full
     /// spelled name, e.g. `S::x`.
     quals: Qualifiers,
+    /// The qualifiers in source order.
+    qual_words: []const QualWord = &.{},
     type: *TypeRef,
     name: []const u8,
     name_loc: Loc,
@@ -210,6 +225,7 @@ pub const TemplateParam = struct {
 pub const FuncDecl = struct {
     attrs: []const Attribute,
     quals: Qualifiers,
+    qual_words: []const QualWord = &.{},
     template_params: []const TemplateParam,
     ret: *TypeRef,
     /// Function name; for operators `operator+`, `operator[]`, `operator()`.
@@ -258,7 +274,7 @@ pub const Decl = struct {
         func: FuncDecl,
         @"struct": StructDecl,
         cbuffer: CBufferDecl,
-        typedef: struct { name: []const u8, type: *TypeRef, array_dims: []const ?*Expr, template_params: []const TemplateParam = &.{} },
+        typedef: struct { name: []const u8, type: *TypeRef, array_dims: []const ?*Expr, template_params: []const TemplateParam = &.{}, qual_words: []const QualWord = &.{} },
         @"enum": EnumDecl,
         namespace: struct { name: []const u8, decls: []const *Decl },
         /// `using namespace N;`

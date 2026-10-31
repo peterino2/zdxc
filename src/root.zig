@@ -23,6 +23,12 @@ pub const dxil = struct {
     pub const shader = @import("dxil/shader.zig");
 };
 
+pub const sema = struct {
+    pub const types = @import("sema/types.zig");
+    pub const intrinsics = @import("sema/intrinsics.zig");
+    pub const Sema = @import("sema/sema.zig").Sema;
+};
+
 pub const spirv = struct {
     pub const builder = @import("spirv/builder.zig");
 };
@@ -33,6 +39,8 @@ test {
     const std = @import("std");
     std.testing.refAllDecls(front);
     std.testing.refAllDecls(dxil);
+    _ = @import("sema/types.zig");
+    _ = @import("sema/sema.zig");
     std.testing.refAllDecls(spirv);
     _ = @import("diag.zig");
     _ = @import("options.zig");

@@ -27,6 +27,7 @@ pub const Extra = enum {
     zdxc_lex,
     zdxc_parse,
     zdxc_ast,
+    zdxc_sema,
     fcolor_diagnostics,
     fno_color_diagnostics,
 };
@@ -37,6 +38,7 @@ const extra_options = [_]struct { id: Extra, spelling: []const u8, help: []const
     .{ .id = .zdxc_lex, .spelling = "zdxc-lex", .help = "Print the input's tokens, one per line (development)" },
     .{ .id = .zdxc_parse, .spelling = "zdxc-parse", .help = "Preprocess and parse the input, reporting syntax errors only (development)" },
     .{ .id = .zdxc_ast, .spelling = "zdxc-ast", .help = "Preprocess, parse and dump the syntax tree (development)" },
+    .{ .id = .zdxc_sema, .spelling = "zdxc-sema", .help = "Run the front end through semantic analysis only (development)" },
     .{ .id = .fcolor_diagnostics, .spelling = "fcolor-diagnostics", .help = "Always use colors in diagnostics" },
     .{ .id = .fno_color_diagnostics, .spelling = "fno-color-diagnostics", .help = "Never use colors in diagnostics" },
 };
