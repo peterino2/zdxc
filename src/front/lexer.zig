@@ -212,25 +212,20 @@ pub const Lexer = struct {
         return .{ .kind = .string, .flags = .{ .space = trivia.space }, .text = l.text[start..l.pos], .loc = .{ .file = l.file, .offset = start } };
     }
 
-    /// Skip to the start of the next line (used for skipped conditional
-    /// blocks and after directives).
+    /// Skip the rest of the current line (used for skipped conditional
+    /// blocks and after directives). Works token by token so that `/*` or
+    /// `//` inside string literals is not mistaken for a comment.
     pub fn skipLine(l: *Lexer) void {
-        while (l.pos < l.text.len) {
-            const c = l.text[l.pos];
-            if (c == '\n') return;
-            if (c == '/' and l.peekAt(l.pos + 1) == '*') {
-                if (std.mem.indexOfPos(u8, l.text, l.pos + 2, "*/")) |end| {
-                    l.pos = @intCast(end + 2);
-                    continue;
-                }
-                l.pos = @intCast(l.text.len);
+        // At the start of a line, its first token is part of this line.
+        var line_start = l.at_bol;
+        while (true) {
+            const saved = l.*;
+            const t = l.next();
+            if (t.kind == .eof or (t.flags.bol and !line_start)) {
+                l.* = saved;
                 return;
             }
-            if (c == '/' and l.peekAt(l.pos + 1) == '/') {
-                while (l.pos < l.text.len and l.text[l.pos] != '\n') l.pos += 1;
-                return;
-            }
-            l.pos += 1;
+            line_start = false;
         }
     }
 
@@ -351,6 +346,13 @@ test "punctuators and literals" {
     try expectKinds("x::y->z...", &.{ .identifier, .colon_colon, .identifier, .arrow, .identifier, .ellipsis });
     try expectKinds("\"a\\\"b\" 'c' .5h 0x1Fu", &.{ .string, .char, .number, .number });
     try expectKinds("# ## #x", &.{ .hash, .hash_hash, .hash, .identifier });
+}
+
+test "skipLine ignores comment markers inside strings" {
+    var l = Lexer.init("x = \"/*\"; y\n#endif\n", 0);
+    l.skipLine();
+    const t = l.next();
+    try std.testing.expect(t.kind == .hash and t.flags.bol);
 }
 
 test "comments, flags and lines" {

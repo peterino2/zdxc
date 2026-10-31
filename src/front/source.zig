@@ -65,11 +65,28 @@ pub const DiskFs = struct {
     }
 };
 
-pub const File = struct {
-    path: []const u8,
+/// Text of a source file, shared by every inclusion of it.
+pub const Content = struct {
     text: []const u8,
     /// Offsets of the first byte of each line.
     line_starts: []const u32,
+    /// Include-guard macro, computed lazily by the preprocessor.
+    guard: Guard = .unknown,
+
+    pub const Guard = union(enum) {
+        unknown,
+        none,
+        macro: []const u8,
+    };
+};
+
+/// One inclusion of a file. Each `#include` gets its own FileId (so that
+/// `#line` and other per-inclusion state stay separate) but shares Content.
+pub const File = struct {
+    path: []const u8,
+    text: []const u8,
+    line_starts: []const u32,
+    content: *Content,
 };
 
 pub const LineCol = struct { line: u32, col: u32 };
@@ -78,6 +95,8 @@ pub const SourceManager = struct {
     arena: std.heap.ArenaAllocator,
     files: std.ArrayList(File) = .empty,
     fs: FileSystem,
+    /// path -> contents, or null if the path could not be read.
+    cache: std.StringHashMapUnmanaged(?*Content) = .empty,
 
     pub fn init(gpa: Allocator, fs: FileSystem) SourceManager {
         return .{ .arena = .init(gpa), .fs = fs };
@@ -91,15 +110,39 @@ pub const SourceManager = struct {
         return sm.arena.allocator();
     }
 
-    /// Load a file from the file system; null if it cannot be read.
+    /// Load a file through the cache; null if it cannot be read. Each call
+    /// returns a new FileId, but the file system is read once per path.
     pub fn load(sm: *SourceManager, path: []const u8) !?FileId {
-        const text = sm.fs.read(sm.allocator(), path) orelse return null;
-        return try sm.addFile(path, text);
+        const a = sm.allocator();
+        const gop = try sm.cache.getOrPut(a, path);
+        if (!gop.found_existing) {
+            gop.key_ptr.* = try a.dupe(u8, path);
+            gop.value_ptr.* = if (sm.fs.read(a, path)) |raw| try sm.makeContent(raw) else null;
+        }
+        const content = gop.value_ptr.* orelse return null;
+        return try sm.addInclusion(path, content);
     }
 
-    /// Register text under `path`. Backslash-newline sequences are removed
-    /// (translation phase 2), so offsets refer to the spliced text.
+    /// Register in-memory text under `path`, through the same cache as
+    /// `load` (used for compiled-in headers).
+    pub fn loadText(sm: *SourceManager, path: []const u8, raw: []const u8) !FileId {
+        const a = sm.allocator();
+        const gop = try sm.cache.getOrPut(a, path);
+        if (!gop.found_existing or gop.value_ptr.* == null) {
+            gop.key_ptr.* = try a.dupe(u8, path);
+            gop.value_ptr.* = try sm.makeContent(raw);
+        }
+        return sm.addInclusion(path, gop.value_ptr.*.?);
+    }
+
+    /// Register uncached text under `path` (main file text, predefines).
     pub fn addFile(sm: *SourceManager, path: []const u8, raw: []const u8) !FileId {
+        return sm.addInclusion(path, try sm.makeContent(raw));
+    }
+
+    /// Backslash-newline sequences are removed (translation phase 2), so
+    /// offsets refer to the spliced text.
+    fn makeContent(sm: *SourceManager, raw: []const u8) !*Content {
         const a = sm.allocator();
         const no_bom = if (std.mem.startsWith(u8, raw, "\xEF\xBB\xBF")) raw[3..] else raw;
         const text = try spliceLines(a, no_bom);
@@ -108,10 +151,18 @@ pub const SourceManager = struct {
         for (text, 0..) |c, i| {
             if (c == '\n') try starts.append(a, @intCast(i + 1));
         }
+        const content = try a.create(Content);
+        content.* = .{ .text = text, .line_starts = try starts.toOwnedSlice(a) };
+        return content;
+    }
+
+    fn addInclusion(sm: *SourceManager, path: []const u8, content: *Content) !FileId {
+        const a = sm.allocator();
         try sm.files.append(a, .{
             .path = try a.dupe(u8, path),
-            .text = text,
-            .line_starts = try starts.toOwnedSlice(a),
+            .text = content.text,
+            .line_starts = content.line_starts,
+            .content = content,
         });
         return @intCast(sm.files.items.len - 1);
     }
@@ -177,6 +228,20 @@ test "line and column lookup" {
     try std.testing.expectEqual(LineCol{ .line = 2, .col = 2 }, sm.lineCol(.{ .file = id, .offset = 4 }));
     try std.testing.expectEqual(LineCol{ .line = 4, .col = 1 }, sm.lineCol(.{ .file = id, .offset = 7 }));
     try std.testing.expectEqualStrings("cd", sm.lineText(.{ .file = id, .offset = 3 }));
+}
+
+test "files are read once per path" {
+    var mfs: MemoryFs = .{};
+    defer mfs.deinit(std.testing.allocator);
+    try mfs.put(std.testing.allocator, "a.h", "x");
+    var sm = SourceManager.init(std.testing.allocator, mfs.fileSystem());
+    defer sm.deinit();
+    const a = (try sm.load("a.h")).?;
+    const b = (try sm.load("a.h")).?;
+    try std.testing.expect(a != b);
+    try std.testing.expectEqual(sm.file(a).content, sm.file(b).content);
+    try std.testing.expect(try sm.load("missing.h") == null);
+    try std.testing.expect(try sm.load("missing.h") == null);
 }
 
 test "line splicing" {

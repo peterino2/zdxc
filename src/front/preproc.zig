@@ -159,7 +159,8 @@ pub const Preprocessor = struct {
         const f = pp.sm.file(id);
         try pp.includes.append(pp.arena, .{
             .lex = .init(f.text, id),
-            .dir = std.fs.path.dirname(f.path) orelse ".",
+            // The predefines pseudo-file has no directory to search.
+            .dir = if (std.mem.eql(u8, f.path, "<built-in>")) "" else std.fs.path.dirname(f.path) orelse ".",
             .cond_base = pp.conds.items.len,
         });
     }
@@ -857,35 +858,112 @@ pub const Preprocessor = struct {
             return;
         }
         const id = try pp.resolveInclude(spelled, angled) orelse {
-            pp.diags.add(.fatal, directive.loc, "'{s}' file not found", .{spelled});
+            if (angled and try pp.resolveInclude(spelled, false) != null) {
+                pp.diags.add(.fatal, directive.loc, "'{s}' file not found with <angled> include; use \"quotes\" instead", .{spelled});
+            } else {
+                pp.diags.add(.fatal, directive.loc, "'{s}' file not found", .{spelled});
+            }
             return;
         };
+        // Multiple-include optimization: a guarded file whose guard macro is
+        // defined would contribute nothing, so do not even enter it.
+        if (includeGuard(pp.sm.file(id).content)) |guard| {
+            if (pp.macros.contains(guard)) return;
+        }
         if (pp.pragma_once.contains(try pp.fileKey(pp.sm.file(id).path))) return;
         try pp.enterFileId(id);
     }
 
+    /// Search order (matching dxc):
+    /// - "quoted": the directory of each file on the include stack, innermost
+    ///   first, then each -I directory;
+    /// - <angled>: each -I directory, then the compiled-in HLSL headers.
     fn resolveInclude(pp: *Preprocessor, spelled: []const u8, angled: bool) Error!?source.FileId {
         if (std.fs.path.isAbsolute(spelled)) return pp.sm.load(spelled);
-        const frame = pp.includes.items[pp.includes.items.len - 1];
-        const local = try std.fs.path.join(pp.arena, &.{ frame.dir, spelled });
-        if (try pp.sm.load(local)) |id| return id;
+        if (!angled) {
+            var i = pp.includes.items.len;
+            while (i > 0) {
+                i -= 1;
+                const frame = pp.includes.items[i];
+                if (frame.dir.len == 0) continue; // predefines pseudo-file
+                const p = try std.fs.path.join(pp.arena, &.{ frame.dir, spelled });
+                if (try pp.sm.load(p)) |id| return id;
+            }
+        }
         for (pp.opts.include_dirs) |dir| {
             const p = try std.fs.path.join(pp.arena, &.{ dir, spelled });
             if (try pp.sm.load(p)) |id| return id;
         }
-        // Like dxc, fall back to the compiled-in HLSL headers for <...>.
         if (angled) {
-            var name = try pp.arena.dupe(u8, spelled);
+            const name = try pp.arena.dupe(u8, spelled);
             std.mem.replaceScalar(u8, name, '\\', '/');
             if (hlsl_headers.find(name)) |text| {
-                name = try std.mem.concat(pp.arena, u8, &.{ embedded_prefix, name });
-                for (pp.sm.files.items, 0..) |f, i| {
-                    if (std.mem.eql(u8, f.path, name)) return @intCast(i);
-                }
-                return try pp.sm.addFile(name, text);
+                return try pp.sm.loadText(try std.mem.concat(pp.arena, u8, &.{ embedded_prefix, name }), text);
             }
         }
         return null;
+    }
+
+    /// The macro guarding `content`, if the whole file is wrapped in
+    /// `#ifndef X` / `#if !defined(X)` ... `#endif` with no `#else`/`#elif`
+    /// at the top level and nothing outside. Computed once per content.
+    fn includeGuard(content: *source.Content) ?[]const u8 {
+        switch (content.guard) {
+            .none => return null,
+            .macro => |m| return m,
+            .unknown => {},
+        }
+        content.guard = .none;
+        var lx = lexer.Lexer.init(content.text, 0);
+        const hash = lx.next();
+        if (hash.kind != .hash) return null;
+        const d = lx.next();
+        var name: ?Token = null;
+        if (d.isIdent("ifndef")) {
+            name = lx.next();
+        } else if (d.isIdent("if")) {
+            if (lx.next().kind != .exclaim) return null;
+            if (!lx.next().isIdent("defined")) return null;
+            var t = lx.next();
+            if (t.kind == .l_paren) {
+                name = lx.next();
+                t = lx.next();
+                if (t.kind != .r_paren) return null;
+            } else name = t;
+        }
+        const macro = name orelse return null;
+        if (macro.kind != .identifier) return null;
+        lx.skipLine();
+        var depth: u32 = 1;
+        while (true) {
+            const t = lx.next();
+            if (t.kind == .eof) return null;
+            if (!(t.kind == .hash and t.flags.bol)) {
+                lx.skipLine();
+                continue;
+            }
+            const dir = lx.next();
+            if (dir.flags.bol) {
+                // Null directive: `dir` starts the next line; re-examine it.
+                lx.pos = dir.loc.offset;
+                lx.at_bol = true;
+                continue;
+            }
+            if (dir.isIdent("if") or dir.isIdent("ifdef") or dir.isIdent("ifndef")) {
+                depth += 1;
+            } else if (dir.isIdent("endif")) {
+                depth -= 1;
+                if (depth == 0) {
+                    lx.skipLine();
+                    if (lx.next().kind != .eof) return null;
+                    content.guard = .{ .macro = macro.text };
+                    return macro.text;
+                }
+            } else if (depth == 1 and (dir.isIdent("else") or dir.isIdent("elif"))) {
+                return null;
+            }
+            lx.skipLine();
+        }
     }
 
     fn fileKey(pp: *Preprocessor, path: []const u8) Error![]const u8 {
@@ -1031,6 +1109,10 @@ const Eval = struct {
     pp: *Preprocessor,
     toks: []const Token,
     pos: usize = 0,
+    /// Nonzero while evaluating an operand whose value is discarded (the
+    /// right side of a short-circuited && or ||, the unused arm of ?:).
+    /// Errors such as division by zero are not reported there.
+    unevaluated: u32 = 0,
 
     const EvalError = error{EvalFailed};
 
@@ -1068,19 +1150,30 @@ const Eval = struct {
             if (prec < min_prec) break;
             e.pos += 1;
             if (op.kind == .question) {
-                const t = try e.expr(0);
+                const cond = lhs.v != 0;
+                const t = try e.operand(0, !cond);
                 const colon = e.peek() orelse return e.fail("expected ':' in preprocessor expression");
                 if (colon.kind != .colon) return e.fail("expected ':' in preprocessor expression");
                 e.pos += 1;
-                const f = try e.expr(1);
-                lhs = if (lhs.v != 0) t else f;
+                const f = try e.operand(1, cond);
+                lhs = if (cond) t else f;
                 lhs.unsigned = t.unsigned or f.unsigned;
                 continue;
             }
-            const rhs = try e.expr(prec + 1);
+            const skip = (op.kind == .amp_amp and lhs.v == 0) or (op.kind == .pipe_pipe and lhs.v != 0);
+            const rhs = try e.operand(prec + 1, skip);
             lhs = try e.binary(op, lhs, rhs);
         }
         return lhs;
+    }
+
+    /// Parse an operand, marking it unevaluated when `skip` is set.
+    fn operand(e: *Eval, min_prec: u8, skip: bool) EvalError!Value {
+        if (skip) e.unevaluated += 1;
+        defer if (skip) {
+            e.unevaluated -= 1;
+        };
+        return e.expr(min_prec);
     }
 
     fn binary(e: *Eval, op: Token, a: Value, b: Value) EvalError!Value {
@@ -1109,6 +1202,7 @@ const Eval = struct {
             .star => .{ .v = a.v *% b.v, .unsigned = u },
             .slash, .percent => blk: {
                 if (b.v == 0) {
+                    if (e.unevaluated != 0) break :blk .{ .v = 0, .unsigned = u };
                     e.pp.diags.err(op.loc, "division by zero in preprocessor expression", .{});
                     return error.EvalFailed;
                 }
@@ -1306,4 +1400,60 @@ test "errors are diagnosed" {
     defer t.deinit();
     _ = try t.output();
     try std.testing.expectEqual(@as(u32, 2), t.diags.error_count);
+}
+
+test "#if short-circuits && || ?:" {
+    try expectPP("#if 0 && (1/0)\na\n#endif\n#if 1 || (1/0)\nb\n#endif\n#if 0 ? 1/0 : 2\nc\n#endif\n#if 1 ? 3 : 1%0\nd\n#endif", "b c d");
+    try expectPP("#if defined(N) && (64 / N > 2)\nbad\n#else\nok\n#endif", "ok");
+}
+
+test "quoted includes search the include stack innermost first, then -I" {
+    var t: TestPP = .{};
+    try t.init(&.{
+        .{ "./sub/b.h", "#include \"deeper/e.h\"\n" },
+        .{ "./sub/deeper/e.h", "#include \"f.h\"\n#include \"g.h\"\n#include <a.h>\n" },
+        .{ "./sub/f.h", "f_sub" },
+        .{ "./f.h", "f_main" },
+        .{ "./g.h", "g_main" },
+        .{ "inc/g.h", "g_inc" },
+        .{ "inc/a.h", "a_inc" },
+        .{ "./sub/deeper/a.h", "a_includer" },
+    }, "#include \"sub/b.h\"\n", .{ .include_dirs = &.{"inc"} });
+    defer t.deinit();
+    try std.testing.expectEqualStrings("f_sub g_main a_inc", try t.output());
+    try std.testing.expectEqual(@as(u32, 0), t.diags.error_count);
+}
+
+test "angled includes do not search the includer's directory" {
+    var t: TestPP = .{};
+    try t.init(&.{.{ "./a.h", "a" }}, "#include <a.h>\n", .{});
+    defer t.deinit();
+    _ = try t.output();
+    try std.testing.expectEqual(@as(u32, 1), t.diags.error_count);
+    try std.testing.expect(std.mem.indexOf(u8, t.diags.list.items[0].message, "use \"quotes\"") != null);
+}
+
+test "include guards are detected and guarded files are not re-entered" {
+    var t: TestPP = .{};
+    try t.init(&.{
+        .{ "./g.h", "// header\n#ifndef G_H\n#define G_H\nint g;\n#if 1\n#endif\n#endif // G_H\n" },
+        .{ "./d.h", "#if !defined(D_H)\n#define D_H\nint d;\n#endif\n" },
+        .{ "./e.h", "#ifndef E_H\n#define E_H\nint e;\n#else\nint again;\n#endif\n" },
+        .{ "./o.h", "#ifndef O_H\n#define O_H\n#endif\nint outside;\n" },
+    }, "#include \"g.h\"\n#include \"g.h\"\n#include \"d.h\"\n#include \"d.h\"\n#include \"e.h\"\n#include \"e.h\"\n#include \"o.h\"\n#include \"o.h\"\n", .{});
+    defer t.deinit();
+    try std.testing.expectEqualStrings("int g ; int d ; int e ; int again ; int outside ; int outside ;", try t.output());
+    const sm = &t.sm;
+    var guards: [4]?[]const u8 = undefined;
+    for ([_][]const u8{ "./g.h", "./d.h", "./e.h", "./o.h" }, 0..) |path, i| {
+        guards[i] = Preprocessor.includeGuard(sm.cache.get(path).?.?);
+    }
+    try std.testing.expectEqualStrings("G_H", guards[0].?);
+    try std.testing.expectEqualStrings("D_H", guards[1].?);
+    try std.testing.expect(guards[2] == null);
+    try std.testing.expect(guards[3] == null);
+}
+
+test "skipped blocks are skipped token by token" {
+    try expectPP("#if 0\nx = \"/*\";\n#endif\nok", "ok");
 }
