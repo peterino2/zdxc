@@ -10,7 +10,7 @@ const Io = std.Io;
 const zdxc = @import("zdxc");
 const front = zdxc.front;
 
-const Mode = enum { lex, pp, print };
+const Mode = enum { lex, load, pp, print };
 
 /// Serves each path from memory after the first read.
 const CachedFs = struct {
@@ -98,6 +98,10 @@ fn runOne(gpa: std.mem.Allocator, cfs: *CachedFs, path: []const u8, mode: Mode) 
     }
 
     var sm = front.source.SourceManager.init(arena, cfs.fileSystem());
+    if (mode == .load) {
+        const id = try sm.load(path) orelse return 0;
+        return sm.file(id).line_starts.len;
+    }
     var diags = zdxc.Diagnostics.init(arena);
     var pp = front.preproc.Preprocessor.init(arena, &sm, &diags, .{});
     if (!try pp.enterMainFile(path)) return 0;

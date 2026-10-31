@@ -282,7 +282,7 @@ pub const Preprocessor = struct {
         }
         while (pp.includes.items.len > 0) {
             const frame = &pp.includes.items[pp.includes.items.len - 1];
-            const t = frame.lex.next();
+            const t = @call(.always_inline, lexer.Lexer.next, .{&frame.lex});
             if (t.kind != .eof) return .{ .tok = t, .from_file = true };
             // End of file: diagnose unterminated conditionals, pop.
             while (pp.conds.items.len > frame.cond_base) {
@@ -316,7 +316,7 @@ pub const Preprocessor = struct {
             const r = try pp.lexRawSkipDirectives();
             const t = r.tok;
             if (t.kind != .identifier or t.flags.no_expand) return t;
-            if (std.mem.eql(u8, t.text, "_Pragma")) {
+            if (t.text.len == 7 and t.text[0] == '_' and std.mem.eql(u8, t.text, "_Pragma")) {
                 if (try pp.pragmaOperator(t)) |pragma| return pragma;
                 continue;
             }
