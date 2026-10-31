@@ -1773,6 +1773,7 @@ const Emitter = struct {
                 const st = try e.t.scalar(vec.elem);
                 return .{ if (vec.len == 1) v else try e.op1(.composite_extract, st, &.{ v, k }), st };
             },
+            .matrix => |m| return .{ try e.elementAt(v, ty, k / m.cols, k % m.cols), try e.t.scalar(m.elem) },
             .array => |a| {
                 const n = e.t.componentCount(a.elem).?;
                 return e.flatComponent(try e.op1(.composite_extract, a.elem, &.{ v, k / n }), a.elem, k % n);
@@ -1786,7 +1787,7 @@ const Emitter = struct {
                 }
                 return e.unsupported("internal: component out of range", .{});
             },
-            else => return e.unsupported("mesh outputs of type '{s}' are not supported yet", .{try e.t.format(e.arena, ty)}),
+            else => return e.unsupported("values of type '{s}' are not supported here yet", .{try e.t.format(e.arena, ty)}),
         }
     }
 
@@ -2339,16 +2340,19 @@ const Emitter = struct {
         }.f;
         const off = try e.convert(e.val(args[0]), e.f.inst(args[0]).ty, uint_ty);
         if (std.mem.startsWith(u8, name, "Load") and args.len == 1) {
-            const n = e.t.componentCount(ty) orelse return e.unsupported("templated Load is not supported yet", .{});
-            if (e.t.component(ty) != .uint) return e.unsupported("templated Load is not supported yet", .{});
+            if (e.t.component(ty) != .uint or e.t.get(ty) == .matrix) return e.rawLoad(e.val(res), off, ty);
+            const n = e.t.componentCount(ty).?;
             const parts = try e.arena.alloc(Id, n);
             for (parts, 0..) |*p, k| p.* = try e.op1(.load, uint_ty, &.{try word(e, e.val(res), off, @intCast(k))});
             return if (n == 1) parts[0] else e.op1(.composite_construct, ty, parts);
         }
         if (std.mem.startsWith(u8, name, "Store") and args.len == 2) {
             const vty = e.f.inst(args[1]).ty;
-            const n = e.t.componentCount(vty) orelse return e.unsupported("templated Store is not supported yet", .{});
-            if (e.t.component(vty) != .uint) return e.unsupported("templated Store is not supported yet", .{});
+            if (e.t.component(vty) != .uint or e.t.get(vty) == .matrix) {
+                try e.rawStore(e.val(res), off, vty, e.val(args[1]));
+                return 0;
+            }
+            const n = e.t.componentCount(vty).?;
             for (0..n) |k| {
                 const v = if (n == 1) e.val(args[1]) else try e.op1(.composite_extract, uint_ty, &.{ e.val(args[1]), @intCast(k) });
                 try e.b.emit(.functions, .store, &.{ try word(e, e.val(res), off, @intCast(k)), v });
@@ -2361,6 +2365,133 @@ const Emitter = struct {
             return e.atomicOp(name["Interlocked".len..], try word(e, e.val(res), off, 0), uint_ty, 1, args[1..]);
         }
         return e.unsupported("method '{s}' is not supported yet", .{name});
+    }
+
+    /// Pointer to the 32-bit word holding byte `addr` of a byte-address
+    /// buffer.
+    fn rawWord(e: *Emitter, buf: Id, addr: Id) Error!Id {
+        const ut = try e.t.scalar(.uint);
+        const idx = try e.op1(.shift_right_logical, ut, &.{ addr, try e.constUint(2) });
+        return e.opRaw(.access_chain, try e.pointerType(e.bufferSc(), try e.scalarType(.uint)), &.{ buf, try e.constInt(0), idx });
+    }
+
+    /// The scalar type and byte offset of flattened component `k` of a
+    /// value of `ty` in a byte-address buffer (natural alignment).
+    fn rawComponent(e: *Emitter, ty: TypeId, k: u32) Error!struct { TypeId, u32 } {
+        const off = layout.componentOffset(e.arena, e.t, ty, false, k, .dx_packed) catch return e.unsupported("byte-address buffer accesses of type '{s}' are not supported yet", .{try e.t.format(e.arena, ty)});
+        var cur = ty;
+        var kk = k;
+        while (true) switch (e.t.get(cur)) {
+            .scalar, .@"enum" => return .{ cur, off },
+            .vector, .matrix => return .{ try e.t.scalar(e.t.component(cur).?), off },
+            .array => |a| {
+                const n = e.t.componentCount(a.elem) orelse return e.unsupported("byte-address buffer accesses of type '{s}' are not supported yet", .{try e.t.format(e.arena, ty)});
+                kk %= n;
+                cur = a.elem;
+            },
+            .@"struct" => |st| {
+                for (st.fields.items) |fld| {
+                    const n = e.t.componentCount(fld.type).?;
+                    if (kk < n) {
+                        cur = fld.type;
+                        break;
+                    }
+                    kk -= n;
+                }
+            },
+            else => return e.unsupported("byte-address buffer accesses of type '{s}' are not supported yet", .{try e.t.format(e.arena, ty)}),
+        };
+    }
+
+    /// A templated byte-address Load: 32-bit words, combined for 64-bit
+    /// components and split for 16-bit ones.
+    fn rawLoad(e: *Emitter, buf: Id, base: Id, ty: TypeId) Error!Id {
+        const ut = try e.t.scalar(.uint);
+        const n = e.t.componentCount(ty) orelse return e.unsupported("byte-address buffer accesses of type '{s}' are not supported yet", .{try e.t.format(e.arena, ty)});
+        const comps = try e.arena.alloc(Id, n);
+        for (comps, 0..) |*c, k| {
+            const rc = try e.rawComponent(ty, @intCast(k));
+            const sc = rc[0];
+            const addr = try e.op1(.i_add, ut, &.{ base, try e.constUint(rc[1]) });
+            const w0 = try e.op1(.load, ut, &.{try e.rawWord(buf, addr)});
+            const comp = storageScalar(e.t.component(sc).?);
+            c.* = switch (comp.size()) {
+                8 => blk: {
+                    const addr1 = try e.op1(.i_add, ut, &.{ addr, try e.constUint(4) });
+                    const w1 = try e.op1(.load, ut, &.{try e.rawWord(buf, addr1)});
+                    const pair = try e.op1(.composite_construct, try e.t.vector(.uint, 2), &.{ w0, w1 });
+                    break :blk try e.op1(.bitcast, sc, &.{pair});
+                },
+                2 => blk: {
+                    const shift = try e.op1(.shift_left_logical, ut, &.{ try e.op1(.bitwise_and, ut, &.{ addr, try e.constUint(2) }), try e.constUint(3) });
+                    const bits = try e.op1(.shift_right_logical, ut, &.{ w0, shift });
+                    const u16t = try e.t.scalar(.uint16);
+                    const h = try e.op1(.u_convert, u16t, &.{bits});
+                    break :blk if (comp == .uint16) h else try e.op1(.bitcast, sc, &.{h});
+                },
+                else => if (comp == .uint) w0 else if (comp == .bool) try e.convert(w0, ut, sc) else try e.op1(.bitcast, sc, &.{w0}),
+            };
+        }
+        return e.composeFlat(ty, comps);
+    }
+
+    fn rawStore(e: *Emitter, buf: Id, base: Id, ty: TypeId, v: Id) Error!void {
+        const ut = try e.t.scalar(.uint);
+        const n = e.t.componentCount(ty) orelse return e.unsupported("byte-address buffer accesses of type '{s}' are not supported yet", .{try e.t.format(e.arena, ty)});
+        for (0..n) |k| {
+            const rc = try e.rawComponent(ty, @intCast(k));
+            const sc = rc[0];
+            const x = (try e.flatComponent(v, ty, @intCast(k)))[0];
+            const addr = try e.op1(.i_add, ut, &.{ base, try e.constUint(rc[1]) });
+            const comp = storageScalar(e.t.component(sc).?);
+            switch (comp.size()) {
+                8 => {
+                    const pair = try e.op1(.bitcast, try e.t.vector(.uint, 2), &.{x});
+                    try e.b.emit(.functions, .store, &.{ try e.rawWord(buf, addr), try e.op1(.composite_extract, ut, &.{ pair, 0 }) });
+                    const addr1 = try e.op1(.i_add, ut, &.{ addr, try e.constUint(4) });
+                    try e.b.emit(.functions, .store, &.{ try e.rawWord(buf, addr1), try e.op1(.composite_extract, ut, &.{ pair, 1 }) });
+                },
+                2 => {
+                    // Replace the half of the word (not atomic, as dxc).
+                    const u16t = try e.t.scalar(.uint16);
+                    const h = if (comp == .uint16) x else try e.op1(.bitcast, u16t, &.{x});
+                    const wide = try e.op1(.u_convert, ut, &.{h});
+                    const shift = try e.op1(.shift_left_logical, ut, &.{ try e.op1(.bitwise_and, ut, &.{ addr, try e.constUint(2) }), try e.constUint(3) });
+                    const ptr = try e.rawWord(buf, addr);
+                    const old = try e.op1(.load, ut, &.{ptr});
+                    const keep = try e.op1(.bitwise_and, ut, &.{ old, try e.op1(.not_, ut, &.{try e.op1(.shift_left_logical, ut, &.{ try e.constUint(0xFFFF), shift })}) });
+                    try e.b.emit(.functions, .store, &.{ ptr, try e.op1(.bitwise_or, ut, &.{ keep, try e.op1(.shift_left_logical, ut, &.{ wide, shift }) }) });
+                },
+                else => {
+                    const w = if (comp == .uint) x else if (comp == .bool) try e.convert(x, sc, ut) else try e.op1(.bitcast, ut, &.{x});
+                    try e.b.emit(.functions, .store, &.{ try e.rawWord(buf, addr), w });
+                },
+            }
+        }
+    }
+
+    /// A value of `ty` from its flattened scalar components.
+    fn composeFlat(e: *Emitter, ty: TypeId, comps: []const Id) Error!Id {
+        switch (e.t.get(ty)) {
+            .scalar, .@"enum", .vector, .matrix => return e.fromScalars(ty, comps),
+            .array => |a| {
+                const n = e.t.componentCount(a.elem).?;
+                const parts = try e.arena.alloc(Id, a.len);
+                for (parts, 0..) |*p, k| p.* = try e.composeFlat(a.elem, comps[k * n ..][0..n]);
+                return e.op1(.composite_construct, ty, parts);
+            },
+            .@"struct" => |st| {
+                const parts = try e.arena.alloc(Id, st.fields.items.len);
+                var at: usize = 0;
+                for (parts, st.fields.items) |*p, fld| {
+                    const n = e.t.componentCount(fld.type).?;
+                    p.* = try e.composeFlat(fld.type, comps[at..][0..n]);
+                    at += n;
+                }
+                return e.op1(.composite_construct, ty, parts);
+            },
+            else => return e.unsupported("values of type '{s}' are not supported yet", .{try e.t.format(e.arena, ty)}),
+        }
     }
 
     fn getDimensions(e: *Emitter, res: Ref, r: @FieldType(types.Type, "resource"), args: []const Ref) Error!void {

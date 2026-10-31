@@ -140,6 +140,7 @@ const Emitter = struct {
     resources: std.ArrayList(Resource) = .empty,
     resource_of_global: std.AutoHashMapUnmanaged(u32, u32) = .empty,
     private_globals: std.AutoHashMapUnmanaged(u32, Ptr) = .empty,
+    private_typed: std.AutoHashMapUnmanaged(u32, @FieldType(Lowered, "typed")) = .empty,
     res_locals: std.ArrayList(?Lowered) = .empty,
     /// Indices marked with NonUniformResourceIndex.
     nonuniform: std.AutoHashMapUnmanaged(Value, void) = .empty,
@@ -211,18 +212,29 @@ const Emitter = struct {
         return switch (s) {
             .bool => e.dm.intType(1),
             .int, .uint, .min16int, .min12int, .min16uint, .literal_int, .int8_4packed, .uint8_4packed => e.dm.intType(32),
-            .int16, .uint16 => e.dm.intType(16),
+            .int16, .uint16 => blk: {
+                e.uses_min_precision = true;
+                break :blk e.dm.intType(16);
+            },
             .int64, .uint64 => blk: {
                 e.uses_int64 = true;
                 break :blk e.dm.intType(64);
             },
             .float, .half, .min16float, .min10float, .literal_float => e.dm.getType(.float),
-            .float16 => e.dm.getType(.half),
+            .float16 => blk: {
+                e.uses_min_precision = true;
+                break :blk e.dm.getType(.half);
+            },
             .double => blk: {
                 e.uses_double = true;
                 break :blk e.dm.getType(.double);
             },
         };
+    }
+
+    /// The scalar a component is kept as in struct-typed memory.
+    fn memScalar(s: Scalar) Scalar {
+        return if (s == .bool) .uint else storageScalar(s);
     }
 
     fn storageScalar(s: Scalar) Scalar {
@@ -327,6 +339,7 @@ const Emitter = struct {
             e.prologue = .empty;
             e.next_id = 0;
             e.private_globals = .empty;
+            e.private_typed = .empty;
             e.nonuniform = .empty;
             const name = m.functions.items[pw].name;
             e.pc_fn = try e.dm.addFunction(.{ .name = name[0 .. name.len - ".wrapper".len], .ty = fn_ty, .num_blocks = 1 });
@@ -841,6 +854,16 @@ const Emitter = struct {
                 // Static globals live in the entry function (everything is
                 // inlined into it).
                 if (e.m.globals.items[g].space == .private) {
+                    const gty = e.m.globals.items[g].ty;
+                    if (try e.mixedSizes(gty)) {
+                        const tg = try e.private_typed.getOrPut(e.arena, g);
+                        if (!tg.found_existing) {
+                            const dty = try e.memoryType(gty);
+                            const base = try e.addPrologue(try e.dm.ptrType(dty), .{ .alloca = .{ .elem = dty, .size = try e.i32Const(1) } });
+                            tg.value_ptr.* = .{ .base = base, .dty = dty, .addr_space = 0, .ty = gty };
+                        }
+                        return .{ .typed = tg.value_ptr.* };
+                    }
                     const gop = try e.private_globals.getOrPut(e.arena, g);
                     if (!gop.found_existing) gop.value_ptr.* = try e.alloca(e.m.globals.items[g].ty);
                     return .{ .ptr = gop.value_ptr.* };
@@ -872,6 +895,12 @@ const Emitter = struct {
                 if (isResourceType(e.t, i.ty)) {
                     try e.res_locals.append(e.arena, null);
                     return .{ .res_local = @intCast(e.res_locals.items.len - 1) };
+                }
+                if (try e.mixedSizes(i.ty)) {
+                    // Components of several sizes: a struct-typed alloca.
+                    const dty = try e.memoryType(i.ty);
+                    const base = try e.addPrologue(try e.dm.ptrType(dty), .{ .alloca = .{ .elem = dty, .size = try e.i32Const(1) } });
+                    return .{ .typed = .{ .base = base, .dty = dty, .addr_space = 0, .ty = i.ty } };
                 }
                 return .{ .ptr = try e.alloca(i.ty) };
             },
@@ -1170,6 +1199,20 @@ const Emitter = struct {
             4 => @as(i32, @truncate(v)),
             else => v,
         };
+    }
+
+    /// Whether `ty`'s components are of several sizes (kept in struct-typed
+    /// memory rather than a flat array).
+    fn mixedSizes(e: *Emitter, ty: TypeId) Error!bool {
+        if (e.t.get(ty) != .@"struct" and e.t.get(ty) != .array) return false;
+        const n = try e.flatCount(ty);
+        var size: ?u32 = null;
+        for (0..n) |k| {
+            const sz = memScalar(e.compOf(try e.componentType(ty, @intCast(k)))).size();
+            if (size != null and size.? != sz) return true;
+            size = sz;
+        }
+        return false;
     }
 
     /// Whether `ty`'s components differ in type (all 32-bit), so storage is
@@ -2508,6 +2551,7 @@ const Emitter = struct {
         }
         const idx = (try e.scalars(frame, index_ref))[0];
         if (res.kind == 12) return .{ .scalars = try e.structuredLoad(res.*, idx, 0, null, false, ty) };
+        if (res.kind == 11 and !try e.simpleRaw(ty)) return .{ .scalars = try e.rawLoad(res.*, idx, ty) };
         const n = try e.flatCount(ty);
         const c = try e.uniformScalar(ty);
         const mem_c = if (c == .bool) Scalar.uint else c;
@@ -2549,12 +2593,118 @@ const Emitter = struct {
         return .{ .scalars = out };
     }
 
+    /// Whether a byte-address Load/Store of `ty` is a single access of up
+    /// to four 32-bit components.
+    fn simpleRaw(e: *Emitter, ty: TypeId) Error!bool {
+        const n = try e.flatCount(ty);
+        if (n > 4 or e.t.get(ty) == .matrix) return false;
+        const c = e.uniformScalar(ty) catch return false;
+        return storageScalar(c).size() == 4;
+    }
+
+    /// Byte offsets of the components of `ty` in a byte-address buffer
+    /// (templated Load / Store: natural alignment; dxc's DXIL lays
+    /// matrices out by row here, its SPIR-V by column).
+    fn rawOffset(e: *Emitter, ty: TypeId, k: u32) Error!u32 {
+        return layout.componentOffset(e.arena, e.t, ty, true, k, .dx_packed) catch e.unsupported("byte-address buffer accesses of type '{s}' are not supported yet", .{try e.t.format(e.arena, ty)});
+    }
+
+    /// A templated byte-address Load: one raw load per component.
+    fn rawLoad(e: *Emitter, res: Resource, base: Value, ty: TypeId) Error![]const Value {
+        if (e.profile.minor < 2) return e.unsupported("templated loads of '{s}' need shader model 6.2", .{try e.t.format(e.arena, ty)});
+        const i32t = try e.dm.intType(32);
+        const i8t = try e.dm.intType(8);
+        const undef_i32 = try e.dm.constant(.{ .ty = i32t, .kind = .undef });
+        const out = try e.arena.alloc(Value, try e.flatCount(ty));
+        for (out, 0..) |*o, k| {
+            const c = e.compOf(try e.componentType(ty, @intCast(k)));
+            const mem_c = if (c == .bool) Scalar.uint else storageScalar(c);
+            const addr = try e.intArith(.add, base, try e.i32Const(try e.rawOffset(ty, @intCast(k))));
+            if (mem_c.size() == 8 and e.profile.minor < 3) {
+                // 64-bit overloads need SM 6.3: two words.
+                const ut = try e.scalarTy(.uint);
+                const rt = try e.resRetType(ut);
+                const fn_i = try e.dxOp("dx.op.rawBufferLoad.i32", rt, &.{ i32t, e.handle_ty, i32t, i32t, i8t, i32t }, .nounwind_readonly);
+                const call = try e.callOp(fn_i, rt, &.{ try e.i32Const(139), res.handle, addr, undef_i32, try e.dm.constInt(8, 3), try e.i32Const(4) });
+                const lo = try e.add(ut, .{ .extractvalue = .{ .agg = call, .index = 0 } });
+                const hi = try e.add(ut, .{ .extractvalue = .{ .agg = call, .index = 1 } });
+                o.* = try e.joinWords(lo, hi, mem_c);
+                continue;
+            }
+            const st = try e.scalarTy(mem_c);
+            const ret_ty = try e.resRetType(st);
+            const fn_i = try e.dxOp(try std.fmt.allocPrint(e.arena, "dx.op.rawBufferLoad.{s}", .{e.overloadName(st)}), ret_ty, &.{ i32t, e.handle_ty, i32t, i32t, i8t, i32t }, .nounwind_readonly);
+            const call = try e.callOp(fn_i, ret_ty, &.{ try e.i32Const(139), res.handle, addr, undef_i32, try e.dm.constInt(8, 1), try e.i32Const(mem_c.size()) });
+            const v = try e.add(st, .{ .extractvalue = .{ .agg = call, .index = 0 } });
+            o.* = if (c == .bool) try e.convertScalar(v, .uint, .bool) else v;
+        }
+        return out;
+    }
+
+    /// A 64-bit value from its low and high words (makeDouble for
+    /// doubles).
+    fn joinWords(e: *Emitter, lo: Value, hi: Value, c: Scalar) Error!Value {
+        const i32t = try e.dm.intType(32);
+        if (c == .double) {
+            const dt = try e.scalarTy(.double);
+            const fn_i = try e.dxOp("dx.op.makeDouble.f64", dt, &.{ i32t, i32t, i32t }, .nounwind_readnone);
+            return e.callOp(fn_i, dt, &.{ try e.i32Const(101), lo, hi });
+        }
+        const i64t = try e.scalarTy(c);
+        const l = try e.add(i64t, .{ .cast = .{ .op = .zext, .val = lo } });
+        const h = try e.add(i64t, .{ .cast = .{ .op = .zext, .val = hi } });
+        const sh = try e.add(i64t, .{ .binop = .{ .op = .shl, .lhs = h, .rhs = try e.dm.constant(.{ .ty = i64t, .kind = .{ .int = 32 } }) } });
+        return e.add(i64t, .{ .binop = .{ .op = .@"or", .lhs = sh, .rhs = l } });
+    }
+
+    /// The low and high words of a 64-bit value (splitDouble for doubles).
+    fn splitWords(e: *Emitter, v: Value, c: Scalar) Error![2]Value {
+        const i32t = try e.dm.intType(32);
+        if (c == .double) {
+            const st = try e.dm.getType(.{ .@"struct" = .{ .name = "dx.types.splitdouble", .elems = &.{ i32t, i32t } } });
+            const fn_i = try e.dxOp("dx.op.splitDouble.f64", st, &.{ i32t, try e.scalarTy(.double) }, .nounwind_readnone);
+            const r = try e.callOp(fn_i, st, &.{ try e.i32Const(102), v });
+            return .{ try e.add(i32t, .{ .extractvalue = .{ .agg = r, .index = 0 } }), try e.add(i32t, .{ .extractvalue = .{ .agg = r, .index = 1 } }) };
+        }
+        const i64t = try e.scalarTy(c);
+        const lo = try e.add(i32t, .{ .cast = .{ .op = .trunc, .val = v } });
+        const sh = try e.add(i64t, .{ .binop = .{ .op = .lshr, .lhs = v, .rhs = try e.dm.constant(.{ .ty = i64t, .kind = .{ .int = 32 } }) } });
+        return .{ lo, try e.add(i32t, .{ .cast = .{ .op = .trunc, .val = sh } }) };
+    }
+
+    fn rawStore(e: *Emitter, res: Resource, base: Value, ty: TypeId, vals: []const Value) Error!void {
+        if (e.profile.minor < 2) return e.unsupported("templated stores of '{s}' need shader model 6.2", .{try e.t.format(e.arena, ty)});
+        const i32t = try e.dm.intType(32);
+        const i8t = try e.dm.intType(8);
+        const void_ty = try e.voidTy();
+        const undef_i32 = try e.dm.constant(.{ .ty = i32t, .kind = .undef });
+        for (vals, 0..) |v, k| {
+            const c = e.compOf(try e.componentType(ty, @intCast(k)));
+            const mem_c = if (c == .bool) Scalar.uint else storageScalar(c);
+            const addr = try e.intArith(.add, base, try e.i32Const(try e.rawOffset(ty, @intCast(k))));
+            if (mem_c.size() == 8 and e.profile.minor < 3) {
+                const ut = try e.scalarTy(.uint);
+                const words = try e.splitWords(v, mem_c);
+                const undef_u = try e.dm.constant(.{ .ty = ut, .kind = .undef });
+                const fn_i = try e.dxOp("dx.op.rawBufferStore.i32", void_ty, &.{ i32t, e.handle_ty, i32t, i32t, ut, ut, ut, ut, i8t, i32t }, .nounwind);
+                _ = try e.callOp(fn_i, void_ty, &.{ try e.i32Const(140), res.handle, addr, undef_i32, words[0], words[1], undef_u, undef_u, try e.dm.constInt(8, 3), try e.i32Const(4) });
+                continue;
+            }
+            const st = try e.scalarTy(mem_c);
+            const undef_v = try e.dm.constant(.{ .ty = st, .kind = .undef });
+            const fn_i = try e.dxOp(try std.fmt.allocPrint(e.arena, "dx.op.rawBufferStore.{s}", .{e.overloadName(st)}), void_ty, &.{ i32t, e.handle_ty, i32t, i32t, st, st, st, st, i8t, i32t }, .nounwind);
+            const sv = if (c == .bool) try e.convertScalar(v, .bool, .uint) else v;
+            _ = try e.callOp(fn_i, void_ty, &.{ try e.i32Const(140), res.handle, addr, undef_i32, sv, undef_v, undef_v, undef_v, try e.dm.constInt(8, 1), try e.i32Const(mem_c.size()) });
+        }
+    }
+
     fn resourceStore(e: *Emitter, frame: *Frame, res_ref: Ref, index_ref: Ref, value_ref: Ref) Error!void {
         const res = try e.resourceOf(frame, res_ref);
         if (res.kind >= 1 and res.kind <= 9) return e.textureStore(res.*, try e.scalars(frame, index_ref), try e.scalars(frame, value_ref), frame.f.inst(value_ref).ty);
         const idx = (try e.scalars(frame, index_ref))[0];
         const vals = try e.scalars(frame, value_ref);
         if (res.kind == 12) return e.structuredStore(res.*, idx, 0, null, false, frame.f.inst(value_ref).ty, vals);
+        if (res.kind == 11 and !try e.simpleRaw(frame.f.inst(value_ref).ty)) return e.rawStore(res.*, idx, frame.f.inst(value_ref).ty, vals);
         const vt = frame.f.inst(value_ref).ty;
         const c = try e.uniformScalar(vt);
         const mem_c = if (c == .bool) Scalar.uint else c;
@@ -2944,9 +3094,9 @@ const Emitter = struct {
     /// and matrices (by row) become arrays, bools 32-bit integers.
     fn memoryType(e: *Emitter, ty: TypeId) Error!DType {
         return switch (e.t.get(ty)) {
-            .scalar, .@"enum" => e.scalarTy(storageScalar(e.compOf(ty))),
-            .vector => |v| e.dm.getType(.{ .array = .{ .len = v.len, .elem = try e.scalarTy(storageScalar(e.compOf(ty))) } }),
-            .matrix => |m| e.dm.getType(.{ .array = .{ .len = m.rows, .elem = try e.dm.getType(.{ .array = .{ .len = m.cols, .elem = try e.scalarTy(storageScalar(e.compOf(ty))) } }) } }),
+            .scalar, .@"enum" => e.scalarTy(memScalar(e.compOf(ty))),
+            .vector => |v| e.dm.getType(.{ .array = .{ .len = v.len, .elem = try e.scalarTy(memScalar(e.compOf(ty))) } }),
+            .matrix => |m| e.dm.getType(.{ .array = .{ .len = m.rows, .elem = try e.dm.getType(.{ .array = .{ .len = m.cols, .elem = try e.scalarTy(memScalar(e.compOf(ty))) } }) } }),
             .array => |a| e.dm.getType(.{ .array = .{ .len = a.len, .elem = try e.memoryType(a.elem) } }),
             .@"struct" => |st| blk: {
                 const elems = try e.arena.alloc(DType, st.fields.items.len);
@@ -2966,7 +3116,7 @@ const Emitter = struct {
     fn memLayout(e: *Emitter, ty: TypeId) Error![2]u32 {
         switch (e.t.get(ty)) {
             .scalar, .@"enum", .vector, .matrix => {
-                const sz = storageScalar(e.compOf(ty)).size();
+                const sz = memScalar(e.compOf(ty)).size();
                 return .{ sz * (e.t.componentCount(ty) orelse 1), sz };
             },
             .array => |a| {
@@ -3025,8 +3175,8 @@ const Emitter = struct {
         const out = try e.arena.alloc(Value, paths.items.len);
         for (out, paths.items, 0..) |*o, sub, c| {
             const ct = e.compOf(try e.componentType(ty, @intCast(c)));
-            const st = try e.scalarTy(storageScalar(ct));
-            const raw = try e.add(st, .{ .load = .{ .ptr = try e.typedScalarPtr(tp, sub, st), .@"align" = 4 } });
+            const st = try e.scalarTy(memScalar(ct));
+            const raw = try e.add(st, .{ .load = .{ .ptr = try e.typedScalarPtr(tp, sub, st), .@"align" = memScalar(ct).size() } });
             o.* = if (ct == .bool) try e.add(try e.dm.intType(1), .{ .cmp = .{ .pred = 33, .lhs = raw, .rhs = try e.i32Const(0) } }) else raw;
         }
         return .{ .scalars = out };
@@ -3037,9 +3187,9 @@ const Emitter = struct {
         try e.scalarPaths(ty, &.{}, &paths);
         for (vals, paths.items, 0..) |v, sub, c| {
             const ct = e.compOf(try e.componentType(ty, @intCast(c)));
-            const st = try e.scalarTy(storageScalar(ct));
+            const st = try e.scalarTy(memScalar(ct));
             const sv = if (ct == .bool) try e.add(st, .{ .cast = .{ .op = .zext, .val = v } }) else v;
-            _ = try e.add(try e.voidTy(), .{ .store = .{ .ptr = try e.typedScalarPtr(tp, sub, st), .val = sv, .@"align" = 4 } });
+            _ = try e.add(try e.voidTy(), .{ .store = .{ .ptr = try e.typedScalarPtr(tp, sub, st), .val = sv, .@"align" = memScalar(ct).size() } });
         }
     }
 
