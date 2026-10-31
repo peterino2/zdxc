@@ -1,0 +1,14 @@
+.{
+    .name = .zdxc,
+    .version = "0.0.0",
+    .fingerprint = 0x59453f044e69c7f1, // Changing this has security and trust implications.
+    .minimum_zig_version = "0.17.0",
+    // zdxc has no dependencies, by design.
+    .dependencies = .{},
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "vendor",
+    },
+}
