@@ -382,6 +382,7 @@ const Emitter = struct {
             .texture2dms_array, .rw_texture2dms_array => 8,
             .texture_cube_array => 9,
             .constant_buffer => 13,
+            .texture_buffer => 15,
             else => return e.unsupported("resource type '{s}' is not supported yet", .{r.name}),
         };
         const class: Resource.Class = if (kind == 13) .cbuffer else if (r.kind.isWritable() or r.kind == .consume_structured_buffer) .uav else .srv;
@@ -392,12 +393,19 @@ const Emitter = struct {
         var counts = [_]u32{ 0, 0, 0, 0 };
         // Constant buffers: `$Globals` first, then the others in order.
         for ([_]bool{ true, false }) |globals_pass| for (e.m.globals.items, 0..) |g, gi| {
-            if (g.space != .cbuffer or std.mem.eql(u8, g.name, "$Globals") != globals_pass) continue;
+            if (g.space != .cbuffer or g.tbuffer or std.mem.eql(u8, g.name, "$Globals") != globals_pass) continue;
             try e.resources.append(e.arena, .{ .global = @intCast(gi), .class = .cbuffer, .id = counts[2], .kind = 13, .elem = g.ty });
             counts[2] += 1;
             try e.resource_of_global.put(e.arena, @intCast(gi), @intCast(e.resources.items.len - 1));
         };
         for (e.m.globals.items, 0..) |g, gi| {
+            if (g.tbuffer) {
+                // tbuffer blocks: SRVs (TBuffer) laid out like cbuffers.
+                try e.resources.append(e.arena, .{ .global = @intCast(gi), .class = .srv, .id = counts[0], .kind = 15, .elem = g.ty });
+                counts[0] += 1;
+                try e.resource_of_global.put(e.arena, @intCast(gi), @intCast(e.resources.items.len - 1));
+                continue;
+            }
             if (g.space != .resource) continue;
             // Arrays of resources are register ranges.
             var gty = g.ty;
@@ -891,7 +899,7 @@ const Emitter = struct {
                     return .{ .ptr = gop.value_ptr.* };
                 }
                 const ri = e.resource_of_global.get(g) orelse return e.unsupported("global '{s}' is not supported yet", .{e.m.globals.items[g].name});
-                if (e.resources.items[ri].class == .cbuffer and e.m.globals.items[g].space == .cbuffer) return .{ .cbuf = .{ .res = ri } };
+                if (e.m.globals.items[g].space == .cbuffer) return .{ .cbuf = .{ .res = ri } };
                 if (e.resources.items[ri].count != 1) return .{ .res_array = .{ .res = ri, .ty = e.m.globals.items[g].ty } };
                 return .{ .handle = ri };
             },
@@ -1010,7 +1018,7 @@ const Emitter = struct {
                 if (frame.vals[a.base.index()] == .handle) {
                     const ri = frame.vals[a.base.index()].handle;
                     const rk = e.resources.items[ri].kind;
-                    if (rk == 13) return e.cbufferAccess(frame, .{ .res = ri }, e.resources.items[ri].elem, a.indices);
+                    if (rk == 13 or rk == 15) return e.cbufferAccess(frame, .{ .res = ri }, e.resources.items[ri].elem, a.indices);
                     if (rk >= 1 and rk <= 10) return .{ .texel = .{ .res = ri, .coords = try e.scalars(frame, a.indices[0]) } };
                     if (rk != 12) return e.unsupported("member access into this resource is not supported yet", .{});
                     const start: @FieldType(Lowered, "buf") = .{ .res = ri, .index = (try e.scalars(frame, a.indices[0]))[0] };
@@ -2084,6 +2092,29 @@ const Emitter = struct {
             const off = offset + (layout.componentOffset(e.arena, e.t, ty, row_major, @intCast(k), .dx_legacy) catch return e.unsupported("constant buffer member types", .{}));
             const reg = off / 16;
             const st = try e.scalarTy(mem_c);
+            if (res.kind == 15) {
+                // tbuffer: whole registers as i32 (bufferLoad).
+                if (sz != 4 and sz != 8) return e.unsupported("16-bit tbuffer members are not supported yet", .{});
+                if (cache_reg == null or cache_reg.? != reg) {
+                    const it = try e.scalarTy(.uint);
+                    const rt = try e.resRetType(it);
+                    const fn_i = try e.dxOp("dx.op.bufferLoad.i32", rt, &.{ i32t, e.handle_ty, i32t, i32t }, .nounwind_readonly);
+                    var reg_v = try e.i32Const(reg);
+                    if (dyn_regs) |d| reg_v = try e.add(i32t, .{ .binop = .{ .op = .add, .lhs = d, .rhs = reg_v } });
+                    cache_val = try e.callOp(fn_i, rt, &.{ try e.i32Const(68), res.handle, reg_v, try e.dm.constant(.{ .ty = i32t, .kind = .undef }) });
+                    cache_reg = reg;
+                }
+                const it = try e.scalarTy(.uint);
+                const w0 = try e.add(it, .{ .extractvalue = .{ .agg = cache_val, .index = (off % 16) / 4 } });
+                const v = if (sz == 8)
+                    try e.joinWords(w0, try e.add(it, .{ .extractvalue = .{ .agg = cache_val, .index = (off % 16) / 4 + 1 } }), mem_c)
+                else if (mem_c.isFloat())
+                    try e.add(st, .{ .cast = .{ .op = .bitcast, .val = w0 } })
+                else
+                    w0;
+                o.* = if (c == .bool) try e.convertScalar(v, .uint, .bool) else v;
+                continue;
+            }
             if (cache_reg == null or cache_reg.? != reg or cache_st != st) {
                 const ret_name = try std.fmt.allocPrint(e.arena, "dx.types.CBufRet.{s}{s}", .{ e.overloadName(st), if (sz == 2) ".8" else "" });
                 const elems: []const DType = switch (sz) {
@@ -3434,6 +3465,16 @@ const Emitter = struct {
                     return m.getType(.{ .array = .{ .len = if (n == std.math.maxInt(u32)) 0 else n, .elem = t } });
                 }
             }.f;
+            if (r.kind == 15) {
+                // tbuffer / TextureBuffer<S>: an SRV of 32-bit elements.
+                const f32t = try dm.getType(.float);
+                const tb_name = if (r.rty != 0) try std.fmt.allocPrint(e.arena, "struct.{s}", .{try e.t.format(e.arena, r.elem)}) else g.name;
+                const tb_ty = try rangeTy(dm, r.count, try dm.getType(.{ .@"struct" = .{ .name = tb_name, .elems = &.{f32t} } }));
+                const undef_tb = try dm.constant(.{ .ty = try dm.ptrType(tb_ty), .kind = .undef });
+                const b = g.binding;
+                try lists[0].append(e.arena, try dm.mdNode(&.{ try mdI32(dm, r.id), try dm.mdValue(try dm.ptrType(tb_ty), undef_tb), try dm.mdString(""), try mdI32(dm, b.space), try mdI32(dm, b.index), try mdI32(dm, range), try mdI32(dm, 15), try mdI32(dm, 0), try dm.mdNode(&.{ try mdI32(dm, 0), try mdI32(dm, 5) }) }));
+                continue;
+            }
             if (r.class == .cbuffer) {
                 const f32t = try dm.getType(.float);
                 const cb_name = if (r.rty != 0) try std.fmt.allocPrint(e.arena, "struct.{s}", .{try e.t.format(e.arena, r.elem)}) else g.name;

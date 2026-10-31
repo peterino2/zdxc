@@ -66,8 +66,10 @@ pub fn matrixStride(t: *const TypeTable, ty: TypeId, row_major: bool, rules: Rul
 pub fn alignOf(t: *const TypeTable, ty: TypeId, row_major: bool, rules: Rules) Error!u32 {
     switch (t.get(ty)) {
         .scalar, .@"enum" => return scalarSize(t, ty),
+        // (The base alignment; relaxed placement packs 32-bit vectors
+        // tighter, see `place`.)
         .vector => |v| return switch (rules) {
-            .std430 => vectorAlign(v.len, scalarSize(t, ty)),
+            .std430, .vk_relaxed => vectorAlign(v.len, scalarSize(t, ty)),
             else => scalarSize(t, ty),
         },
         .matrix => return switch (rules) {
@@ -76,7 +78,8 @@ pub fn alignOf(t: *const TypeTable, ty: TypeId, row_major: bool, rules: Rules) E
             .dx_packed => scalarSize(t, ty),
         },
         .array => |a| return switch (rules) {
-            .dx_legacy, .vk_relaxed => 16,
+            .dx_legacy => 16,
+            .vk_relaxed => @max(16, try alignOf(t, a.elem, row_major, rules)),
             else => alignOf(t, a.elem, row_major, rules),
         },
         .@"struct" => |st| return structAlign(t, st, rules),
@@ -125,7 +128,12 @@ pub fn place(t: *const TypeTable, off: u32, ty: TypeId, row_major: bool, rules: 
     switch (t.get(ty)) {
         .scalar, .@"enum", .vector => {
             const size = try sizeOf(t, ty, row_major, rules);
-            var o = roundUp(off, scalarSize(t, ty));
+            // Relaxed placement: vectors of 32-bit (or narrower)
+            // components align like their components; 64-bit ones keep
+            // their full alignment (as dxc).
+            const s = scalarSize(t, ty);
+            const al = if (t.get(ty) == .vector and s > 4 and (rules == .vk_relaxed or rules == .std430)) vectorAlign(t.get(ty).vector.len, s) else s;
+            var o = roundUp(off, al);
             // No straddling a 16-byte boundary (except tightly packed).
             if (rules != .dx_packed and o / 16 != (o + size - 1) / 16) o = roundUp(o, 16);
             return o;
@@ -137,9 +145,9 @@ pub fn place(t: *const TypeTable, off: u32, ty: TypeId, row_major: bool, rules: 
 
 fn structAlign(t: *const TypeTable, info: *const types.StructInfo, rules: Rules) Error!u32 {
     switch (rules) {
-        .dx_legacy, .vk_relaxed => return 16,
+        .dx_legacy => return 16,
         else => {
-            var al: u32 = 1;
+            var al: u32 = if (rules == .vk_relaxed) 16 else 1;
             for (info.fields.items) |f| al = @max(al, try alignOf(t, f.type, f.row_major, rules));
             return al;
         },
@@ -152,8 +160,7 @@ fn structSize(t: *const TypeTable, info: *const types.StructInfo, rules: Rules) 
     const off = try layoutFields(t, info, rules, buf[0..info.fields.items.len]);
     return switch (rules) {
         .dx_legacy, .dx_packed => off,
-        .vk_relaxed => roundUp(off, 16),
-        .std430 => roundUp(off, try structAlign(t, info, rules)),
+        .vk_relaxed, .std430 => roundUp(off, try structAlign(t, info, rules)),
     };
 }
 

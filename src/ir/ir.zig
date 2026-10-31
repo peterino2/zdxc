@@ -203,6 +203,9 @@ pub const Global = struct {
     ty: TypeId,
     space: Space,
     binding: Binding = .{},
+    /// A `tbuffer` block (space `cbuffer`): a texture buffer with the
+    /// constant buffer layout.
+    tbuffer: bool = false,
 };
 
 pub const Stage = enum { vertex, pixel, geometry, hull, domain, compute, mesh, amplification, library };

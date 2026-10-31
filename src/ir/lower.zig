@@ -193,12 +193,10 @@ const Lowerer = struct {
         var members: std.ArrayList(*const Variable) = .empty;
         var name: []const u8 = "$Globals";
         var binding: ir.Binding = .{};
+        var is_tbuffer = false;
         if (v.block) |b| {
             const cb = b.kind.cbuffer;
-            if (cb.tbuffer) {
-                l.unsupported(v.loc, "tbuffer variables are not supported yet", .{});
-                return error.Unsupported;
-            }
+            is_tbuffer = cb.tbuffer;
             name = cb.name;
             for (cb.members) |m| if (m.kind == .@"var") {
                 if (l.s.decl_vars.get(&m.kind.@"var")) |mv| try members.append(l.arena, mv);
@@ -216,7 +214,7 @@ const Lowerer = struct {
         info.* = .{ .name = name, .complete = true };
         for (members.items) |mv| try info.fields.append(l.arena, .{ .name = mv.name, .type = mv.type, .row_major = mv.row_major });
         const ty = try l.s.types.intern(.{ .@"struct" = info });
-        try l.m.globals.append(l.arena, .{ .name = name, .ty = ty, .space = .cbuffer, .binding = binding });
+        try l.m.globals.append(l.arena, .{ .name = name, .ty = ty, .space = .cbuffer, .binding = binding, .tbuffer = is_tbuffer });
         const gi: u32 = @intCast(l.m.globals.items.len - 1);
         try l.cbuffers.put(l.arena, key, gi);
         for (members.items, 0..) |mv, fi| try l.cbuffer_members.put(l.arena, mv, .{ .global = gi, .field = @intCast(fi) });

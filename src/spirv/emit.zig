@@ -124,6 +124,7 @@ const Emitter = struct {
     buffer_blocks: std.AutoHashMapUnmanaged(TypeId, Id) = .empty,
     /// ConstantBuffer<S> blocks by S.
     cb_blocks: std.AutoHashMapUnmanaged(TypeId, Id) = .empty,
+    tb_blocks: std.AutoHashMapUnmanaged(TypeId, Id) = .empty,
     /// Descriptor heaps: a runtime array variable per (heap, element type),
     /// on the heap's binding.
     heap_vars: std.AutoHashMapUnmanaged(struct { bool, Id }, Id) = .empty,
@@ -370,6 +371,18 @@ const Emitter = struct {
                 try e.b.emitWithString(.debug_names, .name, &.{id}, name, &.{});
             }
         }
+    }
+
+    /// The block of TextureBuffer<S>: S's members, std430, read-only.
+    fn textureBufferBlock(e: *Emitter, s: TypeId) Error!Id {
+        if (e.tb_blocks.get(s)) |id| return id;
+        const st = e.t.get(s).@"struct";
+        const id = e.b.newId();
+        try e.layoutStruct(id, st, .std430, try std.fmt.allocPrint(e.arena, "type.TextureBuffer.{s}", .{st.name}));
+        for (0..st.fields.items.len) |k| try e.b.emit(.annotations, .member_decorate, &.{ id, @intCast(k), 24 }); // NonWritable
+        try e.b.emit(.annotations, .decorate, &.{ id, e.bufferBlockDecoration() });
+        try e.tb_blocks.put(e.arena, s, id);
+        return id;
     }
 
     /// The Block struct of ConstantBuffer<S>: S's members laid out as a
@@ -674,11 +687,16 @@ const Emitter = struct {
                     e.global_vars[gi] = var_id;
                 },
                 .cbuffer => {
-                    const st = try e.layoutTypeId(g.ty, .vk_relaxed, false);
-                    try e.b.emit(.annotations, .decorate, &.{ st, 2 }); // Block
-                    const ptr = try e.pointerType(.uniform, st);
+                    // tbuffers: read-only storage buffers, std430.
+                    const st = try e.layoutTypeId(g.ty, if (g.tbuffer) .std430 else .vk_relaxed, false);
+                    try e.b.emit(.annotations, .decorate, &.{ st, if (g.tbuffer) e.bufferBlockDecoration() else 2 }); // Block
+                    if (g.tbuffer) for (0..e.t.get(g.ty).@"struct".fields.items.len) |k| {
+                        try e.b.emit(.annotations, .member_decorate, &.{ st, @intCast(k), 24 }); // NonWritable
+                    };
+                    const sc: StorageClass = if (g.tbuffer) e.bufferSc() else .uniform;
+                    const ptr = try e.pointerType(sc, st);
                     const var_id = e.b.newId();
-                    try e.b.emit(.types_globals, .variable, &.{ ptr, var_id, @backingInt(StorageClass.uniform) });
+                    try e.b.emit(.types_globals, .variable, &.{ ptr, var_id, @backingInt(sc) });
                     var binding = g.binding.index;
                     if (!g.binding.explicit) {
                         while (used.contains(.{ g.binding.space, next_free })) next_free += 1;
@@ -1272,7 +1290,7 @@ const Emitter = struct {
             .global => |g| {
                 e.vals[ri] = e.global_vars[g];
                 e.ptr_layouts[ri] = switch (e.m.globals.items[g].space) {
-                    .cbuffer => .{ .rules = .vk_relaxed, .row_major = false },
+                    .cbuffer => .{ .rules = if (e.m.globals.items[g].tbuffer) .std430 else .vk_relaxed, .row_major = false },
                     .resource => .{ .rules = .std430, .row_major = false },
                     else => null,
                 };
@@ -1338,6 +1356,7 @@ const Emitter = struct {
                 // Uniform std430 storage.
                 const into_buffer = e.t.get(f.inst(a.base).ty) == .resource;
                 const into_cb = into_buffer and e.t.get(f.inst(a.base).ty).resource.kind == .constant_buffer;
+                const into_tb = into_buffer and e.t.get(f.inst(a.base).ty).resource.kind == .texture_buffer;
                 const base_pl = e.ptr_layouts[a.base.index()];
                 if (i.ptr == .mesh) {
                     // Mesh outputs: a place, written component by component.
@@ -1378,12 +1397,12 @@ const Emitter = struct {
                     .cbuffer, .resource => .uniform,
                     else => return e.unsupported("access into this storage is not supported yet", .{}),
                 };
-                var pl = if (into_cb) PtrLayout{ .rules = .vk_relaxed, .row_major = false } else if (into_buffer) PtrLayout{ .rules = .std430, .row_major = false } else e.ptr_layouts[a.base.index()];
+                var pl = if (into_cb) PtrLayout{ .rules = .vk_relaxed, .row_major = false } else if (into_tb) PtrLayout{ .rules = .std430, .row_major = false } else if (into_buffer) PtrLayout{ .rules = .std430, .row_major = false } else e.ptr_layouts[a.base.index()];
                 var ops: std.ArrayList(u32) = .empty;
                 try ops.appendSlice(e.arena, &.{ 0, 0, e.val(a.base) });
                 var cur = f.inst(a.base).ty;
                 var indices = a.indices;
-                if (into_cb) {
+                if (into_cb or into_tb) {
                     cur = e.t.get(cur).resource.elem;
                 } else if (e.t.get(cur) == .resource) {
                     // buffer[i]...: member 0 (the runtime array), element i.
@@ -1965,6 +1984,7 @@ const Emitter = struct {
             .resource => |r| switch (r.kind) {
                 .structured_buffer, .rw_structured_buffer, .append_structured_buffer, .consume_structured_buffer, .byte_address_buffer, .rw_byte_address_buffer => return .{ .sc = e.bufferSc(), .ty = try e.bufferBlockType(ty) },
                 .constant_buffer => if (e.t.get(r.elem) == .@"struct") return .{ .sc = .uniform, .ty = try e.constantBufferBlock(r.elem) },
+                .texture_buffer => if (e.t.get(r.elem) == .@"struct") return .{ .sc = e.bufferSc(), .ty = try e.textureBufferBlock(r.elem) },
                 else => if (texture.shape(r.kind)) |sh| return .{ .sc = .uniform_constant, .ty = try e.imageType(sh, r.elem) },
             },
             .array => |arr| {
