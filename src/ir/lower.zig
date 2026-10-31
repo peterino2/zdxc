@@ -158,7 +158,7 @@ const Lowerer = struct {
             var strs: std.ArrayList([]const u8) = .empty;
             var ints: std.ArrayList(u32) = .empty;
             for (items) |it| switch (it.kind) {
-                .string_lit => |lit| try strs.append(l.arena, lit[1 .. lit.len - 1]),
+                .string_lit => |lit| try strs.append(l.arena, try stringContents(l.arena, lit)),
                 else => try ints.append(l.arena, @truncate(@as(u64, @bitCast(l.s.evalInt(it) orelse 0)))),
             };
             for (ints.items[0..@min(2, ints.items.len)], 0..) |x, k| so.ints[k] = x;
@@ -1891,6 +1891,7 @@ const Lowerer = struct {
             }
             if (std.ascii.eqlIgnoreCase(a.name, "maxvertexcount") and a.args.len == 1) entry.geometry.max_vertex_count = @intCast(@max(1, l.s.evalInt(a.args[0]) orelse 1));
             if (std.ascii.eqlIgnoreCase(a.name, "instance") and a.args.len == 1) entry.geometry.instance_count = @intCast(@max(1, l.s.evalInt(a.args[0]) orelse 1));
+            if (std.ascii.eqlIgnoreCase(a.name, "RootSignature") and a.args.len == 1 and a.args[0].kind == .string_lit) entry.root_signature = try stringContents(l.arena, a.args[0].kind.string_lit);
         }
         for (l.streams.items, 0..) |sm, k| entry.geometry.streams[k] = switch (sm.kind.kind) {
             .point => .point,
@@ -2048,6 +2049,30 @@ pub fn saturatingInt(f: f64) i64 {
 /// parameter.
 fn isMethod(f: *const semamod.Function) bool {
     return f.owner != null and !f.decl.quals.static;
+}
+
+/// The characters of a string literal (quotes removed, escapes
+/// resolved).
+pub fn stringContents(a: Allocator, lit: []const u8) Allocator.Error![]const u8 {
+    const body = if (lit.len >= 2 and lit[0] == '"') lit[1 .. lit.len - 1] else lit;
+    if (std.mem.indexOfScalar(u8, body, '\\') == null) return body;
+    var out: std.ArrayList(u8) = .empty;
+    var k: usize = 0;
+    while (k < body.len) : (k += 1) {
+        if (body[k] != '\\' or k + 1 == body.len) {
+            try out.append(a, body[k]);
+            continue;
+        }
+        k += 1;
+        try out.append(a, switch (body[k]) {
+            'n' => '\n',
+            't' => '\t',
+            'r' => '\r',
+            '0' => 0,
+            else => body[k],
+        });
+    }
+    return out.items;
 }
 
 fn isShaderRecord(attrs: []const ast.Attribute) bool {

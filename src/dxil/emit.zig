@@ -19,6 +19,7 @@ const texture = @import("../ir/texture.zig");
 const mangle = @import("mangle.zig");
 const rdat = @import("rdat.zig");
 const libinfo = @import("libinfo.zig");
+const rootsig = @import("rootsig.zig");
 
 const TypeId = types.TypeId;
 const TypeTable = types.TypeTable;
@@ -4516,7 +4517,11 @@ const Emitter = struct {
                     rec[2] = so.ints[0];
                     for (so.strings, 0..) |x, k| rec[3 + k] = try b.string(x);
                 },
-                .global_root_signature, .local_root_signature => return e.unsupported("root signature subobjects are not supported yet", .{}),
+                .global_root_signature, .local_root_signature => {
+                    const blob = try e.compileRootSignature(so.strings[0], if (so.kind == .local_root_signature) .local else .global);
+                    rec[2] = try b.bytes(blob);
+                    rec[3] = @intCast(blob.len);
+                },
             }
             try b.addSubobject(rec);
         }
@@ -4582,6 +4587,17 @@ const Emitter = struct {
             const state = try dm.mdNode(&.{ try mdI32(dm, @intFromEnum(entry.tess.domain)), try mdI32(dm, entry.tess.input_control_points) });
             try props.appendSlice(e.arena, &.{ try mdI32(dm, 2), state });
         }
+    }
+
+    /// A root signature's serialized form (RTS0), or an error reported.
+    fn compileRootSignature(e: *Emitter, text: []const u8, flags: rootsig.CompilationFlags) Error![]u8 {
+        var d: rootsig.Diagnostic = .{};
+        const version: rootsig.Version = if (e.m.rootsig_version == .v1_0) .v1_0 else .v1_1;
+        const blob = try rootsig.compileWithOptions(e.arena, text, .{ .version = version, .flags = flags }, &d) orelse {
+            _ = e.diags.report(.{ .severity = .@"error", .loc = .none }, "root signature error - {s}", .{d.message()});
+            return error.Unsupported;
+        };
+        return blob;
     }
 
     fn writeModule(e: *Emitter, entry: ir.Entry) Error![]u8 {
@@ -4764,10 +4780,11 @@ const Emitter = struct {
             .{ .fourcc = container.fourcc("OSG1"), .data = osg1 },
         });
         if (entry.stage == .hull or entry.stage == .domain or entry.stage == .mesh) try parts.append(e.arena, .{ .fourcc = container.fourcc("PSG1"), .data = psg1 });
-        try parts.appendSlice(e.arena, &.{
-            .{ .fourcc = container.fourcc("PSV0"), .data = psv },
-            .{ .fourcc = container.fourcc("DXIL"), .data = dxil_part },
-        });
+        try parts.append(e.arena, .{ .fourcc = container.fourcc("PSV0"), .data = psv });
+        if (entry.root_signature) |text| if (!e.m.strip_rootsig) {
+            try parts.append(e.arena, .{ .fourcc = container.fourcc("RTS0"), .data = try e.compileRootSignature(text, .global) });
+        };
+        try parts.append(e.arena, .{ .fourcc = container.fourcc("DXIL"), .data = dxil_part });
         return container.assemble(gpa, parts.items);
     }
 };

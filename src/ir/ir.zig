@@ -327,6 +327,8 @@ pub const Entry = struct {
     patch_wrapper: ?u32 = null,
     /// The HLSL patch constant function.
     patch_func: ?u32 = null,
+    /// `[RootSignature("...")]`: the root signature text.
+    root_signature: ?[]const u8 = null,
     /// The wrapper with no parameters that reads `inputs`, calls `func`
     /// and writes `outputs`.
     wrapper: u32 = 0,
@@ -370,6 +372,10 @@ pub const Module = struct {
     subobjects: std.ArrayList(Subobject) = .empty,
     /// -enable-16bit-types: half and 16-bit integers are native types.
     native_16bit: bool = false,
+    /// Root signatures: version 1.0 or 1.1 (-force-rootsig-ver), and
+    /// -Qstrip_rootsignature.
+    rootsig_version: enum { v1_0, v1_1 } = .v1_1,
+    strip_rootsig: bool = false,
 
     pub fn addFunction(m: *Module, f: Function) !u32 {
         const p = try m.arena.create(Function);

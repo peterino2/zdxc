@@ -18,6 +18,11 @@ const Options = struct {
     preprocess: bool = false,
     pp_output: ?[]const u8 = null,
     enable_16bit: bool = false,
+    /// -force-rootsig-ver, -Qstrip_rootsignature, -rootsig-define, -Frs.
+    rootsig_ver: ?[]const u8 = null,
+    strip_rootsig: bool = false,
+    rootsig_define: ?[]const u8 = null,
+    rootsig_output: ?[]const u8 = null,
     defines: std.ArrayList(front.preproc.Define) = .empty,
     include_dirs: std.ArrayList([]const u8) = .empty,
     empty: bool = false,
@@ -126,6 +131,10 @@ fn parseArgs(cli: Cli, arena: std.mem.Allocator, argv: []const [:0]const u8, std
                     .spirv => opts.spirv = true,
                     .fspv_target_env_EQ => opts.target_env = v,
                     .enable_16bit_types => opts.enable_16bit = true,
+                    .force_rootsig_ver, .force_rootsig_ver_ => opts.rootsig_ver = v,
+                    .Qstrip_rootsignature => opts.strip_rootsig = true,
+                    .rootsig_define => opts.rootsig_define = v,
+                    .Frs => opts.rootsig_output = v,
                     ._SLASH_WX => opts.warnings_as_errors = true,
                     .no_warnings => opts.no_warnings = true,
                     .W_Joined => {
@@ -213,6 +222,16 @@ fn run(cli: Cli, arena: std.mem.Allocator, args: []const [:0]const u8, stdout: *
         return;
     }
 
+    // Root signature targets: the root signature in the macro -E names.
+    if (opts.profile) |p| if (std.mem.eql(u8, p, "rootsig_1_0") or std.mem.eql(u8, p, "rootsig_1_1")) {
+        const input = opts.input orelse return cli.fail("no input file", .{});
+        const out = opts.output orelse return cli.fail("missing -Fo <file>", .{});
+        const version: zdxc.dxil.rootsig.Version = if (std.mem.eql(u8, p, "rootsig_1_0")) .v1_0 else .v1_1;
+        const blob = try compileRootSignatureMacro(cli, arena, opts, input, opts.entry, version, .none) orelse return error.CompileFailed;
+        try Io.Dir.cwd().writeFile(cli.io, .{ .sub_path = out, .data = try rootSignatureContainer(arena, blob) });
+        return;
+    };
+
     const profile: ?shader.Profile = if (opts.profile) |p|
         shader.Profile.parse(p) orelse return cli.fail("unknown profile '{s}'", .{p})
     else
@@ -275,7 +294,13 @@ fn run(cli: Cli, arena: std.mem.Allocator, args: []const [:0]const u8, stdout: *
                             error.Unsupported => null,
                             else => |x| return x,
                         };
-                        if (module) |*mm| mm.native_16bit = opts.enable_16bit;
+                        if (module) |*mm| {
+                            mm.native_16bit = opts.enable_16bit;
+                            mm.strip_rootsig = opts.strip_rootsig;
+                            if (opts.rootsig_ver) |rv| {
+                                if (std.mem.eql(u8, rv, "rootsig_1_0")) mm.rootsig_version = .v1_0 else if (!std.mem.eql(u8, rv, "rootsig_1_1")) return cli.fail("unknown root signature version '{s}'", .{rv});
+                            }
+                        }
                     }
                 }
             }
@@ -311,6 +336,10 @@ fn run(cli: Cli, arena: std.mem.Allocator, args: []const [:0]const u8, stdout: *
                 try Io.Dir.cwd().writeFile(cli.io, .{ .sub_path = path, .data = bytes });
                 return;
             }
+            // -rootsig-define: the macro's root signature for the entry.
+            if (opts.rootsig_define) |macro| if (m.entries.items.len == 1) {
+                m.entries.items[0].root_signature = try rootSignatureMacroText(cli, arena, opts, input, macro) orelse return error.CompileFailed;
+            };
             const bytes = zdxc.dxil.emit.emit(arena, m, profile.?, &diags) catch |err| switch (err) {
                 error.Unsupported => {
                     try diags.render(&sm, cli.stderr, .{ .format = opts.diag_format, .color = false });
@@ -321,6 +350,12 @@ fn run(cli: Cli, arena: std.mem.Allocator, args: []const [:0]const u8, stdout: *
             };
             const path = opts.output orelse return cli.fail("missing -Fo <file>", .{});
             try Io.Dir.cwd().writeFile(cli.io, .{ .sub_path = path, .data = bytes });
+            if (opts.rootsig_output) |rs_path| {
+                const text = (if (m.entries.items.len == 1) m.entries.items[0].root_signature else null) orelse return cli.fail("-Frs: the shader has no root signature", .{});
+                var d: zdxc.dxil.rootsig.Diagnostic = .{};
+                const blob = try zdxc.dxil.rootsig.compileWithOptions(arena, text, .{ .version = if (m.rootsig_version == .v1_0) .v1_0 else .v1_1, .flags = .global }, &d) orelse return cli.fail("root signature error - {s}", .{d.message()});
+                try Io.Dir.cwd().writeFile(cli.io, .{ .sub_path = rs_path, .data = try rootSignatureContainer(arena, blob) });
+            }
             return;
         }
         return cli.fail("code generation is not implemented yet: the input was checked but no output was written (use -zdxc-empty for a placeholder shader)", .{});
@@ -337,4 +372,60 @@ fn run(cli: Cli, arena: std.mem.Allocator, args: []const [:0]const u8, stdout: *
 
     const out = opts.output orelse return cli.fail("missing -Fo <file>", .{});
     try Io.Dir.cwd().writeFile(cli.io, .{ .sub_path = out, .data = bytes });
+}
+
+/// The text of the root signature macro `macro` defines in `input` (its
+/// string literals concatenated), or null after reporting an error.
+fn rootSignatureMacroText(cli: Cli, arena: std.mem.Allocator, opts: Options, input: []const u8, macro: []const u8) !?[]const u8 {
+    const text = try Io.Dir.cwd().readFileAlloc(cli.io, input, arena, .limited(256 << 20));
+    var disk: front.source.DiskFs = .{ .io = cli.io };
+    var sm = front.source.SourceManager.init(arena, disk.fileSystem());
+    var diags = zdxc.Diagnostics.init(arena);
+    var pp = front.preproc.Preprocessor.init(arena, &sm, &diags, .{
+        .defines = opts.defines.items,
+        .include_dirs = opts.include_dirs.items,
+        .stage = 6,
+    });
+    // Expand the macro after a marker at the end of the file.
+    const marker = "__zdxc_root_signature__";
+    try pp.enterMainText(input, try std.mem.concat(arena, u8, &.{ text, "\n" ++ marker ++ " ", macro, "\n" }));
+    var parts: std.ArrayList(u8) = .empty;
+    var seen = false;
+    var any = false;
+    while (true) {
+        const t = try pp.next();
+        if (t.kind == .eof) break;
+        if (!seen) {
+            seen = t.kind == .identifier and std.mem.eql(u8, t.text, marker);
+            continue;
+        }
+        if (t.kind != .string) {
+            _ = diags.report(.{ .severity = .@"error", .loc = t.loc }, "root signature macro '{s}' must expand to string literals", .{macro});
+            break;
+        }
+        any = true;
+        try parts.appendSlice(arena, try zdxc.ir.lower.stringContents(arena, t.text));
+    }
+    if (!any and !diags.hasErrors()) _ = diags.report(.{ .severity = .@"error", .loc = .none }, "root signature macro '{s}' is not defined", .{macro});
+    if (diags.hasErrors()) {
+        try diags.render(&sm, cli.stderr, .{ .format = opts.diag_format, .color = false });
+        try cli.stderr.flush();
+        return null;
+    }
+    return parts.items;
+}
+
+fn compileRootSignatureMacro(cli: Cli, arena: std.mem.Allocator, opts: Options, input: []const u8, macro: []const u8, version: zdxc.dxil.rootsig.Version, flags: zdxc.dxil.rootsig.CompilationFlags) !?[]const u8 {
+    const text = try rootSignatureMacroText(cli, arena, opts, input, macro) orelse return null;
+    var d: zdxc.dxil.rootsig.Diagnostic = .{};
+    return try zdxc.dxil.rootsig.compileWithOptions(arena, text, .{ .version = version, .flags = flags }, &d) orelse {
+        try cli.stderr.print("{s}: error: root signature error - {s}\n", .{ input, d.message() });
+        try cli.stderr.flush();
+        return null;
+    };
+}
+
+/// A container holding only the root signature (RTS0) part.
+fn rootSignatureContainer(arena: std.mem.Allocator, blob: []const u8) ![]u8 {
+    return zdxc.dxil.container.assemble(arena, &.{.{ .fourcc = zdxc.dxil.container.fourcc("RTS0"), .data = blob }});
 }
