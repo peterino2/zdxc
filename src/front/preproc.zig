@@ -108,6 +108,10 @@ pub const Error = Allocator.Error;
 pub const PresumedLoc = struct { file: []const u8, line: u32 };
 
 const max_include_depth = 200;
+/// Nesting limit for macro-argument pre-expansion (`F(F(F(...)))`) and for
+/// parentheses in #if expressions; deeper input would exhaust the stack.
+/// dxc itself crashes at a few thousand levels.
+const max_nesting_depth = 512;
 const embedded_prefix = "<built-in:hlsl>/";
 const hlsl_headers = @import("hlsl_headers");
 
@@ -125,6 +129,8 @@ pub const Preprocessor = struct {
     line_overrides: std.AutoHashMapUnmanaged(source.FileId, std.ArrayList(LineOverride)) = .empty,
     counter: u32 = 0,
     main_file: ?source.FileId = null,
+    isolated_depth: u32 = 0,
+    nesting_reported: bool = false,
 
     const Raw = struct { tok: Token, from_file: bool };
 
@@ -273,6 +279,10 @@ pub const Preprocessor = struct {
             const r = try pp.lexRawSkipDirectives();
             const t = r.tok;
             if (t.kind != .identifier or t.flags.no_expand) return t;
+            if (std.mem.eql(u8, t.text, "_Pragma")) {
+                if (try pp.pragmaOperator(t)) |pragma| return pragma;
+                continue;
+            }
             const m = pp.macros.get(t.text) orelse return t;
             if (m.disabled) {
                 var painted = t;
@@ -320,6 +330,36 @@ pub const Preprocessor = struct {
         m.disabled = true;
         try pp.contexts.append(pp.arena, .{ .tokens = result, .macro = m });
         return true;
+    }
+
+    /// `_Pragma("...")`: destringize the operand and treat it like a
+    /// `#pragma` line.
+    fn pragmaOperator(pp: *Preprocessor, op: Token) Error!?Token {
+        const open = try pp.lexRawSkipDirectives();
+        const str = try pp.lexRawSkipDirectives();
+        const close = try pp.lexRawSkipDirectives();
+        if (open.tok.kind != .l_paren or str.tok.kind != .string or close.tok.kind != .r_paren) {
+            pp.diags.err(op.loc, "_Pragma takes a parenthesized string literal", .{});
+            if (close.tok.kind != .r_paren) try pp.pushback.append(pp.arena, close);
+            return null;
+        }
+        const body = try unquoteString(pp.arena, str.tok.text);
+        return pp.handlePragma(std.mem.trim(u8, body, " \t"), op.loc);
+    }
+
+    /// Handle a pragma body. `#pragma once` is consumed; anything else is
+    /// returned as a `.pragma` token for the parser.
+    fn handlePragma(pp: *Preprocessor, body: []const u8, loc: Loc) Error!?Token {
+        if (std.mem.eql(u8, body, "once")) {
+            const file = pp.currentLexer().?.file;
+            if (file == pp.main_file) {
+                pp.diags.warn(loc, "#pragma once in main file", .{});
+            } else {
+                try pp.pragma_once.put(pp.arena, try pp.fileKey(pp.sm.file(file).path), {});
+            }
+            return null;
+        }
+        return .{ .kind = .pragma, .flags = .{ .bol = true }, .text = body, .loc = loc };
     }
 
     /// `__has_feature(name)` and similar: consume `( ident )`, push 0 or 1.
@@ -401,6 +441,16 @@ pub const Preprocessor = struct {
 
     /// Fully macro-expand `tokens` in isolation.
     fn expandIsolated(pp: *Preprocessor, tokens: []const Token) Error![]Token {
+        if (pp.isolated_depth >= max_nesting_depth) {
+            if (!pp.nesting_reported) {
+                const loc = if (tokens.len > 0) tokens[0].loc else Loc.none;
+                pp.diags.err(loc, "macro arguments nested too deeply (limit {d})", .{max_nesting_depth});
+                pp.nesting_reported = true;
+            }
+            return pp.arena.dupe(Token, tokens);
+        }
+        pp.isolated_depth += 1;
+        defer pp.isolated_depth -= 1;
         const saved_pushback = pp.pushback;
         pp.pushback = .empty;
         defer pp.pushback = saved_pushback;
@@ -603,6 +653,15 @@ pub const Preprocessor = struct {
             lx.* = saved; // null directive
             return null;
         }
+        if (name.kind == .number) {
+            // GNU line marker: `# <line> ["file" [flags...]]`.
+            const rest = try pp.directiveTokens();
+            const toks = try pp.arena.alloc(Token, rest.len + 1);
+            toks[0] = name;
+            @memcpy(toks[1..], rest);
+            try pp.applyLine(hash, toks[0..@min(toks.len, 2)]);
+            return null;
+        }
         if (name.kind != .identifier) {
             pp.diags.err(name.loc, "invalid preprocessing directive", .{});
             pp.skipRestOfLine();
@@ -649,13 +708,7 @@ pub const Preprocessor = struct {
             } else _ = pp.conds.pop();
             pp.skipRestOfLine();
         } else if (std.mem.eql(u8, d, "pragma")) {
-            const body = lx.restOfLine();
-            if (std.mem.eql(u8, body, "once")) {
-                const key = try pp.fileKey(pp.sm.file(lx.file).path);
-                try pp.pragma_once.put(pp.arena, key, {});
-                return null;
-            }
-            return .{ .kind = .pragma, .flags = .{ .bol = true }, .text = body, .loc = hash.loc };
+            return pp.handlePragma(lx.restOfLine(), hash.loc);
         } else if (std.mem.eql(u8, d, "error")) {
             pp.diags.err(hash.loc, "{s}", .{lx.restOfLine()});
         } else if (std.mem.eql(u8, d, "warning")) {
@@ -806,6 +859,15 @@ pub const Preprocessor = struct {
             m.params = params.items;
         }
         const body = toks[i..];
+        if (m.function_like) {
+            for (body, 0..) |t, j| {
+                if (t.kind != .hash) continue;
+                if (j + 1 >= body.len or m.paramIndex(body[j + 1]) == null) {
+                    pp.diags.err(t.loc, "'#' is not followed by a macro parameter", .{});
+                    return;
+                }
+            }
+        }
         if (body.len > 0) {
             if (body[0].kind == .hash_hash or body[body.len - 1].kind == .hash_hash) {
                 pp.diags.err(body[0].loc, "'##' cannot appear at either end of a macro expansion", .{});
@@ -972,7 +1034,11 @@ pub const Preprocessor = struct {
 
     fn handleLine(pp: *Preprocessor, directive: Token) Error!void {
         const raw = try pp.directiveTokens();
-        const toks = try pp.expandIsolated(raw);
+        try pp.applyLine(directive, try pp.expandIsolated(raw));
+    }
+
+    /// Record a `#line` / line marker: `toks` is `<number> ["file"]`.
+    fn applyLine(pp: *Preprocessor, directive: Token, toks: []const Token) Error!void {
         if (toks.len == 0 or toks[0].kind != .number) {
             pp.diags.err(directive.loc, "#line directive requires a positive integer argument", .{});
             return;
@@ -1113,6 +1179,7 @@ const Eval = struct {
     /// right side of a short-circuited && or ||, the unused arm of ?:).
     /// Errors such as division by zero are not reported there.
     unevaluated: u32 = 0,
+    depth: u32 = 0,
 
     const EvalError = error{EvalFailed};
 
@@ -1215,6 +1282,9 @@ const Eval = struct {
     }
 
     fn unary(e: *Eval) EvalError!Value {
+        if (e.depth >= max_nesting_depth) return e.fail("preprocessor expression nested too deeply");
+        e.depth += 1;
+        defer e.depth -= 1;
         const t = e.peek() orelse return e.fail("expected value in expression");
         e.pos += 1;
         switch (t.kind) {
@@ -1456,4 +1526,40 @@ test "include guards are detected and guarded files are not re-entered" {
 
 test "skipped blocks are skipped token by token" {
     try expectPP("#if 0\nx = \"/*\";\n#endif\nok", "ok");
+}
+
+test "'#' must name a parameter in function-like macros" {
+    var t: TestPP = .{};
+    try t.init(&.{}, "#define O # x\nO\n#define F(x) #x #\nF(1)\n", .{});
+    defer t.deinit();
+    try std.testing.expectEqualStrings("# x F ( 1 )", try t.output());
+    try std.testing.expectEqual(@as(u32, 1), t.diags.error_count);
+}
+
+test "_Pragma operator" {
+    try expectPP("#define P(x) _Pragma(#x) int a;\nP(pack_matrix(row_major))\n_Pragma(\"dxc diagnostic ignored \\\"-Wfoo\\\"\") int b;", "#pragma pack_matrix(row_major) int a ; #pragma dxc diagnostic ignored \"-Wfoo\" int b ;");
+}
+
+test "GNU line markers" {
+    try expectPP("a\n# 40 \"foo.hlsl\" 1 3\nb __LINE__ __FILE__\n#90\nc __LINE__", "a b 40 \"foo.hlsl\" c 90");
+}
+
+test "deep nesting is diagnosed instead of overflowing the stack" {
+    const gpa = std.testing.allocator;
+    var src: std.ArrayList(u8) = .empty;
+    defer src.deinit(gpa);
+    try src.appendSlice(gpa, "#define F(x) (x)\n");
+    for (0..20000) |_| try src.appendSlice(gpa, "F(");
+    try src.append(gpa, '1');
+    for (0..20000) |_| try src.append(gpa, ')');
+    try src.appendSlice(gpa, "\n#if ");
+    for (0..20000) |_| try src.append(gpa, '(');
+    try src.append(gpa, '1');
+    for (0..20000) |_| try src.append(gpa, ')');
+    try src.appendSlice(gpa, "\n#endif\n");
+    var t: TestPP = .{};
+    try t.init(&.{}, src.items, .{});
+    defer t.deinit();
+    _ = try t.output();
+    try std.testing.expectEqual(@as(u32, 2), t.diags.error_count);
 }
