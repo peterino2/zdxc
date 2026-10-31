@@ -1882,7 +1882,7 @@ pub const Sema = struct {
     fn funcDeclMode(s: *Sema, d: *const ast.Decl, f: *const ast.FuncDecl, owner: ?*types.StructInfo, mode: FuncMode) Allocator.Error!void {
         const name = f.name.last();
         if (mode == .body_only) {
-            if (f.template_params.len > 0 or std.mem.startsWith(u8, name, "operator") or f.name.parts.len > 1) return;
+            if (f.template_params.len > 0 or (std.mem.startsWith(u8, name, "operator") and owner == null) or f.name.parts.len > 1) return;
             const sym = s.scope.syms.get(name) orelse return;
             if (sym != .functions) return;
             for (sym.functions.funcs.items) |func| if (func.decl == f) return s.funcBody(func, f);
@@ -1892,8 +1892,9 @@ pub const Sema = struct {
             o.has_operators = true;
         };
         if (f.template_params.len > 0) return s.declareTemplate(name, d);
-        if (std.mem.startsWith(u8, name, "operator")) {
-            s.err(d.loc, "operator overloading is not supported yet (planned for milestone 0.2)", .{});
+        // HLSL 2021 overloads operators as member functions only.
+        if (std.mem.startsWith(u8, name, "operator") and owner == null) {
+            s.err(d.loc, "non-member operator overloading is not supported yet", .{});
             return;
         }
         if (f.name.parts.len > 1) return; // out-of-line method definition: not modelled yet
@@ -2279,11 +2280,64 @@ pub const Sema = struct {
         return err_typed;
     }
 
+    /// `obj op args`: a call to the struct's `operator<op>` method
+    /// (recorded on `e`), or null when it declares none.
+    fn operatorCall(s: *Sema, e: *ast.Expr, obj: TypeId, name: []const u8, args: []const intrinsics.ArgInfo) Allocator.Error!?TypeId {
+        const info = switch (s.types.get(obj)) {
+            .@"struct" => |info| info,
+            else => return null,
+        };
+        const ss: *StructSema = @ptrCast(@alignCast(info.sema orelse return null));
+        const sym = structMember(ss, name) orelse return null;
+        if (sym != .functions) return null;
+        return s.resolveUserCall(e, sym.functions, args, e);
+    }
+
+    fn argInfo(s: *Sema, e: *ast.Expr, t: Typed) intrinsics.ArgInfo {
+        return .{ .ty = t.ty, .lvalue = t.lvalue and !t.read_only, .loc = e.loc, .groupshared = s.isGroupshared(e) };
+    }
+
+    fn binaryOpName(op: ast.BinaryOp) ?[]const u8 {
+        return switch (op) {
+            .mul => "operator*",
+            .div => "operator/",
+            .rem => "operator%",
+            .add => "operator+",
+            .sub => "operator-",
+            .shl => "operator<<",
+            .shr => "operator>>",
+            .lt => "operator<",
+            .gt => "operator>",
+            .le => "operator<=",
+            .ge => "operator>=",
+            .eq => "operator==",
+            .ne => "operator!=",
+            .bit_and => "operator&",
+            .bit_xor => "operator^",
+            .bit_or => "operator|",
+            .log_and => "operator&&",
+            .log_or => "operator||",
+            .comma => null,
+        };
+    }
+
     /// A port of dxc's CheckUnaryOpForHLSL.
     fn unaryExpr(s: *Sema, e: *ast.Expr, op: ast.UnaryOp, operand: *ast.Expr) Allocator.Error!Typed {
         const t = try s.expr(operand);
         if (t.ty == TypeTable.error_type) return err_typed;
-        if (s.types.get(t.ty) == .@"struct" and s.types.get(t.ty).@"struct".overloadsOperators()) return err_typed;
+        if (s.types.get(t.ty) == .@"struct" and s.types.get(t.ty).@"struct".overloadsOperators()) {
+            const name: []const u8 = switch (op) {
+                .plus => "operator+",
+                .minus => "operator-",
+                .not => "operator!",
+                .bit_not => "operator~",
+                .pre_inc, .post_inc => "operator++",
+                .pre_dec, .post_dec => "operator--",
+            };
+            if (try s.operatorCall(e, t.ty, name, &.{})) |rt| return rvalue(rt);
+            s.err(e.loc, "invalid argument type '{s}' to unary expression", .{s.typeName(t.ty)});
+            return err_typed;
+        }
         const inc_dec = switch (op) {
             .pre_inc, .pre_dec, .post_inc, .post_dec => true,
             else => false,
@@ -2328,6 +2382,9 @@ pub const Sema = struct {
     fn binaryExpr(s: *Sema, e: *ast.Expr, op: ast.BinaryOp, lhs: *ast.Expr, rhs: *ast.Expr) Allocator.Error!Typed {
         const l = try s.expr(lhs);
         const r = try s.expr(rhs);
+        if (binaryOpName(op)) |name| if (l.ty != TypeTable.error_type and r.ty != TypeTable.error_type) {
+            if (try s.operatorCall(e, l.ty, name, &.{s.argInfo(rhs, r)})) |rt| return rvalue(rt);
+        };
         if (op == .comma) return rvalue(r.ty);
         if (l.ty == TypeTable.error_type or r.ty == TypeTable.error_type) return err_typed;
         return rvalue(try s.binaryOp(e.loc, op, l.ty, r.ty, false, lhs.loc, rhs.loc) orelse return err_typed);
@@ -2493,6 +2550,17 @@ pub const Sema = struct {
             }
         } else {
             const r = try s.expr(rhs);
+            // `a op= b` on a struct: its operator op= (or operator op).
+            if (s.types.get(l.ty) == .@"struct" and r.ty != TypeTable.error_type) {
+                const bop = std.meta.stringToEnum(ast.BinaryOp, @tagName(op)).?;
+                const base = binaryOpName(bop).?;
+                const compound = try std.fmt.allocPrint(s.arena, "{s}=", .{base});
+                if (try s.operatorCall(e, l.ty, compound, &.{s.argInfo(rhs, r)})) |rt| return rvalue(rt);
+                if (try s.operatorCall(e, l.ty, base, &.{s.argInfo(rhs, r)})) |rt| {
+                    if (s.conversionCost(rt, l.ty) == null) s.convertError(e.loc, rt, l.ty);
+                    return .{ .ty = l.ty };
+                }
+            }
             if (r.ty != TypeTable.error_type) {
                 const bop = std.meta.stringToEnum(ast.BinaryOp, @tagName(op)).?;
                 _ = try s.binaryOp(e.loc, bop, l.ty, r.ty, true, lhs.loc, rhs.loc);
@@ -2691,6 +2759,7 @@ pub const Sema = struct {
             // Structs declaring operator[] were already reported as
             // milestone 0.2 at the declaration.
             .@"struct" => |info| {
+                if (i.ty != TypeTable.error_type) if (try s.operatorCall(e, b.ty, "operator[]", &.{s.argInfo(index, i)})) |rt| return rvalue(rt);
                 if (!info.overloadsOperators()) s.err(e.loc, "type '{s}' does not provide a subscript operator", .{s.typeName(b.ty)});
                 return err_typed;
             },
@@ -2750,6 +2819,8 @@ pub const Sema = struct {
         }
         const target = c.callee orelse {
             if (s.types.get(c.ty) == .@"struct") {
+                for (arg_types) |a| if (a.ty == TypeTable.error_type) return err_typed;
+                if (try s.operatorCall(e, c.ty, "operator()", arg_types)) |rt| return rvalue(rt);
                 if (!s.types.get(c.ty).@"struct".overloadsOperators()) s.err(callee.loc, "type '{s}' does not provide a call operator", .{s.typeName(c.ty)});
             } else if (c.ty != TypeTable.error_type) s.err(callee.loc, "called object type '{s}' is not a function", .{s.typeName(c.ty)});
             return err_typed;

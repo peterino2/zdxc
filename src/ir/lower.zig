@@ -587,6 +587,10 @@ const Lowerer = struct {
     fn rvalue(l: *Lowerer, e: *ast.Expr) Error!Ref {
         const t = l.types();
         switch (e.kind) {
+            .binary, .unary, .index, .assign => if (l.s.resolution(e)) |r| if (r == .function) return l.operatorCall(e, r.function),
+            else => {},
+        }
+        switch (e.kind) {
             .int_lit => |text| {
                 const ty = try l.concrete(e.ty);
                 return l.b.constInt(ty, semamod.parseIntLiteral(text) orelse 0);
@@ -888,46 +892,76 @@ const Lowerer = struct {
                 }
                 // `obj.method(...)`: the object's storage (a temporary for
                 // rvalues).
-                var object: ?Ref = null;
-                var write_back: ?Ref = null;
-                const owner_ty = if (isMethod(f)) try l.s.types.intern(.{ .@"struct" = f.owner.? }) else TypeTable.void_type;
-                if (isMethod(f) and callee.kind == .member) {
-                    const base = callee.kind.member.base;
-                    const direct = if (isAddressable(base)) try l.lvalue(base) else null;
-                    const plain = if (direct) |p| l.b.f.inst(p).op == .local_var or l.b.f.inst(p).op == .param else false;
-                    if (direct != null and plain and base.ty == owner_ty) {
-                        object = direct;
-                    } else {
-                        // Through a function-local copy of the method's own
-                        // struct (a base prefix of derived objects), written
-                        // back afterwards to writable storage.
-                        const tmp = try l.b.add(.{ .op = .local_var, .ty = owner_ty, .ptr = .function });
-                        const whole = if (direct) |p| try l.b.load(p) else try l.rvalue(base);
-                        try l.b.store(tmp, try l.basePrefix(whole, base.ty, owner_ty));
-                        object = tmp;
-                        if (direct) |p| switch (l.b.f.inst(p).ptr) {
-                            .function, .private, .groupshared => write_back = p,
-                            else => {},
-                        };
-                    }
-                }
-                const res = try l.userCall(f, fi, full, ret_ty, object);
-                if (write_back) |p| {
-                    const updated = try l.b.load(object.?);
-                    if (callee.kind.member.base.ty == owner_ty) {
-                        try l.b.store(p, updated);
-                    } else {
-                        // Only the base's fields.
-                        for (l.s.types.get(owner_ty).@"struct".fields.items, 0..) |fld, k| {
-                            const idx = try l.b.constInt(try l.types().scalar(.uint), @intCast(k));
-                            const fp = try l.b.add(.{ .op = .{ .access = .{ .base = p, .indices = try l.arena.dupe(Ref, &.{idx}) } }, .ty = fld.type, .ptr = l.b.f.inst(p).ptr });
-                            try l.b.store(fp, try l.b.add(.{ .op = .{ .extract = .{ .agg = updated, .index = @intCast(k) } }, .ty = fld.type }));
-                        }
-                    }
-                }
-                return res;
+                // (A struct value called directly uses its operator().)
+                const base: ?*ast.Expr = if (!isMethod(f)) null else if (callee.kind == .member) callee.kind.member.base else if (l.s.types.get(callee.ty) == .@"struct") callee else null;
+                return l.methodCall(f, fi, base, full, ret_ty);
             },
             else => return l.callOther(e, r, callee, args, ret_ty),
+        }
+    }
+
+    /// A call to `f` with `base_expr` as the object of a method (null:
+    /// the current `this`, or no object).
+    fn methodCall(l: *Lowerer, f: *const semamod.Function, fi: u32, base_expr: ?*ast.Expr, args: []const *ast.Expr, ret_ty: TypeId) Error!Ref {
+            var object: ?Ref = null;
+            var write_back: ?Ref = null;
+            const owner_ty = if (isMethod(f)) try l.s.types.intern(.{ .@"struct" = f.owner.? }) else TypeTable.void_type;
+            if (base_expr) |base| {
+                const direct = if (isAddressable(base)) try l.lvalue(base) else null;
+                const plain = if (direct) |p| l.b.f.inst(p).op == .local_var or l.b.f.inst(p).op == .param else false;
+                if (direct != null and plain and base.ty == owner_ty) {
+                    object = direct;
+                } else {
+                    // Through a function-local copy of the method's own
+                    // struct (a base prefix of derived objects), written
+                    // back afterwards to writable storage.
+                    const tmp = try l.b.add(.{ .op = .local_var, .ty = owner_ty, .ptr = .function });
+                    const whole = if (direct) |p| try l.b.load(p) else try l.rvalue(base);
+                    try l.b.store(tmp, try l.basePrefix(whole, base.ty, owner_ty));
+                    object = tmp;
+                    if (direct) |p| switch (l.b.f.inst(p).ptr) {
+                        .function, .private, .groupshared => write_back = p,
+                        else => {},
+                    };
+                }
+            }
+            const res = try l.userCall(f, fi, args, ret_ty, object);
+            if (write_back) |p| {
+                const updated = try l.b.load(object.?);
+                if (base_expr.?.ty == owner_ty) {
+                    try l.b.store(p, updated);
+                } else {
+                    // Only the base's fields.
+                    for (l.s.types.get(owner_ty).@"struct".fields.items, 0..) |fld, k| {
+                        const idx = try l.b.constInt(try l.types().scalar(.uint), @intCast(k));
+                        const fp = try l.b.add(.{ .op = .{ .access = .{ .base = p, .indices = try l.arena.dupe(Ref, &.{idx}) } }, .ty = fld.type, .ptr = l.b.f.inst(p).ptr });
+                        try l.b.store(fp, try l.b.add(.{ .op = .{ .extract = .{ .agg = updated, .index = @intCast(k) } }, .ty = fld.type }));
+                    }
+                }
+            }
+            return res;
+    }
+
+    /// An overloaded operator: a method call on the first operand.
+    fn operatorCall(l: *Lowerer, e: *ast.Expr, f: *const semamod.Function) Error!Ref {
+        const fi = try l.functionIndex(f);
+        const ret_ty = try l.concrete(f.ret);
+        switch (e.kind) {
+            .binary => |x| return l.methodCall(f, fi, x.lhs, &.{x.rhs}, ret_ty),
+            .unary => |x| return l.methodCall(f, fi, x.operand, &.{}, ret_ty),
+            .index => |x| return l.methodCall(f, fi, x.base, &.{x.index}, ret_ty),
+            .call => |x| return l.methodCall(f, fi, x.callee, x.args, ret_ty),
+            .assign => |x| {
+                const r = try l.methodCall(f, fi, x.lhs, &.{x.rhs}, ret_ty);
+                // `a op= b` through operator op: assign the result.
+                if (!std.mem.endsWith(u8, f.name, "=")) {
+                    const v = try l.convert(r, x.lhs.ty);
+                    try l.storeTo(x.lhs, v);
+                    return v;
+                }
+                return r;
+            },
+            else => return l.fail(e, "this operator"),
         }
     }
 
