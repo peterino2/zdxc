@@ -79,14 +79,7 @@ pub fn alignOf(t: *const TypeTable, ty: TypeId, row_major: bool, rules: Rules) E
             .dx_legacy, .vk_relaxed => 16,
             else => alignOf(t, a.elem, row_major, rules),
         },
-        .@"struct" => |st| switch (rules) {
-            .dx_legacy, .vk_relaxed => return 16,
-            else => {
-                var al: u32 = 1;
-                for (st.fields.items) |f| al = @max(al, try alignOf(t, f.type, f.row_major, rules));
-                return al;
-            },
-        },
+        .@"struct" => |st| return structAlign(t, st, rules),
         else => return error.Unsupported,
     }
 }
@@ -111,15 +104,7 @@ pub fn sizeOf(t: *const TypeTable, ty: TypeId, row_major: bool, rules: Rules) Er
                 else => a.len * stride,
             };
         },
-        .@"struct" => |s| {
-            var off: u32 = 0;
-            for (s.fields.items) |f| off = try place(t, off, f.type, f.row_major, rules) + try sizeOf(t, f.type, f.row_major, rules);
-            return switch (rules) {
-                .dx_legacy, .dx_packed => off,
-                .vk_relaxed => roundUp(off, 16),
-                .std430 => roundUp(off, try alignOf(t, ty, false, rules)),
-            };
-        },
+        .@"struct" => |s| return structSize(t, s, rules),
         else => return error.Unsupported,
     }
 }
@@ -150,14 +135,52 @@ pub fn place(t: *const TypeTable, off: u32, ty: TypeId, row_major: bool, rules: 
     }
 }
 
-/// Offsets of a struct's fields.
-pub fn fieldOffsets(a: Allocator, t: *const TypeTable, info: *const types.StructInfo, rules: Rules) Error![]u32 {
-    const out = try a.alloc(u32, info.fields.items.len);
+fn structAlign(t: *const TypeTable, info: *const types.StructInfo, rules: Rules) Error!u32 {
+    switch (rules) {
+        .dx_legacy, .vk_relaxed => return 16,
+        else => {
+            var al: u32 = 1;
+            for (info.fields.items) |f| al = @max(al, try alignOf(t, f.type, f.row_major, rules));
+            return al;
+        },
+    }
+}
+
+fn structSize(t: *const TypeTable, info: *const types.StructInfo, rules: Rules) Error!u32 {
+    var buf: [256]u32 = undefined;
+    if (info.fields.items.len > buf.len) return error.Unsupported;
+    const off = try layoutFields(t, info, rules, buf[0..info.fields.items.len]);
+    return switch (rules) {
+        .dx_legacy, .dx_packed => off,
+        .vk_relaxed => roundUp(off, 16),
+        .std430 => roundUp(off, try structAlign(t, info, rules)),
+    };
+}
+
+/// Stores the offsets of `info`'s fields in `out`; returns where the last
+/// one ends.
+fn layoutFields(t: *const TypeTable, info: *const types.StructInfo, rules: Rules, out: []u32) Error!u32 {
     var off: u32 = 0;
-    for (info.fields.items, out) |f, *o| {
+    var first: usize = 0;
+    if (info.bases.items.len > 0 and (rules == .vk_relaxed or rules == .std430)) {
+        // dxc's SPIR-V keeps a base class as a nested struct (padded to
+        // its alignment); DXIL lays its fields out in place.
+        const base = info.bases.items[0];
+        first = base.fields.items.len;
+        _ = try layoutFields(t, base, rules, out[0..first]);
+        off = try structSize(t, base, rules);
+    }
+    for (info.fields.items[first..], out[first..]) |f, *o| {
         o.* = try place(t, off, f.type, f.row_major, rules);
         off = o.* + try sizeOf(t, f.type, f.row_major, rules);
     }
+    return off;
+}
+
+/// Offsets of a struct's fields.
+pub fn fieldOffsets(a: Allocator, t: *const TypeTable, info: *const types.StructInfo, rules: Rules) Error![]u32 {
+    const out = try a.alloc(u32, info.fields.items.len);
+    _ = try layoutFields(t, info, rules, out);
     return out;
 }
 

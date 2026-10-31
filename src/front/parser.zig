@@ -719,7 +719,7 @@ pub const Parser = struct {
         if (t.isIdent("typedef")) return p.parseTypedefInto(out);
         if (t.isIdent("using")) return out.append(p.arena, try p.parseUsing(template_params));
         if (t.isIdent("namespace")) return out.append(p.arena, try p.parseNamespace());
-        if (t.isIdent("enum")) return p.parseEnumInto(out);
+        if (t.isIdent("enum")) return p.parseEnumInto(out, ctx);
         if (t.isIdent("_Static_assert")) {
             const d = try p.parseStaticAssert();
             _ = try p.expect(.semi, "';'");
@@ -963,14 +963,21 @@ pub const Parser = struct {
         return p.mk(ast.Decl, .{ .loc = kw.loc, .kind = .{ .namespace = .{ .name = name.text, .decls = decls.items } } });
     }
 
-    fn parseEnumInto(p: *Parser, out: *std.ArrayList(*ast.Decl)) Error!void {
+    fn parseEnumInto(p: *Parser, out: *std.ArrayList(*ast.Decl), ctx: DeclContext) Error!void {
         const kw = p.advance();
         const scoped = p.eatIdent("class") or p.eatIdent("struct");
         var name: ?[]const u8 = null;
+        var name_loc = kw.loc;
         if (p.at(.identifier) and !isReserved(p.tok().text)) {
+            name_loc = p.tok().loc;
             name = p.advance().text;
-            try p.declareName(name.?, .type);
         }
+        // `enum E x;` / `enum E : 1;` (a bitfield): the enum used as a type.
+        if (name != null and !scoped and !p.at(.l_brace) and !(p.at(.colon) and p.isTypeStartAt(p.pos + 1))) {
+            const ty = try p.mk(ast.TypeRef, .{ .loc = name_loc, .name = try p.simpleName(name_loc, name.?) });
+            return p.parseDeclaratorsInto(out, &.{}, .{}, &.{}, ty, ctx);
+        }
+        if (name) |n| try p.declareName(n, .type);
         var underlying: ?*ast.TypeRef = null;
         if (p.eat(.colon)) underlying = try p.parseType();
         _ = try p.expect(.l_brace, "'{'");
@@ -1065,6 +1072,9 @@ pub const Parser = struct {
             var name: Token = undefined;
             if (first and qualified_var != null) {
                 name = .{ .kind = .identifier, .text = qualified_var.?, .loc = name_loc };
+            } else if (ctx == .member and p.at(.colon)) {
+                // Anonymous bitfield (`uint : 4;`).
+                name = .{ .kind = .identifier, .text = "", .loc = p.tok().loc };
             } else name = try p.expectIdent("declarator name");
             const first_spec = first;
             first = false;

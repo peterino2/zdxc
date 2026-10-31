@@ -9,6 +9,7 @@ const ast = @import("../front/ast.zig");
 const ir = @import("ir.zig");
 const semamod = @import("../sema/sema.zig");
 const types = @import("../sema/types.zig");
+const Bitfield = types.Bitfield;
 const Interp = types.Interp;
 const Field = types.Field;
 const table = @import("intrinsics_table");
@@ -382,6 +383,10 @@ const Lowerer = struct {
                     try l.vars.put(l.arena, variable, try l.b.add(.{ .op = .{ .global = gi }, .ty = glob.ty, .ptr = glob.space }));
                     return;
                 }
+                if (v.init == null and isObject(&l.s.types, variable.type)) {
+                    l.unsupported(d.loc, "uninitialized local resource '{s}' is not supported yet", .{variable.name});
+                    return error.Unsupported;
+                }
                 const local = try l.b.add(.{ .op = .local_var, .ty = variable.type, .ptr = .function });
                 try l.vars.put(l.arena, variable, local);
                 if (v.init) |init_e| {
@@ -540,7 +545,12 @@ const Lowerer = struct {
             .scalar, .@"enum" => try out.append(l.arena, v),
             .vector, .matrix => for (0..t.componentCount(ty).?) |k| try out.append(l.arena, try l.component(v, @intCast(k))),
             .array => |a| for (0..a.len) |i| try l.flatten(try l.b.add(.{ .op = .{ .extract = .{ .agg = v, .index = @intCast(i) } }, .ty = a.elem }), out),
-            .@"struct" => |st| for (st.fields.items, 0..) |f, i| try l.flatten(try l.b.add(.{ .op = .{ .extract = .{ .agg = v, .index = @intCast(i) } }, .ty = f.type }), out),
+            .@"struct" => |st| for (st.fields.items, 0..) |f, i| {
+                const fv = try l.b.add(.{ .op = .{ .extract = .{ .agg = v, .index = @intCast(i) } }, .ty = f.type });
+                if (f.bits) {
+                    for (st.bitfieldsIn(@intCast(i))) |bf| try out.append(l.arena, try l.bitRead(fv, bf));
+                } else try l.flatten(fv, out);
+            },
             else => {
                 l.unsupported(.none, "flattening values of type '{s}' is not supported yet", .{l.s.typeName(ty)});
                 return error.Unsupported;
@@ -574,7 +584,15 @@ const Lowerer = struct {
             },
             .@"struct" => |st| {
                 const parts = try l.arena.alloc(Ref, st.fields.items.len);
-                for (parts, st.fields.items) |*p, f| p.* = try l.fromFlat(f.type, comps, next);
+                for (parts, st.fields.items, 0..) |*p, f, i| {
+                    if (f.bits) {
+                        p.* = try l.b.constInt(f.type, 0);
+                        for (st.bitfieldsIn(@intCast(i))) |bf| {
+                            p.* = try l.bitInsert(p.*, bf, try l.convert(comps[next.*], bf.type));
+                            next.* += 1;
+                        }
+                    } else p.* = try l.fromFlat(f.type, comps, next);
+                }
                 return l.b.add(.{ .op = .{ .construct = parts }, .ty = ty });
             },
             else => {
@@ -604,6 +622,10 @@ const Lowerer = struct {
                 const r = l.s.resolution(e) orelse return l.fail(e, "this name");
                 switch (r) {
                     .this_field => return l.b.load(try l.lvalue(e)),
+                    .this_bitfield => |bf| {
+                        if (l.this_ptr == .none) return l.fail(e, "this name");
+                        return l.bitRead(try l.b.load(try l.bitStorage(l.this_ptr, bf)), bf);
+                    },
                     .variable => |v| {
                         // Integer `static const` scalars are constants.
                         if (v.storage == .constant and v.init != null and l.s.types.get(v.type) == .scalar and !l.s.types.get(v.type).scalar.isFloat()) {
@@ -664,7 +686,7 @@ const Lowerer = struct {
                     const idx = try l.indexValue(x.index, bt.resource.kind.indexDims());
                     return l.b.add(.{ .op = .{ .res_load = .{ .res = res, .index = idx } }, .ty = try l.concrete(e.ty) });
                 }
-                if (isAddressable(x.base)) return l.b.load(try l.lvalue(e));
+                if (isAddressable(l.s, x.base)) return l.b.load(try l.lvalue(e));
                 const base = try l.rvalue(x.base);
                 if (l.s.evalInt(x.index)) |k| return l.b.add(.{ .op = .{ .extract = .{ .agg = base, .index = @intCast(k) } }, .ty = try l.concrete(e.ty) });
                 // Dynamic index into a value: spill to storage.
@@ -864,10 +886,18 @@ const Lowerer = struct {
                 for (parts, ks) |*p, k| p.* = try l.component(v, k);
                 return l.b.add(.{ .op = .{ .construct = parts }, .ty = try l.concrete(e.ty) });
             },
-            .@"struct" => {
-                if (isAddressable(base)) return l.b.load(try l.lvalue(e));
-                const v = try l.rvalue(base);
+            .@"struct" => |info| {
                 const r = l.s.resolution(e) orelse return l.fail(e, "this member");
+                if (r == .bitfield) {
+                    const bf = r.bitfield;
+                    const storage = if (isAddressable(l.s, base))
+                        try l.b.load(try l.bitStorage(try l.lvalue(base), bf))
+                    else
+                        try l.b.add(.{ .op = .{ .extract = .{ .agg = try l.rvalue(base), .index = bf.storage } }, .ty = info.fields.items[bf.storage].type });
+                    return l.bitRead(storage, bf);
+                }
+                if (isAddressable(l.s, base)) return l.b.load(try l.lvalue(e));
+                const v = try l.rvalue(base);
                 return l.b.add(.{ .op = .{ .extract = .{ .agg = v, .index = r.field } }, .ty = e.ty });
             },
             else => return l.fail(e, "this member access"),
@@ -907,7 +937,7 @@ const Lowerer = struct {
             var write_back: ?Ref = null;
             const owner_ty = if (isMethod(f)) try l.s.types.intern(.{ .@"struct" = f.owner.? }) else TypeTable.void_type;
             if (base_expr) |base| {
-                const direct = if (isAddressable(base)) try l.lvalue(base) else null;
+                const direct = if (isAddressable(l.s, base)) try l.lvalue(base) else null;
                 const plain = if (direct) |p| l.b.f.inst(p).op == .local_var or l.b.f.inst(p).op == .param else false;
                 if (direct != null and plain and base.ty == owner_ty) {
                     object = direct;
@@ -1118,9 +1148,72 @@ const Lowerer = struct {
         }
     }
 
+    /// Pointer to the storage field holding bitfield `bf` of the struct
+    /// `ptr` points to.
+    fn bitStorage(l: *Lowerer, ptr: Ref, bf: Bitfield) Error!Ref {
+        const t = l.types();
+        const info = t.get(l.b.f.inst(ptr).ty).@"struct";
+        const idx = try l.b.constInt(try t.scalar(.uint), bf.storage);
+        return l.b.add(.{ .op = .{ .access = .{ .base = ptr, .indices = try l.arena.dupe(Ref, &.{idx}) } }, .ty = info.fields.items[bf.storage].type, .ptr = l.b.f.inst(ptr).ptr });
+    }
+
+    /// The value of bitfield `bf` in its storage word, zero- or
+    /// sign-extended.
+    fn bitRead(l: *Lowerer, storage: Ref, bf: Bitfield) Error!Ref {
+        const t = l.types();
+        const sc = t.component(bf.type).?;
+        const st = try t.scalar(if (sc == .bool) .uint else sc);
+        const bits: u8 = @intCast(sc.size() * 8);
+        const x = try l.convert(storage, st);
+        var v: Ref = undefined;
+        if (t.get(st).scalar.isUnsigned()) {
+            const shifted = if (bf.offset == 0) x else try l.b.add(.{ .op = .{ .binary = .{ .op = .shr, .lhs = x, .rhs = try l.b.constInt(st, bf.offset) } }, .ty = st });
+            v = if (bf.width == bits) shifted else try l.b.add(.{ .op = .{ .binary = .{ .op = .bit_and, .lhs = shifted, .rhs = try l.constBits(st, lowMask(bf.width)) } }, .ty = st });
+        } else {
+            // Shift the field to the top, then arithmetically back down.
+            const up = bits - bf.offset - bf.width;
+            const hi = if (up == 0) x else try l.b.add(.{ .op = .{ .binary = .{ .op = .shl, .lhs = x, .rhs = try l.b.constInt(st, up) } }, .ty = st });
+            v = if (bf.width == bits) hi else try l.b.add(.{ .op = .{ .binary = .{ .op = .shr, .lhs = hi, .rhs = try l.b.constInt(st, bits - bf.width) } }, .ty = st });
+        }
+        return l.convert(v, bf.type);
+    }
+
+    /// An integer constant of scalar type `ty` with bit pattern `v`.
+    fn constBits(l: *Lowerer, ty: TypeId, v: u64) Error!Ref {
+        const sc = l.types().component(ty).?;
+        const bits: u8 = @intCast(sc.size() * 8);
+        if (sc.isUnsigned()) return l.b.constInt(ty, @bitCast(v & lowMask(bits)));
+        return l.b.constInt(ty, signExtend(v, bits));
+    }
+
+    /// `storage` with bitfield `bf` replaced by `value`.
+    fn bitInsert(l: *Lowerer, storage: Ref, bf: Bitfield, value: Ref) Error!Ref {
+        const t = l.types();
+        const st = l.b.f.inst(storage).ty;
+        const bits: u8 = @intCast(t.component(st).?.size() * 8);
+        const mask = lowMask(bf.width);
+        const field_mask = mask << @intCast(bf.offset);
+        const keep_bits: u64 = if (bits == 64) ~field_mask else ~field_mask & lowMask(bits);
+        const keep = try l.b.add(.{ .op = .{ .binary = .{ .op = .bit_and, .lhs = storage, .rhs = try l.constBits(st, keep_bits) } }, .ty = st });
+        var v = try l.convert(value, st);
+        if (bf.width < bits) v = try l.b.add(.{ .op = .{ .binary = .{ .op = .bit_and, .lhs = v, .rhs = try l.constBits(st, mask) } }, .ty = st });
+        if (bf.offset > 0) v = try l.b.add(.{ .op = .{ .binary = .{ .op = .shl, .lhs = v, .rhs = try l.b.constInt(st, bf.offset) } }, .ty = st });
+        return l.b.add(.{ .op = .{ .binary = .{ .op = .bit_or, .lhs = keep, .rhs = v } }, .ty = st });
+    }
+
     /// Stores `value` (already of `lhs`'s type) into what `lhs` designates.
     fn storeTo(l: *Lowerer, lhs: *ast.Expr, value: Ref) Error!void {
         const t = l.types();
+        if (lhs.kind == .member or lhs.kind == .name) if (l.s.resolution(lhs)) |r| switch (r) {
+            .bitfield, .this_bitfield => |bf| {
+                const struct_ptr = if (r == .bitfield) try l.lvalue(lhs.kind.member.base) else l.this_ptr;
+                if (struct_ptr == .none) return l.fail(lhs, "this assignment target");
+                const ptr = try l.bitStorage(struct_ptr, bf);
+                try l.b.store(ptr, try l.bitInsert(try l.b.load(ptr), bf, value));
+                return;
+            },
+            else => {},
+        };
         switch (lhs.kind) {
             .index => |x| if (t.get(x.base.ty) == .resource) {
                 const res = try l.rvalue(x.base);
@@ -1605,11 +1698,24 @@ fn matrixSwizzle(a: Allocator, name: []const u8, cols: u8) ?[]const u32 {
     return if (out.items.len == 0) null else out.items;
 }
 
-fn isAddressable(e: *const ast.Expr) bool {
+fn lowMask(width: u8) u64 {
+    return if (width >= 64) ~@as(u64, 0) else (@as(u64, 1) << @intCast(width)) - 1;
+}
+
+/// `v`'s low `bits` bits as a sign-extended constant (ir.Constant.int).
+fn signExtend(v: u64, bits: u8) i64 {
+    if (bits >= 64) return @bitCast(v);
+    const sh: u6 = @intCast(64 - bits);
+    return @as(i64, @bitCast(v << sh)) >> sh;
+}
+
+/// Whether `e` designates storage (a variable, or a part of one) rather
+/// than a temporary such as an operator call's result.
+fn isAddressable(s: *const Sema, e: *const ast.Expr) bool {
     return switch (e.kind) {
         .name, .this => true,
-        .member => |m| isAddressable(m.base),
-        .index => |x| isAddressable(x.base),
+        .member => |m| isAddressable(s, m.base),
+        .index => |x| if (s.resolution(e)) |r| r != .function and isAddressable(s, x.base) else isAddressable(s, x.base),
         else => false,
     };
 }

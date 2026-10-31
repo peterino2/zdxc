@@ -13,6 +13,7 @@ const ast_clone = @import("../front/ast_clone.zig");
 const source = @import("../front/source.zig");
 const diag = @import("../diag.zig");
 const types = @import("types.zig");
+const layout = @import("../ir/layout.zig");
 const intrinsics = @import("intrinsics.zig");
 const Loc = source.Loc;
 const TypeId = types.TypeId;
@@ -72,6 +73,9 @@ pub const Resolution = union(enum) {
     field: u32,
     /// A field named without `this.` inside a method.
     this_field: u32,
+    /// A bitfield member (`this_bitfield`: named without `this.`).
+    bitfield: types.Bitfield,
+    this_bitfield: types.Bitfield,
 };
 
 pub const Param = struct {
@@ -1168,7 +1172,8 @@ pub const Sema = struct {
             },
             .cast => |c| s.evalConst(c.operand),
             .construct => |c| if (c.args.len == 1) s.evalConst(c.args[0]) else null,
-            .sizeof_type, .sizeof_expr => null,
+            // Sizes are kept by Sema (plus one; zero: unknown).
+            .sizeof_type, .sizeof_expr => if (e.info != 0) .{ .int = e.info - 1 } else null,
             else => null,
         };
     }
@@ -1389,6 +1394,7 @@ pub const Sema = struct {
             if (s.types.get(bt) == .@"struct") {
                 const base = s.types.get(bt).@"struct";
                 try info.fields.appendSlice(s.arena, base.fields.items);
+                try info.bitfields.appendSlice(s.arena, base.bitfields.items);
                 try info.bases.append(s.arena, base);
                 base_fields = info.fields.items.len;
                 if (base.sema) |bp| {
@@ -1415,15 +1421,21 @@ pub const Sema = struct {
         defer s.scope = saved;
         // Fields and nested types first, then methods (which may use any
         // field regardless of order).
+        const errors_before = s.diags.error_count;
+        // The storage field consecutive bitfields are packed into.
+        var unit: ?BitUnit = null;
         for (members) |m| switch (m.kind) {
             .@"var" => |v| {
                 if (v.quals.static) {
+                    if (v.bitfield != null) s.err(v.name_loc, "static member '{s}' cannot be a bit-field", .{v.name});
                     try s.varDecl(m, &m.kind.@"var", .member);
                     continue;
                 }
-                if (v.bitfield != null) {
-                    s.err(m.loc, "bitfields are not supported yet (planned for milestone 0.2)", .{});
+                if (v.bitfield) |width_e| {
+                    try s.bitfieldDecl(info, &unit, v, width_e, base_fields);
+                    continue;
                 }
+                unit = null;
                 const fbase = try s.resolveType(v.type);
                 const start = if (v.qual_words.len > 0) v.qual_words[0].loc else v.type.loc;
                 if (v.array_dims.len > 0 and v.array_dims[0] == null) {
@@ -1434,7 +1446,7 @@ pub const Sema = struct {
                 const ft = try s.applyArrayDims(fbase, v.array_dims);
                 s.checkSemantics(.field, v.semantics, ft, false);
                 if (s.types.get(fbase) == .string) s.err(v.name_loc, "string declaration may only appear in global scope", .{});
-                for (info.fields.items[base_fields..]) |f| if (std.mem.eql(u8, f.name, v.name)) s.err(v.name_loc, "duplicate member '{s}'", .{v.name});
+                s.checkDuplicateMember(info, base_fields, v.name, v.name_loc);
                 var fsem: ?[]const u8 = null;
                 for (v.semantics) |sem| if (sem.kind == .semantic) {
                     fsem = sem.values[0];
@@ -1444,6 +1456,7 @@ pub const Sema = struct {
             .func => {},
             else => try s.decl(m, .member),
         };
+        if (s.diags.error_count != errors_before) info.invalid = true;
         info.complete = true;
         const saved_struct = s.current_struct;
         s.current_struct = info;
@@ -1814,6 +1827,7 @@ pub const Sema = struct {
                 s.err(v.name_loc, "array of type string is not supported", .{});
             } else if (ctx != .global) s.err(v.name_loc, "string declaration may only appear in global scope", .{});
         }
+        if (ctx == .local or (ctx == .global and v.quals.static)) s.checkBoolBitfield(ty, v.name_loc);
         const q = v.quals;
         const storage: Storage = switch (ctx) {
             .cbuffer => .cbuffer,
@@ -1919,6 +1933,7 @@ pub const Sema = struct {
             const pt = try s.applyArrayDims(pbase, p.array_dims);
             s.checkSemantics(.parameter, p.semantics, pt, false);
             if (s.types.get(pbase) == .string) s.err(p.name_loc, "parameter of type string is not supported", .{});
+            s.checkBoolBitfield(pt, p.name_loc);
             out.* = .{
                 .name = p.name,
                 .type = pt,
@@ -2211,11 +2226,17 @@ pub const Sema = struct {
                 return err_typed; // typed by checkInitializer
             },
             .sizeof_type => |t| {
-                _ = try s.resolveType(t);
+                e.info = s.sizeInfo(try s.resolveType(t));
                 return rvalue(try s.types.scalar(.uint));
             },
             .sizeof_expr => |x| {
-                _ = try s.expr(x);
+                const xt = try s.expr(x);
+                const target = if (x.kind == .assign and x.kind.assign.op != .assign) x.kind.assign.lhs else x;
+                if (target.kind == .member or target.kind == .name) if (s.resolution(target)) |r| if (r == .bitfield or r == .this_bitfield) {
+                    s.err(e.loc, "invalid application of 'sizeof' to bit-field", .{});
+                    return rvalue(try s.types.scalar(.uint));
+                };
+                e.info = s.sizeInfo(xt.ty);
                 return rvalue(try s.types.scalar(.uint));
             },
             .is_same => |x| {
@@ -2259,6 +2280,10 @@ pub const Sema = struct {
                     s.record(e, .{ .this_field = @intCast(k) });
                     return .{ .ty = f.type, .lvalue = true };
                 };
+                if (findBitfield(info, n.parts[0])) |bf| {
+                    s.record(e, .{ .this_bitfield = bf });
+                    return .{ .ty = bf.type, .lvalue = true };
+                }
             }
         }
         if (n.parts.len > 1) {
@@ -2599,6 +2624,108 @@ pub const Sema = struct {
         return err_typed;
     }
 
+    /// `sizeof(ty)` plus one, or zero when it has no size: HLSL sizes are
+    /// tightly packed at scalar alignment. A struct that had errors has
+    /// size 1, as in clang.
+    fn sizeInfo(s: *Sema, ty: TypeId) u32 {
+        if (ty == TypeTable.error_type) return 0;
+        if (s.types.get(ty) == .@"struct" and s.types.get(ty).@"struct".invalid) return 2;
+        const size = layout.sizeOf(&s.types, ty, false, .dx_packed) catch return 0;
+        return size + 1;
+    }
+
+    /// SPIR-V can only lay out bool bitfields in external (buffer) memory.
+    fn checkBoolBitfield(s: *Sema, ty: TypeId, loc: Loc) void {
+        if (!s.opts.spirv) return;
+        var elem = ty;
+        while (s.types.get(elem) == .array) elem = s.types.get(elem).array.elem;
+        if (s.hasBoolBitfield(elem)) s.err(loc, "type '{s}' contains a boolean bitfield which is not supported for variables that are not externally visible when targeting SPIR-V", .{s.typeName(elem)});
+    }
+
+    fn hasBoolBitfield(s: *Sema, ty: TypeId) bool {
+        switch (s.types.get(ty)) {
+            .array => |a| return s.hasBoolBitfield(a.elem),
+            .@"struct" => |info| {
+                for (info.bitfields.items) |bf| if (s.types.component(bf.type) == .bool) return true;
+                for (info.fields.items) |f| if (!f.bits and s.hasBoolBitfield(f.type)) return true;
+                return false;
+            },
+            else => return false,
+        }
+    }
+
+    const BitUnit = struct { field: u32, type: TypeId, used: u8, bits: u8 };
+
+    fn checkDuplicateMember(s: *Sema, info: *types.StructInfo, base_fields: usize, name: []const u8, loc: Loc) void {
+        for (info.fields.items[base_fields..]) |f| if (f.name.len > 0 and std.mem.eql(u8, f.name, name)) s.err(loc, "duplicate member '{s}'", .{name});
+        for (info.bitfields.items) |bf| if (bf.storage >= base_fields and std.mem.eql(u8, bf.name, name)) s.err(loc, "duplicate member '{s}'", .{name});
+    }
+
+    /// `T name : width;` in a struct. Consecutive bitfields share a storage
+    /// field of their type while they fit, as dxc lays them out: DXIL packs
+    /// bitfields of the same size together, SPIR-V only the same type.
+    fn bitfieldDecl(s: *Sema, info: *types.StructInfo, unit: *?BitUnit, v: ast.VarDecl, width_e: *ast.Expr, base_fields: usize) Allocator.Error!void {
+        const ty = try s.resolveType(v.type);
+        _ = try s.expr(width_e);
+        if (ty == TypeTable.error_type) return;
+        const sc = switch (s.types.get(ty)) {
+            .scalar => |x| x,
+            .@"enum" => |en| en.underlying,
+            else => null,
+        };
+        if (sc == null or !sc.?.isIntegral() or v.array_dims.len > 0) {
+            if (v.name.len == 0) {
+                s.err(v.type.loc, "anonymous bit-field has non-integral type '{s}'", .{s.typeName(ty)});
+            } else s.err(v.name_loc, "bit-field '{s}' has non-integral type '{s}'", .{ v.name, s.typeName(ty) });
+            return;
+        }
+        const bits: u8 = @intCast(sc.?.size() * 8);
+        const width = s.evalInt(width_e) orelse {
+            s.err(width_e.loc, "integer constant expression required", .{});
+            return;
+        };
+        if (width < 0) {
+            s.err(width_e.loc, "bit-field '{s}' has negative width ({d})", .{ v.name, width });
+            return;
+        }
+        if (width > bits) {
+            if (v.name.len == 0) {
+                s.err(width_e.loc, "size of anonymous bit-field ({d} bits) exceeds size of its type ({d} bits)", .{ width, bits });
+            } else s.err(width_e.loc, "size of bit-field '{s}' ({d} bits) exceeds size of its type ({d} bits)", .{ v.name, width, bits });
+            return;
+        }
+        if (width == 0) {
+            if (v.name.len > 0) s.err(v.name_loc, "named bit-field '{s}' has zero width", .{v.name});
+            unit.* = null;
+            return;
+        }
+        if (v.name.len > 0) s.checkDuplicateMember(info, base_fields, v.name, v.name_loc);
+        const w: u8 = @intCast(width);
+        const fits = if (unit.*) |u|
+            u.used + w <= u.bits and (if (s.opts.spirv) u.type == ty else u.bits == bits)
+        else
+            false;
+        if (!fits) {
+            // Bools are stored as uint.
+            const storage_ty = if (sc.? == .bool) try s.types.scalar(.uint) else ty;
+            try info.fields.append(s.arena, .{ .name = "", .type = storage_ty, .bits = true });
+            unit.* = .{ .field = @intCast(info.fields.items.len - 1), .type = ty, .used = 0, .bits = bits };
+        }
+        const u = &unit.*.?;
+        // Unnamed bitfields only take up space.
+        if (v.name.len > 0) try info.bitfields.append(s.arena, .{ .name = v.name, .type = ty, .storage = u.field, .offset = u.used, .width = w });
+        u.used += w;
+    }
+
+    fn findBitfield(info: *const types.StructInfo, name: []const u8) ?types.Bitfield {
+        var i = info.bitfields.items.len;
+        while (i > 0) {
+            i -= 1;
+            if (std.mem.eql(u8, info.bitfields.items[i].name, name)) return info.bitfields.items[i];
+        }
+        return null;
+    }
+
     fn memberExpr(s: *Sema, e: *ast.Expr, base: *ast.Expr, name: []const u8, name_loc: Loc) Allocator.Error!Typed {
         const b = try s.expr(base);
         if (b.ty == TypeTable.error_type) return err_typed;
@@ -2637,6 +2764,10 @@ pub const Sema = struct {
                         s.record(e, .{ .field = @intCast(fi) });
                         return .{ .ty = f.type, .lvalue = b.lvalue, .read_only = b.read_only };
                     }
+                }
+                if (findBitfield(info, name)) |bf| {
+                    s.record(e, .{ .bitfield = bf });
+                    return .{ .ty = bf.type, .lvalue = b.lvalue, .read_only = b.read_only };
                 }
                 if (info.sema) |p| {
                     const ss: *StructSema = @ptrCast(@alignCast(p));

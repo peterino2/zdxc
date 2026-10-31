@@ -321,6 +321,17 @@ pub const Field = struct {
     semantic: ?[]const u8 = null,
     /// Interpolation modifiers (for entry-point inputs and outputs).
     interp: Interp = .{},
+    /// Hidden storage for consecutive bitfields (see StructInfo.bitfields).
+    bits: bool = false,
+};
+
+/// A bitfield member: `width` bits at `offset` in storage field `storage`.
+pub const Bitfield = struct {
+    name: []const u8,
+    type: TypeId,
+    storage: u32,
+    offset: u8,
+    width: u8,
 };
 
 /// Interpolation modifiers written on a parameter, field or function.
@@ -339,12 +350,26 @@ pub const StructInfo = struct {
     fields: std.ArrayList(Field) = .empty,
     /// Direct base structs (HLSL 2021 single inheritance, in practice).
     bases: std.ArrayList(*StructInfo) = .empty,
+    /// Bitfield members, in declaration order (their storage fields are in
+    /// `fields`, unnamed).
+    bitfields: std.ArrayList(Bitfield) = .empty,
     /// Opaque pointer to Sema's per-struct data (methods, base).
     sema: ?*anyopaque = null,
     complete: bool = false,
+    /// Had errors in its members (sizeof gives 1, as in clang).
+    invalid: bool = false,
     /// Declares operator overloads (milestone 0.2): uses of operators on
     /// it are not diagnosed.
     has_operators: bool = false,
+
+    /// The bitfields stored in field `storage` (consecutive).
+    pub fn bitfieldsIn(info: *const StructInfo, storage: u32) []const Bitfield {
+        var lo: usize = 0;
+        while (lo < info.bitfields.items.len and info.bitfields.items[lo].storage != storage) lo += 1;
+        var hi = lo;
+        while (hi < info.bitfields.items.len and info.bitfields.items[hi].storage == storage) hi += 1;
+        return info.bitfields.items[lo..hi];
+    }
 
     pub fn overloadsOperators(info: *const StructInfo) bool {
         if (info.has_operators) return true;
@@ -579,7 +604,7 @@ pub const TypeTable = struct {
             .array => |a| if (a.len == 0) null else if (t.componentCount(a.elem)) |n| n * a.len else null,
             .@"struct" => |s| blk: {
                 var n: u32 = 0;
-                for (s.fields.items) |f| n += t.componentCount(f.type) orelse break :blk null;
+                for (s.fields.items, 0..) |f, i| n += if (f.bits) @as(u32, @intCast(s.bitfieldsIn(@intCast(i)).len)) else t.componentCount(f.type) orelse break :blk null;
                 break :blk n;
             },
             else => null,
