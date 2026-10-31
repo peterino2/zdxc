@@ -540,6 +540,7 @@ const Emitter = struct {
             .ret => |*v| if (v.*) |x| {
                 v.* = R.v(map, x);
             },
+            .@"switch" => |*sw| sw.cond = R.v(map, sw.cond),
             .br => |*b| if (b.cond) |c| {
                 b.cond = R.v(map, c);
             },
@@ -671,7 +672,12 @@ const Emitter = struct {
                 _ = try e.add(void_ty, .{ .br = .{ .then = then_b, .@"else" = else_b, .cond = cond } });
             },
             .none, .@"unreachable" => _ = try e.add(void_ty, .@"unreachable"),
-            .@"switch" => return e.unsupported("switch", .{}),
+            .@"switch" => |sw| {
+                const cond = (try e.scalars(frame, sw.value))[0];
+                const cases = try e.arena.alloc(@typeInfo(@FieldType(@FieldType(@FieldType(module.Inst, "op"), "switch"), "cases")).pointer.child, sw.cases.len);
+                for (sw.cases, cases) |c, *o| o.* = .{ .val = try e.i32Const(@as(i32, @truncate(c.value))), .block = try e.blockFor(frame, c.block.index()) };
+                _ = try e.add(void_ty, .{ .@"switch" = .{ .cond = cond, .default = try e.blockFor(frame, sw.default.index()), .cases = cases } });
+            },
             .discard => {
                 // Like SPIR-V's OpKill: the invocation stops here.
                 const i32t = try e.dm.intType(32);

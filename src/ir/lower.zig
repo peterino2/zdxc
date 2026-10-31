@@ -244,11 +244,68 @@ const Lowerer = struct {
                 l.b.terminate(.{ .br = target.cont });
             },
             .discard => l.b.terminate(.discard),
-            .@"switch", .case, .default => {
-                l.unsupported(st.loc, "switch statements are not supported yet", .{});
+            .@"switch" => |x| try l.switchStmt(x),
+            .case, .default => {
+                l.unsupported(st.loc, "case labels outside a switch body", .{});
                 return error.Unsupported;
             },
         }
+    }
+
+    /// `switch`: the header branches to one block per label (labels in a
+    /// row get their own, falling through); `break` goes to the merge.
+    fn switchStmt(l: *Lowerer, x: @FieldType(ast.Stmt.Kind, "switch")) Error!void {
+        if (x.cond_decl) |d| try l.localDecl(d);
+        const t = l.types();
+        var cond_ty = x.cond.ty;
+        if (t.component(cond_ty)) |c| cond_ty = try t.scalar(if (c.isUnsigned()) .uint else .int);
+        const cond = try l.converted(x.cond, cond_ty);
+        const header = l.b.cur;
+        const merge = try l.b.newBlock();
+        // Segments: a label and the statements up to the next one.
+        const Seg = struct { block: BlockId, value: ?i64, stmts: std.ArrayList(*const ast.Stmt) = .empty };
+        var segs: std.ArrayList(Seg) = .empty;
+        const body: []const *ast.Stmt = switch (x.body.kind) {
+            .compound => |c| c,
+            else => &.{x.body},
+        };
+        for (body) |st| {
+            var cur: *const ast.Stmt = st;
+            while (true) switch (cur.kind) {
+                .case => |c| {
+                    const v = l.s.evalInt(c.value) orelse {
+                        l.unsupported(cur.loc, "case values that are not constants", .{});
+                        return error.Unsupported;
+                    };
+                    try segs.append(l.arena, .{ .block = try l.b.newBlock(), .value = v });
+                    cur = c.stmt;
+                },
+                .default => |d| {
+                    try segs.append(l.arena, .{ .block = try l.b.newBlock(), .value = null });
+                    cur = d;
+                },
+                else => break,
+            };
+            // Statements before the first label never run.
+            if (segs.items.len > 0) try segs.items[segs.items.len - 1].stmts.append(l.arena, cur);
+        }
+        var default: BlockId = merge;
+        var cases: std.ArrayList(@typeInfo(@FieldType(@FieldType(ir.Terminator, "switch"), "cases")).pointer.child) = .empty;
+        for (segs.items) |sg| {
+            if (sg.value) |v| try cases.append(l.arena, .{ .value = v, .block = sg.block }) else default = sg.block;
+        }
+        l.b.f.block(header).merge = .{ .selection = merge };
+        l.b.terminate(.{ .@"switch" = .{ .value = cond, .default = default, .cases = cases.items } });
+        const cont: BlockId = if (l.loops.items.len > 0) l.loops.getLast().cont else .none;
+        try l.loops.append(l.arena, .{ .brk = merge, .cont = cont });
+        for (segs.items, 0..) |sg, k| {
+            l.b.setBlock(sg.block);
+            for (sg.stmts.items) |st| try l.stmt(st);
+            // Fall through to the next label, or leave the switch.
+            l.b.terminate(.{ .br = if (k + 1 < segs.items.len) segs.items[k + 1].block else merge });
+        }
+        _ = l.loops.pop();
+        l.b.setBlock(merge);
     }
 
     /// header (loop merge) -> cond -> body -> continue (inc) -> header.

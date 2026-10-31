@@ -83,6 +83,8 @@ pub const Inst = struct {
     op: union(enum) {
         ret: ?Value,
         br: struct { then: u32, @"else": ?u32 = null, cond: ?Value = null },
+        /// Case values are constants.
+        @"switch": struct { cond: Value, default: u32, cases: []const struct { val: Value, block: u32 } },
         call: struct { callee: u32, args: []const Value },
         binop: struct { op: BinOp, lhs: Value, rhs: Value, flags: u32 = 0 },
         cast: struct { op: CastOp, val: Value },
@@ -540,6 +542,17 @@ const Encoder = struct {
                 .ret => |v| {
                     if (v) |val| try e.pushValueAndType(f, inst_id, val);
                     try e.rec(10);
+                },
+                .@"switch" => |sw| {
+                    // SWITCH: [opty, cond, default, (case value id, block)...]
+                    try e.push(e.typeOf(f, sw.cond));
+                    try e.pushValue(f, inst_id, sw.cond);
+                    try e.push(sw.default);
+                    for (sw.cases) |c| {
+                        try e.push(e.valueId(f, c.val));
+                        try e.push(c.block);
+                    }
+                    try e.rec(12);
                 },
                 .br => |b| {
                     try e.push(b.then);
