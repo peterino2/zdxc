@@ -47,6 +47,24 @@ pub const Variable = struct {
     read_only: bool,
     /// Initializer of `static const` / `const` variables, for constants.
     init: ?*ast.Expr = null,
+    /// The declaration (globals, locals): register bindings, semantics.
+    decl: ?*const ast.VarDecl = null,
+    /// Position among the function's parameters (storage == .param).
+    param_index: u32 = 0,
+};
+
+/// What an expression refers to, recorded by Sema for lowering
+/// (`Expr.info` is an index into `Sema.resolutions` plus one).
+pub const Resolution = union(enum) {
+    variable: *Variable,
+    enumerator: i64,
+    /// A call to a user function or method.
+    function: *Function,
+    /// A call to an intrinsic or builtin method (`object` is the method's
+    /// object type).
+    intrinsic: struct { index: u16, params: []const TypeId, object: ?TypeId = null },
+    /// A struct field (member expression).
+    field: u32,
 };
 
 pub const Param = struct {
@@ -69,6 +87,9 @@ pub const Function = struct {
     owner: ?*types.StructInfo = null,
     /// Functions called from the body (call graph for recursion checks).
     callees: std.ArrayList(*Function) = .empty,
+    /// The parameters' variables, created when the body is checked
+    /// (null for unnamed parameters).
+    param_vars: []?*Variable = &.{},
 };
 
 pub const FuncSet = struct {
@@ -134,6 +155,9 @@ pub const Sema = struct {
     typedef_attrs: std.StringHashMapUnmanaged(TypeAttrs) = .empty,
     /// Type attributes of the last resolveType result.
     last_attrs: TypeAttrs = .{},
+    resolutions: std.ArrayList(Resolution) = .empty,
+    /// Variable of each checked variable declaration (for lowering).
+    decl_vars: std.AutoHashMapUnmanaged(*const ast.VarDecl, *Variable) = .empty,
     loop_depth: u32 = 0,
     switch_depth: u32 = 0,
     intrinsic_db: intrinsics.Db,
@@ -1323,8 +1347,10 @@ pub const Sema = struct {
             .loc = v.name_loc,
             .read_only = read_only,
             .init = v.init,
+            .decl = v,
         };
         try s.declare(v.name, .{ .variable = variable }, v.name_loc);
+        try s.decl_vars.put(s.arena, v, variable);
         // Unsized arrays take their size from the initializer.
         if (v.init) |init_e| if (!is_auto) {
             if (s.types.get(ty) == .array and s.types.get(ty).array.len == 0 and init_e.kind == .init_list) {
@@ -1449,10 +1475,13 @@ pub const Sema = struct {
         defer s.current_fn = saved_fn;
         _ = try s.pushScope(.function);
         defer s.popScope();
-        for (f.params, params) |p, pp| {
+        func.param_vars = try s.arena.alloc(?*Variable, params.len);
+        @memset(func.param_vars, null);
+        for (f.params, params, 0..) |*p, pp, pi| {
             if (p.name.len == 0) continue;
             const pv = try s.arena.create(Variable);
-            pv.* = .{ .name = p.name, .type = pp.type, .quals = p.quals, .storage = .param, .loc = p.name_loc, .read_only = p.quals.@"const" };
+            pv.* = .{ .name = p.name, .type = pp.type, .quals = p.quals, .storage = .param, .loc = p.name_loc, .read_only = p.quals.@"const", .decl = p, .param_index = @intCast(pi) };
+            func.param_vars[pi] = pv;
             try s.declare(p.name, .{ .variable = pv }, p.name_loc);
         }
         // The body's top-level block shares the parameter scope.
@@ -1580,6 +1609,16 @@ pub const Sema = struct {
     // ------------------------------------------------------------------
     // Expressions
 
+    fn record(s: *Sema, e: *ast.Expr, r: Resolution) void {
+        s.resolutions.append(s.arena, r) catch return;
+        e.info = @intCast(s.resolutions.items.len);
+    }
+
+    /// The resolution Sema recorded for `e`, if any.
+    pub fn resolution(s: *const Sema, e: *const ast.Expr) ?Resolution {
+        return if (e.info == 0) null else s.resolutions.items[e.info - 1];
+    }
+
     fn setType(e: *ast.Expr, t: Typed) Typed {
         e.ty = t.ty;
         return t;
@@ -1693,7 +1732,10 @@ pub const Sema = struct {
 
     fn nameExpr(s: *Sema, e: *ast.Expr, n: ast.Name) Allocator.Error!Typed {
         if (s.lookupName(n)) |sym| switch (sym) {
-            .variable => |v| return .{ .ty = v.type, .lvalue = true, .read_only = v.read_only },
+            .variable => |v| {
+                s.record(e, .{ .variable = v });
+                return .{ .ty = v.type, .lvalue = true, .read_only = v.read_only };
+            },
             .functions => |set| return .{ .ty = TypeTable.error_type, .callee = .{ .functions = set } },
             .enumerator => |en| return rvalue(en.type),
             .type => |t| return .{ .ty = TypeTable.error_type, .callee = .{ .type = t } },
@@ -2002,7 +2044,6 @@ pub const Sema = struct {
     }
 
     fn memberExpr(s: *Sema, e: *ast.Expr, base: *ast.Expr, name: []const u8, name_loc: Loc) Allocator.Error!Typed {
-        _ = e;
         const b = try s.expr(base);
         if (b.ty == TypeTable.error_type) return err_typed;
         switch (s.types.get(b.ty)) {
@@ -2036,7 +2077,10 @@ pub const Sema = struct {
                 while (fi > 0) {
                     fi -= 1;
                     const f = info.fields.items[fi];
-                    if (std.mem.eql(u8, f.name, name)) return .{ .ty = f.type, .lvalue = b.lvalue, .read_only = b.read_only };
+                    if (std.mem.eql(u8, f.name, name)) {
+                        s.record(e, .{ .field = @intCast(fi) });
+                        return .{ .ty = f.type, .lvalue = b.lvalue, .read_only = b.read_only };
+                    }
                 }
                 if (info.sema) |p| {
                     const ss: *StructSema = @ptrCast(@alignCast(p));
@@ -2223,7 +2267,9 @@ pub const Sema = struct {
             .intrinsic => |name| {
                 var explicit: ?TypeId = null;
                 if (template_args.len > 0) explicit = try s.typeArg(template_args[0]);
-                return rvalue(try s.intrinsic_db.resolve(s, e.loc, if (s.opts.spirv and isVkQualified(callee)) "VkIntrinsics" else "Intrinsics", name, null, arg_types, explicit));
+                const r = try s.intrinsic_db.resolve(s, e.loc, if (s.opts.spirv and isVkQualified(callee)) "VkIntrinsics" else "Intrinsics", name, null, arg_types, explicit);
+                if (r.ok) s.record(e, .{ .intrinsic = .{ .index = r.index, .params = r.params } });
+                return rvalue(r.ret);
             },
             .method => |m| {
                 switch (s.types.get(m.object)) {
@@ -2237,7 +2283,9 @@ pub const Sema = struct {
                         var explicit: ?TypeId = null;
                         if (template_args.len > 0) explicit = try s.typeArg(template_args[0]);
                         const ns = methodNamespace(s.types.get(m.object)) orelse return err_typed;
-                        return rvalue(try s.intrinsic_db.resolve(s, e.loc, ns, m.name, m.object, arg_types, explicit));
+                        const r = try s.intrinsic_db.resolve(s, e.loc, ns, m.name, m.object, arg_types, explicit);
+                        if (r.ok) s.record(e, .{ .intrinsic = .{ .index = r.index, .params = r.params, .object = m.object } });
+                        return rvalue(r.ret);
                     },
                 }
             },
@@ -2300,8 +2348,8 @@ pub const Sema = struct {
                 s.err(a.loc, "cannot bind non-lvalue argument to {s} parameter", .{if (f.params[i].dir == .out) "out" else "inout"});
             }
         }
-        _ = e;
         if (s.current_fn) |caller| caller.callees.append(s.arena, f) catch {};
+        s.record(e, .{ .function = f });
         return f.ret;
     }
 
@@ -2542,7 +2590,7 @@ pub fn parseIntLiteral(text: []const u8) ?i64 {
     return @bitCast(v);
 }
 
-fn parseFloatLiteral(text: []const u8) ?f64 {
+pub fn parseFloatLiteral(text: []const u8) ?f64 {
     if (std.mem.indexOf(u8, text, ".#INF") != null) return std.math.inf(f64);
     var end = text.len;
     while (end > 0 and std.mem.indexOfScalar(u8, "fFhHlL", text[end - 1]) != null) end -= 1;

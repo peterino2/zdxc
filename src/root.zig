@@ -23,6 +23,11 @@ pub const dxil = struct {
     pub const shader = @import("dxil/shader.zig");
 };
 
+pub const ir = struct {
+    pub const ir = @import("ir/ir.zig");
+    pub const lower = @import("ir/lower.zig");
+};
+
 pub const sema = struct {
     pub const types = @import("sema/types.zig");
     pub const intrinsics = @import("sema/intrinsics.zig");
@@ -31,6 +36,7 @@ pub const sema = struct {
 
 pub const spirv = struct {
     pub const builder = @import("spirv/builder.zig");
+    pub const emit = @import("spirv/emit.zig");
 };
 
 pub const version = "0.0.0";

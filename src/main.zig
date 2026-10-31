@@ -30,6 +30,7 @@ const Options = struct {
     parse: bool = false,
     dump_ast: bool = false,
     sema: bool = false,
+    dump_ir: bool = false,
     /// -O0..-O3 / -Od (default -O3, as in dxc).
     opt_level: enum { od, o0, o1, o2, o3 } = .o3,
     /// Accepted options with no effect yet, reported once each.
@@ -93,6 +94,7 @@ fn parseArgs(cli: Cli, arena: std.mem.Allocator, argv: []const [:0]const u8, std
                     opts.dump_ast = true;
                 },
                 .zdxc_sema => opts.sema = true,
+                .zdxc_ir => opts.dump_ir = true,
                 .fcolor_diagnostics => opts.color = true,
                 .fno_color_diagnostics => opts.color = false,
             },
@@ -234,6 +236,7 @@ fn run(cli: Cli, arena: std.mem.Allocator, args: []const [:0]const u8, stdout: *
             .enable_16bit = opts.enable_16bit,
         });
         var out: Io.Writer.Allocating = .init(arena);
+        var module: ?zdxc.ir.ir.Module = null;
         if (try pp.enterMainFile(input)) {
             if (opts.preprocess) {
                 try front.pp_print.print(&pp, &out.writer);
@@ -252,6 +255,21 @@ fn run(cli: Cli, arena: std.mem.Allocator, args: []const [:0]const u8, stdout: *
                         .root = opts.entry,
                     });
                     try sema.checkUnit(tu);
+                    if (!opts.sema and !diags.hasErrors() and profile != null and !is_lib) {
+                        const stage: zdxc.ir.ir.Stage = switch (profile.?.kind) {
+                            .vertex => .vertex,
+                            .pixel => .pixel,
+                            .geometry => .geometry,
+                            .hull => .hull,
+                            .domain => .domain,
+                            .compute => .compute,
+                            else => .library,
+                        };
+                        module = zdxc.ir.lower.lowerUnit(arena, &sema, .{ .entry = opts.entry, .stage = stage }) catch |e| switch (e) {
+                            error.Unsupported => null,
+                            else => |x| return x,
+                        };
+                    }
                 }
             }
         }
@@ -267,6 +285,25 @@ fn run(cli: Cli, arena: std.mem.Allocator, args: []const [:0]const u8, stdout: *
         }
         if (opts.parse or opts.sema) return;
         if (profile == null) return cli.fail("missing -T <profile>", .{});
+        if (module) |*m| {
+            if (opts.dump_ir) {
+                try zdxc.ir.ir.dump(m, stdout);
+                return;
+            }
+            if (opts.spirv) {
+                const bytes = zdxc.spirv.emit.emit(arena, m, &diags) catch |err| switch (err) {
+                    error.Unsupported => {
+                        try diags.render(&sm, cli.stderr, .{ .format = opts.diag_format, .color = false });
+                        try cli.stderr.flush();
+                        return error.CompileFailed;
+                    },
+                    else => |x| return x,
+                };
+                const path = opts.output orelse return cli.fail("missing -Fo <file>", .{});
+                try Io.Dir.cwd().writeFile(cli.io, .{ .sub_path = path, .data = bytes });
+                return;
+            }
+        }
         return cli.fail("code generation is not implemented yet: the input was checked but no output was written (use -zdxc-empty for a placeholder shader)", .{});
     }
 

@@ -72,32 +72,38 @@ pub const Db = struct {
     /// Resolve a call; reports a diagnostic and returns the error type when
     /// no overload matches. `sema` is the calling Sema (for conversions and
     /// diagnostics); `object` is the method's object type, if any.
-    pub fn resolve(db: *const Db, sema: anytype, loc: source.Loc, ns: []const u8, name: []const u8, object: ?TypeId, args: []const ArgInfo, explicit: ?TypeId) !TypeId {
+    /// A resolved intrinsic call: the table entry and its concrete
+    /// parameter types (the argument's type where the table leaves a
+    /// parameter unconstrained).
+    pub const Resolved = struct { ret: TypeId, index: u16 = 0, params: []const TypeId = &.{}, ok: bool = false };
+
+    pub fn resolve(db: *const Db, sema: anytype, loc: source.Loc, ns: []const u8, name: []const u8, object: ?TypeId, args: []const ArgInfo, explicit: ?TypeId) !Resolved {
         const cands = try db.candidates(sema.arena, ns, name);
         if (cands.len == 0) {
             if (object) |o| {
                 sema.err(loc, "no member named '{s}' in '{s}'", .{ name, sema.typeName(o) });
             } else sema.err(loc, "use of undeclared identifier '{s}'", .{name});
-            return TypeTable.error_type;
+            return .{ .ret = TypeTable.error_type };
         }
         var best: ?Match = null;
         for (cands) |ci| {
-            const m = try matchOne(sema, &table.intrinsics[ci], object, args, explicit) orelse continue;
+            var m = try matchOne(sema, &table.intrinsics[ci], object, args, explicit) orelse continue;
+            m.index = ci;
             if (best == null or m.cost < best.?.cost) best = m;
         }
         // vk::static_pointer_cast / reinterpret_pointer_cast return a
         // BufferPointer of the template argument: not modelled yet.
-        if (best != null and (std.mem.eql(u8, name, "static_pointer_cast") or std.mem.eql(u8, name, "reinterpret_pointer_cast"))) return TypeTable.error_type;
+        if (best != null and (std.mem.eql(u8, name, "static_pointer_cast") or std.mem.eql(u8, name, "reinterpret_pointer_cast"))) return .{ .ret = TypeTable.error_type };
         const m = best orelse {
             sema.err(loc, "no matching function for call to '{s}'", .{name});
-            return TypeTable.error_type;
+            return .{ .ret = TypeTable.error_type };
         };
         for (args, 0..) |a, i| {
             if (i < m.out_params.len and m.out_params[i] and !a.lvalue) {
                 sema.err(a.loc, "cannot bind non-lvalue argument to out parameter", .{});
             }
         }
-        return m.ret;
+        return .{ .ret = m.ret, .index = m.index, .params = m.params, .ok = true };
     }
 };
 
@@ -105,6 +111,8 @@ const Match = struct {
     ret: TypeId,
     cost: u32,
     out_params: []const bool,
+    index: u16 = 0,
+    params: []const TypeId = &.{},
 };
 
 const Layout = struct { rows: u8, cols: u8, kind: TypeTable.Shape };
@@ -179,6 +187,7 @@ fn matchOne(sema: anytype, it: *const table.Intrinsic, object: ?TypeId, args: []
     var cost: u32 = 0;
     const out_params = try sema.arena.alloc(bool, args.len);
     @memset(out_params, false);
+    const param_types = try sema.arena.alloc(TypeId, args.len);
 
     // Parameter types, checked against the arguments.
     for (args, 0..) |a, ai| {
@@ -187,6 +196,7 @@ fn matchOne(sema: anytype, it: *const table.Intrinsic, object: ?TypeId, args: []
         const s = specs[i];
         out_params[ai] = s.qual == .out or s.qual == .inout or s.qual == .ref;
         const pt = try paramType(sema, specs, i, comp_group, layout_group, group_comp, &bindings, args, obj_elem, explicit) orelse return null;
+        param_types[ai] = if (pt == TypeTable.error_type) a.ty else pt;
         if (pt == TypeTable.error_type) continue; // unconstrained object / unknown class
         const c = sema.conversionCost(a.ty, pt) orelse return null;
         cost += c;
@@ -194,7 +204,8 @@ fn matchOne(sema: anytype, it: *const table.Intrinsic, object: ?TypeId, args: []
 
     // Return type.
     const ret = try paramType(sema, specs, 0, comp_group, layout_group, group_comp, &bindings, args, obj_elem, explicit) orelse return null;
-    return .{ .ret = ret, .cost = cost, .out_params = out_params };
+    for (args[@min(args.len, it.params.len)..], @min(args.len, it.params.len)..) |a, ai| param_types[ai] = a.ty; // varargs
+    return .{ .ret = ret, .cost = cost, .out_params = out_params, .params = param_types };
 }
 
 /// The concrete type of spec `i`, or null if the arguments cannot fit.
