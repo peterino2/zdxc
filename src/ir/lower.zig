@@ -68,6 +68,8 @@ const Lowerer = struct {
     early_outputs: std.ArrayList(ir.SigElement) = .empty,
     streams: std.ArrayList(Stream) = .empty,
     entry_fn: ?*const semamod.Function = null,
+    /// The current method's object pointer.
+    this_ptr: Ref = .none,
     ret_ty: TypeId = TypeTable.void_type,
 
     fn unsupported(l: *Lowerer, loc: ast.Loc, comptime fmt: []const u8, args: anytype) void {
@@ -86,6 +88,8 @@ const Lowerer = struct {
         if (l.funcs.get(f)) |i| return i;
         // Stream-output objects exist only at compile time: no parameter.
         var params: std.ArrayList(ir.Param) = .empty;
+        // Methods take the object first (`this`, by reference).
+        if (isMethod(f)) try params.append(l.arena, .{ .name = "this", .ty = try l.s.types.intern(.{ .@"struct" = f.owner.? }), .by_ref = true });
         for (f.params) |p| {
             if (l.s.types.get(p.type) == .stream) continue;
             try params.append(l.arena, .{ .name = p.name, .ty = p.type, .by_ref = p.dir != .in });
@@ -114,6 +118,11 @@ const Lowerer = struct {
         // Parameters: by-value ones get local storage, out / inout ones
         // are the caller's pointers.
         var ir_index: u32 = 0;
+        l.this_ptr = .none;
+        if (isMethod(f)) {
+            l.this_ptr = try l.b.add(.{ .op = .{ .param = 0 }, .ty = try l.s.types.intern(.{ .@"struct" = f.owner.? }), .ptr = .function });
+            ir_index = 1;
+        }
         for (f.params, 0..) |p, i| {
             if (l.s.types.get(p.type) == .stream) continue;
             const pv = try l.b.add(.{ .op = .{ .param = ir_index }, .ty = p.type, .ptr = if (p.dir != .in) .function else .none });
@@ -590,6 +599,7 @@ const Lowerer = struct {
             .name => {
                 const r = l.s.resolution(e) orelse return l.fail(e, "this name");
                 switch (r) {
+                    .this_field => return l.b.load(try l.lvalue(e)),
                     .variable => |v| {
                         // Integer `static const` scalars are constants.
                         if (v.storage == .constant and v.init != null and l.s.types.get(v.type) == .scalar and !l.s.types.get(v.type).scalar.isFloat()) {
@@ -664,7 +674,11 @@ const Lowerer = struct {
                 if (l.s.evalInt(e)) |v| return l.b.constInt(try l.concrete(e.ty), v);
                 return l.fail(e, "this expression");
             },
-            .this, .init_list, .string_lit => return l.fail(e, "this expression"),
+            .this => {
+                if (l.this_ptr == .none) return l.fail(e, "this expression");
+                return l.b.load(l.this_ptr);
+            },
+            .init_list, .string_lit => return l.fail(e, "this expression"),
         }
     }
 
@@ -872,13 +886,52 @@ const Lowerer = struct {
                     }
                     full = all;
                 }
-                return l.userCall(f, fi, full, ret_ty);
+                // `obj.method(...)`: the object's storage (a temporary for
+                // rvalues).
+                var object: ?Ref = null;
+                var write_back: ?Ref = null;
+                const owner_ty = if (isMethod(f)) try l.s.types.intern(.{ .@"struct" = f.owner.? }) else TypeTable.void_type;
+                if (isMethod(f) and callee.kind == .member) {
+                    const base = callee.kind.member.base;
+                    const direct = if (isAddressable(base)) try l.lvalue(base) else null;
+                    const plain = if (direct) |p| l.b.f.inst(p).op == .local_var or l.b.f.inst(p).op == .param else false;
+                    if (direct != null and plain and base.ty == owner_ty) {
+                        object = direct;
+                    } else {
+                        // Through a function-local copy of the method's own
+                        // struct (a base prefix of derived objects), written
+                        // back afterwards to writable storage.
+                        const tmp = try l.b.add(.{ .op = .local_var, .ty = owner_ty, .ptr = .function });
+                        const whole = if (direct) |p| try l.b.load(p) else try l.rvalue(base);
+                        try l.b.store(tmp, try l.basePrefix(whole, base.ty, owner_ty));
+                        object = tmp;
+                        if (direct) |p| switch (l.b.f.inst(p).ptr) {
+                            .function, .private, .groupshared => write_back = p,
+                            else => {},
+                        };
+                    }
+                }
+                const res = try l.userCall(f, fi, full, ret_ty, object);
+                if (write_back) |p| {
+                    const updated = try l.b.load(object.?);
+                    if (callee.kind.member.base.ty == owner_ty) {
+                        try l.b.store(p, updated);
+                    } else {
+                        // Only the base's fields.
+                        for (l.s.types.get(owner_ty).@"struct".fields.items, 0..) |fld, k| {
+                            const idx = try l.b.constInt(try l.types().scalar(.uint), @intCast(k));
+                            const fp = try l.b.add(.{ .op = .{ .access = .{ .base = p, .indices = try l.arena.dupe(Ref, &.{idx}) } }, .ty = fld.type, .ptr = l.b.f.inst(p).ptr });
+                            try l.b.store(fp, try l.b.add(.{ .op = .{ .extract = .{ .agg = updated, .index = @intCast(k) } }, .ty = fld.type }));
+                        }
+                    }
+                }
+                return res;
             },
             else => return l.callOther(e, r, callee, args, ret_ty),
         }
     }
 
-    fn userCall(l: *Lowerer, f: *const semamod.Function, fi: u32, args: []const *ast.Expr, ret_ty: TypeId) Error!Ref {
+    fn userCall(l: *Lowerer, f: *const semamod.Function, fi: u32, args: []const *ast.Expr, ret_ty: TypeId, object: ?Ref) Error!Ref {
         {
             {
                 const vals = try l.arena.alloc(Ref, args.len);
@@ -900,6 +953,7 @@ const Lowerer = struct {
                 var packed_vals: std.ArrayList(Ref) = .empty;
                 for (f.params, 0..) |p, i| if (l.s.types.get(p.type) != .stream) try packed_vals.append(l.arena, vals[i]);
                 std.debug.assert(packed_vals.items.len == n_vals);
+                if (isMethod(f)) try packed_vals.insert(l.arena, 0, object orelse (if (l.this_ptr != .none) l.this_ptr else return error.Unsupported));
                 const res = try l.b.add(.{ .op = .{ .call = .{ .func = fi, .args = packed_vals.items } }, .ty = ret_ty });
                 for (args, f.params, 0..) |a, p, i| {
                     if (p.dir == .in or l.s.types.get(p.type) == .stream) continue;
@@ -974,8 +1028,17 @@ const Lowerer = struct {
     fn lvalue(l: *Lowerer, e: *ast.Expr) Error!Ref {
         const t = l.types();
         switch (e.kind) {
+            .this => {
+                if (l.this_ptr == .none) return l.fail(e, "this expression");
+                return l.this_ptr;
+            },
             .name => {
                 const r = l.s.resolution(e) orelse return l.fail(e, "this name");
+                if (r == .this_field) {
+                    if (l.this_ptr == .none) return l.fail(e, "this name");
+                    const idx = try l.b.constInt(try t.scalar(.uint), r.this_field);
+                    return l.b.add(.{ .op = .{ .access = .{ .base = l.this_ptr, .indices = try l.arena.dupe(Ref, &.{idx}) } }, .ty = e.ty, .ptr = l.b.f.inst(l.this_ptr).ptr });
+                }
                 if (r != .variable) return l.fail(e, "this name");
                 const v = r.variable;
                 if (l.vars.get(v)) |p| return p;
@@ -1321,6 +1384,16 @@ const Lowerer = struct {
         return l.b.add(.{ .op = .{ .construct = parts }, .ty = ty });
     }
 
+    /// `value` (of struct `from`) as its base struct `to` (the leading
+    /// fields).
+    fn basePrefix(l: *Lowerer, value: Ref, from: TypeId, to: TypeId) Error!Ref {
+        if (from == to) return value;
+        const fields = l.s.types.get(to).@"struct".fields.items;
+        const parts = try l.arena.alloc(Ref, fields.len);
+        for (parts, fields, 0..) |*p, fld, k| p.* = try l.b.add(.{ .op = .{ .extract = .{ .agg = value, .index = @intCast(k) } }, .ty = fld.type });
+        return l.b.add(.{ .op = .{ .construct = parts }, .ty = to });
+    }
+
     fn buildEntry(l: *Lowerer, f: *const semamod.Function, main: u32, opts: Options) Error!void {
         const inits = try l.staticInits();
         var entry: ir.Entry = .{ .func = main, .name = opts.entry, .stage = opts.stage };
@@ -1400,6 +1473,12 @@ pub fn saturatingInt(f: f64) i64 {
     if (f >= 9.2233720368547758e18) return std.math.maxInt(i64);
     if (f <= -9.2233720368547758e18) return std.math.minInt(i64);
     return @intFromFloat(@trunc(f));
+}
+
+/// Non-static member functions take their object as a hidden first
+/// parameter.
+fn isMethod(f: *const semamod.Function) bool {
+    return f.owner != null and !f.decl.quals.static;
 }
 
 /// Resources, samplers and arrays of them.
@@ -1494,7 +1573,7 @@ fn matrixSwizzle(a: Allocator, name: []const u8, cols: u8) ?[]const u32 {
 
 fn isAddressable(e: *const ast.Expr) bool {
     return switch (e.kind) {
-        .name => true,
+        .name, .this => true,
         .member => |m| isAddressable(m.base),
         .index => |x| isAddressable(x.base),
         else => false,

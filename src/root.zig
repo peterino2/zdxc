@@ -13,6 +13,7 @@ pub const front = struct {
     pub const ast = @import("front/ast.zig");
     pub const parser = @import("front/parser.zig");
     pub const ast_dump = @import("front/ast_dump.zig");
+    pub const ast_clone = @import("front/ast_clone.zig");
 };
 
 pub const dxil = struct {

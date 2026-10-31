@@ -9,6 +9,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const ast = @import("../front/ast.zig");
+const ast_clone = @import("../front/ast_clone.zig");
 const source = @import("../front/source.zig");
 const diag = @import("../diag.zig");
 const types = @import("types.zig");
@@ -69,6 +70,8 @@ pub const Resolution = union(enum) {
     intrinsic: struct { index: u16, params: []const TypeId, object: ?TypeId = null },
     /// A struct field (member expression).
     field: u32,
+    /// A field named without `this.` inside a method.
+    this_field: u32,
 };
 
 pub const Param = struct {
@@ -96,6 +99,9 @@ pub const Function = struct {
     param_vars: []?*Variable = &.{},
 };
 
+/// A bound template argument.
+pub const Bound = union(enum) { type: TypeId, value: i64 };
+
 pub const FuncSet = struct {
     funcs: std.ArrayList(*Function) = .empty,
 };
@@ -106,8 +112,14 @@ pub const Symbol = union(enum) {
     type: TypeId,
     namespace: *Scope,
     enumerator: struct { type: TypeId, value: i64 },
-    /// A template (milestone 0.2); uses report "not supported yet".
-    template: *const ast.Decl,
+    /// Templates of one name: primaries (function overloads) and
+    /// specializations.
+    template: *TemplateSet,
+};
+
+pub const TemplateSet = struct {
+    decls: std.ArrayList(*const ast.Decl) = .empty,
+    specs: std.ArrayList(*const ast.Decl) = .empty,
 };
 
 pub const Scope = struct {
@@ -139,6 +151,8 @@ const Callee = union(enum) {
     /// `obj.Method`: methods of a builtin object, or of a struct.
     method: struct { object: TypeId, name: []const u8, object_lvalue: bool },
     type: TypeId,
+    /// Function templates (instantiated per call).
+    template: *TemplateSet,
     /// A callable zdxc does not model yet: the call is unconstrained.
     unknown,
 };
@@ -172,6 +186,14 @@ pub const Sema = struct {
     switch_depth: u32 = 0,
     intrinsic_db: intrinsics.Db,
     enum_scopes: std.AutoHashMapUnmanaged(*types.EnumInfo, *Scope) = .empty,
+    /// Where each template was declared (its names resolve from there).
+    template_scopes: std.AutoHashMapUnmanaged(*const ast.Decl, *Scope) = .empty,
+    /// Nesting of template instances being checked.
+    instance_depth: u32 = 0,
+    /// Instances by template and arguments.
+    template_instances: std.StringHashMapUnmanaged(Symbol) = .empty,
+    /// The template and arguments of each struct instance (for deduction).
+    struct_instances: std.AutoHashMapUnmanaged(TypeId, struct { decl: *const ast.Decl, args: []const Bound }) = .empty,
 
     pub fn init(arena: Allocator, diags: *diag.Diagnostics, opts: Options) !Sema {
         const global = try arena.create(Scope);
@@ -244,6 +266,456 @@ pub const Sema = struct {
             }
         }
         gop.value_ptr.* = sym;
+    }
+
+    fn declareTemplate(s: *Sema, name: []const u8, d: *const ast.Decl) !void {
+        return s.addTemplate(name, d, false);
+    }
+
+    /// Adds a template (or a specialization) to the name's set here.
+    fn addTemplate(s: *Sema, name: []const u8, d: *const ast.Decl, spec: bool) !void {
+        try s.template_scopes.put(s.arena, d, s.scope);
+        const set = blk: {
+            if (s.scope.syms.get(name)) |sym| switch (sym) {
+                .template => |t| break :blk t,
+                // Plain functions take precedence over templates.
+                .functions => return,
+                else => {},
+            };
+            const set = try s.arena.create(TemplateSet);
+            set.* = .{};
+            try s.declare(name, .{ .template = set }, d.loc);
+            break :blk set;
+        };
+        // A definition replaces a forward-declared struct template, and
+        // completes instances made before it.
+        if (!spec and d.kind == .@"struct" and set.decls.items.len > 0 and set.decls.items[0].kind == .@"struct") {
+            const old = set.decls.items[0];
+            if (old.kind.@"struct".members == null and d.kind.@"struct".members != null) {
+                set.decls.items[0] = d;
+                try s.template_scopes.put(s.arena, d, s.template_scopes.get(old) orelse s.scope);
+                var it = s.struct_instances.iterator();
+                while (it.next()) |kv| {
+                    if (kv.value_ptr.decl != old) continue;
+                    kv.value_ptr.decl = d;
+                    const info = s.types.get(kv.key_ptr.*).@"struct";
+                    if (info.complete) continue;
+                    try s.completeInstance(d, kv.key_ptr.*, kv.value_ptr.args);
+                }
+                return;
+            }
+        }
+        try (if (spec) &set.specs else &set.decls).append(s.arena, d);
+    }
+
+    /// Checks a struct template's body for an existing instance type.
+    fn completeInstance(s: *Sema, d: *const ast.Decl, ty: TypeId, args: []const Bound) Allocator.Error!void {
+        const params = templateParams(d);
+        const sc = try s.arena.create(Scope);
+        sc.* = .{ .parent = s.template_scopes.get(d) orelse s.global, .kind = .block };
+        for (params, args) |p, a| switch (a) {
+            .type => |t| try sc.syms.put(s.arena, p.name, .{ .type = t }),
+            .value => |v| {
+                const saved = s.scope;
+                s.scope = sc;
+                defer s.scope = saved;
+                try sc.syms.put(s.arena, p.name, .{ .enumerator = .{ .type = try s.resolveType(p.value_type.?), .value = v } });
+            },
+        };
+        const info = s.types.get(ty).@"struct";
+        try sc.syms.put(s.arena, info.name, .{ .type = ty });
+        const copy = try ast_clone.clone(s.arena, *const ast.Decl, d);
+        const cd: *ast.Decl = @constCast(copy);
+        cd.kind.@"struct".template_params = &.{};
+        cd.kind.@"struct".name = info.name;
+        const ctx = s.enterInstance(sc);
+        defer s.leaveInstance(ctx);
+        try s.structDecl(cd, &cd.kind.@"struct");
+    }
+
+    fn specializationArgs(d: *const ast.Decl) []const ast.TemplateArg {
+        return switch (d.kind) {
+            .@"struct" => |st| st.specialization_args,
+            .@"var" => |v| v.specialization_args,
+            else => &.{},
+        };
+    }
+
+    /// Binds a specialization's parameters if its pattern matches `args`.
+    fn matchSpecialization(s: *Sema, spec: *const ast.Decl, args: []const Bound) Allocator.Error!?*Scope {
+        const pats = specializationArgs(spec);
+        if (pats.len != args.len) return null;
+        const params = templateParams(spec);
+        const sc = try s.arena.create(Scope);
+        sc.* = .{ .parent = s.template_scopes.get(spec) orelse s.global, .kind = .block };
+        const bound = try s.arena.alloc(?Bound, params.len);
+        @memset(bound, null);
+        const saved = s.scope;
+        s.scope = sc;
+        defer s.scope = saved;
+        for (pats, args) |pat, arg| {
+            const pname: ?[]const u8 = switch (pat) {
+                .type => |t| if (t.name.parts.len == 1 and t.args.len == 0 and t.array_dims.len == 0) t.name.parts[0] else null,
+                .expr => |e| if (e.kind == .name and e.kind.name.parts.len == 1) e.kind.name.parts[0] else null,
+            };
+            const pi: ?usize = if (pname) |n| for (params, 0..) |p, i| {
+                if (eql(p.name, n)) break i;
+            } else null else null;
+            if (pi) |i| {
+                if (bound[i]) |old| {
+                    if (!std.meta.eql(old, arg)) return null;
+                } else bound[i] = arg;
+                continue;
+            }
+            // A concrete pattern must equal the argument.
+            switch (arg) {
+                .type => |t| {
+                    const pt = (try s.typeArg(pat)) orelse return null;
+                    if (pt != t) return null;
+                },
+                .value => |v| if ((s.constArg(pat) orelse return null) != v) return null,
+            }
+        }
+        for (params, bound) |p, b| {
+            const v = b orelse return null;
+            switch (v) {
+                .type => |t| try sc.syms.put(s.arena, p.name, .{ .type = t }),
+                .value => |x| try sc.syms.put(s.arena, p.name, .{ .enumerator = .{ .type = try s.resolveType(p.value_type.?), .value = x } }),
+            }
+        }
+        return sc;
+    }
+
+    fn templateParams(d: *const ast.Decl) []const ast.TemplateParam {
+        return switch (d.kind) {
+            .@"struct" => |st| st.template_params,
+            .func => |f| f.template_params,
+            .typedef => |td| td.template_params,
+            .@"var" => |v| v.template_params,
+            else => &.{},
+        };
+    }
+
+    /// Binds a template's parameters: explicit arguments, then deduced
+    /// ones, then defaults (which may use earlier parameters). Returns the
+    /// instance scope and its cache key, or null after reporting an error.
+    const Binding = struct { scope: *Scope, key: []const u8, args: []const Bound };
+
+    fn bindTemplate(s: *Sema, d: *const ast.Decl, explicit: []const ast.TemplateArg, deduced: []const ?Bound, loc: Loc) Allocator.Error!?Binding {
+        return s.bindTemplateMode(d, explicit, deduced, loc, false);
+    }
+
+    fn bindTemplateMode(s: *Sema, d: *const ast.Decl, explicit: []const ast.TemplateArg, deduced: []const ?Bound, loc: Loc, quiet: bool) Allocator.Error!?Binding {
+        const params = templateParams(d);
+        if (explicit.len > params.len) {
+            if (!quiet) s.err(loc, "too many template arguments", .{});
+            return null;
+        }
+        const sc = try s.arena.create(Scope);
+        sc.* = .{ .parent = s.template_scopes.get(d) orelse s.global, .kind = .block };
+        const bound = try s.arena.alloc(Bound, params.len);
+        var key: std.ArrayList(u8) = .empty;
+        try key.print(s.arena, "{x}:", .{@intFromPtr(d)});
+        const saved = s.scope;
+        defer s.scope = saved;
+        for (params, 0..) |p, i| {
+            // Explicit arguments and defaults are evaluated in the caller's
+            // scope and the instance scope (earlier parameters) respectively.
+            const arg: ?ast.TemplateArg = if (i < explicit.len) explicit[i] else null;
+            s.scope = if (arg != null) saved else sc;
+            if (p.value_type) |vt| {
+                const v: ?i64 = if (arg) |x| s.constArg(x) else if (i < deduced.len and deduced[i] != null) deduced[i].?.value else if (p.default) |dflt| s.constArg(dflt) else null;
+                const value = v orelse {
+                    if (!quiet) {
+                        if (arg != null) s.err(loc, "this template argument for '{s}' is not supported yet", .{p.name}) else s.err(loc, "could not deduce template argument '{s}'", .{p.name});
+                    }
+                    return null;
+                };
+                s.scope = sc;
+                const ty = try s.resolveType(vt);
+                bound[i] = .{ .value = value };
+                const gop = try sc.syms.getOrPut(s.arena, p.name);
+                gop.value_ptr.* = .{ .enumerator = .{ .type = ty, .value = value } };
+                try key.print(s.arena, "v{d},", .{value});
+            } else {
+                const t: ?TypeId = if (arg) |x| try s.typeArg(x) else if (i < deduced.len and deduced[i] != null) deduced[i].?.type else if (p.default) |dflt| try s.typeArg(dflt) else null;
+                const ty = t orelse {
+                    if (!quiet) s.err(loc, "could not deduce template argument '{s}'", .{p.name});
+                    return null;
+                };
+                bound[i] = .{ .type = ty };
+                const gop = try sc.syms.getOrPut(s.arena, p.name);
+                gop.value_ptr.* = .{ .type = ty };
+                try key.print(s.arena, "t{d},", .{ty});
+            }
+        }
+        return .{ .scope = sc, .key = key.items, .args = bound };
+    }
+
+    /// The context Sema saves around checking a template instance.
+    const Context = struct { scope: *Scope, func: ?*Function, strct: ?*types.StructInfo, block: ?*const ast.Decl, loops: u32, switches: u32 };
+
+    fn enterInstance(s: *Sema, sc: *Scope) Context {
+        const c: Context = .{ .scope = s.scope, .func = s.current_fn, .strct = s.current_struct, .block = s.current_block, .loops = s.loop_depth, .switches = s.switch_depth };
+        s.instance_depth += 1;
+        s.scope = sc;
+        s.current_fn = null;
+        s.current_struct = null;
+        s.current_block = null;
+        s.loop_depth = 0;
+        s.switch_depth = 0;
+        return c;
+    }
+
+    fn leaveInstance(s: *Sema, c: Context) void {
+        s.instance_depth -= 1;
+        s.scope = c.scope;
+        s.current_fn = c.func;
+        s.current_struct = c.strct;
+        s.current_block = c.block;
+        s.loop_depth = c.loops;
+        s.switch_depth = c.switches;
+    }
+
+    /// `name<float, 3>`: an instance's readable name.
+    fn instanceName(s: *Sema, name: []const u8, args: []const Bound) Allocator.Error![]const u8 {
+        var out: std.ArrayList(u8) = .empty;
+        try out.print(s.arena, "{s}<", .{name});
+        for (args, 0..) |a, i| {
+            if (i > 0) try out.appendSlice(s.arena, ", ");
+            switch (a) {
+                .type => |t| try out.appendSlice(s.arena, s.typeName(t)),
+                .value => |v| try out.print(s.arena, "{d}", .{v}),
+            }
+        }
+        try out.append(s.arena, '>');
+        return out.items;
+    }
+
+    /// `S<args>`: a struct template instance (or a template typedef).
+    fn instantiateType(s: *Sema, set: *TemplateSet, args: []const ast.TemplateArg, loc: Loc) Allocator.Error!TypeId {
+        if (set.decls.items.len == 0) {
+            s.err(loc, "this template cannot be used as a type", .{});
+            return TypeTable.error_type;
+        }
+        const d = set.decls.items[0];
+        // dxc accepted this code, so a failure here is a gap in zdxc.
+        var b = (try s.bindTemplateMode(d, args, &.{}, loc, true)) orelse {
+            s.err(loc, "this use of a class template is not supported yet", .{});
+            return TypeTable.error_type;
+        };
+        if (s.template_instances.get(b.key)) |sym| return if (sym == .type) sym.type else TypeTable.error_type;
+        // A matching specialization replaces the primary definition.
+        var body = d;
+        for (set.specs.items) |sp| if (try s.matchSpecialization(sp, b.args)) |sc| {
+            body = sp;
+            b.scope = sc;
+            break;
+        };
+        switch (d.kind) {
+            .typedef => |td| {
+                const ctx = s.enterInstance(b.scope);
+                defer s.leaveInstance(ctx);
+                const ty = try s.applyArrayDims(try s.resolveType(td.type), td.array_dims);
+                try s.template_instances.put(s.arena, b.key, .{ .type = ty });
+                return ty;
+            },
+            .@"struct" => |st| {
+                // A readable name: S<float, 3>.
+                var name: std.ArrayList(u8) = .empty;
+                try name.print(s.arena, "{s}<", .{st.name orelse "?"});
+                for (b.args, 0..) |a, i| {
+                    if (i > 0) try name.appendSlice(s.arena, ", ");
+                    switch (a) {
+                        .type => |t| try name.appendSlice(s.arena, s.typeName(t)),
+                        .value => |v| try name.print(s.arena, "{d}", .{v}),
+                    }
+                }
+                try name.append(s.arena, '>');
+                const copy = try ast_clone.clone(s.arena, *const ast.Decl, body);
+                const cd: *ast.Decl = @constCast(copy);
+                cd.kind.@"struct".template_params = &.{};
+                cd.kind.@"struct".specialization_args = &.{};
+                cd.kind.@"struct".name = name.items;
+                // Register the type before checking members, so the struct
+                // may name itself.
+                const info = try s.arena.create(types.StructInfo);
+                info.* = .{ .name = name.items };
+                const ty = try s.types.intern(.{ .@"struct" = info });
+                try b.scope.syms.put(s.arena, name.items, .{ .type = ty });
+                try s.template_instances.put(s.arena, b.key, .{ .type = ty });
+                try s.struct_instances.put(s.arena, ty, .{ .decl = d, .args = b.args });
+                const ctx = s.enterInstance(b.scope);
+                defer s.leaveInstance(ctx);
+                try s.structDecl(cd, &cd.kind.@"struct");
+                return ty;
+            },
+            else => {
+                s.err(loc, "this template cannot be used as a type", .{});
+                return TypeTable.error_type;
+            },
+        }
+    }
+
+    /// Deduces template arguments from one parameter type and argument.
+    fn deduce(s: *Sema, params: []const ast.TemplateParam, pt: *const ast.TypeRef, dims: []const ?*ast.Expr, arg: TypeId, out: []?Bound) void {
+        var at = arg;
+        // `T x[N]`: through the array.
+        if (dims.len > 0) {
+            if (s.types.get(at) != .array) return;
+            const arr = s.types.get(at).array;
+            if (dims[0]) |de| if (de.kind == .name and de.kind.name.parts.len == 1) {
+                for (params, 0..) |p, i| if (p.value_type != null and eql(p.name, de.kind.name.parts[0]) and out[i] == null) {
+                    out[i] = .{ .value = arr.len };
+                };
+            };
+            at = arr.elem;
+        }
+        if (s.types.component(at)) |c| if (c.isLiteral()) {
+            at = s.types.withComponent(at, c.concrete()) catch at;
+        };
+        const n = pt.name;
+        if (n.parts.len != 1) return;
+        const name = n.parts[0];
+        const bindName = struct {
+            fn f(ps: []const ast.TemplateParam, o: []?Bound, nm: []const u8, v: Bound) void {
+                for (ps, 0..) |p, i| if (eql(p.name, nm) and o[i] == null and ((p.value_type == null) == (v == .type))) {
+                    o[i] = v;
+                };
+            }
+        }.f;
+        const argName = struct {
+            fn f(x: ast.TemplateArg) ?[]const u8 {
+                return switch (x) {
+                    .type => |t| if (t.name.parts.len == 1 and t.args.len == 0) t.name.parts[0] else null,
+                    .expr => |e| if (e.kind == .name and e.kind.name.parts.len == 1) e.kind.name.parts[0] else null,
+                };
+            }
+        }.f;
+        if (pt.args.len == 0) {
+            bindName(params, out, name, .{ .type = at });
+            return;
+        }
+        // vector<T, N> / matrix<T, R, C>.
+        if (eql(name, "vector") and pt.args.len == 2) {
+            const v = switch (s.types.get(at)) {
+                .vector => |v| v,
+                else => return,
+            };
+            if (argName(pt.args[0])) |tn| bindName(params, out, tn, .{ .type = s.types.scalar(v.elem) catch return });
+            if (argName(pt.args[1])) |nn| bindName(params, out, nn, .{ .value = v.len });
+            return;
+        }
+        if (eql(name, "matrix") and pt.args.len == 3) {
+            const m = switch (s.types.get(at)) {
+                .matrix => |m| m,
+                else => return,
+            };
+            if (argName(pt.args[0])) |tn| bindName(params, out, tn, .{ .type = s.types.scalar(m.elem) catch return });
+            if (argName(pt.args[1])) |rn| bindName(params, out, rn, .{ .value = m.rows });
+            if (argName(pt.args[2])) |cn| bindName(params, out, cn, .{ .value = m.cols });
+            return;
+        }
+        // S<T, ...> against an instance of S.
+        const inst = s.struct_instances.get(at) orelse return;
+        const sym = s.lookupName(pt.name) orelse return;
+        if (sym != .template or std.mem.indexOfScalar(*const ast.Decl, sym.template.decls.items, inst.decl) == null) return;
+        for (pt.args, 0..) |x, i| {
+            if (i >= inst.args.len) break;
+            if (argName(x)) |an| bindName(params, out, an, inst.args[i]);
+        }
+    }
+
+    /// A call to a function template: deduce, instantiate (once per
+    /// argument list), then resolve as an ordinary call.
+    fn callTemplate(s: *Sema, e: *ast.Expr, tset: *TemplateSet, explicit: []const ast.TemplateArg, args: []const intrinsics.ArgInfo, callee: *ast.Expr) Allocator.Error!TypeId {
+        // Every overload that deduces contributes its instance.
+        const all = try s.arena.create(FuncSet);
+        all.* = .{};
+        for (tset.decls.items) |d| {
+            if (d.kind != .func) continue;
+            const inst = try s.instantiateCall(d, explicit, args, callee, tset.decls.items.len > 1);
+            if (inst) |set| try all.funcs.appendSlice(s.arena, set.funcs.items);
+        }
+        if (all.funcs.items.len == 0) {
+            s.err(callee.loc, "this call to a function template is not supported yet", .{});
+            return TypeTable.error_type;
+        }
+        // Instances with the same parameters would need C++ partial
+        // ordering, which zdxc does not model.
+        for (all.funcs.items, 0..) |a, i| for (all.funcs.items[i + 1 ..]) |b2| if (sameSignature(a, b2)) {
+            s.err(callee.loc, "choosing among these function templates is not supported yet", .{});
+            return TypeTable.error_type;
+        };
+        return s.resolveUserCall(e, all, args, callee);
+    }
+
+    fn instantiateCall(s: *Sema, d: *const ast.Decl, explicit: []const ast.TemplateArg, args: []const intrinsics.ArgInfo, callee: *ast.Expr, quiet: bool) Allocator.Error!?*FuncSet {
+        const f = d.kind.func;
+        const deduced = try s.arena.alloc(?Bound, f.template_params.len);
+        @memset(deduced, null);
+        for (f.params, 0..) |p, i| {
+            if (i >= args.len) break;
+            s.deduce(f.template_params, p.type, p.array_dims, args[i].ty, deduced);
+        }
+        if (f.params.len < args.len) return null;
+        const b = (try s.bindTemplateMode(d, explicit, deduced, callee.loc, quiet)) orelse return null;
+        const set = blk: {
+            if (s.template_instances.get(b.key)) |sym| break :blk sym.functions;
+            const copy = try ast_clone.clone(s.arena, *const ast.Decl, d);
+            const cd: *ast.Decl = @constCast(copy);
+            cd.kind.func.template_params = &.{};
+            // A distinct name, so the template stays visible in the body.
+            const iname = try s.instanceName(f.name.last(), b.args);
+            const parts = try s.arena.dupe([]const u8, f.name.parts);
+            parts[parts.len - 1] = iname;
+            cd.kind.func.name = .{ .loc = f.name.loc, .parts = parts };
+            const set = try s.arena.create(FuncSet);
+            set.* = .{};
+            try s.template_instances.put(s.arena, b.key, .{ .functions = set });
+            const ctx = s.enterInstance(b.scope);
+            defer s.leaveInstance(ctx);
+            try s.funcDeclMode(cd, &cd.kind.func, null, .both);
+            if (b.scope.syms.get(iname)) |sym| if (sym == .functions) {
+                try set.funcs.appendSlice(s.arena, sym.functions.funcs.items);
+            };
+            break :blk set;
+        };
+        return set;
+    }
+
+    /// `v<args>`: a variable template instance (or its specialization).
+    fn instantiateVar(s: *Sema, e: *ast.Expr, set: *TemplateSet, args: []const ast.TemplateArg) Allocator.Error!Typed {
+        const d = for (set.decls.items) |x| {
+            if (x.kind == .@"var") break x;
+        } else {
+            s.err(e.loc, "this template cannot be used as a value", .{});
+            return err_typed;
+        };
+        var b = (try s.bindTemplate(d, args, &.{}, e.loc)) orelse return err_typed;
+        const v = blk: {
+            if (s.template_instances.get(b.key)) |sym| break :blk sym.variable;
+            var body = d;
+            for (set.specs.items) |sp| if (try s.matchSpecialization(sp, b.args)) |sc| {
+                body = sp;
+                b.scope = sc;
+                break;
+            };
+            const copy = try ast_clone.clone(s.arena, *const ast.Decl, body);
+            const cd: *ast.Decl = @constCast(copy);
+            cd.kind.@"var".template_params = &.{};
+            cd.kind.@"var".specialization_args = &.{};
+            cd.kind.@"var".name = try std.fmt.allocPrint(s.arena, "{s}<{s}>", .{ d.kind.@"var".name, b.key });
+            const ctx = s.enterInstance(b.scope);
+            defer s.leaveInstance(ctx);
+            try s.varDecl(cd, &cd.kind.@"var", .global);
+            const sym = b.scope.syms.get(cd.kind.@"var".name) orelse return err_typed;
+            if (sym != .variable) return err_typed;
+            try s.template_instances.put(s.arena, b.key, sym);
+            break :blk sym.variable;
+        };
+        s.record(e, .{ .variable = v });
+        return .{ .ty = v.type, .lvalue = true, .read_only = v.read_only };
     }
 
     fn lookup(s: *Sema, name: []const u8) ?Symbol {
@@ -565,10 +1037,7 @@ pub const Sema = struct {
         }
         if (s.lookupName(t.name)) |sym| switch (sym) {
             .type => |ty| return ty,
-            .template => {
-                s.err(t.loc, "templates are not supported yet (planned for milestone 0.2)", .{});
-                return TypeTable.error_type;
-            },
+            .template => |set| return s.instantiateType(set, args, t.loc),
             else => {
                 s.err(t.loc, "'{s}' does not name a type", .{n});
                 return TypeTable.error_type;
@@ -796,8 +1265,8 @@ pub const Sema = struct {
                 }
             },
             .typedef => |td| {
-                if (td.template_params.len > 0) return s.declare(td.name, .{ .template = d }, d.loc);
-                if (ctx == .member) {
+                if (td.template_params.len > 0) return s.declareTemplate(td.name, d);
+                if (ctx == .member and s.instance_depth == 0) {
                     s.err(d.loc, "nested typedefs are not supported in HLSL", .{});
                     return;
                 }
@@ -884,7 +1353,7 @@ pub const Sema = struct {
     fn structDecl(s: *Sema, d: *const ast.Decl, st: *const ast.StructDecl) Allocator.Error!void {
         const name = st.name orelse "<anonymous struct>";
         if (st.template_params.len > 0 or st.specialization_args.len > 0) {
-            if (st.template_params.len > 0 and st.specialization_args.len == 0) try s.declare(name, .{ .template = d }, d.loc);
+            try s.addTemplate(name, d, st.specialization_args.len > 0);
             return;
         }
         // Reuse a forward-declared struct.
@@ -1313,7 +1782,7 @@ pub const Sema = struct {
     }
 
     fn varDecl(s: *Sema, d: *const ast.Decl, v: *const ast.VarDecl, ctx: DeclCtx) Allocator.Error!void {
-        if (v.template_params.len > 0) return s.declare(v.name, .{ .template = d }, d.loc);
+        if (v.template_params.len > 0 or v.specialization_args.len > 0) return s.addTemplate(v.name, d, v.specialization_args.len > 0);
         if (std.mem.indexOf(u8, v.name, "::") != null) return; // out-of-line static member definition
         const is_auto = v.type.name.isSimple("auto");
         const base = if (is_auto) TypeTable.error_type else try s.resolveType(v.type);
@@ -1422,7 +1891,7 @@ pub const Sema = struct {
         if (std.mem.startsWith(u8, name, "operator")) if (owner) |o| {
             o.has_operators = true;
         };
-        if (f.template_params.len > 0) return s.declare(name, .{ .template = d }, d.loc);
+        if (f.template_params.len > 0) return s.declareTemplate(name, d);
         if (std.mem.startsWith(u8, name, "operator")) {
             s.err(d.loc, "operator overloading is not supported yet (planned for milestone 0.2)", .{});
             return;
@@ -1763,9 +2232,10 @@ pub const Sema = struct {
                 s.err(e.loc, "unexpected namespace name '{s}'", .{n.last()});
                 return err_typed;
             },
-            .template => {
-                s.err(e.loc, "templates are not supported yet (planned for milestone 0.2)", .{});
-                return err_typed;
+            .template => |set| {
+                if (set.decls.items.len > 0 and set.decls.items[0].kind == .func) return .{ .ty = TypeTable.error_type, .callee = .{ .template = set } };
+                const targs: []const ast.TemplateArg = if (n.args.len > 0) n.args[n.args.len - 1] else &.{};
+                return s.instantiateVar(e, set, targs);
             },
         };
         // Builtin type names used as values (`half4` in an expression).
@@ -1775,7 +2245,10 @@ pub const Sema = struct {
         // Struct fields and methods used unqualified inside methods.
         if (s.current_struct) |info| {
             if (n.parts.len == 1) {
-                for (info.fields.items) |f| if (std.mem.eql(u8, f.name, n.parts[0])) return .{ .ty = f.type, .lvalue = true };
+                for (info.fields.items, 0..) |f, k| if (std.mem.eql(u8, f.name, n.parts[0])) {
+                    s.record(e, .{ .this_field = @intCast(k) });
+                    return .{ .ty = f.type, .lvalue = true };
+                };
             }
         }
         if (n.parts.len > 1) {
@@ -2284,6 +2757,7 @@ pub const Sema = struct {
         for (arg_types) |a| if (a.ty == TypeTable.error_type) return err_typed;
         switch (target) {
             .functions => |set| return rvalue(s.resolveUserCall(e, set, arg_types, callee)),
+            .template => |set| return rvalue(try s.callTemplate(e, set, template_args, arg_types, callee)),
             .intrinsic => |name| {
                 var explicit: ?TypeId = null;
                 if (template_args.len > 0) explicit = try s.typeArg(template_args[0]);

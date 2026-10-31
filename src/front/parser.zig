@@ -1027,6 +1027,7 @@ pub const Parser = struct {
         const name_loc = p.tok().loc;
         var fname: ?ast.Name = null;
         var qualified_var: ?[]const u8 = null;
+        var var_spec: []const ast.TemplateArg = &.{};
         if (p.atIdent("operator")) {
             fname = try p.parseOperatorName();
         } else if (p.at(.identifier) and (p.peek(1).kind == .colon_colon or p.peek(1).kind == .l_paren or p.peek(1).kind == .less)) {
@@ -1043,7 +1044,7 @@ pub const Parser = struct {
             } else {
                 // Explicit specialization `f<T>(...)` is not supported yet;
                 // accept the syntax.
-                if (p.at(.less)) _ = try p.parseTemplateArgs();
+                if (p.at(.less)) var_spec = try p.parseTemplateArgs();
                 if (p.at(.l_paren)) {
                     fname = n;
                 } else if (n.parts.len > 1 or p.toks[p.pos - 1].kind == .greater) {
@@ -1065,6 +1066,7 @@ pub const Parser = struct {
             if (first and qualified_var != null) {
                 name = .{ .kind = .identifier, .text = qualified_var.?, .loc = name_loc };
             } else name = try p.expectIdent("declarator name");
+            const first_spec = first;
             first = false;
             const dims = try p.parseArrayDims();
             var bitfield: ?*ast.Expr = null;
@@ -1094,6 +1096,7 @@ pub const Parser = struct {
                 .semantics = sems,
                 .bitfield = bitfield,
                 .init = init_expr,
+                .specialization_args = if (first_spec) var_spec else &.{},
             } } }));
             if (ctx == .local) try p.declareName(name.text, .value);
             // Variable templates are referenced as `v<Args>`.

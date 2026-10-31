@@ -217,6 +217,8 @@ pub const VarDecl = struct {
     semantics: []const Semantic,
     bitfield: ?*Expr = null,
     init: ?*Expr = null,
+    /// Arguments of a variable template specialization: `v<T, T>`.
+    specialization_args: []const TemplateArg = &.{},
 };
 
 pub const TemplateParam = struct {
