@@ -54,6 +54,7 @@ pub const Op = enum(u16) {
     composite_construct = 80,
     composite_extract = 81,
     composite_insert = 82,
+    copy_object = 83,
     transpose = 84,
     array_length = 68,
     sampled_image = 86,

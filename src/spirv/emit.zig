@@ -45,6 +45,13 @@ const Capability = enum(u32) {
     image_query = 50,
     storage_image_read_without_format = 55,
     storage_image_write_without_format = 56,
+    shader_non_uniform = 5301,
+    runtime_descriptor_array = 5302,
+    uniform_texel_buffer_array_non_uniform_indexing = 5311,
+    storage_texel_buffer_array_non_uniform_indexing = 5312,
+    sampled_image_array_non_uniform_indexing = 5307,
+    storage_buffer_array_non_uniform_indexing = 5308,
+    storage_image_array_non_uniform_indexing = 5309,
 };
 
 pub fn emit(gpa: Allocator, m: *const ir.Module, diags: *diag.Diagnostics) Error![]u8 {
@@ -86,6 +93,11 @@ const Emitter = struct {
     image_types: std.AutoHashMapUnmanaged([6]u32, Id) = .empty,
     sampled_image_types: std.AutoHashMapUnmanaged(Id, Id) = .empty,
     sampler_type: Id = 0,
+    resource_arrays: std.AutoHashMapUnmanaged([2]u32, Id) = .empty,
+    extensions: std.ArrayList([]const u8) = .empty,
+    /// Values selected with NonUniformResourceIndex (and resources reached
+    /// through them).
+    nonuniform_ids: std.AutoHashMapUnmanaged(Id, void) = .empty,
     variants: std.ArrayList(struct { fi: u32, bindings: []const Id, id: Id }) = .empty,
     /// Entry inputs / outputs: interface variable and its value type.
     inputs: []Interface = &.{},
@@ -484,16 +496,9 @@ const Emitter = struct {
         for (m.globals.items, 0..) |g, gi| {
             switch (g.space) {
                 .resource => {
-                    const r = if (e.t.get(g.ty) == .sampler) @FieldType(types.Type, "resource"){ .kind = .other, .elem = g.ty, .name = "SamplerState" } else switch (e.t.get(g.ty)) {
-                        .resource => |r| r,
-                        else => return e.unsupported("global '{s}' of type '{s}' is not supported yet", .{ g.name, try e.t.format(e.arena, g.ty) }),
-                    };
                     const var_id = e.b.newId();
-                    const sc: StorageClass = switch (r.kind) {
-                        .structured_buffer, .rw_structured_buffer, .byte_address_buffer, .rw_byte_address_buffer => .uniform,
-                        else => .uniform_constant,
-                    };
-                    try e.b.emit(.types_globals, .variable, &.{ try e.resourcePtrType(g.ty), var_id, @backingInt(sc) });
+                    const p = try e.resourcePointee(g.ty);
+                    try e.b.emit(.types_globals, .variable, &.{ try e.pointerType(p.sc, p.ty), var_id, @backingInt(p.sc) });
                     var binding = g.binding.index;
                     if (!g.binding.explicit) {
                         while (used.contains(.{ g.binding.space, next_free })) next_free += 1;
@@ -884,6 +889,7 @@ const Emitter = struct {
                 try e.b.emit(.functions, .store, &.{ e.val(s.ptr), e.val(s.value) });
             },
             .access => |a| {
+                if (e.t.get(f.inst(a.base).ty) == .array and isResourceType(e.t, f.inst(a.base).ty)) return e.resourceArrayAccess(ri, a, i.ty);
                 // Buffers reached through locals or parameters are still
                 // Uniform std430 storage.
                 const into_buffer = e.t.get(f.inst(a.base).ty) == .resource;
@@ -935,6 +941,8 @@ const Emitter = struct {
                 e.vals[ri] = e.b.newId();
                 ops.items[1] = e.vals[ri];
                 try e.b.emit(.functions, .access_chain, ops.items);
+                // Elements of a non-uniformly selected buffer.
+                if (e.nonuniform_ids.contains(e.val(a.base))) try e.markNonUniform(e.vals[ri], f.inst(a.base).ty);
             },
             .binary => |x| {
                 if (e.isTrueMatrix(i.ty)) {
@@ -1213,15 +1221,82 @@ const Emitter = struct {
     /// The pointer type of a resource variable of HLSL type `ty` (also how
     /// resources are passed to functions).
     fn resourcePtrType(e: *Emitter, ty: TypeId) Error!Id {
+        const p = try e.resourcePointee(ty);
+        return e.pointerType(p.sc, p.ty);
+    }
+
+    const Pointee = struct { sc: StorageClass, ty: Id };
+
+    /// Storage class and type of a resource variable of HLSL type `ty`
+    /// (arrays of resources are arrays of these).
+    fn resourcePointee(e: *Emitter, ty: TypeId) Error!Pointee {
         switch (e.t.get(ty)) {
-            .sampler => return e.pointerType(.uniform_constant, try e.samplerType()),
+            .sampler => return .{ .sc = .uniform_constant, .ty = try e.samplerType() },
             .resource => |r| switch (r.kind) {
-                .structured_buffer, .rw_structured_buffer, .byte_address_buffer, .rw_byte_address_buffer => return e.pointerType(.uniform, try e.bufferBlockType(ty)),
-                else => if (texture.shape(r.kind)) |sh| return e.pointerType(.uniform_constant, try e.imageType(sh, r.elem)),
+                .structured_buffer, .rw_structured_buffer, .byte_address_buffer, .rw_byte_address_buffer => return .{ .sc = .uniform, .ty = try e.bufferBlockType(ty) },
+                else => if (texture.shape(r.kind)) |sh| return .{ .sc = .uniform_constant, .ty = try e.imageType(sh, r.elem) },
+            },
+            .array => |arr| {
+                const inner = try e.resourcePointee(arr.elem);
+                const key: [2]u32 = .{ inner.ty, arr.len };
+                if (e.resource_arrays.get(key)) |id| return .{ .sc = inner.sc, .ty = id };
+                const id = e.b.newId();
+                if (arr.len == 0) {
+                    try e.cap(.runtime_descriptor_array);
+                    try e.extension("SPV_EXT_descriptor_indexing");
+                    try e.b.emit(.types_globals, .type_runtime_array, &.{ id, inner.ty });
+                } else try e.b.emit(.types_globals, .type_array, &.{ id, inner.ty, try e.constUint(arr.len) });
+                try e.resource_arrays.put(e.arena, key, id);
+                return .{ .sc = inner.sc, .ty = id };
             },
             else => {},
         }
         return e.unsupported("resource type '{s}' is not supported yet", .{try e.t.format(e.arena, ty)});
+    }
+
+    fn extension(e: *Emitter, name: []const u8) Error!void {
+        for (e.extensions.items) |x| if (std.mem.eql(u8, x, name)) return;
+        try e.extensions.append(e.arena, name);
+        try e.b.emitWithString(.extensions, .extension, &.{}, name, &.{});
+    }
+
+    /// `array[i]...` into an array of resources: an access chain to the
+    /// element (or sub-array) variable.
+    fn resourceArrayAccess(e: *Emitter, ri: usize, a: @FieldType(ir.Op, "access"), ty: TypeId) Error!void {
+        const p = try e.resourcePointee(ty);
+        var ops: std.ArrayList(u32) = .empty;
+        const id = e.b.newId();
+        var nonuniform = false;
+        try ops.appendSlice(e.arena, &.{ try e.pointerType(p.sc, p.ty), id, e.val(a.base) });
+        for (a.indices) |x| {
+            if (e.nonuniform_ids.contains(e.val(x))) nonuniform = true;
+            try ops.append(e.arena, e.val(x));
+        }
+        try e.b.emit(.functions, .access_chain, ops.items);
+        e.vals[ri] = id;
+        if (nonuniform) try e.markNonUniform(id, ty);
+    }
+
+    /// Decorates a non-uniformly selected resource value (and requires
+    /// the matching capability).
+    fn markNonUniform(e: *Emitter, id: Id, ty: TypeId) Error!void {
+        try e.cap(.shader_non_uniform);
+        try e.extension("SPV_EXT_descriptor_indexing");
+        var et = ty;
+        while (e.t.get(et) == .array) et = e.t.get(et).array.elem;
+        const c: Capability = switch (e.t.get(et)) {
+            .sampler => .sampled_image_array_non_uniform_indexing,
+            .resource => |r| switch (r.kind) {
+                .structured_buffer, .rw_structured_buffer, .byte_address_buffer, .rw_byte_address_buffer => .storage_buffer_array_non_uniform_indexing,
+                .buffer => .uniform_texel_buffer_array_non_uniform_indexing,
+                .rw_buffer => .storage_texel_buffer_array_non_uniform_indexing,
+                else => if (r.kind.isWritable()) .storage_image_array_non_uniform_indexing else .sampled_image_array_non_uniform_indexing,
+            },
+            else => .shader_non_uniform,
+        };
+        try e.cap(c);
+        try e.b.emit(.annotations, .decorate, &.{ id, 5300 }); // NonUniform
+        try e.nonuniform_ids.put(e.arena, id, {});
     }
 
     // ------------------------------------------------------------------
@@ -1318,7 +1393,9 @@ const Emitter = struct {
     }
 
     fn loadImage(e: *Emitter, r: Ref) Error!Id {
-        return e.opRaw(.load, try e.imageTypeOf(r), &.{e.val(r)});
+        const id = try e.opRaw(.load, try e.imageTypeOf(r), &.{e.val(r)});
+        if (e.nonuniform_ids.contains(e.val(r))) try e.markNonUniform(id, e.f.inst(r).ty);
+        return id;
     }
 
     fn resourceInfo(e: *Emitter, r: Ref) @FieldType(types.Type, "resource") {
@@ -1481,7 +1558,9 @@ const Emitter = struct {
         }
         if (call.op == .sample_position) return e.unsupported("GetSamplePosition is not supported yet", .{});
         const smp = try e.opRaw(.load, try e.samplerType(), &.{e.val(args[call.sampler.?])});
+        if (e.nonuniform_ids.contains(e.val(args[call.sampler.?]))) try e.markNonUniform(smp, e.f.inst(args[call.sampler.?]).ty);
         const si = try e.opRaw(.sampled_image, try e.sampledImageType(try e.imageTypeOf(res)), &.{ img, smp });
+        if (e.nonuniform_ids.contains(img) or e.nonuniform_ids.contains(smp)) try e.markNonUniform(si, e.f.inst(res).ty);
         if (call.op == .calc_lod or call.op == .calc_lod_unclamped) {
             try e.cap(.image_query);
             const q = try e.opRaw(.image_query_lod, try e.typeId(try e.t.vector(.float, 2)), &.{ si, coord });
@@ -1673,6 +1752,15 @@ const Emitter = struct {
     }
 
     fn intrinsic(e: *Emitter, name: []const u8, ty: TypeId, args: []const Ref) Error!Id {
+        if (std.mem.eql(u8, name, "NonUniformResourceIndex")) {
+            // A decorated copy marks the index (as dxc).
+            const id = try e.op1(.copy_object, ty, &.{e.val(args[0])});
+            try e.cap(.shader_non_uniform);
+            try e.extension("SPV_EXT_descriptor_indexing");
+            try e.b.emit(.annotations, .decorate, &.{ id, 5300 }); // NonUniform
+            try e.nonuniform_ids.put(e.arena, id, {});
+            return id;
+        }
         const ids = try e.arena.alloc(u32, args.len);
         const tys = try e.arena.alloc(TypeId, args.len);
         for (args, ids, tys) |a, *id, *t| {
@@ -1868,6 +1956,7 @@ fn dfs(a: Allocator, f: *const ir.Function, b: u32, seen: []bool, post: *std.Arr
 fn isResourceType(t: *TypeTable, ty: TypeId) bool {
     return switch (t.get(ty)) {
         .resource, .sampler => true,
+        .array => |a| isResourceType(t, a.elem),
         else => false,
     };
 }

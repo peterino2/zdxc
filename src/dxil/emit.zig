@@ -45,6 +45,9 @@ const Lowered = union(enum) {
     /// A local holding a resource (index into Emitter.res_locals): an
     /// alias of the one resource stored into it.
     res_local: u32,
+    /// An array of resources (or a sub-array), with the flattened index so
+    /// far.
+    res_array: struct { res: u32, index: ?Value = null, ty: TypeId },
     /// A place in a constant buffer: byte offset plus a dynamic register
     /// offset.
     cbuf: struct { res: u32, offset: u32 = 0, dyn_regs: ?Value = null, row_major: bool = false },
@@ -77,6 +80,11 @@ const Resource = struct {
     elem: TypeId,
     /// SamplerComparisonState.
     comparison: bool = false,
+    /// Registers in the range (arrays of resources); maxInt for unsized.
+    count: u32 = 1,
+    /// An array element's handle made at its use: a copy of the array's
+    /// entry, skipped by metadata.
+    view: bool = false,
 
     const Class = enum(u8) { srv = 0, uav = 1, cbuffer = 2, sampler = 3 };
 };
@@ -111,7 +119,9 @@ const Emitter = struct {
     resources: std.ArrayList(Resource) = .empty,
     resource_of_global: std.AutoHashMapUnmanaged(u32, u32) = .empty,
     private_globals: std.AutoHashMapUnmanaged(u32, Ptr) = .empty,
-    res_locals: std.ArrayList(?u32) = .empty,
+    res_locals: std.ArrayList(?Lowered) = .empty,
+    /// Indices marked with NonUniformResourceIndex.
+    nonuniform: std.AutoHashMapUnmanaged(Value, void) = .empty,
     uses_double: bool = false,
     uses_int64: bool = false,
     /// 16-bit min-precision values cross the signature.
@@ -299,14 +309,22 @@ const Emitter = struct {
         };
         for (e.m.globals.items, 0..) |g, gi| {
             if (g.space != .resource) continue;
-            if (e.t.get(g.ty) == .sampler) {
+            // Arrays of resources are register ranges.
+            var gty = g.ty;
+            var count: u32 = 1;
+            while (e.t.get(gty) == .array) {
+                const arr = e.t.get(gty).array;
+                count = if (arr.len == 0 or count == std.math.maxInt(u32)) std.math.maxInt(u32) else count * arr.len;
+                gty = arr.elem;
+            }
+            if (e.t.get(gty) == .sampler) {
                 if (g.binding.explicit and g.binding.class != 's') return e.unsupported("binding '{s}' to the wrong register class", .{g.name});
-                try e.resources.append(e.arena, .{ .global = @intCast(gi), .class = .sampler, .id = counts[3], .kind = 14, .elem = g.ty, .comparison = e.t.get(g.ty).sampler.comparison });
+                try e.resources.append(e.arena, .{ .global = @intCast(gi), .class = .sampler, .id = counts[3], .kind = 14, .elem = gty, .comparison = e.t.get(gty).sampler.comparison, .count = count });
                 counts[3] += 1;
                 try e.resource_of_global.put(e.arena, @intCast(gi), @intCast(e.resources.items.len - 1));
                 continue;
             }
-            const r = switch (e.t.get(g.ty)) {
+            const r = switch (e.t.get(gty)) {
                 .resource => |r| r,
                 else => return e.unsupported("global '{s}' is not supported yet", .{g.name}),
             };
@@ -329,22 +347,33 @@ const Emitter = struct {
             if (g.binding.explicit and g.binding.class != @as(u8, if (class == .uav) 'u' else 't')) {
                 return e.unsupported("binding '{s}' to the wrong register class", .{g.name});
             }
-            try e.resources.append(e.arena, .{ .global = @intCast(gi), .class = class, .id = counts[@backingInt(class)], .kind = kind, .elem = r.elem });
+            try e.resources.append(e.arena, .{ .global = @intCast(gi), .class = class, .id = counts[@backingInt(class)], .kind = kind, .elem = r.elem, .count = count });
             counts[@backingInt(class)] += 1;
             try e.resource_of_global.put(e.arena, @intCast(gi), @intCast(e.resources.items.len - 1));
         }
         // Unbound resources take the next free register of their class.
         var used: std.AutoHashMapUnmanaged(struct { u8, u32, u32 }, void) = .empty;
+        // (Unsized ranges are taken to hold 64 registers here.)
+        const span = struct {
+            fn f(n: u32) u32 {
+                return if (n == std.math.maxInt(u32)) 64 else n;
+            }
+        }.f;
         for (e.resources.items) |res| {
             const b = e.m.globals.items[res.global].binding;
-            if (b.explicit) try used.put(e.arena, .{ @backingInt(res.class), b.space, b.index }, {});
+            if (b.explicit) for (0..span(res.count)) |k| try used.put(e.arena, .{ @backingInt(res.class), b.space, b.index + @as(u32, @intCast(k)) }, {});
         }
         for (e.resources.items) |res| {
             const g = &e.m.globals.items[res.global];
             if (g.binding.explicit) continue;
             var i: u32 = 0;
-            while (used.contains(.{ @backingInt(res.class), g.binding.space, i })) i += 1;
-            try used.put(e.arena, .{ @backingInt(res.class), g.binding.space, i }, {});
+            while (true) : (i += 1) {
+                const free = for (0..span(res.count)) |k| {
+                    if (used.contains(.{ @backingInt(res.class), g.binding.space, i + @as(u32, @intCast(k)) })) break false;
+                } else true;
+                if (free) break;
+            }
+            for (0..span(res.count)) |k| try used.put(e.arena, .{ @backingInt(res.class), g.binding.space, i + @as(u32, @intCast(k)) }, {});
             // Globals are const in the module; record the chosen binding.
             @constCast(g).binding.index = i;
         }
@@ -355,41 +384,53 @@ const Emitter = struct {
     }
 
     fn createHandles(e: *Emitter) Error!void {
-        if (e.resources.items.len == 0) return;
+        for (e.resources.items) |*res| {
+            // Array elements get their handles where they are used.
+            if (res.count != 1) continue;
+            res.handle = try e.makeHandle(res.*, try e.i32Const(e.binding(res.*).index), false, true);
+        }
+    }
+
+    /// A handle to register `index` of `res`'s range (in the prologue, or
+    /// at the current point).
+    fn makeHandle(e: *Emitter, res: Resource, index: Value, nonuniform: bool, prologue: bool) Error!Value {
         const i32t = try e.dm.intType(32);
         const i1t = try e.dm.intType(1);
         const i8t = try e.dm.intType(8);
+        const b = e.binding(res);
+        const nu = try e.dm.constant(.{ .ty = i1t, .kind = .{ .int = @intFromBool(nonuniform) } });
+        const emitCall = struct {
+            fn f(em: *Emitter, pro: bool, callee: u32, args: []const Value) Error!Value {
+                const op: @FieldType(module.Inst, "op") = .{ .call = .{ .callee = callee, .args = try em.arena.dupe(Value, args) } };
+                return if (pro) em.addPrologue(em.handle_ty, op) else em.add(em.handle_ty, op);
+            }
+        }.f;
         if (self_sm66(e)) {
             const bind_ty = try e.dm.getType(.{ .@"struct" = .{ .name = "dx.types.ResBind", .elems = &.{ i32t, i32t, i32t, i8t } } });
             const props_ty = try e.dm.getType(.{ .@"struct" = .{ .name = "dx.types.ResourceProperties", .elems = &.{ i32t, i32t } } });
             const create = try e.dxOp("dx.op.createHandleFromBinding", e.handle_ty, &.{ i32t, bind_ty, i32t, i1t }, .nounwind_readnone);
             const annotate = try e.dxOp("dx.op.annotateHandle", e.handle_ty, &.{ i32t, e.handle_ty, props_ty }, .nounwind_readnone);
-            for (e.resources.items) |*res| {
-                const b = e.binding(res.*);
-                const lb = try e.dm.constant(.{ .ty = i32t, .kind = .{ .int = b.index } });
-                const space = try e.dm.constant(.{ .ty = i32t, .kind = .{ .int = b.space } });
-                const cls = try e.dm.constant(.{ .ty = i8t, .kind = .{ .int = @backingInt(res.class) } });
-                const bind = try e.dm.constant(.{ .ty = bind_ty, .kind = .{ .aggregate = try e.arena.dupe(module.ConstId, &.{ lb.constant, lb.constant, space.constant, cls.constant }) } });
-                const raw = try e.addPrologue(e.handle_ty, .{ .call = .{ .callee = create, .args = try e.arena.dupe(Value, &.{ try e.i32Const(217), bind, try e.i32Const(b.index), try e.dm.constant(.{ .ty = i1t, .kind = .{ .int = 0 } }) }) } });
-                const p = try e.resourceProperties(res.*);
-                const p0 = try e.dm.constant(.{ .ty = i32t, .kind = .{ .int = p[0] } });
-                const p1 = try e.dm.constant(.{ .ty = i32t, .kind = .{ .int = p[1] } });
-                const props = try e.dm.constant(.{ .ty = props_ty, .kind = .{ .aggregate = try e.arena.dupe(module.ConstId, &.{ p0.constant, p1.constant }) } });
-                res.handle = try e.addPrologue(e.handle_ty, .{ .call = .{ .callee = annotate, .args = try e.arena.dupe(Value, &.{ try e.i32Const(216), raw, props }) } });
-            }
-        } else {
-            const create = try e.dxOp("dx.op.createHandle", e.handle_ty, &.{ i32t, i8t, i32t, i32t, i1t }, .nounwind_readonly);
-            for (e.resources.items) |*res| {
-                const b = e.binding(res.*);
-                res.handle = try e.addPrologue(e.handle_ty, .{ .call = .{ .callee = create, .args = try e.arena.dupe(Value, &.{
-                    try e.i32Const(57),
-                    try e.dm.constant(.{ .ty = i8t, .kind = .{ .int = @backingInt(res.class) } }),
-                    try e.i32Const(res.id),
-                    try e.i32Const(b.index),
-                    try e.dm.constant(.{ .ty = i1t, .kind = .{ .int = 0 } }),
-                }) } });
-            }
+            const ub: i64 = if (res.count == std.math.maxInt(u32)) -1 else b.index + res.count - 1;
+            const lb_c = try e.dm.constant(.{ .ty = i32t, .kind = .{ .int = b.index } });
+            const ub_c = try e.dm.constant(.{ .ty = i32t, .kind = .{ .int = ub } });
+            const space = try e.dm.constant(.{ .ty = i32t, .kind = .{ .int = b.space } });
+            const cls = try e.dm.constant(.{ .ty = i8t, .kind = .{ .int = @backingInt(res.class) } });
+            const bind = try e.dm.constant(.{ .ty = bind_ty, .kind = .{ .aggregate = try e.arena.dupe(module.ConstId, &.{ lb_c.constant, ub_c.constant, space.constant, cls.constant }) } });
+            const raw = try emitCall(e, prologue, create, &.{ try e.i32Const(217), bind, index, nu });
+            const p = try e.resourceProperties(res);
+            const p0 = try e.dm.constant(.{ .ty = i32t, .kind = .{ .int = p[0] } });
+            const p1 = try e.dm.constant(.{ .ty = i32t, .kind = .{ .int = p[1] } });
+            const props = try e.dm.constant(.{ .ty = props_ty, .kind = .{ .aggregate = try e.arena.dupe(module.ConstId, &.{ p0.constant, p1.constant }) } });
+            return emitCall(e, prologue, annotate, &.{ try e.i32Const(216), raw, props });
         }
+        const create = try e.dxOp("dx.op.createHandle", e.handle_ty, &.{ i32t, i8t, i32t, i32t, i1t }, .nounwind_readonly);
+        return emitCall(e, prologue, create, &.{
+            try e.i32Const(57),
+            try e.dm.constant(.{ .ty = i8t, .kind = .{ .int = @backingInt(res.class) } }),
+            try e.i32Const(res.id),
+            index,
+            nu,
+        });
     }
 
     fn self_sm66(e: *Emitter) bool {
@@ -650,6 +691,7 @@ const Emitter = struct {
                 }
                 const ri = e.resource_of_global.get(g) orelse return e.unsupported("global '{s}' is not supported yet", .{e.m.globals.items[g].name});
                 if (e.resources.items[ri].class == .cbuffer) return .{ .cbuf = .{ .res = ri } };
+                if (e.resources.items[ri].count != 1) return .{ .res_array = .{ .res = ri, .ty = e.m.globals.items[g].ty } };
                 return .{ .handle = ri };
             },
             .local_var => {
@@ -661,7 +703,8 @@ const Emitter = struct {
             },
             .load => |p| switch (frame.vals[p.index()]) {
                 .handle => |h| return .{ .handle = h },
-                .res_local => |k| return .{ .handle = e.res_locals.items[k] orelse return e.unsupported("a resource local read before it is assigned", .{}) },
+                .res_local => |k| return e.res_locals.items[k] orelse return e.unsupported("a resource local read before it is assigned", .{}),
+                .res_array => |ra| return .{ .res_array = ra },
                 .cbuf => |c| return e.cbufferLoad(c.res, c.offset, c.dyn_regs, c.row_major, i.ty),
                 .buf => |b| return .{ .scalars = try e.structuredLoad(e.resources.items[b.res], b.index, b.offset, b.dyn, b.row_major, i.ty) },
                 .ptr => |ptr| return e.loadPtr(ptr, i.ty),
@@ -670,13 +713,11 @@ const Emitter = struct {
             .store => |s| {
                 if (frame.vals[s.ptr.index()] == .res_local) {
                     const slot = &e.res_locals.items[frame.vals[s.ptr.index()].res_local];
-                    const h = switch (frame.vals[s.value.index()]) {
-                        .handle => |h| h,
-                        else => return e.unsupported("resources not tied to a global are not supported yet", .{}),
-                    };
+                    const h = frame.vals[s.value.index()];
+                    if (h != .handle and h != .res_array) return e.unsupported("resources not tied to a global are not supported yet", .{});
                     // Selecting between resources at run time has no
                     // handle-based lowering here; one assignment is fine.
-                    if (slot.*) |old| if (old != h) return e.unsupported("assigning different resources to one variable is not supported yet", .{});
+                    if (slot.*) |old| if (!std.meta.eql(old, h)) return e.unsupported("assigning different resources to one variable is not supported yet", .{});
                     slot.* = h;
                     return .none;
                 }
@@ -693,6 +734,7 @@ const Emitter = struct {
                 return .none;
             },
             .access => |a| {
+                if (frame.vals[a.base.index()] == .res_array) return e.arrayElement(frame, frame.vals[a.base.index()].res_array, a.indices);
                 if (frame.vals[a.base.index()] == .cbuf) return e.cbufferAccess(frame, frame.vals[a.base.index()].cbuf, f.inst(a.base).ty, a.indices);
                 if (frame.vals[a.base.index()] == .handle) {
                     const ri = frame.vals[a.base.index()].handle;
@@ -1214,6 +1256,10 @@ const Emitter = struct {
             return .none;
         }
         if (try e.mathIntrinsic(name, a[0..args.len], ac, rc, out)) return .{ .scalars = out };
+        if (eq(u8, name, "NonUniformResourceIndex")) {
+            try e.nonuniform.put(e.arena, a[0][0], {});
+            return .{ .scalars = a[0] };
+        }
         const Deriv = struct { name: []const u8, op: i64 };
         const derivs = [_]Deriv{
             .{ .name = "ddx", .op = 83 },      .{ .name = "ddx_coarse", .op = 83 }, .{ .name = "ddy", .op = 84 },
@@ -1525,8 +1571,60 @@ const Emitter = struct {
     // ------------------------------------------------------------------
     // Resources and stage inputs
 
+    /// `array[i]...` on a resource array: a sub-array, or the element's
+    /// handle (created here, at register lower bound + flattened index).
+    fn arrayElement(e: *Emitter, frame: *Frame, start: @FieldType(Lowered, "res_array"), indices: []const Ref) Error!Lowered {
+        var ra = start;
+        const i32t = try e.dm.intType(32);
+        var nonuniform = false;
+        for (indices) |x| {
+            const arr = switch (e.t.get(ra.ty)) {
+                .array => |arr| arr,
+                else => return e.unsupported("indexing this resource is not supported yet", .{}),
+            };
+            var inner: u32 = 1;
+            var et = arr.elem;
+            while (e.t.get(et) == .array) : (et = e.t.get(et).array.elem) inner *= e.t.get(et).array.len;
+            const xv = (try e.scalars(frame, x))[0];
+            if (e.nonuniform.contains(xv)) nonuniform = true;
+            const scaled = try e.intArith(.mul, xv, try e.i32Const(inner));
+            ra.index = if (ra.index) |old| try e.intArith(.add, old, scaled) else scaled;
+            ra.ty = arr.elem;
+        }
+        _ = i32t;
+        if (e.t.get(ra.ty) == .array) return .{ .res_array = ra };
+        const res = e.resources.items[ra.res];
+        const lb = e.binding(res).index;
+        const idx = try e.intArith(.add, ra.index orelse try e.i32Const(0), try e.i32Const(lb));
+        var view = res;
+        view.view = true;
+        view.handle = try e.makeHandle(res, idx, nonuniform, false);
+        try e.resources.append(e.arena, view);
+        return .{ .handle = @intCast(e.resources.items.len - 1) };
+    }
+
+    fn constIntOf(e: *Emitter, v: Value) ?i64 {
+        if (v != .constant) return null;
+        return switch (e.dm.constants.items[v.constant].kind) {
+            .int => |x| x,
+            else => null,
+        };
+    }
+
+    /// i32 `a op b`, folded when both are constants (and identities).
+    fn intArith(e: *Emitter, op: module.BinOp, a: Value, b: Value) Error!Value {
+        const x = e.constIntOf(a);
+        const y = e.constIntOf(b);
+        if (x != null and y != null) return e.i32Const(@as(i32, @truncate(if (op == .add) x.? + y.? else x.? * y.?)));
+        if (op == .add and y == 0) return a;
+        if (op == .mul and y == 1) return a;
+        return e.add(try e.dm.intType(32), .{ .binop = .{ .op = op, .lhs = a, .rhs = b } });
+    }
+
     fn resourceKind(e: *Emitter, res: Resource) types.ResourceKind {
-        return e.t.get(e.m.globals.items[res.global].ty).resource.kind;
+        var ty = e.m.globals.items[res.global].ty;
+        while (e.t.get(ty) == .array) ty = e.t.get(ty).array.elem;
+        return e.t.get(ty).resource.kind;
     }
 
     /// The scalar a texture's ResRet carries for elements of `elem`.
@@ -2244,8 +2342,9 @@ const Emitter = struct {
         if (e.uses_min_precision) flags |= 1 << 5;
         var uavs: u32 = 0;
         for (e.resources.items) |r| {
+            if (r.view) continue;
             if (r.kind == 11 or r.kind == 12) flags |= 1 << 4;
-            if (r.class == .uav) uavs += 1;
+            if (r.class == .uav) uavs += @min(r.count, 9);
         }
         if (uavs > 8) flags |= 1 << 15;
         if (e.uses_typed_uav_load) flags |= 1 << 13;
@@ -2307,7 +2406,16 @@ const Emitter = struct {
         // Resource lists by class.
         var lists: [4]std.ArrayList(?module.MdId) = .{ .empty, .empty, .empty, .empty };
         for (e.resources.items) |r| {
+            if (r.view) continue;
             const g = e.m.globals.items[r.global];
+            // Ranges: the pointer is to an array; unsized ones have size -1.
+            const range: i64 = if (r.count == std.math.maxInt(u32)) -1 else r.count;
+            const rangeTy = struct {
+                fn f(m: *module.Module, n: u32, t: DType) !DType {
+                    if (n == 1) return t;
+                    return m.getType(.{ .array = .{ .len = if (n == std.math.maxInt(u32)) 0 else n, .elem = t } });
+                }
+            }.f;
             if (r.class == .cbuffer) {
                 const f32t = try dm.getType(.float);
                 const cb_ty = try dm.getType(.{ .@"struct" = .{ .name = g.name, .elems = &.{f32t} } });
@@ -2318,13 +2426,15 @@ const Emitter = struct {
             }
             if (r.class == .sampler) {
                 const name = if (r.comparison) "struct.SamplerComparisonState" else "struct.SamplerState";
-                const st = try dm.getType(.{ .@"struct" = .{ .name = name, .elems = &.{try dm.intType(32)} } });
+                const st = try rangeTy(dm, r.count, try dm.getType(.{ .@"struct" = .{ .name = name, .elems = &.{try dm.intType(32)} } }));
                 const undef_s = try dm.constant(.{ .ty = try dm.ptrType(st), .kind = .undef });
                 const b = g.binding;
-                try lists[3].append(e.arena, try dm.mdNode(&.{ try mdI32(dm, r.id), try dm.mdValue(try dm.ptrType(st), undef_s), try dm.mdString(""), try mdI32(dm, b.space), try mdI32(dm, b.index), try mdI32(dm, 1), try mdI32(dm, @intFromBool(r.comparison)), null }));
+                try lists[3].append(e.arena, try dm.mdNode(&.{ try mdI32(dm, r.id), try dm.mdValue(try dm.ptrType(st), undef_s), try dm.mdString(""), try mdI32(dm, b.space), try mdI32(dm, b.index), try mdI32(dm, range), try mdI32(dm, @intFromBool(r.comparison)), null }));
                 continue;
             }
-            const rt = e.t.get(g.ty).resource;
+            var rty = g.ty;
+            while (e.t.get(rty) == .array) rty = e.t.get(rty).array.elem;
+            const rt = e.t.get(rty).resource;
             const class_name = try std.fmt.allocPrint(e.arena, "class.{s}<{s}>", .{ rt.name, try e.t.format(e.arena, r.elem) });
             // The class type only names the resource; aggregates get a
             // placeholder element.
@@ -2332,11 +2442,11 @@ const Emitter = struct {
             // Typed resources carry their component count in the element
             // (the validator reads it from here).
             if (r.kind >= 1 and r.kind <= 10 and e.t.get(r.elem) == .vector) elem_dt = try dm.getType(.{ .vector = .{ .len = e.t.get(r.elem).vector.len, .elem = elem_dt } });
-            const class_ty = try dm.getType(.{ .@"struct" = .{ .name = class_name, .elems = &.{elem_dt} } });
+            const class_ty = try rangeTy(dm, r.count, try dm.getType(.{ .@"struct" = .{ .name = class_name, .elems = &.{elem_dt} } }));
             const undef_ptr = try dm.constant(.{ .ty = try dm.ptrType(class_ty), .kind = .undef });
             const b = g.binding;
             var fields: std.ArrayList(?module.MdId) = .empty;
-            try fields.appendSlice(e.arena, &.{ try mdI32(dm, r.id), try dm.mdValue(try dm.ptrType(class_ty), undef_ptr), try dm.mdString(""), try mdI32(dm, b.space), try mdI32(dm, b.index), try mdI32(dm, 1), try mdI32(dm, r.kind) });
+            try fields.appendSlice(e.arena, &.{ try mdI32(dm, r.id), try dm.mdValue(try dm.ptrType(class_ty), undef_ptr), try dm.mdString(""), try mdI32(dm, b.space), try mdI32(dm, b.index), try mdI32(dm, range), try mdI32(dm, r.kind) });
             if (r.class == .uav) {
                 try fields.appendSlice(e.arena, &.{ try mdBool(dm, i1t, false), try mdBool(dm, i1t, false), try mdBool(dm, i1t, false) });
             } else try fields.append(e.arena, try mdI32(dm, 0)); // sample count
@@ -2416,7 +2526,7 @@ const Emitter = struct {
         defer gpa.free(dxil_part);
         var binds: std.ArrayList(shader.ResourceBind) = .empty;
         // PSV lists CBVs, samplers, SRVs, then UAVs.
-        for ([_]Resource.Class{ .cbuffer, .sampler, .srv, .uav }) |cls| for (e.resources.items) |r| if (r.class == cls) {
+        for ([_]Resource.Class{ .cbuffer, .sampler, .srv, .uav }) |cls| for (e.resources.items) |r| if (r.class == cls and !r.view) {
             const b = e.binding(r);
             const res_type: u32 = switch (r.class) {
                 .srv => switch (r.kind) {
@@ -2432,7 +2542,8 @@ const Emitter = struct {
                 .cbuffer => 2,
                 .sampler => 1,
             };
-            try binds.append(e.arena, .{ .res_type = res_type, .space = b.space, .lower = b.index, .upper = b.index, .kind = r.kind });
+            const upper: u32 = if (r.count == std.math.maxInt(u32)) std.math.maxInt(u32) else b.index + r.count - 1;
+            try binds.append(e.arena, .{ .res_type = res_type, .space = b.space, .lower = b.index, .upper = upper, .kind = r.kind });
         };
         var stage_info: [16]u8 = @splat(0);
         switch (entry.stage) {

@@ -125,7 +125,7 @@ const Lowerer = struct {
         if (l.globals.get(v)) |i| return i;
         const space: ir.Space = switch (v.storage) {
             .groupshared => .groupshared,
-            .global_static, .constant => if (l.s.types.get(v.type) == .resource or l.s.types.get(v.type) == .sampler) .resource else .private,
+            .global_static, .constant => if (isObject(&l.s.types, v.type)) .resource else .private,
             .global_uniform, .cbuffer => unreachable, // see cbufferMember
             else => unreachable,
         };
@@ -164,7 +164,7 @@ const Lowerer = struct {
             };
         } else {
             for (l.s.uniform_globals.items) |g| {
-                if (l.s.types.get(g.type) == .resource or l.s.types.get(g.type) == .sampler) continue;
+                if (isObject(&l.s.types, g.type)) continue;
                 try members.append(l.arena, g);
             }
         }
@@ -879,7 +879,7 @@ const Lowerer = struct {
                 switch (v.storage) {
                     .local, .param, .local_static => return l.fail(e, "this variable"),
                     .global_uniform, .cbuffer => {
-                        if (l.s.types.get(v.type) == .resource or l.s.types.get(v.type) == .sampler) {
+                        if (isObject(&l.s.types, v.type)) {
                             l.unsupported(e.loc, "resource '{s}' declared as a uniform is not supported yet", .{v.name});
                             return error.Unsupported;
                         }
@@ -1072,7 +1072,7 @@ const Lowerer = struct {
             for (l.s.static_globals.items) |v| {
                 const init_e = v.init orelse continue;
                 if (!l.globals.contains(v) or inits.contains(v)) continue;
-                if (l.s.types.get(v.type) == .resource or l.s.types.get(v.type) == .sampler) continue;
+                if (isObject(&l.s.types, v.type)) continue;
                 const fi = try l.m.addFunction(.{ .name = try std.fmt.allocPrint(l.arena, "init.{s}", .{v.name}), .params = &.{}, .ret = v.type });
                 try inits.put(l.arena, v, fi);
                 l.b = .{ .m = &l.m, .f = l.m.functions.items[fi] };
@@ -1138,6 +1138,15 @@ pub fn saturatingInt(f: f64) i64 {
     if (f >= 9.2233720368547758e18) return std.math.maxInt(i64);
     if (f <= -9.2233720368547758e18) return std.math.minInt(i64);
     return @intFromFloat(@trunc(f));
+}
+
+/// Resources, samplers and arrays of them.
+pub fn isObject(t: *TypeTable, ty: TypeId) bool {
+    return switch (t.get(ty)) {
+        .resource, .sampler => true,
+        .array => |a| isObject(t, a.elem),
+        else => false,
+    };
 }
 
 fn paramAttrs(q: ast.Qualifiers) Lowerer.SigAttrs {
