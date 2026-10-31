@@ -216,6 +216,9 @@ pub const Global = struct {
     /// A `tbuffer` block (space `cbuffer`): a texture buffer with the
     /// constant buffer layout.
     tbuffer: bool = false,
+    /// `[[vk::shader_record_ext]]` / `[[vk::shader_record_nv]]` buffers
+    /// (SPIR-V ShaderRecordBufferKHR storage).
+    shader_record: bool = false,
 };
 
 pub const Stage = enum {

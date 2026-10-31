@@ -233,7 +233,8 @@ const Lowerer = struct {
             if (sem.kind != .register) continue;
             binding = parseBinding(sem.values);
         };
-        try l.m.globals.append(l.arena, .{ .name = v.name, .ty = v.type, .space = space, .binding = binding });
+        const shader_record = if (v.decl) |d| isShaderRecord(d.attrs) else false;
+        try l.m.globals.append(l.arena, .{ .name = v.name, .ty = v.type, .space = space, .binding = binding, .shader_record = shader_record });
         const i: u32 = @intCast(l.m.globals.items.len - 1);
         try l.globals.put(l.arena, v, i);
         return i;
@@ -249,9 +250,11 @@ const Lowerer = struct {
         var name: []const u8 = "$Globals";
         var binding: ir.Binding = .{};
         var is_tbuffer = false;
+        var shader_record = false;
         if (v.block) |b| {
             const cb = b.kind.cbuffer;
             is_tbuffer = cb.tbuffer;
+            shader_record = isShaderRecord(cb.attrs);
             name = cb.name;
             for (cb.members) |m| if (m.kind == .@"var") {
                 if (l.s.decl_vars.get(&m.kind.@"var")) |mv| try members.append(l.arena, mv);
@@ -269,7 +272,7 @@ const Lowerer = struct {
         info.* = .{ .name = name, .complete = true };
         for (members.items) |mv| try info.fields.append(l.arena, .{ .name = mv.name, .type = mv.type, .row_major = mv.row_major });
         const ty = try l.s.types.intern(.{ .@"struct" = info });
-        try l.m.globals.append(l.arena, .{ .name = name, .ty = ty, .space = .cbuffer, .binding = binding, .tbuffer = is_tbuffer });
+        try l.m.globals.append(l.arena, .{ .name = name, .ty = ty, .space = .cbuffer, .binding = binding, .tbuffer = is_tbuffer, .shader_record = shader_record });
         const gi: u32 = @intCast(l.m.globals.items.len - 1);
         try l.cbuffers.put(l.arena, key, gi);
         for (members.items, 0..) |mv, fi| try l.cbuffer_members.put(l.arena, mv, .{ .global = gi, .field = @intCast(fi) });
@@ -1983,6 +1986,13 @@ pub fn saturatingInt(f: f64) i64 {
 /// parameter.
 fn isMethod(f: *const semamod.Function) bool {
     return f.owner != null and !f.decl.quals.static;
+}
+
+fn isShaderRecord(attrs: []const ast.Attribute) bool {
+    for (attrs) |a| {
+        if (std.mem.eql(u8, a.name, "vk::shader_record_ext") or std.mem.eql(u8, a.name, "vk::shader_record_nv")) return true;
+    }
+    return false;
 }
 
 /// RayQuery objects: stateful, they live in function storage.

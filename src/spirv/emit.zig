@@ -703,7 +703,8 @@ const Emitter = struct {
             if (e.fn_calls.get(fid)) |cs| try stack.appendSlice(e.arena, cs.items);
         }
         if (e.spv_minor >= 4) {
-            for (e.global_vars) |v| if (v != 0) try out.put(e.arena, v, {});
+            // (Shader record buffers only where used: at most one each.)
+            for (e.global_vars, e.m.globals.items) |v, g| if (v != 0 and !g.shader_record) try out.put(e.arena, v, {});
             for (e.counter_vars) |v| if (v != 0) try out.put(e.arena, v, {});
         }
         return out.keys();
@@ -808,6 +809,22 @@ const Emitter = struct {
         for (m.globals.items) |g| if (g.binding.explicit) try used.put(e.arena, .{ g.binding.space, g.binding.index }, {});
         var next_free: u32 = 0;
         for (m.globals.items, 0..) |g, gi| {
+            switch (g.space) {
+                .resource, .cbuffer => if (g.shader_record) {
+                    // Shader record buffers: std430, no descriptor.
+                    const st = e.t.get(if (g.space == .resource) e.t.get(g.ty).resource.elem else g.ty);
+                    if (st != .@"struct") return e.unsupported("this shader record buffer is not supported yet", .{});
+                    const block = e.b.newId();
+                    try e.layoutStruct(block, st.@"struct", .std430, try std.fmt.allocPrint(e.arena, "type.ShaderRecord.{s}", .{g.name}));
+                    try e.b.emit(.annotations, .decorate, &.{ block, 2 }); // Block
+                    const var_id = e.b.newId();
+                    try e.b.emit(.types_globals, .variable, &.{ try e.pointerType(.shader_record_buffer_khr, block), var_id, @backingInt(StorageClass.shader_record_buffer_khr) });
+                    try e.b.emitWithString(.debug_names, .name, &.{var_id}, g.name, &.{});
+                    e.global_vars[gi] = var_id;
+                    continue;
+                },
+                else => {},
+            }
             switch (g.space) {
                 .resource => {
                     const var_id = e.b.newId();
@@ -1614,6 +1631,11 @@ const Emitter = struct {
             }, i.ty),
             .global => |g| {
                 e.vals[ri] = e.global_vars[g];
+                if (e.m.globals.items[g].shader_record) {
+                    try e.useVar(e.global_vars[g]);
+                    e.ptr_layouts[ri] = .{ .rules = .std430, .row_major = false };
+                    return;
+                }
                 e.ptr_layouts[ri] = switch (e.m.globals.items[g].space) {
                     .cbuffer => .{ .rules = if (e.m.globals.items[g].tbuffer) .std430 else .vk_relaxed, .row_major = false },
                     .resource => .{ .rules = .std430, .row_major = false },
@@ -1720,14 +1742,15 @@ const Emitter = struct {
                     try e.mesh_places.put(e.arena, ri, mp);
                     return;
                 }
-                const sc: StorageClass = if (into_cb) .uniform else if (into_buffer or (base_pl != null and base_pl.?.rules == .std430)) e.bufferSc() else if (base_pl != null) .uniform else switch (i.ptr) {
+                const shader_record = e.inShaderRecord(a.base);
+                const sc: StorageClass = if (shader_record) .shader_record_buffer_khr else if (into_cb) .uniform else if (into_buffer or (base_pl != null and base_pl.?.rules == .std430)) e.bufferSc() else if (base_pl != null) .uniform else switch (i.ptr) {
                     .function => .function,
                     .private => .private,
                     .groupshared => if (e.payload_global != null and e.rootGlobal(a.base) == e.payload_global) .task_payload_workgroup else .workgroup,
                     .cbuffer, .resource => .uniform,
                     else => return e.unsupported("access into this storage is not supported yet", .{}),
                 };
-                var pl = if (into_cb) PtrLayout{ .rules = .vk_relaxed, .row_major = false } else if (into_tb) PtrLayout{ .rules = .std430, .row_major = false } else if (into_buffer) PtrLayout{ .rules = .std430, .row_major = false } else e.ptr_layouts[a.base.index()];
+                var pl = if (shader_record) PtrLayout{ .rules = .std430, .row_major = false } else if (into_cb) PtrLayout{ .rules = .vk_relaxed, .row_major = false } else if (into_tb) PtrLayout{ .rules = .std430, .row_major = false } else if (into_buffer) PtrLayout{ .rules = .std430, .row_major = false } else e.ptr_layouts[a.base.index()];
                 var ops: std.ArrayList(u32) = .empty;
                 try ops.appendSlice(e.arena, &.{ 0, 0, e.val(a.base) });
                 var cur = f.inst(a.base).ty;
@@ -3166,6 +3189,18 @@ const Emitter = struct {
     }
 
     /// The global a resource value comes from (`load (global g)`).
+    /// Whether pointer / resource `r` reaches into a shader record buffer.
+    fn inShaderRecord(e: *Emitter, r: Ref) bool {
+        var x = r;
+        while (true) switch (e.f.inst(x).op) {
+            .access => |a| x = a.base,
+            .load => |p| x = p,
+            else => break,
+        };
+        const g = e.globalOf(x) orelse return false;
+        return e.m.globals.items[g].shader_record;
+    }
+
     fn globalOf(e: *Emitter, r: Ref) ?u32 {
         const i = e.f.inst(r);
         return switch (i.op) {
@@ -3335,6 +3370,14 @@ const Emitter = struct {
         while (e.t.get(et) == .array) et = e.t.get(et).array.elem;
         const c = e.t.component(et).?;
         if (e.entry.stage == .pixel and !c.isFloat() and c != .bool) try e.b.emit(.annotations, .decorate, &.{ v, 14 }); // Flat
+        // Values that change during a ray tracing invocation (from SPIR-V
+        // 1.6 such reads need Volatile, as in dxc).
+        const changing = switch (builtin) {
+            36, 41, 4416...4420 => e.entry.stage.isRayTracing(),
+            5326 => e.entry.stage == .intersection,
+            else => false,
+        };
+        if (changing and e.spv_minor >= 6) try e.b.emit(.annotations, .decorate, &.{ v, 21 }); // Volatile
         try e.useVar(v);
         try e.builtin_inputs.put(e.arena, builtin, v);
         return v;

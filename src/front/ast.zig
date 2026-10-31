@@ -259,6 +259,7 @@ pub const StructDecl = struct {
 };
 
 pub const CBufferDecl = struct {
+    attrs: []const Attribute = &.{},
     tbuffer: bool,
     name: []const u8,
     semantics: []const Semantic,

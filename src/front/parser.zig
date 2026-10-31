@@ -715,7 +715,11 @@ pub const Parser = struct {
             return p.parseStructDeclInto(out, attrs, lead_quals, template_params, ctx);
         }
         p.pos = save;
-        if (t.isIdent("cbuffer") or t.isIdent("tbuffer")) return out.append(p.arena, try p.parseCBuffer());
+        if (t.isIdent("cbuffer") or t.isIdent("tbuffer")) {
+            const d = try p.parseCBuffer();
+            d.kind.cbuffer.attrs = attrs;
+            return out.append(p.arena, d);
+        }
         if (t.isIdent("typedef")) return p.parseTypedefInto(out);
         if (t.isIdent("using")) return out.append(p.arena, try p.parseUsing(template_params));
         if (t.isIdent("namespace")) return out.append(p.arena, try p.parseNamespace());
