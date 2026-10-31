@@ -168,6 +168,13 @@ fn parseArgs(cli: Cli, arena: std.mem.Allocator, argv: []const [:0]const u8, std
                     .fvk_use_gl_layout => opts.vk.layout = .gl,
                     .fvk_use_dx_layout => opts.vk.layout = .dx,
                     .fvk_use_scalar_layout => opts.vk.layout = .scalar,
+                    .fspv_entrypoint_name_EQ => opts.vk.entry_name = v,
+                    .fspv_extension_EQ => try opts.vk.extensions.append(arena, v),
+                    .fspv_reflect => opts.vk.reflect = true,
+                    .fspv_enable_maximal_reconvergence => opts.vk.maximal_reconvergence = true,
+                    .fvk_support_nonzero_base_instance => opts.vk.nonzero_base_instance = true,
+                    .fvk_support_nonzero_base_vertex => opts.vk.nonzero_base_vertex = true,
+                    .fspv_use_unknown_image_format => opts.vk.unknown_image_format = true,
                     .fvk_use_dx_position_w => opts.vk.dx_position_w = true,
                     .fvk_stage_io_order_EQ => {
                         if (std.mem.eql(u8, v, "alpha")) opts.vk.alpha_io_order = true else if (!std.mem.eql(u8, v, "decl")) return cli.fail("unknown -fvk-stage-io-order '{s}'", .{v});

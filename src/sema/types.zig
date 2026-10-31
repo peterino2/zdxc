@@ -348,6 +348,7 @@ pub const Field = struct {
     vk_location: ?u32 = null,
     vk_index: ?u32 = null,
     vk_offset: ?u32 = null,
+    vk_builtin: ?[]const u8 = null,
 };
 
 /// A bitfield member: `width` bits at `offset` in storage field `storage`.

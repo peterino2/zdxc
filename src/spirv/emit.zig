@@ -45,6 +45,7 @@ const Capability = enum(u32) {
     clip_distance = 32,
     cull_distance = 33,
     draw_parameters = 4427,
+    device_group = 4437,
     multi_view = 4439,
     fragment_shading_rate_khr = 4422,
     stencil_export_ext = 5013,
@@ -780,7 +781,12 @@ const Emitter = struct {
             .library => return e.unsupported("library targets are not supported", .{}),
         };
         const wrapper = e.func_ids[entry.wrapper];
-        try e.b.emitWithString(.entry_points, .entry_point, &.{ model, wrapper }, entry.name, try e.entryInterface(wrapper));
+        const name = if (e.m.entries.items.len == 1) e.vk.entry_name orelse entry.name else entry.name;
+        try e.b.emitWithString(.entry_points, .entry_point, &.{ model, wrapper }, name, try e.entryInterface(wrapper));
+        if (e.vk.maximal_reconvergence) {
+            try e.extension("SPV_KHR_maximal_reconvergence");
+            try e.b.emit(.execution_modes, .execution_mode, &.{ wrapper, 6023 }); // MaximallyReconvergesKHR
+        }
         switch (entry.stage) {
             .compute => try e.b.emit(.execution_modes, .execution_mode, &.{ wrapper, 17, entry.num_threads[0], entry.num_threads[1], entry.num_threads[2] }),
             .geometry => {
@@ -904,11 +910,14 @@ const Emitter = struct {
                     try e.b.emit(.annotations, .decorate, &.{ var_id, 34, slot.set }); // DescriptorSet
                     try e.b.emit(.annotations, .decorate, &.{ var_id, 33, slot.binding }); // Binding
                     try e.b.emitWithString(.debug_names, .name, &.{var_id}, g.name, &.{});
+                    try e.userType(var_id, g.ty, g);
                     e.global_vars[gi] = var_id;
                 },
                 .cbuffer => {
                     // tbuffers: read-only storage buffers, std430.
-                    const st = try e.layoutTypeId(g.ty, if (g.tbuffer) e.tbRules() else e.cbRules(), false);
+                    // (A struct of its own, named `type.<buffer>` as in dxc.)
+                    const st = e.b.newId();
+                    try e.layoutStruct(st, e.t.get(g.ty).@"struct", if (g.tbuffer) e.tbRules() else e.cbRules(), try std.fmt.allocPrint(e.arena, "type.{s}", .{g.name}));
                     try e.b.emit(.annotations, .decorate, &.{ st, if (g.tbuffer) e.bufferBlockDecoration() else 2 }); // Block
                     if (g.tbuffer) for (0..e.t.get(g.ty).@"struct".fields.items.len) |k| {
                         try e.b.emit(.annotations, .member_decorate, &.{ st, @intCast(k), 24 }); // NonWritable
@@ -920,8 +929,8 @@ const Emitter = struct {
                     const slot = try e.slotOf(@intCast(gi), false);
                     try e.b.emit(.annotations, .decorate, &.{ var_id, 34, slot.set }); // DescriptorSet
                     try e.b.emit(.annotations, .decorate, &.{ var_id, 33, slot.binding }); // Binding
-                    try e.b.emitWithString(.debug_names, .name, &.{st}, try std.fmt.allocPrint(e.arena, "type.{s}", .{g.name}), &.{});
                     try e.b.emitWithString(.debug_names, .name, &.{var_id}, g.name, &.{});
+                    try e.userType(var_id, g.ty, g);
                     e.global_vars[gi] = var_id;
                 },
                 .groupshared, .private => {
@@ -987,6 +996,10 @@ const Emitter = struct {
             try e.b.emit(.annotations, .decorate, &.{ var_id, 33, slot.binding }); // Binding
             try e.b.emitWithString(.debug_names, .name, &.{var_id}, try std.fmt.allocPrint(e.arena, "counter.var.{s}", .{g.name}), &.{});
             e.counter_vars[gi] = var_id;
+            if (e.vk.reflect and e.global_vars[gi] != 0) {
+                try e.extension("SPV_GOOGLE_hlsl_functionality1");
+                try e.b.emit(.annotations, .decorate_id, &.{ e.global_vars[gi], 5634, var_id }); // CounterBuffer
+            }
         }
     }
 
@@ -1295,6 +1308,29 @@ const Emitter = struct {
         const uint1 = try t.scalar(.uint);
         const float4 = try t.vector(.float, 4);
         const eq = std.ascii.eqlIgnoreCase;
+        // [[vk::builtin("...")]]: the named builtin, of the declared type.
+        if (el.vk_builtin) |vb| {
+            const named = [_]struct { []const u8, u32 }{
+                .{ "PointSize", 1 },     .{ "HelperInvocation", 23 }, .{ "BaseVertex", 4424 },
+                .{ "BaseInstance", 4425 }, .{ "DrawIndex", 4426 },    .{ "DeviceIndex", 4438 },
+                .{ "ViewportMaskNV", 5253 },
+            };
+            for (named) |b| if (std.mem.eql(u8, vb, b[0])) {
+                switch (b[1]) {
+                    4424, 4425, 4426 => {
+                        try e.cap(.draw_parameters);
+                        if (e.spv_minor < 3) try e.extension("SPV_KHR_shader_draw_parameters");
+                    },
+                    4438 => {
+                        try e.cap(.device_group);
+                        if (e.spv_minor < 3) try e.extension("SPV_KHR_device_group");
+                    },
+                    else => {},
+                }
+                return .{ .id = b[1], .ty = el.ty };
+            };
+            return e.unsupported("[[vk::builtin(\"{s}\")]] is not supported yet", .{vb});
+        }
         // Builtins exist only for some stages and directions; elsewhere a
         // system value is an ordinary located variable (as in dxc).
         if ((stage == .compute or stage == .mesh or stage == .amplification) and input) {
@@ -1502,6 +1538,7 @@ const Emitter = struct {
                 // (Named after the semantic as written, as dxc.)
                 const name = if (el.spelling) |sp| try std.fmt.allocPrint(e.arena, "{s}.var.{s}", .{ if (input) "in" else "out", sp }) else try std.fmt.allocPrint(e.arena, "{s}.var.{s}{d}", .{ if (input) "in" else "out", el.semantic, el.semantic_index });
                 try e.b.emitWithString(.debug_names, .name, &.{var_id}, name, &.{});
+                try e.userSemantic(var_id, el);
                 iface.* = .{ .var_id = var_id, .ty = vty, .elem_array = bi != null and e.t.get(bi.?.ty) == .array, .builtin = if (bi) |x| x.id else std.math.maxInt(u32) };
                 try e.useVar(var_id);
             }
@@ -2269,6 +2306,14 @@ const Emitter = struct {
                 e.vals[ri] = try e.loadInterface(iface, .input, i.ty);
                 // -fvk-use-dx-position-w: SV_Position.w as in DirectX (w,
                 // not 1 / w).
+                // -fvk-support-nonzero-base-*: DX's vertex / instance IDs
+                // start at 0.
+                if ((iface.builtin == 43 and e.vk.nonzero_base_instance) or (iface.builtin == 42 and e.vk.nonzero_base_vertex)) {
+                    try e.cap(.draw_parameters);
+                    if (e.spv_minor < 3) try e.extension("SPV_KHR_shader_draw_parameters");
+                    const base = try e.op1(.load, i.ty, &.{try e.builtinInput(if (iface.builtin == 43) 4425 else 4424, i.ty)});
+                    e.vals[ri] = try e.op1(.i_sub, i.ty, &.{ e.vals[ri], base });
+                }
                 if (e.vk.dx_position_w and iface.builtin == 15 and e.entry.stage == .pixel) {
                     const f1 = try e.t.scalar(.float);
                     const w = try e.op1(.composite_extract, f1, &.{ e.vals[ri], 3 });
@@ -2503,7 +2548,8 @@ const Emitter = struct {
             else => return e.unsupported("derivatives are not available in {s} shaders", .{@tagName(entry.stage)}),
         }
         if (e.st.derivative_mode != 0) return;
-        try e.extension("SPV_KHR_compute_shader_derivatives");
+        // (The NV extension has the same capabilities and modes.)
+        try e.extension(if (!e.extensionAllowed("SPV_KHR_compute_shader_derivatives") and e.extensionAllowed("SPV_NV_compute_shader_derivatives")) "SPV_NV_compute_shader_derivatives" else "SPV_KHR_compute_shader_derivatives");
         const t = entry.num_threads;
         if (t[0] % 2 == 0 and t[1] % 2 == 0) {
             try e.cap(.compute_derivative_group_quads);
@@ -2668,8 +2714,19 @@ const Emitter = struct {
         return e.unsupported("resource type '{s}' is not supported yet", .{try e.t.format(e.arena, ty)});
     }
 
+    fn extensionAllowed(e: *Emitter, name: []const u8) bool {
+        if (e.vk.extensions.items.len == 0) return true;
+        for (e.vk.extensions.items) |x| {
+            if (std.mem.eql(u8, x, name)) return true;
+            // `KHR`: every KHR extension.
+            if (std.mem.eql(u8, x, "KHR") and std.mem.startsWith(u8, name, "SPV_KHR_")) return true;
+        }
+        return false;
+    }
+
     fn extension(e: *Emitter, name: []const u8) Error!void {
         for (e.extensions.items) |x| if (std.mem.eql(u8, x, name)) return;
+        if (!e.extensionAllowed(name)) return e.unsupported("SPIR-V extension '{s}' required but not permitted to use (-fspv-extension)", .{name});
         try e.extensions.append(e.arena, name);
         try e.b.emitWithString(.extensions, .extension, &.{}, name, &.{});
     }
@@ -2779,6 +2836,44 @@ const Emitter = struct {
             .gl => .gl_std430,
             .dx => .dx_packed,
             .scalar => .scalar,
+        };
+    }
+
+    /// -fspv-reflect: the semantic of a stage variable.
+    fn userSemantic(e: *Emitter, v: Id, el: ir.SigElement) Error!void {
+        if (!e.vk.reflect) return;
+        try e.extension("SPV_GOOGLE_hlsl_functionality1");
+        const sem = el.spelling orelse if (el.semantic_index > 0) try std.fmt.allocPrint(e.arena, "{s}{d}", .{ el.semantic, el.semantic_index }) else el.semantic;
+        try e.b.emitWithString(.annotations, .decorate_string, &.{ v, 5635 }, sem, &.{}); // UserSemantic
+    }
+
+    /// -fspv-reflect: the HLSL type of a resource (`structuredbuffer:<float>`).
+    fn userType(e: *Emitter, v: Id, ty: TypeId, g: ir.Global) Error!void {
+        if (!e.vk.reflect) return;
+        var t = ty;
+        while (e.t.get(t) == .array) t = e.t.get(t).array.elem;
+        const text: []const u8 = switch (e.t.get(t)) {
+            .resource => |r| blk: {
+                const name = try std.ascii.allocLowerString(e.arena, r.name);
+                if (r.elem == TypeTable.void_type or r.kind == .byte_address_buffer or r.kind == .rw_byte_address_buffer or r.kind == .raytracing_acceleration_structure) break :blk name;
+                break :blk try std.fmt.allocPrint(e.arena, "{s}:<{s}>", .{ name, try e.hlslTypeName(r.elem) });
+            },
+            .@"struct" => if (g.space == .cbuffer) (if (g.tbuffer) "tbuffer" else "cbuffer") else return,
+            else => return,
+        };
+        try e.extension("SPV_GOOGLE_hlsl_functionality1");
+        try e.extension("SPV_GOOGLE_user_type");
+        try e.b.emitWithString(.annotations, .decorate_string, &.{ v, 5636 }, text, &.{}); // UserTypeGOOGLE
+    }
+
+    /// A type as HLSL writes it (`float4`, `uint2x3`, `S`).
+    fn hlslTypeName(e: *Emitter, ty: TypeId) Error![]const u8 {
+        return switch (e.t.get(ty)) {
+            .scalar => |s| @tagName(s),
+            .vector => |v| std.fmt.allocPrint(e.arena, "{s}{d}", .{ @tagName(v.elem), v.len }),
+            .matrix => |m| std.fmt.allocPrint(e.arena, "{s}{d}x{d}", .{ @tagName(m.elem), m.rows, m.cols }),
+            .@"struct" => |st| st.name,
+            else => e.t.format(e.arena, ty),
         };
     }
 
@@ -2968,6 +3063,7 @@ const Emitter = struct {
 
     /// dxc's image format for typed buffers and RW textures.
     fn imageFormat(e: *Emitter, elem: TypeId) u32 {
+        if (e.vk.unknown_image_format) return 0;
         const n = e.t.componentCount(elem) orelse return 0;
         const c = e.t.component(elem) orelse return 0;
         const k: usize = switch (n) {

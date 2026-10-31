@@ -236,6 +236,19 @@ pub const VkOptions = struct {
     alpha_io_order: bool = false,
     /// -fvk-use-gl-layout, -fvk-use-dx-layout, -fvk-use-scalar-layout.
     layout: enum { default, gl, dx, scalar } = .default,
+    /// -fspv-entrypoint-name=, -fspv-enable-maximal-reconvergence,
+    /// -fvk-support-nonzero-base-instance / -vertex,
+    /// -fspv-use-unknown-image-format.
+    entry_name: ?[]const u8 = null,
+    /// -fspv-reflect: SPV_GOOGLE semantic / user type / counter
+    /// decorations.
+    reflect: bool = false,
+    /// -fspv-extension=: the only extensions allowed (empty: any).
+    extensions: std.ArrayList([]const u8) = .empty,
+    maximal_reconvergence: bool = false,
+    nonzero_base_instance: bool = false,
+    nonzero_base_vertex: bool = false,
+    unknown_image_format: bool = false,
     /// -fvk-invert-y, -fvk-use-dx-position-w.
     invert_y: bool = false,
     dx_position_w: bool = false,
@@ -338,9 +351,10 @@ pub const SigElement = struct {
     per_vertex: bool = false,
     /// The semantic as written (`TEXCOORD`, `TEXCOORD3`).
     spelling: ?[]const u8 = null,
-    /// [[vk::location(n)]], [[vk::index(n)]].
+    /// [[vk::location(n)]], [[vk::index(n)]], [[vk::builtin("...")]].
     vk_location: ?u32 = null,
     vk_index: ?u32 = null,
+    vk_builtin: ?[]const u8 = null,
 };
 
 pub const Primitive = enum(u8) { point = 1, line = 2, triangle = 3, line_adj = 6, triangle_adj = 7 };

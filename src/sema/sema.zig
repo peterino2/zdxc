@@ -1081,6 +1081,15 @@ pub const Sema = struct {
         return TypeTable.error_type;
     }
 
+    /// The string argument of attribute `name` (`[[vk::builtin("X")]]`).
+    pub fn vkAttrString(attrs: []const ast.Attribute, name: []const u8) ?[]const u8 {
+        for (attrs) |a| if (std.mem.eql(u8, a.name, name) and a.args.len == 1 and a.args[0].kind == .string_lit) {
+            const lit = a.args[0].kind.string_lit;
+            return lit[1 .. lit.len - 1];
+        };
+        return null;
+    }
+
     /// The constant argument of attribute `name` (`[[vk::location(2)]]`).
     pub fn vkAttrInt(s: *Sema, attrs: []const ast.Attribute, name: []const u8) ?u32 {
         for (attrs) |a| if (std.mem.eql(u8, a.name, name) and a.args.len >= 1) {
@@ -1488,7 +1497,7 @@ pub const Sema = struct {
                 if (s.opts.spirv) if (s.vkAttrInt(v.attrs, "vk::offset")) |vo| if (vo % 16 != 0 and s.types.get(ft) == .@"struct") {
                     s.warn(v.name_loc, null, "The offset provided in the attribute should be 16-byte aligned.", .{});
                 };
-                try info.fields.append(s.arena, .{ .name = v.name, .type = ft, .row_major = isRowMajor(fattrs), .semantic = fsem, .interp = interpOf(v.quals), .vk_location = s.vkAttrInt(v.attrs, "vk::location"), .vk_index = s.vkAttrInt(v.attrs, "vk::index"), .vk_offset = if (s.opts.spirv) s.vkAttrInt(v.attrs, "vk::offset") else null });
+                try info.fields.append(s.arena, .{ .name = v.name, .type = ft, .row_major = isRowMajor(fattrs), .semantic = fsem, .interp = interpOf(v.quals), .vk_location = s.vkAttrInt(v.attrs, "vk::location"), .vk_index = s.vkAttrInt(v.attrs, "vk::index"), .vk_offset = if (s.opts.spirv) s.vkAttrInt(v.attrs, "vk::offset") else null, .vk_builtin = vkAttrString(v.attrs, "vk::builtin") });
             },
             .func => {},
             else => try s.decl(m, .member),

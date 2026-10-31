@@ -1599,11 +1599,12 @@ const Lowerer = struct {
         row_major: bool = false,
         vk_location: ?u32 = null,
         vk_index: ?u32 = null,
+        vk_builtin: ?[]const u8 = null,
 
         /// A field's modifiers, inheriting the enclosing interpolation.
         fn field(outer: SigAttrs, fld: Field) SigAttrs {
             const own: u8 = @bitCast(fld.interp);
-            return .{ .interp = if (own != 0) fld.interp else outer.interp, .row_major = fld.row_major, .vk_location = fld.vk_location, .vk_index = fld.vk_index };
+            return .{ .interp = if (own != 0) fld.interp else outer.interp, .row_major = fld.row_major, .vk_location = fld.vk_location, .vk_index = fld.vk_index, .vk_builtin = fld.vk_builtin };
         }
     };
 
@@ -1613,6 +1614,7 @@ const Lowerer = struct {
         r.row_major = attrs.row_major;
         r.vk_location = attrs.vk_location;
         r.vk_index = attrs.vk_index;
+        r.vk_builtin = attrs.vk_builtin;
         return r;
     }
 
@@ -1622,6 +1624,10 @@ const Lowerer = struct {
         var a = paramAttrs(q);
         a.vk_location = l.s.vkAttrInt(attrs, "vk::location");
         a.vk_index = l.s.vkAttrInt(attrs, "vk::index");
+        for (attrs) |at| if (std.mem.eql(u8, at.name, "vk::builtin") and at.args.len == 1 and at.args[0].kind == .string_lit) {
+            const lit = at.args[0].kind.string_lit;
+            a.vk_builtin = lit[1 .. lit.len - 1];
+        };
         return a;
     }
 
