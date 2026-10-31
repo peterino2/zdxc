@@ -790,6 +790,7 @@ const Emitter = struct {
         return switch (e.t.get(ty)) {
             .scalar => |s| storageScalar(s).name(),
             .vector => |v| std.fmt.allocPrint(e.arena, "v{d}{s}", .{ v.len, storageScalar(v.elem).name() }),
+            .matrix => |m| std.fmt.allocPrint(e.arena, "mat{d}v{d}{s}", .{ m.rows, m.cols, storageScalar(m.elem).name() }),
             else => e.t.format(e.arena, ty),
         };
     }
@@ -1917,7 +1918,6 @@ const Emitter = struct {
             .structured_buffer, .rw_structured_buffer, .append_structured_buffer, .consume_structured_buffer => r.elem,
             else => return null,
         };
-        if (e.isTrueMatrix(elem_ty)) return e.unsupported("buffers of matrices are not supported yet", .{});
         return try e.layoutTypeId(elem_ty, .std430, false);
     }
 
@@ -1935,6 +1935,12 @@ const Emitter = struct {
         const st = e.b.newId();
         try e.b.emit(.types_globals, .type_struct, &.{ st, rt });
         try e.b.emit(.annotations, .member_decorate, &.{ st, 0, 35, 0 }); // Offset 0
+        if (e.isTrueMatrix(elem_ty) and storageScalar(e.t.get(elem_ty).matrix.elem).isFloat()) {
+            // Buffers of (column-major) matrices: HLSL rows are SPIR-V
+            // columns.
+            try e.b.emit(.annotations, .member_decorate, &.{ st, 0, 7, layout.matrixStride(e.t, elem_ty, false, .std430) }); // MatrixStride
+            try e.b.emit(.annotations, .member_decorate, &.{ st, 0, 4 }); // RowMajor
+        }
         if (!r.kind.isWritable() and r.kind != .consume_structured_buffer) try e.b.emit(.annotations, .member_decorate, &.{ st, 0, 24 }); // NonWritable
         try e.b.emit(.annotations, .decorate, &.{ st, e.bufferBlockDecoration() });
         try e.b.emitWithString(.debug_names, .name, &.{st}, try std.fmt.allocPrint(e.arena, "type.{s}.{s}", .{ r.name, try e.typeLabel(elem_ty) }), &.{});

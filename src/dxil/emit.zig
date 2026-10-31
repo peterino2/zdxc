@@ -61,7 +61,16 @@ const Lowered = union(enum) {
     typed: struct { base: Value, dty: DType, addr_space: u32, ty: TypeId, path: []const Value = &.{} },
     /// A place inside a structured buffer element: element index plus byte
     /// offset (constant and dynamic).
-    buf: struct { res: u32, index: Value, offset: u32 = 0, dyn: ?Value = null, row_major: bool = false },
+    buf: struct {
+        res: u32,
+        index: Value,
+        offset: u32 = 0,
+        dyn: ?Value = null,
+        row_major: bool = false,
+        /// A row (and component) of the matrix at the place: read from
+        /// the whole matrix (a row need not be contiguous).
+        mat: ?struct { ty: TypeId, row: Value, col: ?u32 = null } = null,
+    },
 };
 
 /// Pointer into a flattened local: alloca `base` of `[n x scalar]`, at
@@ -915,7 +924,31 @@ const Emitter = struct {
                     return .{ .scalars = try e.textureLoad(res, mip, tx.coords, null, i.ty) };
                 },
                 .cbuf => |c| return e.cbufferLoad(c.res, c.offset, c.dyn_regs, c.row_major, i.ty),
-                .buf => |b| return .{ .scalars = try e.structuredLoad(e.resources.items[b.res], b.index, b.offset, b.dyn, b.row_major, i.ty) },
+                .buf => |b| {
+                    const mat = b.mat orelse return .{ .scalars = try e.structuredLoad(e.resources.items[b.res], b.index, b.offset, b.dyn, b.row_major, i.ty) };
+                    const m = e.t.get(mat.ty).matrix;
+                    const whole = try e.structuredLoad(e.resources.items[b.res], b.index, b.offset, b.dyn, b.row_major, mat.ty);
+                    const cols: []const u32 = if (mat.col) |c| &.{c} else blk: {
+                        const all = try e.arena.alloc(u32, m.cols);
+                        for (all, 0..) |*x, k| x.* = @intCast(k);
+                        break :blk all;
+                    };
+                    const out = try e.arena.alloc(Value, cols.len);
+                    for (out, cols) |*o, c| {
+                        if (e.constIntOf(mat.row)) |row| {
+                            o.* = whole[@as(u32, @intCast(row)) * m.cols + c];
+                            continue;
+                        }
+                        // A dynamic row: select among the rows.
+                        var v = whole[c];
+                        for (1..m.rows) |row| {
+                            const is_r = try e.add(try e.dm.intType(1), .{ .cmp = .{ .pred = 32, .lhs = mat.row, .rhs = try e.i32Const(@intCast(row)) } });
+                            v = try e.select(is_r, whole[row * m.cols + c], v, try e.valueType(v));
+                        }
+                        o.* = v;
+                    }
+                    return .{ .scalars = out };
+                },
                 .ptr => |ptr| return e.loadPtr(ptr, i.ty),
                 .typed => |tp| return e.typedLoad(tp, i.ty),
                 .mesh => return e.unsupported("reading mesh shader outputs is not supported", .{}),
@@ -942,6 +975,7 @@ const Emitter = struct {
                 }
                 if (frame.vals[s.ptr.index()] == .buf) {
                     const b = frame.vals[s.ptr.index()].buf;
+                    if (b.mat != null) return e.unsupported("writing part of a matrix in a buffer is not supported yet", .{});
                     try e.structuredStore(e.resources.items[b.res], b.index, b.offset, b.dyn, b.row_major, f.inst(s.value).ty, try e.scalars(frame, s.value));
                     return .none;
                 }
@@ -2444,6 +2478,13 @@ const Emitter = struct {
                     cur = st.fields.items[k].type;
                 },
                 .array, .vector => {
+                    if (b.mat) |*mt| {
+                        // A component of a matrix row.
+                        if (mt.col != null or xi.op != .constant) return e.unsupported("indexing this buffer member is not supported yet", .{});
+                        mt.col = @intCast(xi.op.constant.int);
+                        cur = try e.t.scalar(e.t.get(cur).vector.elem);
+                        continue;
+                    }
                     const elem = if (e.t.get(cur) == .array) e.t.get(cur).array.elem else try e.t.scalar(e.t.get(cur).vector.elem);
                     const stride_b = layout.arrayStride(e.t, elem, b.row_major, .dx_packed) catch return e.unsupported("buffer element types", .{});
                     if (xi.op == .constant) {
@@ -2454,6 +2495,11 @@ const Emitter = struct {
                         b.dyn = if (b.dyn) |d| try e.add(i32t, .{ .binop = .{ .op = .add, .lhs = d, .rhs = bytes } }) else bytes;
                     }
                     cur = elem;
+                },
+                .matrix => |m| {
+                    if (b.mat != null) return e.unsupported("indexing this buffer member is not supported yet", .{});
+                    b.mat = .{ .ty = cur, .row = (try e.scalars(frame, x))[0] };
+                    cur = try e.t.vector(m.elem, m.cols);
                 },
                 else => return e.unsupported("indexing this buffer member is not supported yet", .{}),
             }
