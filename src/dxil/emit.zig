@@ -1167,6 +1167,7 @@ const Emitter = struct {
             _ = try e.callOp(fn_i, try e.voidTy(), &.{ try e.i32Const(80), try e.i32Const(flags) });
             return .none;
         }
+        if (try e.mathIntrinsic(name, a[0..args.len], ac, rc, out)) return .{ .scalars = out };
         const Deriv = struct { name: []const u8, op: i64 };
         const derivs = [_]Deriv{
             .{ .name = "ddx", .op = 83 },      .{ .name = "ddx_coarse", .op = 83 }, .{ .name = "ddy", .op = 84 },
@@ -1204,6 +1205,150 @@ const Emitter = struct {
             return .none;
         }
         return e.unsupported("intrinsic '{s}' is not supported yet", .{name});
+    }
+
+    fn fbin(e: *Emitter, op: module.BinOp, x: Value, y: Value, ty: DType) Error!Value {
+        return e.add(ty, .{ .binop = .{ .op = op, .lhs = x, .rhs = y } });
+    }
+
+    fn fcmp(e: *Emitter, pred: u32, x: Value, y: Value) Error!Value {
+        return e.add(try e.dm.intType(1), .{ .cmp = .{ .pred = pred, .lhs = x, .rhs = y } });
+    }
+
+    fn select(e: *Emitter, cond: Value, t: Value, f: Value, ty: DType) Error!Value {
+        return e.add(ty, .{ .select = .{ .cond = cond, .t = t, .f = f } });
+    }
+
+    /// Math intrinsics built from arithmetic (as dxc's HLOperationLower);
+    /// false if `name` is not one of them.
+    fn mathIntrinsic(e: *Emitter, name: []const u8, a: []const []const Value, ac: Scalar, rc: Scalar, out: []Value) Error!bool {
+        const eq = std.mem.eql;
+        if (!ac.isFloat() and !eq(u8, name, "sign")) return false;
+        const at = try e.scalarTy(ac);
+        const fk = try e.t.scalar(ac);
+        const fc = struct {
+            fn f(em: *Emitter, k: TypeId, v: f64) Error!Value {
+                return em.constant(k, .{ .float = v });
+            }
+        }.f;
+        const zero = try fc(e, fk, 0);
+        const one = try fc(e, fk, 1);
+        // LLVM fcmp predicates.
+        const oeq = 1;
+        const ogt = 2;
+        const oge = 3;
+        const olt = 4;
+        if (eq(u8, name, "atan2")) {
+            const pi = std.math.pi;
+            for (out, a[0], a[1]) |*o, y, x| {
+                const atan = try e.unaryOp(17, "unary", try e.fbin(.sdiv, y, x, at), at);
+                const add_pi = try e.fbin(.add, atan, try fc(e, fk, pi), at);
+                const sub_pi = try e.fbin(.sub, atan, try fc(e, fk, pi), at);
+                const x_lt0 = try e.fcmp(olt, x, zero);
+                const x_eq0 = try e.fcmp(oeq, x, zero);
+                const y_ge0 = try e.fcmp(oge, y, zero);
+                const y_lt0 = try e.fcmp(olt, y, zero);
+                const i1t = try e.dm.intType(1);
+                var r = try e.select(try e.fbin(.@"and", x_lt0, y_ge0, i1t), add_pi, atan, at);
+                r = try e.select(try e.fbin(.@"and", x_lt0, y_lt0, i1t), sub_pi, r, at);
+                r = try e.select(try e.fbin(.@"and", x_eq0, y_lt0, i1t), try fc(e, fk, -pi / 2.0), r, at);
+                o.* = try e.select(try e.fbin(.@"and", x_eq0, y_ge0, i1t), try fc(e, fk, pi / 2.0), r, at);
+            }
+        } else if (eq(u8, name, "fmod")) {
+            const neg_zero = try fc(e, fk, -0.0);
+            for (out, a[0], a[1]) |*o, x, y| {
+                const div = try e.fbin(.sdiv, x, y, at);
+                const ge = try e.fcmp(oge, div, try e.fbin(.sub, neg_zero, div, at));
+                const frc = try e.unaryOp(22, "unary", try e.unaryOp(6, "unary", div, at), at);
+                const real = try e.select(ge, frc, try e.fbin(.sub, neg_zero, frc, at), at);
+                o.* = try e.fbin(.mul, real, y, at);
+            }
+        } else if (eq(u8, name, "isnan") or eq(u8, name, "isinf") or eq(u8, name, "isfinite")) {
+            const op: i64 = if (eq(u8, name, "isnan")) 8 else if (eq(u8, name, "isinf")) 9 else 10;
+            const i1t = try e.dm.intType(1);
+            const i32t = try e.dm.intType(32);
+            const fn_i = try e.dxOp(try std.fmt.allocPrint(e.arena, "dx.op.isSpecialFloat.{s}", .{e.overloadName(at)}), i1t, &.{ i32t, at }, .nounwind_readnone);
+            for (out, a[0]) |*o, x| o.* = try e.convertScalar(try e.callOp(fn_i, i1t, &.{ try e.i32Const(op), x }), .bool, rc);
+        } else if (eq(u8, name, "sign")) {
+            const i32t = try e.dm.intType(32);
+            const z = try e.constant(fk, if (ac.isFloat()) .{ .float = 0 } else .{ .int = 0 });
+            const gt_pred: u32 = if (ac.isFloat()) ogt else if (ac.isUnsigned()) 34 else 38;
+            const lt_pred: u32 = if (ac.isFloat()) olt else if (ac.isUnsigned()) 36 else 40;
+            for (out, a[0]) |*o, x| {
+                const gt = try e.add(i32t, .{ .cast = .{ .op = .zext, .val = try e.fcmp(gt_pred, x, z) } });
+                const lt = try e.add(i32t, .{ .cast = .{ .op = .zext, .val = try e.fcmp(lt_pred, x, z) } });
+                o.* = try e.convertScalar(try e.fbin(.sub, gt, lt, i32t), .int, rc);
+            }
+        } else if (eq(u8, name, "step")) {
+            for (out, a[0], a[1]) |*o, edge, x| o.* = try e.select(try e.fcmp(olt, x, edge), zero, one, at);
+        } else if (eq(u8, name, "smoothstep")) {
+            for (out, a[0], a[1], a[2]) |*o, lo, hi, x| {
+                const t = try e.unaryOp(7, "unary", try e.fbin(.sdiv, try e.fbin(.sub, x, lo, at), try e.fbin(.sub, hi, lo, at), at), at);
+                const s = try e.fbin(.sub, try fc(e, fk, 3), try e.fbin(.mul, try fc(e, fk, 2), t, at), at);
+                o.* = try e.fbin(.mul, try e.fbin(.mul, t, t, at), s, at);
+            }
+        } else if (eq(u8, name, "degrees") or eq(u8, name, "radians")) {
+            const k = try fc(e, fk, if (eq(u8, name, "degrees")) 180.0 / std.math.pi else std.math.pi / 180.0);
+            for (out, a[0]) |*o, x| o.* = try e.fbin(.mul, x, k, at);
+        } else if (eq(u8, name, "ldexp")) {
+            for (out, a[0], a[1]) |*o, x, p| o.* = try e.fbin(.mul, x, try e.unaryOp(21, "unary", p, at), at);
+        } else if (eq(u8, name, "distance")) {
+            const d = try e.arena.alloc(Value, a[0].len);
+            for (d, a[0], a[1]) |*o, x, y| o.* = try e.fbin(.sub, x, y, at);
+            out[0] = try e.unaryOp(24, "unary", try e.dot(d, d, at, true), at);
+        } else if (eq(u8, name, "reflect")) {
+            // i - 2 * dot(n, i) * n
+            const d2 = try e.fbin(.mul, try fc(e, fk, 2), try e.dot(a[1], a[0], at, true), at);
+            for (out, a[0], a[1]) |*o, i, n| o.* = try e.fbin(.sub, i, try e.fbin(.mul, d2, n, at), at);
+        } else if (eq(u8, name, "refract")) {
+            // k = 1 - eta^2 (1 - dot(n, i)^2); k < 0 ? 0 : eta i - (eta dot(n, i) + sqrt(k)) n
+            const eta = a[2][0];
+            const d = try e.dot(a[1], a[0], at, true);
+            const k = try e.fbin(.sub, one, try e.fbin(.mul, try e.fbin(.mul, eta, eta, at), try e.fbin(.sub, one, try e.fbin(.mul, d, d, at), at), at), at);
+            const neg = try e.fcmp(olt, k, zero);
+            const s = try e.fbin(.add, try e.fbin(.mul, eta, d, at), try e.unaryOp(24, "unary", k, at), at);
+            for (out, a[0], a[1]) |*o, i, n| {
+                const r = try e.fbin(.sub, try e.fbin(.mul, eta, i, at), try e.fbin(.mul, s, n, at), at);
+                o.* = try e.select(neg, zero, r, at);
+            }
+        } else if (eq(u8, name, "faceforward")) {
+            // dot(i, ng) < 0 ? n : -n
+            const neg = try e.fcmp(olt, try e.dot(a[1], a[2], at, true), zero);
+            const neg_zero = try fc(e, fk, -0.0);
+            for (out, a[0]) |*o, n| o.* = try e.select(neg, n, try e.fbin(.sub, neg_zero, n, at), at);
+        } else if (eq(u8, name, "cross")) {
+            const x = a[0];
+            const y = a[1];
+            for (out, 0..) |*o, k| {
+                const p = (k + 1) % 3;
+                const q = (k + 2) % 3;
+                o.* = try e.fbin(.sub, try e.fbin(.mul, x[p], y[q], at), try e.fbin(.mul, x[q], y[p], at), at);
+            }
+        } else if (eq(u8, name, "determinant")) {
+            const n = std.math.sqrt(a[0].len);
+            if (n * n != a[0].len or n < 1 or n > 4) return false;
+            out[0] = try e.determinant(a[0], n, at);
+        } else return false;
+        return true;
+    }
+
+    /// Determinant of an n x n matrix (row-major components), by cofactor
+    /// expansion along the first row.
+    fn determinant(e: *Emitter, m: []const Value, n: usize, ty: DType) Error!Value {
+        if (n == 1) return m[0];
+        if (n == 2) return e.fbin(.sub, try e.fbin(.mul, m[0], m[3], ty), try e.fbin(.mul, m[1], m[2], ty), ty);
+        var acc: ?Value = null;
+        var minor: [9]Value = undefined;
+        for (0..n) |c| {
+            var k: usize = 0;
+            for (1..n) |r| for (0..n) |cc| if (cc != c) {
+                minor[k] = m[r * n + cc];
+                k += 1;
+            };
+            const term = try e.fbin(.mul, m[c], try e.determinant(minor[0..k], n - 1, ty), ty);
+            acc = if (acc) |s| try e.fbin(if (c % 2 == 0) .add else .sub, s, term, ty) else term;
+        }
+        return acc.?;
     }
 
     fn dot(e: *Emitter, a: []const Value, b: []const Value, ty: DType, fl: bool) Error!Value {
