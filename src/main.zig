@@ -28,6 +28,8 @@ const usage =
     \\  -zdxc-check-hash      Verify the container hash of <input>
     \\  -zdxc-lex             Print the tokens of <input>, one per line (no preprocessing;
     \\                        `#line` lines are skipped)
+    \\  -zdxc-parse           Preprocess and parse <input>, reporting syntax errors only
+    \\  -zdxc-ast             Preprocess and parse <input> and dump the syntax tree
     \\
 ;
 
@@ -45,6 +47,8 @@ const Options = struct {
     empty: bool = false,
     check_hash: bool = false,
     lex: bool = false,
+    parse: bool = false,
+    dump_ast: bool = false,
 };
 
 const Cli = struct {
@@ -119,6 +123,11 @@ fn parseArgs(cli: Cli, arena: std.mem.Allocator, args: []const [:0]const u8, std
             opts.check_hash = true;
         } else if (std.mem.eql(u8, a, "-zdxc-lex")) {
             opts.lex = true;
+        } else if (std.mem.eql(u8, a, "-zdxc-parse")) {
+            opts.parse = true;
+        } else if (std.mem.eql(u8, a, "-zdxc-ast")) {
+            opts.parse = true;
+            opts.dump_ast = true;
         } else if (std.mem.eql(u8, a, "--version")) {
             try stdout.print("zdxc {s}\n", .{zdxc.version});
             return null;
@@ -173,7 +182,7 @@ fn run(cli: Cli, arena: std.mem.Allocator, args: []const [:0]const u8, stdout: *
     else
         null;
 
-    if (opts.preprocess) {
+    if (opts.preprocess or opts.parse) {
         const input = opts.input orelse return cli.fail("no input file", .{});
         var disk: front.source.DiskFs = .{ .io = cli.io };
         var sm = front.source.SourceManager.init(arena, disk.fileSystem());
@@ -188,7 +197,13 @@ fn run(cli: Cli, arena: std.mem.Allocator, args: []const [:0]const u8, stdout: *
             .enable_16bit = opts.enable_16bit,
         });
         var out: Io.Writer.Allocating = .init(arena);
-        if (try pp.enterMainFile(input)) try front.pp_print.print(&pp, &out.writer);
+        if (try pp.enterMainFile(input)) {
+            if (opts.parse) {
+                var parser = try front.parser.Parser.fromPreprocessor(arena, &diags, &pp);
+                const tu = try parser.parseTranslationUnit();
+                if (opts.dump_ast) try front.ast_dump.dumpUnit(stdout, tu);
+            } else try front.pp_print.print(&pp, &out.writer);
+        }
         try diags.render(&sm, cli.stderr);
         try cli.stderr.flush();
         if (diags.hasErrors()) return error.Fatal;

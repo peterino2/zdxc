@@ -47,6 +47,13 @@ pub fn build(b: *std.Build) void {
     oracle.has_side_effects = true;
     oracle_step.dependOn(&oracle.step);
 
+    const oracle_parse_step = b.step("oracle-parse", "Parse every dxc-valid corpus file with zdxc");
+    const oracle_parse = b.addSystemCommand(&.{ "sh", "test/oracle/parse.sh" });
+    oracle_parse.addArtifactArg(exe);
+    oracle_parse.setCwd(b.path("."));
+    oracle_parse.has_side_effects = true;
+    oracle_parse_step.dependOn(&oracle_parse.step);
+
     // Benchmarks always build optimized so numbers are comparable.
     const bench = b.addExecutable(.{
         .name = "pp_bench",

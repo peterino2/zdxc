@@ -8,6 +8,9 @@ pub const front = struct {
     pub const scan = @import("front/scan.zig");
     pub const preproc = @import("front/preproc.zig");
     pub const pp_print = @import("front/pp_print.zig");
+    pub const ast = @import("front/ast.zig");
+    pub const parser = @import("front/parser.zig");
+    pub const ast_dump = @import("front/ast_dump.zig");
 };
 
 pub const dxil = struct {
