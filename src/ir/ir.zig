@@ -38,7 +38,7 @@ pub const BlockId = enum(u32) {
 };
 
 /// Where a pointer points.
-pub const Space = enum { none, function, private, groupshared, resource, input, output, cbuffer };
+pub const Space = enum { none, function, private, groupshared, resource, input, output, cbuffer, mesh };
 
 pub const BinaryOp = enum {
     add,
@@ -114,6 +114,11 @@ pub const Op = union(enum) {
     /// (hull patch constant function), and a hull output control point
     /// read back by the patch constant function.
     patch_input: u32,
+    /// Mesh shaders: an output array (a pointer in the `mesh` space; stores
+    /// through it write vertices, primitives or indices), and the payload
+    /// from the amplification shader.
+    mesh_output: MeshOutput,
+    mesh_payload,
     patch_output: struct { element: u32, value: Ref },
     output_vertex: struct { element: u32, vertex: u32 },
     /// Geometry shaders: emit the vertex written to the outputs of a stream,
@@ -197,7 +202,7 @@ pub const Global = struct {
     binding: Binding = .{},
 };
 
-pub const Stage = enum { vertex, pixel, geometry, hull, domain, compute, library };
+pub const Stage = enum { vertex, pixel, geometry, hull, domain, compute, mesh, amplification, library };
 
 /// One entry-point input or output (a semantic on a parameter, field or
 /// the return value).
@@ -231,6 +236,18 @@ pub const Domain = enum(u8) { isoline = 1, tri = 2, quad = 3 };
 pub const Partitioning = enum(u8) { integer = 1, pow2 = 2, fractional_odd = 3, fractional_even = 4 };
 pub const OutputTopology = enum(u8) { point = 1, line = 2, triangle_cw = 3, triangle_ccw = 4 };
 
+pub const MeshOutput = enum { vertices, primitives, indices };
+
+pub const MeshInfo = struct {
+    max_vertices: u32 = 0,
+    max_primitives: u32 = 0,
+    /// DXIL::MeshOutputTopology.
+    topology: enum(u8) { line = 1, triangle = 2 } = .triangle,
+    /// The payload struct (read by a mesh shader, sent by an amplification
+    /// shader's DispatchMesh).
+    payload: ?TypeId = null,
+};
+
 pub const TessInfo = struct {
     domain: Domain = .tri,
     partitioning: Partitioning = .integer,
@@ -250,6 +267,7 @@ pub const Entry = struct {
     num_threads: [3]u32 = .{ 1, 1, 1 },
     geometry: GeometryInfo = .{},
     tess: TessInfo = .{},
+    mesh: MeshInfo = .{},
     inputs: std.ArrayList(SigElement) = .empty,
     outputs: std.ArrayList(SigElement) = .empty,
     /// Patch constants: written by the hull shader's patch constant
@@ -422,6 +440,8 @@ fn dumpInst(m: *const Module, f: *const Function, r: Ref, w: *std.Io.Writer) !vo
         .input_vertex => |x| try w.print("input {d} vertex {d}", .{ x.element, x.vertex }),
         .emit => |k| try w.print("emit stream {d}", .{k}),
         .patch_input => |k| try w.print("patch input {d}", .{k}),
+        .mesh_output => |k| try w.print("mesh output {s}", .{@tagName(k)}),
+        .mesh_payload => try w.print("mesh payload", .{}),
         .patch_output => |x| try w.print("patch output {d} = %{d}", .{ x.element, x.value.index() }),
         .output_vertex => |x| try w.print("output {d} vertex {d}", .{ x.element, x.vertex }),
         .cut => |k| try w.print("cut stream {d}", .{k}),

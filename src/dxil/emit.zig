@@ -53,6 +53,12 @@ const Lowered = union(enum) {
     /// A place in a constant buffer: byte offset plus a dynamic register
     /// offset.
     cbuf: struct { res: u32, offset: u32 = 0, dyn_regs: ?Value = null, row_major: bool = false },
+    /// A place in a mesh shader output array: the vertex / primitive index
+    /// and a flattened component offset within it.
+    mesh: struct { kind: ir.MeshOutput, index: ?Value = null, offset: u32 = 0, ty: TypeId },
+    /// Struct-typed memory (mesh payloads): the base pointer, its pointee
+    /// type, the GEP path so far and the HLSL type there.
+    typed: struct { base: Value, dty: DType, addr_space: u32, ty: TypeId, path: []const Value = &.{} },
     /// A place inside a structured buffer element: element index plus byte
     /// offset (constant and dynamic).
     buf: struct { res: u32, index: Value, offset: u32 = 0, dyn: ?Value = null, row_major: bool = false },
@@ -118,6 +124,10 @@ const Emitter = struct {
     main_fn: u32 = 0,
     /// Hull shaders: the patch constant function.
     pc_fn: ?u32 = null,
+    /// Amplification shaders: the variable sent by DispatchMesh (laid out
+    /// as a struct, not flattened): a groupshared global or a local.
+    payload_global: ?u32 = null,
+    payload_local: ?struct { func: *const ir.Function, inst: u32 } = null,
     /// Instructions per block, in creation order, with provisional ids.
     blocks: std.ArrayList(std.ArrayList(PInst)) = .empty,
     prologue: std.ArrayList(PInst) = .empty,
@@ -290,7 +300,7 @@ const Emitter = struct {
         const m = e.m;
         const entry = m.entry orelse return e.unsupported("no entry point", .{});
         switch (entry.stage) {
-            .compute, .vertex, .pixel, .geometry, .hull, .domain => {},
+            .compute, .vertex, .pixel, .geometry, .hull, .domain, .mesh, .amplification => {},
             else => return e.unsupported("{s} shaders are not supported yet", .{@tagName(entry.stage)}),
         }
         const void_ty = try e.voidTy();
@@ -301,6 +311,7 @@ const Emitter = struct {
 
         try e.collectResources();
         try e.buildSignatures(entry);
+        if (entry.stage == .amplification) e.findDispatchPayload();
         e.cur = try e.newBlock();
         try e.createHandles();
         _ = try e.inlineCall(entry.wrapper, &.{});
@@ -756,7 +767,25 @@ const Emitter = struct {
         switch (i.op) {
             .constant => |c| return e.list(&.{try e.constant(i.ty, c)}),
             .param => |p| return frame.params[p],
+            .mesh_output => |k| return .{ .mesh = .{ .kind = k, .ty = i.ty } },
+            .mesh_payload => {
+                const dty = try e.memoryType(i.ty);
+                const ptr_ty = try e.dm.ptrType(dty);
+                const fn_i = try e.dxOp(try std.fmt.allocPrint(e.arena, "dx.op.getMeshPayload.{s}", .{e.dm.types.items[dty].@"struct".name}), ptr_ty, &.{try e.dm.intType(32)}, .nounwind_readonly);
+                const base = try e.callOp(fn_i, ptr_ty, &.{try e.i32Const(170)});
+                return e.typedLoad(.{ .base = base, .dty = dty, .addr_space = 0, .ty = i.ty }, i.ty);
+            },
             .global => |g| {
+                if (e.payload_global == g) {
+                    const gop = try e.private_globals.getOrPut(e.arena, g);
+                    if (!gop.found_existing) {
+                        const dty = try e.memoryType(e.m.globals.items[g].ty);
+                        const gv = try e.dm.addGlobal(e.m.globals.items[g].name, dty, 3);
+                        gop.value_ptr.* = .{ .base = gv, .array_ty = dty, .scalar_ty = dty, .addr_space = 3 };
+                        e.groupshared_bytes += try e.payloadSize(e.m.globals.items[g].ty);
+                    }
+                    return .{ .typed = .{ .base = gop.value_ptr.base, .dty = gop.value_ptr.array_ty, .addr_space = 3, .ty = e.m.globals.items[g].ty } };
+                }
                 // Static globals live in the entry function (everything is
                 // inlined into it).
                 if (e.m.globals.items[g].space == .private) {
@@ -783,6 +812,11 @@ const Emitter = struct {
                 return .{ .handle = ri };
             },
             .local_var => {
+                if (e.payload_local) |pl| if (pl.func == f and pl.inst == r.index()) {
+                    const dty = try e.memoryType(i.ty);
+                    const base = try e.addPrologue(try e.dm.ptrType(dty), .{ .alloca = .{ .elem = dty, .size = try e.i32Const(1) } });
+                    return .{ .typed = .{ .base = base, .dty = dty, .addr_space = 0, .ty = i.ty } };
+                };
                 if (isResourceType(e.t, i.ty)) {
                     try e.res_locals.append(e.arena, null);
                     return .{ .res_local = @intCast(e.res_locals.items.len - 1) };
@@ -802,6 +836,8 @@ const Emitter = struct {
                 .cbuf => |c| return e.cbufferLoad(c.res, c.offset, c.dyn_regs, c.row_major, i.ty),
                 .buf => |b| return .{ .scalars = try e.structuredLoad(e.resources.items[b.res], b.index, b.offset, b.dyn, b.row_major, i.ty) },
                 .ptr => |ptr| return e.loadPtr(ptr, i.ty),
+                .typed => |tp| return e.typedLoad(tp, i.ty),
+                .mesh => return e.unsupported("reading mesh shader outputs is not supported", .{}),
                 else => return e.unsupported("internal: load from a non-pointer", .{}),
             },
             .store => |s| {
@@ -813,6 +849,14 @@ const Emitter = struct {
                     // handle-based lowering here; one assignment is fine.
                     if (slot.*) |old| if (!std.meta.eql(old, h)) return e.unsupported("assigning different resources to one variable is not supported yet", .{});
                     slot.* = h;
+                    return .none;
+                }
+                if (frame.vals[s.ptr.index()] == .mesh) {
+                    try e.meshStore(frame.vals[s.ptr.index()].mesh, try e.scalars(frame, s.value), f.inst(s.value).ty);
+                    return .none;
+                }
+                if (frame.vals[s.ptr.index()] == .typed) {
+                    try e.typedStore(frame.vals[s.ptr.index()].typed, try e.scalars(frame, s.value), f.inst(s.value).ty);
                     return .none;
                 }
                 if (frame.vals[s.ptr.index()] == .buf) {
@@ -828,6 +872,24 @@ const Emitter = struct {
                 return .none;
             },
             .access => |a| {
+                if (frame.vals[a.base.index()] == .mesh) return e.meshAccess(frame, frame.vals[a.base.index()].mesh, a.indices);
+                if (frame.vals[a.base.index()] == .typed) {
+                    var tp = frame.vals[a.base.index()].typed;
+                    var path: std.ArrayList(Value) = .empty;
+                    try path.appendSlice(e.arena, tp.path);
+                    for (a.indices) |x| {
+                        try path.append(e.arena, (try e.scalars(frame, x))[0]);
+                        tp.ty = switch (e.t.get(tp.ty)) {
+                            .@"struct" => |st| st.fields.items[@intCast(f.inst(x).op.constant.int)].type,
+                            .array => |arr| arr.elem,
+                            .vector => |v| try e.t.scalar(v.elem),
+                            .matrix => |mt| try e.t.vector(mt.elem, mt.cols),
+                            else => return e.unsupported("indexing this payload member is not supported yet", .{}),
+                        };
+                    }
+                    tp.path = path.items;
+                    return .{ .typed = tp };
+                }
                 if (frame.vals[a.base.index()] == .res_array) return e.arrayElement(frame, frame.vals[a.base.index()].res_array, a.indices);
                 if (frame.vals[a.base.index()] == .cbuf) return e.cbufferAccess(frame, frame.vals[a.base.index()].cbuf, f.inst(a.base).ty, a.indices);
                 if (frame.vals[a.base.index()] == .handle) {
@@ -1197,6 +1259,32 @@ const Emitter = struct {
     fn intrinsic(e: *Emitter, frame: *Frame, name: []const u8, ty: TypeId, args: []const Ref) Error!Lowered {
         const eq = std.mem.eql;
         if (try e.outIntrinsic(frame, name, ty, args)) |r| return r;
+        if (eq(u8, name, "DispatchMesh")) {
+            const tp = switch (frame.vals[args[3].index()]) {
+                .typed => |x| x,
+                else => return e.unsupported("DispatchMesh with this payload is not supported yet", .{}),
+            };
+            const i32t = try e.dm.intType(32);
+            // A member of a variable: a pointer to it.
+            const dty = if (tp.path.len > 0) try e.memoryType(tp.ty) else tp.dty;
+            if (e.dm.types.items[dty] != .@"struct") return e.unsupported("DispatchMesh payloads must be structs", .{});
+            const pt = try e.dm.getType(.{ .pointer = .{ .elem = dty, .addr_space = tp.addr_space } });
+            const ptr = if (tp.path.len == 0) tp.base else blk: {
+                const idx = try e.arena.alloc(Value, tp.path.len + 1);
+                idx[0] = try e.i32Const(0);
+                @memcpy(idx[1..], tp.path);
+                break :blk try e.add(pt, .{ .gep = .{ .elem = tp.dty, .ptr = tp.base, .indices = idx } });
+            };
+            const fn_i = try e.dxOp(try std.fmt.allocPrint(e.arena, "dx.op.dispatchMesh.{s}", .{e.dm.types.items[dty].@"struct".name}), try e.voidTy(), &.{ i32t, i32t, i32t, i32t, pt }, .nounwind);
+            _ = try e.callOp(fn_i, try e.voidTy(), &.{ try e.i32Const(173), (try e.scalars(frame, args[0]))[0], (try e.scalars(frame, args[1]))[0], (try e.scalars(frame, args[2]))[0], ptr });
+            return .none;
+        }
+        if (eq(u8, name, "SetMeshOutputCounts")) {
+            const i32t = try e.dm.intType(32);
+            const fn_i = try e.dxOp("dx.op.setMeshOutputCounts", try e.voidTy(), &.{ i32t, i32t, i32t }, .nounwind);
+            _ = try e.callOp(fn_i, try e.voidTy(), &.{ try e.i32Const(168), (try e.scalars(frame, args[0]))[0], (try e.scalars(frame, args[1]))[0] });
+            return .none;
+        }
         for (args) |x| if (frame.vals[x.index()] != .scalars) return e.unsupported("intrinsic '{s}' is not supported yet", .{name});
         var a: [4][]const Value = undefined;
         for (args, 0..) |x, k| a[k] = try e.scalars(frame, x);
@@ -2459,6 +2547,7 @@ const Emitter = struct {
             .geometry => .{ .gs_v_in, .gs_out, null },
             .hull => .{ .hs_cp_in, .hs_cp_out, .pc_out },
             .domain => .{ .ds_cp_in, .ds_out, .ds_in },
+            .mesh => .{ null, .ms_out, .ms_p_out },
             else => .{ null, null, null },
         };
         e.in_elem = try e.arena.alloc(?u32, entry.inputs.items.len);
@@ -2540,6 +2629,7 @@ const Emitter = struct {
     /// interpolates with perspective.
     fn interpMode(q: types.Interp, sp: signature.SigPoint, comp: signature.CompType, kind: signature.SemanticKind) signature.InterpMode {
         if (sp == .vs_in or sp == .ps_out or sp == .gs_in or sp == .pc_out or sp == .ds_in) return .undefined;
+        if (sp == .ms_p_out) return .constant; // per primitive: never interpolated
         var m: signature.InterpMode = if (q.nointerpolation)
             .constant
         else if (q.sample)
@@ -2670,7 +2760,7 @@ const Emitter = struct {
 
     fn inputAt(e: *Emitter, k: u32, ty: TypeId, vertex: ?u32) Error!Lowered {
         const entry = e.m.entry.?;
-        if (entry.stage == .compute) return e.computeInput(k, ty);
+        if (entry.stage == .compute or entry.stage == .mesh or entry.stage == .amplification) return e.computeInput(k, ty);
         const el = entry.inputs.items[k];
         const se = if (e.in_elem[k]) |ei| &e.sig_in[ei] else return e.systemValueInput(el.semantic, ty);
         if (se.interpretation == .shadow) return e.systemValueInput(el.semantic, ty);
@@ -2774,6 +2864,210 @@ const Emitter = struct {
         return .{ .scalars = out };
     }
 
+    /// The groupshared variable an amplification shader passes to
+    /// DispatchMesh.
+    fn findDispatchPayload(e: *Emitter) void {
+        for (e.m.functions.items) |f| for (f.insts.items) |inst| switch (inst.op) {
+            .intrinsic => |it| if (std.mem.eql(u8, it.name, "DispatchMesh") and it.args.len == 4) {
+                var x = it.args[3];
+                while (true) switch (f.inst(x).op) {
+                    .global => |g| {
+                        e.payload_global = g;
+                        return;
+                    },
+                    .local_var => {
+                        e.payload_local = .{ .func = f, .inst = x.index() };
+                        return;
+                    },
+                    .access => |a| x = a.base,
+                    else => break,
+                };
+            },
+            else => {},
+        };
+    }
+
+    /// The memory type of an HLSL value in struct-typed memory: vectors
+    /// and matrices (by row) become arrays, bools 32-bit integers.
+    fn memoryType(e: *Emitter, ty: TypeId) Error!DType {
+        return switch (e.t.get(ty)) {
+            .scalar, .@"enum" => e.scalarTy(storageScalar(e.compOf(ty))),
+            .vector => |v| e.dm.getType(.{ .array = .{ .len = v.len, .elem = try e.scalarTy(storageScalar(e.compOf(ty))) } }),
+            .matrix => |m| e.dm.getType(.{ .array = .{ .len = m.rows, .elem = try e.dm.getType(.{ .array = .{ .len = m.cols, .elem = try e.scalarTy(storageScalar(e.compOf(ty))) } }) } }),
+            .array => |a| e.dm.getType(.{ .array = .{ .len = a.len, .elem = try e.memoryType(a.elem) } }),
+            .@"struct" => |st| blk: {
+                const elems = try e.arena.alloc(DType, st.fields.items.len);
+                for (elems, st.fields.items) |*x, fld| x.* = try e.memoryType(fld.type);
+                break :blk e.dm.getType(.{ .@"struct" = .{ .name = try std.fmt.allocPrint(e.arena, "struct.{s}", .{st.name}), .elems = elems } });
+            },
+            else => e.unsupported("payloads of type '{s}' are not supported yet", .{try e.t.format(e.arena, ty)}),
+        };
+    }
+
+    /// The byte size of a payload (its memory type's allocation size).
+    fn payloadSize(e: *Emitter, ty: TypeId) Error!u32 {
+        return (try e.memLayout(ty))[0];
+    }
+
+    /// Size and alignment of `ty`'s memory type.
+    fn memLayout(e: *Emitter, ty: TypeId) Error![2]u32 {
+        switch (e.t.get(ty)) {
+            .scalar, .@"enum", .vector, .matrix => {
+                const sz = storageScalar(e.compOf(ty)).size();
+                return .{ sz * (e.t.componentCount(ty) orelse 1), sz };
+            },
+            .array => |a| {
+                const el = try e.memLayout(a.elem);
+                return .{ el[0] * a.len, el[1] };
+            },
+            .@"struct" => |st| {
+                var off: u32 = 0;
+                var al: u32 = 1;
+                for (st.fields.items) |fld| {
+                    const fl = try e.memLayout(fld.type);
+                    off = std.mem.alignForward(u32, off, fl[1]) + fl[0];
+                    al = @max(al, fl[1]);
+                }
+                return .{ std.mem.alignForward(u32, off, al), al };
+            },
+            else => return e.unsupported("payloads of type '{s}' are not supported yet", .{try e.t.format(e.arena, ty)}),
+        }
+    }
+
+    /// GEP paths to the scalars of a value of `ty`, in flattened order.
+    fn scalarPaths(e: *Emitter, ty: TypeId, prefix: []const Value, out: *std.ArrayList([]const Value)) Error!void {
+        const sub = struct {
+            fn f(em: *Emitter, p: []const Value, k: u32) Error![]const Value {
+                const r = try em.arena.alloc(Value, p.len + 1);
+                @memcpy(r[0..p.len], p);
+                r[p.len] = try em.i32Const(k);
+                return r;
+            }
+        }.f;
+        switch (e.t.get(ty)) {
+            .scalar, .@"enum" => try out.append(e.arena, prefix),
+            .vector => |v| for (0..v.len) |k| try out.append(e.arena, try sub(e, prefix, @intCast(k))),
+            .matrix => |m| for (0..m.rows) |r| {
+                const rp = try sub(e, prefix, @intCast(r));
+                for (0..m.cols) |c| try out.append(e.arena, try sub(e, rp, @intCast(c)));
+            },
+            .array => |a| for (0..a.len) |k| try e.scalarPaths(a.elem, try sub(e, prefix, @intCast(k)), out),
+            .@"struct" => |st| for (st.fields.items, 0..) |fld, k| try e.scalarPaths(fld.type, try sub(e, prefix, @intCast(k)), out),
+            else => return e.unsupported("payloads of type '{s}' are not supported yet", .{try e.t.format(e.arena, ty)}),
+        }
+    }
+
+    fn typedScalarPtr(e: *Emitter, tp: @FieldType(Lowered, "typed"), sub: []const Value, st: DType) Error!Value {
+        const idx = try e.arena.alloc(Value, 1 + tp.path.len + sub.len);
+        idx[0] = try e.i32Const(0);
+        @memcpy(idx[1..][0..tp.path.len], tp.path);
+        @memcpy(idx[1 + tp.path.len ..], sub);
+        const pt = try e.dm.getType(.{ .pointer = .{ .elem = st, .addr_space = tp.addr_space } });
+        return e.add(pt, .{ .gep = .{ .elem = tp.dty, .ptr = tp.base, .indices = idx } });
+    }
+
+    fn typedLoad(e: *Emitter, tp: @FieldType(Lowered, "typed"), ty: TypeId) Error!Lowered {
+        var paths: std.ArrayList([]const Value) = .empty;
+        try e.scalarPaths(ty, &.{}, &paths);
+        const out = try e.arena.alloc(Value, paths.items.len);
+        for (out, paths.items, 0..) |*o, sub, c| {
+            const ct = e.compOf(try e.componentType(ty, @intCast(c)));
+            const st = try e.scalarTy(storageScalar(ct));
+            const raw = try e.add(st, .{ .load = .{ .ptr = try e.typedScalarPtr(tp, sub, st), .@"align" = 4 } });
+            o.* = if (ct == .bool) try e.add(try e.dm.intType(1), .{ .cmp = .{ .pred = 33, .lhs = raw, .rhs = try e.i32Const(0) } }) else raw;
+        }
+        return .{ .scalars = out };
+    }
+
+    fn typedStore(e: *Emitter, tp: @FieldType(Lowered, "typed"), vals: []const Value, ty: TypeId) Error!void {
+        var paths: std.ArrayList([]const Value) = .empty;
+        try e.scalarPaths(ty, &.{}, &paths);
+        for (vals, paths.items, 0..) |v, sub, c| {
+            const ct = e.compOf(try e.componentType(ty, @intCast(c)));
+            const st = try e.scalarTy(storageScalar(ct));
+            const sv = if (ct == .bool) try e.add(st, .{ .cast = .{ .op = .zext, .val = v } }) else v;
+            _ = try e.add(try e.voidTy(), .{ .store = .{ .ptr = try e.typedScalarPtr(tp, sub, st), .val = sv, .@"align" = 4 } });
+        }
+    }
+
+    /// Indexes into a mesh output array: the first index picks the vertex
+    /// or primitive, the rest a part of it (constant indices only).
+    fn meshAccess(e: *Emitter, frame: *Frame, start: @FieldType(Lowered, "mesh"), indices: []const Ref) Error!Lowered {
+        var m = start;
+        for (indices) |x| {
+            if (m.index == null) {
+                m.index = (try e.scalars(frame, x))[0];
+                m.ty = e.t.get(m.ty).array.elem;
+                continue;
+            }
+            const k: u32 = switch (frame.f.inst(x).op) {
+                .constant => |c| @intCast(c.int),
+                else => return e.unsupported("dynamic indexing inside a mesh output is not supported yet", .{}),
+            };
+            switch (e.t.get(m.ty)) {
+                .@"struct" => |st| {
+                    for (st.fields.items[0..k]) |fld| m.offset += try e.flatCount(fld.type);
+                    m.ty = st.fields.items[k].type;
+                },
+                .array => |arr| {
+                    m.offset += k * try e.flatCount(arr.elem);
+                    m.ty = arr.elem;
+                },
+                .vector => |v| {
+                    m.offset += k;
+                    m.ty = try e.t.scalar(v.elem);
+                },
+                .matrix => |mt| {
+                    m.offset += k * mt.cols;
+                    m.ty = try e.t.vector(mt.elem, mt.cols);
+                },
+                else => return e.unsupported("indexing this mesh output is not supported yet", .{}),
+            }
+        }
+        return .{ .mesh = m };
+    }
+
+    /// Writes components [offset, offset + n) of a vertex or primitive, or
+    /// a primitive's indices.
+    fn meshStore(e: *Emitter, m: @FieldType(Lowered, "mesh"), vals: []const Value, ty: TypeId) Error!void {
+        const index = m.index orelse return e.unsupported("storing a whole mesh output array is not supported yet", .{});
+        const i32t = try e.dm.intType(32);
+        const void_ty = try e.voidTy();
+        if (m.kind == .indices) {
+            if (m.offset != 0 or vals.len < 2) return e.unsupported("writing part of a primitive's indices is not supported yet", .{});
+            const fn_i = try e.dxOp("dx.op.emitIndices", void_ty, &.{ i32t, i32t, i32t, i32t, i32t }, .nounwind);
+            const v2 = if (vals.len > 2) vals[2] else try e.dm.constant(.{ .ty = i32t, .kind = .undef });
+            _ = try e.callOp(fn_i, void_ty, &.{ try e.i32Const(169), index, vals[0], vals[1], v2 });
+            return;
+        }
+        const entry = e.m.entry.?;
+        const els = if (m.kind == .vertices) entry.outputs.items else entry.patch_constants.items;
+        const map = if (m.kind == .vertices) e.out_elem else e.pc_elem;
+        const sig = if (m.kind == .vertices) e.sig_out else e.sig_pc;
+        const op: i64 = if (m.kind == .vertices) 171 else 172;
+        const op_name = if (m.kind == .vertices) "storeVertexOutput" else "storePrimitiveOutput";
+        for (vals, 0..) |v, c| {
+            // Which element (leaf) and which of its components.
+            var flat = m.offset + @as(u32, @intCast(c));
+            var k: usize = 0;
+            while (k < els.len) : (k += 1) {
+                const n = try e.flatCount(els[k].ty);
+                if (flat < n) break;
+                flat -= n;
+            }
+            if (k == els.len) return e.unsupported("internal: mesh output component out of range", .{});
+            const el = els[k];
+            const se = if (map[k]) |ei| &sig[ei] else return e.unsupported("mesh output '{s}' is not supported yet", .{el.semantic});
+            const via = sigScalar(se.comp);
+            const vt = try e.scalarTy(via);
+            const fn_i = try e.dxOp(try std.fmt.allocPrint(e.arena, "dx.op.{s}.{s}", .{ op_name, e.overloadName(vt) }), void_ty, &.{ i32t, i32t, i32t, try e.dm.intType(8), vt, i32t }, .nounwind);
+            const rc = try e.sigComponent(el.ty, el.row_major, flat);
+            const from = e.compOf(try e.componentType(ty, @intCast(c)));
+            _ = try e.callOp(fn_i, void_ty, &.{ try e.i32Const(op), try e.i32Const(se.id), try e.i32Const(rc[0]), try e.dm.constInt(8, rc[1]), try e.convertScalar(v, from, via), index });
+            se.usage |= @as(u8, 1) << @intCast(rc[1]);
+        }
+    }
+
     fn computeInput(e: *Emitter, k: u32, ty: TypeId) Error!Lowered {
         const el = e.m.entry.?.inputs.items[k];
         const eqi = std.ascii.eqlIgnoreCase;
@@ -2800,7 +3094,7 @@ const Emitter = struct {
             for (out) |*o| o.* = try e.convertScalar(v, .uint, e.compOf(ty));
             return .{ .scalars = out };
         }
-        return e.unsupported("input '{s}' is not supported yet", .{el.semantic});
+        return e.systemValueInput(el.semantic, ty);
     }
 
     // ------------------------------------------------------------------
@@ -2946,9 +3240,19 @@ const Emitter = struct {
             const i64t = try dm.intType(64);
             try props.appendSlice(e.arena, &.{ try mdI32(dm, 0), try dm.mdValue(i64t, try dm.constant(.{ .ty = i64t, .kind = .{ .int = @bitCast(flags) } })) });
         }
-        if (entry.stage == .compute) {
-            const threads = try dm.mdNode(&.{ try mdI32(dm, entry.num_threads[0]), try mdI32(dm, entry.num_threads[1]), try mdI32(dm, entry.num_threads[2]) });
-            try props.appendSlice(e.arena, &.{ try mdI32(dm, 4), threads });
+        const threads = try dm.mdNode(&.{ try mdI32(dm, entry.num_threads[0]), try mdI32(dm, entry.num_threads[1]), try mdI32(dm, entry.num_threads[2]) });
+        if (entry.stage == .compute) try props.appendSlice(e.arena, &.{ try mdI32(dm, 4), threads });
+        const payload_size: u32 = if (entry.mesh.payload) |p| try e.payloadSize(p) else 0;
+        if (entry.stage == .mesh) {
+            // MS state: thread group, max vertices, max primitives,
+            // topology, payload size.
+            const ms = entry.mesh;
+            const state = try dm.mdNode(&.{ threads, try mdI32(dm, ms.max_vertices), try mdI32(dm, ms.max_primitives), try mdI32(dm, @intFromEnum(ms.topology)), try mdI32(dm, payload_size) });
+            try props.appendSlice(e.arena, &.{ try mdI32(dm, 9), state });
+        }
+        if (entry.stage == .amplification) {
+            const state = try dm.mdNode(&.{ threads, try mdI32(dm, payload_size) });
+            try props.appendSlice(e.arena, &.{ try mdI32(dm, 10), state });
         }
         if (entry.stage == .geometry) {
             // GS state: input primitive, max vertex count, stream mask,
@@ -3084,24 +3388,37 @@ const Emitter = struct {
             }
             std.mem.writeInt(u32, stage_info[8..12], @intFromEnum(entry.tess.domain), .little);
         }
+        const payload_size: u32 = if (entry.mesh.payload) |p| try e.payloadSize(p) else 0;
+        if (entry.stage == .mesh) {
+            std.mem.writeInt(u32, stage_info[0..4], e.groupshared_bytes, .little);
+            std.mem.writeInt(u32, stage_info[8..12], payload_size, .little);
+            std.mem.writeInt(u16, stage_info[12..14], @intCast(entry.mesh.max_vertices), .little);
+            std.mem.writeInt(u16, stage_info[14..16], @intCast(entry.mesh.max_primitives), .little);
+        }
+        if (entry.stage == .amplification) std.mem.writeInt(u32, stage_info[0..4], payload_size, .little);
         const kind: shader.ShaderKind = switch (entry.stage) {
             .vertex => .vertex,
             .pixel => .pixel,
             .geometry => .geometry,
             .hull => .hull,
             .domain => .domain,
+            .mesh => .mesh,
+            .amplification => .amplification,
             else => .compute,
         };
+        const threaded = entry.stage == .compute or entry.stage == .mesh or entry.stage == .amplification;
         const psv = try shader.psv(gpa, .{
             .kind = kind,
             .entry = entry.name,
             .stage_info = stage_info,
-            .num_threads = if (entry.stage == .compute) entry.num_threads else .{ 0, 0, 0 },
+            .num_threads = if (threaded) entry.num_threads else .{ 0, 0, 0 },
+            .mesh_topology = if (entry.stage == .mesh) @intFromEnum(entry.mesh.topology) else 0,
+            .uses_view_id = e.uses_view_id,
             .resources = binds.items,
             .inputs = e.sig_in,
             .outputs = e.sig_out,
             .patch_constants = e.sig_pc,
-            .groupshared_bytes = if (entry.stage == .compute) e.groupshared_bytes else 0,
+            .groupshared_bytes = if (threaded) e.groupshared_bytes else 0,
             .max_vertex_count = if (entry.stage == .geometry) @intCast(entry.geometry.max_vertex_count) else 0,
         });
         defer gpa.free(psv);
@@ -3120,7 +3437,7 @@ const Emitter = struct {
             .{ .fourcc = container.fourcc("ISG1"), .data = isg1 },
             .{ .fourcc = container.fourcc("OSG1"), .data = osg1 },
         });
-        if (entry.stage == .hull or entry.stage == .domain) try parts.append(e.arena, .{ .fourcc = container.fourcc("PSG1"), .data = psg1 });
+        if (entry.stage == .hull or entry.stage == .domain or entry.stage == .mesh) try parts.append(e.arena, .{ .fourcc = container.fourcc("PSG1"), .data = psg1 });
         try parts.appendSlice(e.arena, &.{
             .{ .fourcc = container.fourcc("PSV0"), .data = psv },
             .{ .fourcc = container.fourcc("DXIL"), .data = dxil_part },

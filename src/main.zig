@@ -266,6 +266,8 @@ fn run(cli: Cli, arena: std.mem.Allocator, args: []const [:0]const u8, stdout: *
                             .hull => .hull,
                             .domain => .domain,
                             .compute => .compute,
+                            .mesh => .mesh,
+                            .amplification => .amplification,
                             else => .library,
                         };
                         module = zdxc.ir.lower.lowerUnit(arena, &sema, .{ .entry = opts.entry, .stage = stage }) catch |e| switch (e) {

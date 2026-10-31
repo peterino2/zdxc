@@ -148,6 +148,8 @@ pub const PsvInfo = struct {
     patch_constants: []const signature.Element = &.{},
     groupshared_bytes: u32 = 0,
     max_vertex_count: u16 = 0,
+    mesh_topology: u8 = 0,
+    uses_view_id: bool = false,
 };
 
 pub fn psvCompute(gpa: Allocator, entry: []const u8, num_threads: [3]u32, resources: []const ResourceBind) ![]u8 {
@@ -173,8 +175,13 @@ pub fn psv(gpa: Allocator, info: PsvInfo) ![]u8 {
     // vector counts.
     // (The MaxVertexCount union holds SigPatchConstOrPrimVectors for hull
     // and domain shaders.)
-    const union16: u16 = if (info.kind == .hull or info.kind == .domain) @intCast(pc_vectors) else info.max_vertex_count;
-    try buf.appendSlice(gpa, &.{ @backingInt(info.kind), 0, @truncate(union16), @truncate(union16 >> 8) });
+    // (Mesh shaders: SigPrimVectors and MeshOutputTopology.)
+    const union16: u16 = switch (info.kind) {
+        .hull, .domain => @intCast(pc_vectors),
+        .mesh => @as(u16, @intCast(pc_vectors)) | (@as(u16, info.mesh_topology) << 8),
+        else => info.max_vertex_count,
+    };
+    try buf.appendSlice(gpa, &.{ @backingInt(info.kind), @intFromBool(info.uses_view_id), @truncate(union16), @truncate(union16 >> 8) });
     try buf.appendSlice(gpa, &.{ @intCast(info.inputs.len), @intCast(info.outputs.len), @intCast(info.patch_constants.len), @intCast(in_vectors) });
     for (out_vectors) |v| try buf.append(gpa, @intCast(v));
     // PSVRuntimeInfo2
@@ -237,12 +244,21 @@ pub fn psv(gpa: Allocator, info: PsvInfo) ![]u8 {
         try w(&buf, gpa, 16); // sizeof(PSVSignatureElement0)
         try buf.appendSlice(gpa, records.items);
     }
+    // Outputs depending on the ViewID (left empty, like the dependency
+    // tables below).
+    if (info.uses_view_id) {
+        for (out_vectors, 0..) |ov, stream| {
+            if (stream > 0 and info.kind != .geometry) break;
+            if (ov > 0) try buf.appendNTimes(gpa, 0, ((ov + 7) >> 3) * 4);
+        }
+        if ((info.kind == .hull or info.kind == .mesh) and pc_vectors > 0) try buf.appendNTimes(gpa, 0, ((pc_vectors + 7) >> 3) * 4);
+    }
     // Input-to-output dependency table (no ViewID). Left empty: the
     // validator only checks it against dx.viewIdState, which zdxc omits.
     // (One per output stream for geometry shaders.)
     for (out_vectors, 0..) |ov, stream| {
         if (stream > 0 and info.kind != .geometry) break;
-        if (in_vectors > 0 and ov > 0) try buf.appendNTimes(gpa, 0, tableDwords(in_vectors, ov) * 4);
+        if (info.kind != .mesh and in_vectors > 0 and ov > 0) try buf.appendNTimes(gpa, 0, tableDwords(in_vectors, ov) * 4);
     }
     // Inputs to patch constants (hull), patch constants to outputs
     // (domain).

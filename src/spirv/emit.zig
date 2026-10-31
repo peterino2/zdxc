@@ -23,7 +23,7 @@ const Ref = ir.Ref;
 pub const Error = Allocator.Error || error{Unsupported};
 
 /// SPIR-V storage classes.
-const StorageClass = enum(u32) { uniform_constant = 0, input = 1, uniform = 2, output = 3, workgroup = 4, private = 6, function = 7, image = 11, storage_buffer = 12 };
+const StorageClass = enum(u32) { uniform_constant = 0, input = 1, uniform = 2, output = 3, workgroup = 4, private = 6, function = 7, image = 11, storage_buffer = 12, task_payload_workgroup = 5402 };
 
 const Capability = enum(u32) {
     shader = 1,
@@ -51,6 +51,7 @@ const Capability = enum(u32) {
     storage_image_read_without_format = 55,
     storage_image_write_without_format = 56,
     group_non_uniform = 61,
+    mesh_shading_ext = 5283,
     group_non_uniform_vote = 62,
     group_non_uniform_arithmetic = 63,
     group_non_uniform_ballot = 64,
@@ -136,6 +137,17 @@ const Emitter = struct {
     inputs: []Interface = &.{},
     outputs: []Interface = &.{},
     patches: []Interface = &.{},
+    /// Mesh shaders: the primitive indices builtin and the payload
+    /// variable (both made on first use); amplification shaders: the
+    /// groupshared variable sent by DispatchMesh.
+    indices_var: Id = 0,
+    payload_var: Id = 0,
+    payload_global: ?u32 = null,
+    /// Per instruction (current function): places in mesh output arrays.
+    mesh_places: std.AutoHashMapUnmanaged(u32, MeshPlace) = .empty,
+    /// Parameters receiving mesh output arrays: not real parameters (the
+    /// outputs are module variables); by function and parameter index.
+    mesh_params: std.AutoHashMapUnmanaged(struct { *const ir.Function, u32 }, ir.MeshOutput) = .empty,
     interface_ids: std.ArrayList(Id) = .empty,
 
     // Per function.
@@ -150,6 +162,7 @@ const Emitter = struct {
         tess_level: bool = false,
     };
     const LayoutKey = struct { TypeId, layout.Rules, bool };
+    const MeshPlace = struct { kind: ir.MeshOutput, index: Ref = .none, offset: u32 = 0, ty: TypeId };
     const PtrLayout = struct { rules: layout.Rules, row_major: bool };
 
     fn unsupported(e: *Emitter, comptime fmt: []const u8, args: anytype) Error {
@@ -491,6 +504,13 @@ const Emitter = struct {
         e.void_id = try e.typeId(TypeTable.void_type);
         try e.cap(.shader);
         if (entry.stage == .geometry) try e.cap(.geometry);
+        if (entry.stage == .mesh or entry.stage == .amplification) {
+            if (e.spv_minor < 4) return e.unsupported("mesh and amplification shaders need SPIR-V 1.4 or later (-fspv-target-env=vulkan1.2 or later)", .{});
+            try e.cap(.mesh_shading_ext);
+            try e.extension("SPV_EXT_mesh_shader");
+            e.payload_global = e.dispatchPayloadGlobal();
+            try e.findMeshParams();
+        }
 
         e.func_ids = try e.arena.alloc(Id, m.functions.items.len);
         for (e.func_ids) |*id| id.* = e.b.newId();
@@ -517,6 +537,8 @@ const Emitter = struct {
             .geometry => 3,
             .pixel => 4,
             .compute => 5,
+            .amplification => 5364, // TaskEXT
+            .mesh => 5365, // MeshEXT
             .library => return e.unsupported("library targets are not supported", .{}),
         };
         const wrapper = e.func_ids[entry.wrapper];
@@ -564,6 +586,14 @@ const Emitter = struct {
                 try e.b.emit(.execution_modes, .execution_mode, &.{ wrapper, 26, ts.output_control_points }); // OutputVertices
             },
             .domain => try e.b.emit(.execution_modes, .execution_mode, &.{ wrapper, domainMode(entry.tess.domain) }),
+            .amplification => try e.b.emit(.execution_modes, .execution_mode, &.{ wrapper, 17, entry.num_threads[0], entry.num_threads[1], entry.num_threads[2] }),
+            .mesh => {
+                const ms = entry.mesh;
+                try e.b.emit(.execution_modes, .execution_mode, &.{ wrapper, 17, entry.num_threads[0], entry.num_threads[1], entry.num_threads[2] });
+                try e.b.emit(.execution_modes, .execution_mode, &.{ wrapper, if (ms.topology == .line) 5269 else 5298 }); // OutputLinesEXT / OutputTrianglesEXT
+                try e.b.emit(.execution_modes, .execution_mode, &.{ wrapper, 26, ms.max_vertices }); // OutputVertices
+                try e.b.emit(.execution_modes, .execution_mode, &.{ wrapper, 5270, ms.max_primitives }); // OutputPrimitivesEXT
+            },
             .pixel => {
                 try e.b.emit(.execution_modes, .execution_mode, &.{ wrapper, 7 }); // OriginUpperLeft
                 for (entry.outputs.items) |o| if (std.ascii.eqlIgnoreCase(o.semantic, "SV_Depth")) {
@@ -630,7 +660,7 @@ const Emitter = struct {
                 },
                 .groupshared, .private => {
                     const ty = try e.typeId(g.ty);
-                    const sc: StorageClass = if (g.space == .groupshared) .workgroup else .private;
+                    const sc: StorageClass = if (e.payload_global == @as(u32, @intCast(gi))) .task_payload_workgroup else if (g.space == .groupshared) .workgroup else .private;
                     const ptr = try e.pointerType(sc, ty);
                     const var_id = e.b.newId();
                     try e.b.emit(.types_globals, .variable, &.{ ptr, var_id, @backingInt(sc) });
@@ -729,7 +759,7 @@ const Emitter = struct {
         const eq = std.ascii.eqlIgnoreCase;
         // Builtins exist only for some stages and directions; elsewhere a
         // system value is an ordinary located variable (as in dxc).
-        if (stage == .compute and input) {
+        if ((stage == .compute or stage == .mesh or stage == .amplification) and input) {
             if (eq(n, "SV_DispatchThreadID")) return .{ .id = 28, .ty = uint3 }; // GlobalInvocationId
             if (eq(n, "SV_GroupID")) return .{ .id = 26, .ty = uint3 }; // WorkgroupId
             if (eq(n, "SV_GroupThreadID")) return .{ .id = 27, .ty = uint3 }; // LocalInvocationId
@@ -749,7 +779,11 @@ const Emitter = struct {
             return .{ .id = 7, .ty = uint1 }; // PrimitiveId
         }
         if (input and stage == .geometry and eq(n, "SV_GSInstanceID")) return .{ .id = 8, .ty = uint1 }; // InvocationId
-        if ((!input and stage == .geometry) or (input and stage == .pixel)) {
+        if (stage == .mesh and !input) {
+            if (eq(n, "SV_CullPrimitive")) return .{ .id = 5299, .ty = try t.scalar(.bool) }; // CullPrimitiveEXT
+            if (eq(n, "SV_PrimitiveID")) return .{ .id = 7, .ty = uint1 }; // PrimitiveId
+        }
+        if ((!input and (stage == .geometry or stage == .mesh)) or (input and stage == .pixel)) {
             if (eq(n, "SV_RenderTargetArrayIndex")) {
                 try e.cap(.geometry);
                 return .{ .id = 9, .ty = uint1 }; // Layer
@@ -799,6 +833,7 @@ const Emitter = struct {
                 if (el.per_vertex) ty = try e.t.array(ty, switch (entry.stage) {
                     .geometry => entry.geometry.input_vertices,
                     .hull => if (input) entry.tess.input_control_points else entry.tess.output_control_points,
+                    .mesh => if (patch) entry.mesh.max_primitives else entry.mesh.max_vertices,
                     else => entry.tess.input_control_points,
                 });
                 const sc: StorageClass = if (input) .input else .output;
@@ -811,7 +846,7 @@ const Emitter = struct {
                 const ptr = try e.pointerType(sc, try e.typeId(ty));
                 const var_id = e.b.newId();
                 try e.b.emit(.types_globals, .variable, &.{ ptr, var_id, @backingInt(sc) });
-                if (patch) try e.b.emit(.annotations, .decorate, &.{ var_id, 15 }); // Patch
+                if (patch) try e.b.emit(.annotations, .decorate, if (entry.stage == .mesh) &.{ var_id, 5271 } else &.{ var_id, 15 }); // PerPrimitiveEXT / Patch
                 if (bi) |x| {
                     try e.b.emit(.annotations, .decorate, &.{ var_id, 11, x.id }); // BuiltIn
                     if (input and entry.stage == .pixel and !e.t.component(x.ty).?.isFloat() and e.t.component(x.ty).? != .bool) {
@@ -905,6 +940,7 @@ const Emitter = struct {
     fn emitFunction(e: *Emitter, f: *const ir.Function, fn_id: Id, bindings: []const Id) Error!void {
         e.f = f;
         e.texel_places = .empty;
+        e.mesh_places = .empty;
         e.vals = try e.arena.alloc(Id, f.insts.items.len);
         @memset(e.vals, 0);
         e.ptr_layouts = try e.arena.alloc(?PtrLayout, f.insts.items.len);
@@ -913,6 +949,7 @@ const Emitter = struct {
         var params: std.ArrayList(Id) = .empty;
         for (f.params, 0..) |p, k| {
             if (bindings.len > 0 and bindings[k] != 0) continue;
+            if (e.mesh_params.contains(.{ f, @intCast(k) })) continue;
             const t = try e.typeId(p.ty);
             try params.append(e.arena, if (p.by_ref) try e.pointerType(.function, t) else t);
         }
@@ -923,6 +960,10 @@ const Emitter = struct {
         for (f.params, param_ids, 0..) |p, *id, k| {
             if (bindings.len > 0 and bindings[k] != 0) {
                 id.* = bindings[k];
+                continue;
+            }
+            if (e.mesh_params.contains(.{ f, @intCast(k) })) {
+                id.* = 0;
                 continue;
             }
             id.* = e.b.newId();
@@ -938,7 +979,10 @@ const Emitter = struct {
         // Constants and parameters first (they may be used in any block).
         for (f.insts.items, 0..) |inst, i| switch (inst.op) {
             .constant => |c| e.vals[i] = try e.constant(inst.ty, c),
-            .param => |p| e.vals[i] = param_ids[p],
+            .param => |p| {
+                e.vals[i] = param_ids[p];
+                if (e.mesh_params.get(.{ f, p })) |kind| try e.mesh_places.put(e.arena, @intCast(i), .{ .kind = kind, .ty = inst.ty });
+            },
             else => {},
         };
 
@@ -1149,6 +1193,7 @@ const Emitter = struct {
                 e.vals[ri] = try e.op1(.load, i.ty, &.{e.val(p)});
             },
             .store => |s| {
+                if (e.mesh_places.get(s.ptr.index())) |mp| return e.meshStore(mp, e.val(s.value), f.inst(s.value).ty);
                 if (e.texel_places.get(s.ptr.index())) |tp| {
                     if (tp.comp != .none) return e.unsupported("storing one component of a texel is not supported yet", .{});
                     return e.imageWrite(tp.res, e.val(tp.coord), e.val(s.value));
@@ -1185,10 +1230,42 @@ const Emitter = struct {
                 // Uniform std430 storage.
                 const into_buffer = e.t.get(f.inst(a.base).ty) == .resource;
                 const base_pl = e.ptr_layouts[a.base.index()];
+                if (i.ptr == .mesh) {
+                    // Mesh outputs: a place, written component by component.
+                    var mp: MeshPlace = e.mesh_places.get(a.base.index()) orelse .{ .kind = f.inst(a.base).op.mesh_output, .ty = f.inst(a.base).ty };
+                    for (a.indices) |x| {
+                        if (mp.index == .none) {
+                            mp.index = x;
+                            mp.ty = e.t.get(mp.ty).array.elem;
+                            continue;
+                        }
+                        const k: u32 = switch (f.inst(x).op) {
+                            .constant => |c| @intCast(c.int),
+                            else => return e.unsupported("dynamic indexing inside a mesh output is not supported yet", .{}),
+                        };
+                        switch (e.t.get(mp.ty)) {
+                            .@"struct" => |st| {
+                                for (st.fields.items[0..k]) |fld| mp.offset += e.t.componentCount(fld.type).?;
+                                mp.ty = st.fields.items[k].type;
+                            },
+                            .array => |arr| {
+                                mp.offset += k * e.t.componentCount(arr.elem).?;
+                                mp.ty = arr.elem;
+                            },
+                            .vector => |v| {
+                                mp.offset += k;
+                                mp.ty = try e.t.scalar(v.elem);
+                            },
+                            else => return e.unsupported("indexing this mesh output is not supported yet", .{}),
+                        }
+                    }
+                    try e.mesh_places.put(e.arena, ri, mp);
+                    return;
+                }
                 const sc: StorageClass = if (into_buffer or (base_pl != null and base_pl.?.rules == .std430)) e.bufferSc() else if (base_pl != null) .uniform else switch (i.ptr) {
                     .function => .function,
                     .private => .private,
-                    .groupshared => .workgroup,
+                    .groupshared => if (e.payload_global != null and e.rootGlobal(a.base) == e.payload_global) .task_payload_workgroup else .workgroup,
                     .cbuffer, .resource => .uniform,
                     else => return e.unsupported("access into this storage is not supported yet", .{}),
                 };
@@ -1419,10 +1496,26 @@ const Emitter = struct {
                     return;
                 }
                 try ops.append(e.arena, e.func_ids[c.func]);
-                for (c.args) |a| try ops.append(e.arena, e.val(a));
+                for (c.args, 0..) |a, k| {
+                    if (e.mesh_params.contains(.{ callee, @intCast(k) })) continue;
+                    try ops.append(e.arena, e.val(a));
+                }
                 e.vals[ri] = try e.op1(.function_call, i.ty, ops.items);
             },
-            .intrinsic => |c| e.vals[ri] = try e.intrinsic(c.name, i.ty, c.args),
+            .intrinsic => |c| {
+                if (std.mem.eql(u8, c.name, "SetMeshOutputCounts")) {
+                    try e.b.emit(.functions, .set_mesh_outputs_ext, &.{ e.val(c.args[0]), e.val(c.args[1]) });
+                    return;
+                }
+                if (std.mem.eql(u8, c.name, "DispatchMesh")) {
+                    if (e.rootGlobal(c.args[3]) == null or f.inst(c.args[3]).op != .global) return e.unsupported("DispatchMesh with this payload is not supported yet", .{});
+                    try e.b.emit(.functions, .emit_mesh_tasks_ext, &.{ e.val(c.args[0]), e.val(c.args[1]), e.val(c.args[2]), e.val(c.args[3]) });
+                    // A terminator: what follows is unreachable.
+                    try e.b.emit(.functions, .label, &.{e.b.newId()});
+                    return;
+                }
+                e.vals[ri] = try e.intrinsic(c.name, i.ty, c.args);
+            },
             .res_load => |x| {
                 if (e.isImage(x.res)) {
                     e.vals[ri] = try e.imageIndexLoad(x.res, e.val(x.index), i.ty);
@@ -1453,6 +1546,16 @@ const Emitter = struct {
                 e.vals[ri] = try e.reshape(try e.op1(.load, iface.ty, &.{ptr}), iface.ty, i.ty);
             },
             .patch_input => |k| e.vals[ri] = try e.loadInterface(e.patches[k], .input, i.ty),
+            .mesh_output => try e.mesh_places.put(e.arena, ri, .{ .kind = i.op.mesh_output, .ty = i.ty }),
+            .mesh_payload => {
+                if (e.payload_var == 0) {
+                    e.payload_var = e.b.newId();
+                    try e.b.emit(.types_globals, .variable, &.{ try e.pointerType(.task_payload_workgroup, try e.typeId(i.ty)), e.payload_var, @backingInt(StorageClass.task_payload_workgroup) });
+                    try e.b.emitWithString(.debug_names, .name, &.{e.payload_var}, "in.var.payload", &.{});
+                    try e.interface_ids.append(e.arena, e.payload_var);
+                }
+                e.vals[ri] = try e.op1(.load, i.ty, &.{e.payload_var});
+            },
             .patch_output => |o| try e.storeInterface(e.patches[o.element], f.inst(o.value).ty, e.val(o.value)),
             .output_vertex => |x| {
                 const iface = e.outputs[x.element];
@@ -1476,6 +1579,150 @@ const Emitter = struct {
                 } else try e.b.emit(.functions, .store, &.{ iface.var_id, v });
             },
             .phi => return e.unsupported("phi", .{}),
+        }
+    }
+
+    /// Parameters that receive mesh output arrays, through any depth of
+    /// calls from the entry.
+    fn findMeshParams(e: *Emitter) Error!void {
+        var changed = true;
+        while (changed) {
+            changed = false;
+            for (e.m.functions.items) |f| for (f.insts.items) |inst| switch (inst.op) {
+                .call => |c| for (c.args, 0..) |a, k| {
+                    const kind: ?ir.MeshOutput = switch (f.inst(a).op) {
+                        .mesh_output => |mk| mk,
+                        .param => |p| e.mesh_params.get(.{ f, p }),
+                        else => null,
+                    };
+                    const callee = e.m.functions.items[c.func];
+                    if (kind) |mk| if (!e.mesh_params.contains(.{ callee, @intCast(k) })) {
+                        try e.mesh_params.put(e.arena, .{ callee, @intCast(k) }, mk);
+                        changed = true;
+                    };
+                },
+                else => {},
+            };
+        }
+    }
+
+    /// The global a pointer derives from, if any.
+    fn rootGlobal(e: *Emitter, r: Ref) ?u32 {
+        var x = r;
+        while (true) switch (e.f.inst(x).op) {
+            .global => |g| return g,
+            .access => |a| x = a.base,
+            else => return null,
+        };
+    }
+
+    /// The groupshared variable an amplification shader passes to
+    /// DispatchMesh (its storage becomes the task payload).
+    fn dispatchPayloadGlobal(e: *Emitter) ?u32 {
+        for (e.m.functions.items) |f| for (f.insts.items) |inst| switch (inst.op) {
+            .intrinsic => |it| if (std.mem.eql(u8, it.name, "DispatchMesh") and it.args.len == 4) {
+                var x = it.args[3];
+                while (true) switch (f.inst(x).op) {
+                    .global => |g| return g,
+                    .access => |a| x = a.base,
+                    else => break,
+                };
+            },
+            else => {},
+        };
+        return null;
+    }
+
+    /// Flattened component `k` of value `v` of type `ty`.
+    fn flatComponent(e: *Emitter, v: Id, ty: TypeId, k: u32) Error!struct { Id, TypeId } {
+        switch (e.t.get(ty)) {
+            .scalar, .@"enum" => return .{ v, ty },
+            .vector => |vec| {
+                const st = try e.t.scalar(vec.elem);
+                return .{ if (vec.len == 1) v else try e.op1(.composite_extract, st, &.{ v, k }), st };
+            },
+            .array => |a| {
+                const n = e.t.componentCount(a.elem).?;
+                return e.flatComponent(try e.op1(.composite_extract, a.elem, &.{ v, k / n }), a.elem, k % n);
+            },
+            .@"struct" => |st| {
+                var kk = k;
+                for (st.fields.items, 0..) |fld, fi| {
+                    const n = e.t.componentCount(fld.type).?;
+                    if (kk < n) return e.flatComponent(try e.op1(.composite_extract, fld.type, &.{ v, @intCast(fi) }), fld.type, kk);
+                    kk -= n;
+                }
+                return e.unsupported("internal: component out of range", .{});
+            },
+            else => return e.unsupported("mesh outputs of type '{s}' are not supported yet", .{try e.t.format(e.arena, ty)}),
+        }
+    }
+
+    /// Writes a vertex / primitive output (component by component, into
+    /// each attribute's array) or a primitive's indices.
+    fn meshStore(e: *Emitter, mp: MeshPlace, v: Id, ty: TypeId) Error!void {
+        if (mp.index == .none) return e.unsupported("storing a whole mesh output array is not supported yet", .{});
+        const entry = e.m.entry.?;
+        const index = e.val(mp.index);
+        if (mp.kind == .indices) {
+            const lines = entry.mesh.topology == .line;
+            const vty = try e.t.vector(.uint, if (lines) 2 else 3);
+            if (e.indices_var == 0) {
+                e.indices_var = e.b.newId();
+                try e.b.emit(.types_globals, .variable, &.{ try e.pointerType(.output, try e.typeId(try e.t.array(vty, entry.mesh.max_primitives))), e.indices_var, @backingInt(StorageClass.output) });
+                try e.b.emit(.annotations, .decorate, &.{ e.indices_var, 11, if (lines) 5295 else 5296 }); // BuiltIn Primitive{Line,Triangle}IndicesEXT
+                try e.interface_ids.append(e.arena, e.indices_var);
+            }
+            if (mp.offset == 0 and e.t.componentCount(ty) == e.t.componentCount(vty)) {
+                const ptr = try e.opRaw(.access_chain, try e.pointerType(.output, try e.typeId(vty)), &.{ e.indices_var, index });
+                try e.b.emit(.functions, .store, &.{ ptr, try e.reshape(v, ty, vty) });
+                return;
+            }
+            const ut = try e.t.scalar(.uint);
+            for (0..e.t.componentCount(ty).?) |c| {
+                const comp = try e.flatComponent(v, ty, @intCast(c));
+                const ptr = try e.opRaw(.access_chain, try e.pointerType(.output, try e.typeId(ut)), &.{ e.indices_var, index, try e.constUint(mp.offset + @as(u32, @intCast(c))) });
+                try e.b.emit(.functions, .store, &.{ ptr, try e.reshape(comp[0], comp[1], ut) });
+            }
+            return;
+        }
+        const n = e.t.componentCount(ty) orelse return e.unsupported("mesh outputs of type '{s}' are not supported yet", .{try e.t.format(e.arena, ty)});
+        const els = if (mp.kind == .vertices) entry.outputs.items else entry.patch_constants.items;
+        const ifaces = if (mp.kind == .vertices) e.outputs else e.patches;
+        for (0..n) |c| {
+            const comp = try e.flatComponent(v, ty, @intCast(c));
+            var flat = mp.offset + @as(u32, @intCast(c));
+            var k: usize = 0;
+            while (k < els.len) : (k += 1) {
+                const cnt = e.t.componentCount(els[k].ty).?;
+                if (flat < cnt) break;
+                flat -= cnt;
+            }
+            if (k == els.len) return e.unsupported("internal: mesh output component out of range", .{});
+            const iface = ifaces[k];
+            // Indices into the attribute: [vertex] then within it.
+            var chain: std.ArrayList(u32) = .empty;
+            try chain.appendSlice(e.arena, &.{ 0, 0, iface.var_id, index });
+            var leaf = iface.ty;
+            switch (e.t.get(leaf)) {
+                .scalar, .@"enum" => {},
+                .vector => |vec| {
+                    if (vec.len > 1) try chain.append(e.arena, try e.constUint(flat));
+                    leaf = try e.t.scalar(vec.elem);
+                },
+                .array => |a| {
+                    const per = e.t.componentCount(a.elem).?;
+                    try chain.append(e.arena, try e.constUint(flat / per));
+                    if (e.t.get(a.elem) == .vector and per > 1) try chain.append(e.arena, try e.constUint(flat % per));
+                    leaf = try e.t.scalar(e.t.component(a.elem).?);
+                },
+                else => return e.unsupported("mesh outputs of type '{s}' are not supported yet", .{try e.t.format(e.arena, leaf)}),
+            }
+            const ptr = e.b.newId();
+            chain.items[0] = try e.pointerType(.output, try e.typeId(leaf));
+            chain.items[1] = ptr;
+            try e.b.emit(.functions, .access_chain, chain.items);
+            try e.b.emit(.functions, .store, &.{ ptr, try e.reshape(comp[0], comp[1], leaf) });
         }
     }
 

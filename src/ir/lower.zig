@@ -74,6 +74,8 @@ const Lowerer = struct {
     patch_io: bool = false,
     /// Per-vertex reads come from the hull shader's output control points.
     vertex_from_outputs: bool = false,
+    /// The payload type an amplification shader dispatches.
+    mesh_payload: ?TypeId = null,
     /// The current method's object pointer.
     this_ptr: Ref = .none,
     ret_ty: TypeId = TypeTable.void_type,
@@ -141,7 +143,9 @@ const Lowerer = struct {
         for (f.params, 0..) |p, i| {
             if (l.s.types.get(p.type) == .stream) continue;
             const pty = l.irType(p.type);
-            const pv = try l.b.add(.{ .op = .{ .param = ir_index }, .ty = pty, .ptr = if (p.dir != .in) .function else .none });
+            const mq = if (i < f.decl.params.len) f.decl.params[i].quals else ast.Qualifiers{};
+            const space: ir.Space = if (mq.vertices or mq.indices or mq.primitives) .mesh else if (p.dir != .in) .function else .none;
+            const pv = try l.b.add(.{ .op = .{ .param = ir_index }, .ty = pty, .ptr = space });
             ir_index += 1;
             const storage = if (p.dir != .in) pv else blk: {
                 const local = try l.b.add(.{ .op = .local_var, .ty = pty, .ptr = .function });
@@ -1073,6 +1077,15 @@ const Lowerer = struct {
                     };
                     return result;
                 }
+                if (std.mem.eql(u8, name, "DispatchMesh") and args.len == 4) {
+                    // The payload goes by reference (a groupshared
+                    // variable).
+                    const vals = try l.arena.alloc(Ref, 4);
+                    for (vals[0..3], args[0..3]) |*v, a| v.* = try l.converted(a, try l.types().scalar(.uint));
+                    vals[3] = try l.lvalue(args[3]);
+                    l.mesh_payload = args[3].ty;
+                    return l.b.add(.{ .op = .{ .intrinsic = .{ .name = name, .args = vals } }, .ty = TypeTable.void_type });
+                }
                 // `out` parameters go through temporaries copied back
                 // afterwards; `ref` ones (atomic destinations) pass the
                 // storage itself.
@@ -1161,6 +1174,22 @@ const Lowerer = struct {
             .cast => |c| return l.lvalue(c.operand),
             else => return l.fail(e, "this assignment target"),
         }
+    }
+
+    /// Whether `e` designates part of a mesh shader output array.
+    fn isMeshOutput(l: *Lowerer, e: *const ast.Expr) bool {
+        var x = e;
+        while (true) switch (x.kind) {
+            .member => |m| x = m.base,
+            .index => |ix| x = ix.base,
+            .name => {
+                const r = l.s.resolution(x) orelse return false;
+                if (r != .variable) return false;
+                const p = l.vars.get(r.variable) orelse return false;
+                return l.b.f.inst(p).ptr == .mesh;
+            },
+            else => return false,
+        };
     }
 
     /// Pointer to the storage field holding bitfield `bf` of the struct
@@ -1253,6 +1282,17 @@ const Lowerer = struct {
                 // Swizzle store: read, replace the named components, write.
                 const comps = (try swizzleComponents(l.arena, m.name)) orelse return error.Unsupported;
                 if (t.get(m.base.ty) == .scalar) return l.storeTo(m.base, value);
+                if (l.isMeshOutput(m.base)) {
+                    // Outputs cannot be read back: store each component.
+                    const base_ptr = try l.lvalue(m.base);
+                    const ec = try t.scalar(t.component(m.base.ty).?);
+                    for (comps, 0..) |c, i| {
+                        const part = if (comps.len == 1) value else try l.b.add(.{ .op = .{ .extract = .{ .agg = value, .index = @intCast(i) } }, .ty = ec });
+                        const idx = try l.b.constInt(try t.scalar(.uint), c);
+                        try l.b.store(try l.b.add(.{ .op = .{ .access = .{ .base = base_ptr, .indices = try l.arena.dupe(Ref, &.{idx}) } }, .ty = ec, .ptr = .mesh }), part);
+                    }
+                    return;
+                }
                 var whole = try l.rvalue(m.base);
                 const ec = try t.scalar(t.component(m.base.ty).?);
                 for (comps, 0..) |c, i| {
@@ -1701,6 +1741,12 @@ const Lowerer = struct {
         const args = try l.arena.alloc(Ref, f.params.len);
         const locals = try l.arena.alloc(Ref, f.params.len);
         var n_args: usize = 0;
+        if (opts.stage == .mesh) for (f.decl.attrs) |a| {
+            if (std.ascii.eqlIgnoreCase(a.name, "outputtopology") and a.args.len == 1 and a.args[0].kind == .string_lit) {
+                if (std.mem.indexOf(u8, a.args[0].kind.string_lit, "line") != null) entry.mesh.topology = .line;
+            }
+        };
+        if (opts.stage == .amplification) entry.mesh.payload = l.mesh_payload;
         const tess = opts.stage == .hull or opts.stage == .domain;
         if (tess) l.tessAttributes(f, &entry);
         // Hull shaders: where the control point inputs start.
@@ -1708,8 +1754,38 @@ const Lowerer = struct {
         for (f.decl.params, f.params, 0..) |pd, p, i| {
             if (l.s.types.get(p.type) == .stream) continue;
             n_args += 1;
-            locals[i] = try l.b.add(.{ .op = .local_var, .ty = l.irType(p.type), .ptr = .function });
             const q = pd.quals;
+            if (opts.stage == .mesh and (q.vertices or q.indices or q.primitives) and l.s.types.get(p.type) == .array) {
+                // Output arrays: stores through them write the outputs.
+                const arr = l.s.types.get(p.type).array;
+                const kind: ir.MeshOutput = if (q.vertices) .vertices else if (q.primitives) .primitives else .indices;
+                switch (kind) {
+                    .vertices => {
+                        entry.mesh.max_vertices = arr.len;
+                        var next: u32 = @intCast(entry.outputs.items.len);
+                        try l.streamOut(&entry.outputs, arr.elem, semanticOf(pd.semantics), paramAttrs(q), null, &next, 0, null, pd.name_loc);
+                    },
+                    .primitives => {
+                        entry.mesh.max_primitives = arr.len;
+                        var next: u32 = @intCast(entry.patch_constants.items.len);
+                        try l.streamOut(&entry.patch_constants, arr.elem, semanticOf(pd.semantics), paramAttrs(q), null, &next, 0, null, pd.name_loc);
+                    },
+                    .indices => {
+                        entry.mesh.max_primitives = arr.len;
+                        if (l.s.types.get(arr.elem) == .vector and l.s.types.get(arr.elem).vector.len == 2) entry.mesh.topology = .line;
+                    },
+                }
+                locals[i] = try l.b.add(.{ .op = .{ .mesh_output = kind }, .ty = p.type, .ptr = .mesh });
+                args[i] = locals[i];
+                continue;
+            }
+            locals[i] = try l.b.add(.{ .op = .local_var, .ty = l.irType(p.type), .ptr = .function });
+            if (opts.stage == .mesh and q.payload) {
+                entry.mesh.payload = p.type;
+                try l.b.store(locals[i], try l.b.add(.{ .op = .mesh_payload, .ty = p.type }));
+                args[i] = try l.b.load(locals[i]);
+                continue;
+            }
             if (tess and l.s.types.get(p.type) == .patch) {
                 // Control points: one value per point of the patch.
                 const first: u32 = @intCast(entry.inputs.items.len);
@@ -1754,11 +1830,17 @@ const Lowerer = struct {
         if (f.ret != TypeTable.void_type) try l.entryOutput(&entry, f.ret, semanticOf(f.decl.ret_semantics), paramAttrs(f.decl.quals), ret, f.loc, "return value");
         for (f.decl.params, f.params, 0..) |pd, p, i| {
             if (p.dir == .in or l.s.types.get(p.type) == .stream) continue;
+            if (l.b.f.inst(locals[i]).ptr == .mesh) continue;
             const v = try l.b.load(locals[i]);
             try l.entryOutput(&entry, p.type, semanticOf(pd.semantics), paramAttrs(pd.quals), v, pd.name_loc, pd.name);
         }
         l.b.terminate(.{ .ret = .none });
         entry.wrapper = wrapper;
+        if (opts.stage == .mesh) {
+            // Vertex and primitive outputs are arrays.
+            for (entry.outputs.items) |*el| el.per_vertex = true;
+            for (entry.patch_constants.items) |*el| el.per_vertex = true;
+        }
         if (opts.stage == .hull) {
             // Output control points are arrays over the patch.
             for (entry.outputs.items) |*el| el.per_vertex = true;
