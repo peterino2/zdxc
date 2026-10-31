@@ -21,6 +21,7 @@ pub const dxil = struct {
     pub const hash = @import("dxil/hash.zig");
     pub const module = @import("dxil/module.zig");
     pub const shader = @import("dxil/shader.zig");
+    pub const emit = @import("dxil/emit.zig");
 };
 
 pub const ir = struct {

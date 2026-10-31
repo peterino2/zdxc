@@ -307,7 +307,7 @@ const Lowerer = struct {
             else
                 try l.b.constInt(scalar_ty, switch (c) {
                     .int => |i| i,
-                    .float => |f| if (std.math.isFinite(f)) @intFromFloat(@trunc(f)) else 0,
+                    .float => |f| saturatingInt(f),
                 });
             if (ts.count() == 1 and ts.kind == .scalar) return k;
             return l.b.add(.{ .op = .{ .splat = k }, .ty = target });
@@ -759,6 +759,15 @@ const Lowerer = struct {
         l.m.entry = entry;
     }
 };
+
+/// Float to integer for constants: truncates toward zero, saturating out of
+/// range (NaN gives 0).
+pub fn saturatingInt(f: f64) i64 {
+    if (std.math.isNan(f)) return 0;
+    if (f >= 9.2233720368547758e18) return std.math.maxInt(i64);
+    if (f <= -9.2233720368547758e18) return std.math.minInt(i64);
+    return @intFromFloat(@trunc(f));
+}
 
 fn semanticOf(sems: []const ast.Semantic) ?[]const u8 {
     for (sems) |sem| if (sem.kind == .semantic) return sem.values[0];

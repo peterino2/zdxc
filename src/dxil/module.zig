@@ -47,6 +47,8 @@ pub const Constant = struct {
         float_bits: u64,
         undef,
         null,
+        /// Struct / array / vector of earlier constants.
+        aggregate: []const ConstId,
     },
 };
 
@@ -80,6 +82,13 @@ pub const Inst = struct {
         select: struct { cond: Value, t: Value, f: Value },
         extractvalue: struct { agg: Value, index: u32 },
         phi: struct { incoming: []const struct { val: Value, block: u32 } },
+        /// `ty` is the pointer type; `elem` the allocated type.
+        alloca: struct { elem: TypeId, size: Value },
+        load: struct { ptr: Value, @"align": u32 },
+        store: struct { ptr: Value, val: Value, @"align": u32 },
+        /// `ty` is the result pointer type; `elem` the source element type.
+        gep: struct { elem: TypeId, ptr: Value, indices: []const Value },
+        @"unreachable",
     },
 };
 
@@ -435,6 +444,10 @@ const Encoder = struct {
                 },
                 .undef => try e.rec(3),
                 .null => try e.rec(2),
+                .aggregate => |elems| {
+                    for (elems) |el| try e.push(e.valueId(null, .{ .constant = el }));
+                    try e.rec(7); // CST_CODE_AGGREGATE
+                },
             }
         }
         try w.endBlock();
@@ -545,6 +558,35 @@ const Encoder = struct {
                     try e.push(x.index);
                     try e.rec(26);
                 },
+                .alloca => |a| {
+                    try e.push(a.elem);
+                    try e.push(e.typeOf(f, a.size));
+                    try e.push(e.valueId(f, a.size)); // absolute
+                    try e.push(@as(u64, std.math.log2_int(u32, 4)) + 1 | (1 << 6)); // align 4, explicit type
+                    try e.rec(19);
+                },
+                .load => |l| {
+                    try e.pushValueAndType(f, inst_id, l.ptr);
+                    try e.push(inst.ty);
+                    try e.push(@as(u64, std.math.log2_int(u32, l.@"align")) + 1);
+                    try e.push(0);
+                    try e.rec(20);
+                },
+                .store => |s| {
+                    try e.pushValueAndType(f, inst_id, s.ptr);
+                    try e.pushValueAndType(f, inst_id, s.val);
+                    try e.push(@as(u64, std.math.log2_int(u32, s.@"align")) + 1);
+                    try e.push(0);
+                    try e.rec(44);
+                },
+                .gep => |g| {
+                    try e.push(1); // inbounds
+                    try e.push(g.elem);
+                    try e.pushValueAndType(f, inst_id, g.ptr);
+                    for (g.indices) |x| try e.pushValueAndType(f, inst_id, x);
+                    try e.rec(43);
+                },
+                .@"unreachable" => try e.rec(15),
                 .phi => |p| {
                     try e.push(inst.ty);
                     for (p.incoming) |in| {

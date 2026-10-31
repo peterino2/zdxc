@@ -303,6 +303,17 @@ fn run(cli: Cli, arena: std.mem.Allocator, args: []const [:0]const u8, stdout: *
                 try Io.Dir.cwd().writeFile(cli.io, .{ .sub_path = path, .data = bytes });
                 return;
             }
+            const bytes = zdxc.dxil.emit.emit(arena, m, profile.?, &diags) catch |err| switch (err) {
+                error.Unsupported => {
+                    try diags.render(&sm, cli.stderr, .{ .format = opts.diag_format, .color = false });
+                    try cli.stderr.flush();
+                    return error.CompileFailed;
+                },
+                else => |x| return x,
+            };
+            const path = opts.output orelse return cli.fail("missing -Fo <file>", .{});
+            try Io.Dir.cwd().writeFile(cli.io, .{ .sub_path = path, .data = bytes });
+            return;
         }
         return cli.fail("code generation is not implemented yet: the input was checked but no output was written (use -zdxc-empty for a placeholder shader)", .{});
     }

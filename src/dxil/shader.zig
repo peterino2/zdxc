@@ -102,7 +102,7 @@ pub fn buildEmptyCompute(gpa: Allocator, info: ComputeInfo) ![]u8 {
 
     const dxil_part = try programPart(gpa, info.profile, bitcode);
     defer gpa.free(dxil_part);
-    const psv = try psvCompute(gpa, info.entry, info.num_threads);
+    const psv = try psvCompute(gpa, info.entry, info.num_threads, &.{});
     defer gpa.free(psv);
     const empty_sig = [_]u8{ 0, 0, 0, 0, 8, 0, 0, 0 }; // ParamCount 0, ParamOffset 8
 
@@ -117,7 +117,7 @@ pub fn buildEmptyCompute(gpa: Allocator, info: ComputeInfo) ![]u8 {
 }
 
 /// DxilProgramHeader + DxilBitcodeHeader + bitcode.
-fn programPart(gpa: Allocator, profile: Profile, bitcode: []const u8) ![]u8 {
+pub fn programPart(gpa: Allocator, profile: Profile, bitcode: []const u8) ![]u8 {
     const padded = std.mem.alignForward(usize, bitcode.len, 4);
     const out = try gpa.alloc(u8, 24 + padded);
     @memset(out, 0);
@@ -132,8 +132,11 @@ fn programPart(gpa: Allocator, profile: Profile, bitcode: []const u8) ![]u8 {
     return out;
 }
 
+/// One PSVResourceBindInfo1 record.
+pub const ResourceBind = struct { res_type: u32, space: u32, lower: u32, upper: u32, kind: u32, flags: u32 = 0 };
+
 /// PSV0 with PSVRuntimeInfo4 (60 bytes), as produced for validator 1.11.
-fn psvCompute(gpa: Allocator, entry: []const u8, num_threads: [3]u32) ![]u8 {
+pub fn psvCompute(gpa: Allocator, entry: []const u8, num_threads: [3]u32, resources: []const ResourceBind) ![]u8 {
     var buf: std.ArrayList(u8) = .empty;
     errdefer buf.deinit(gpa);
     const w = struct {
@@ -161,7 +164,13 @@ fn psvCompute(gpa: Allocator, entry: []const u8, num_threads: [3]u32) ![]u8 {
     try w(&buf, gpa, 0); // NumBytesGroupSharedMemory
     try w(&buf, gpa, 0); // Flags
 
-    try w(&buf, gpa, 0); // resource count
+    try w(&buf, gpa, @intCast(resources.len)); // resource count
+    if (resources.len > 0) {
+        try w(&buf, gpa, 24); // sizeof(PSVResourceBindInfo1)
+        for (resources) |r| {
+            for ([_]u32{ r.res_type, r.space, r.lower, r.upper, r.kind, r.flags }) |v| try w(&buf, gpa, v);
+        }
+    }
 
     // String table: "\0" ++ entry ++ "\0", padded to 4 bytes.
     const strtab_len = std.mem.alignForward(usize, entry.len + 2, 4);

@@ -225,7 +225,7 @@ const Emitter = struct {
     fn intOf(c: ir.Constant) i64 {
         return switch (c) {
             .int => |i| i,
-            .float => |f| @intFromFloat(@trunc(f)),
+            .float => |f| @import("../ir/lower.zig").saturatingInt(f),
         };
     }
 

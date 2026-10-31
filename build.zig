@@ -89,6 +89,17 @@ pub fn build(b: *std.Build) void {
     oracle_sema.step.dependOn(&oracle_parse.step); // builds the corpus list
     oracle_sema_step.dependOn(&oracle_sema.step);
 
+    const oracle_codegen_step = b.step("oracle-codegen", "Compile the dxc-valid corpus to SPIR-V and DXIL and validate the output");
+    for ([_][]const u8{ "spirv", "dxil" }) |backend| {
+        const run = b.addSystemCommand(&.{ "sh", "test/oracle/codegen.sh" });
+        run.addArtifactArg(exe);
+        run.addArg(backend);
+        run.setCwd(b.path("."));
+        run.has_side_effects = true;
+        run.step.dependOn(&oracle_parse.step); // builds the corpus list
+        oracle_codegen_step.dependOn(&run.step);
+    }
+
     const oracle_verify_step = b.step("oracle-verify", "Compare Sema errors with dxc's SemaHLSL -verify expectations");
     const oracle_verify = b.addSystemCommand(&.{ "sh", "test/oracle/verify.sh" });
     oracle_verify.addArtifactArg(exe);
