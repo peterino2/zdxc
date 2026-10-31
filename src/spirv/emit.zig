@@ -138,6 +138,8 @@ const Emitter = struct {
     /// ConstantBuffer<S> blocks by S.
     cb_blocks: std.AutoHashMapUnmanaged(TypeId, Id) = .empty,
     tb_blocks: std.AutoHashMapUnmanaged(TypeId, Id) = .empty,
+    /// Structured buffers whose hidden counter is used.
+    counter_globals: std.AutoHashMapUnmanaged(u32, void) = .empty,
     /// Descriptor heaps: a runtime array variable per (heap, element type),
     /// on the heap's binding.
     heap_vars: std.AutoHashMapUnmanaged(struct { bool, Id }, Id) = .empty,
@@ -763,6 +765,7 @@ const Emitter = struct {
 
         // Hidden counters (as dxc): a `{ int }` buffer per structured buffer
         // that uses one, on the next free binding of its set.
+        try e.findCounterGlobals();
         e.counter_vars = try e.arena.alloc(Id, m.globals.items.len);
         @memset(e.counter_vars, 0);
         for (m.globals.items, 0..) |g, gi| {
@@ -774,8 +777,24 @@ const Emitter = struct {
                 try e.b.emit(.annotations, .decorate, &.{ e.counter_type, e.bufferBlockDecoration() });
                 try e.b.emitWithString(.debug_names, .name, &.{e.counter_type}, "type.ACSBuffer.counter", &.{});
             }
+            // Arrays of buffers: an array of counters of the same shape.
+            var cty = e.counter_type;
+            var dims: std.ArrayList(u32) = .empty;
+            var at = g.ty;
+            while (e.t.get(at) == .array) : (at = e.t.get(at).array.elem) try dims.append(e.arena, e.t.get(at).array.len);
+            var di = dims.items.len;
+            while (di > 0) {
+                di -= 1;
+                const arr = e.b.newId();
+                if (dims.items[di] == 0) {
+                    try e.cap(.runtime_descriptor_array);
+                    try e.extension("SPV_EXT_descriptor_indexing");
+                    try e.b.emit(.types_globals, .type_runtime_array, &.{ arr, cty });
+                } else try e.b.emit(.types_globals, .type_array, &.{ arr, cty, try e.constUint(dims.items[di]) });
+                cty = arr;
+            }
             const var_id = e.b.newId();
-            try e.b.emit(.types_globals, .variable, &.{ try e.pointerType(e.bufferSc(), e.counter_type), var_id, @backingInt(e.bufferSc()) });
+            try e.b.emit(.types_globals, .variable, &.{ try e.pointerType(e.bufferSc(), cty), var_id, @backingInt(e.bufferSc()) });
             while (used.contains(.{ g.binding.space, next_free })) next_free += 1;
             try used.put(e.arena, .{ g.binding.space, next_free }, {});
             try e.b.emit(.annotations, .decorate, &.{ var_id, 34, g.binding.space }); // DescriptorSet
@@ -788,38 +807,107 @@ const Emitter = struct {
     /// Append/Consume buffers, and structured buffers whose counter is
     /// incremented or decremented somewhere.
     fn needsCounter(e: *Emitter, gi: u32) bool {
-        const r = switch (e.t.get(e.m.globals.items[gi].ty)) {
+        var gty = e.m.globals.items[gi].ty;
+        while (e.t.get(gty) == .array) gty = e.t.get(gty).array.elem;
+        const r = switch (e.t.get(gty)) {
             .resource => |r| r,
             else => return false,
         };
         if (r.kind == .append_structured_buffer or r.kind == .consume_structured_buffer) return true;
         if (r.kind != .rw_structured_buffer) return false;
+        return e.counter_globals.contains(gi);
+    }
+
+    /// The globals whose counter is used: directly, or through the
+    /// parameters (and resource locals) of the functions they are passed
+    /// to.
+    fn findCounterGlobals(e: *Emitter) Error!void {
+        const Origin = union(enum) { global: u32, param: struct { *const ir.Function, u32 }, none };
+        const origin = struct {
+            fn f(func: *const ir.Function, r: Ref) Origin {
+                var x = r;
+                while (true) switch (func.inst(x).op) {
+                    .load => |p| x = p,
+                    .access => |a| x = a.base,
+                    .local_var => x = for (func.insts.items) |inst| {
+                        if (inst.op == .store and inst.op.store.ptr == x) break inst.op.store.value;
+                    } else return .none,
+                    .global => |g| return .{ .global = g },
+                    .param => |p| return .{ .param = .{ func, p } },
+                    else => return .none,
+                };
+            }
+        }.f;
+        var params: std.AutoHashMapUnmanaged(struct { *const ir.Function, u32 }, void) = .empty;
+        const mark = struct {
+            fn f(em: *Emitter, ps: *std.AutoHashMapUnmanaged(struct { *const ir.Function, u32 }, void), o: Origin) Error!bool {
+                switch (o) {
+                    .global => |g| {
+                        if (em.counter_globals.contains(g)) return false;
+                        try em.counter_globals.put(em.arena, g, {});
+                        return true;
+                    },
+                    .param => |p| {
+                        if (ps.contains(p)) return false;
+                        try ps.put(em.arena, p, {});
+                        return true;
+                    },
+                    .none => return false,
+                }
+            }
+        }.f;
         for (e.m.functions.items) |f| for (f.insts.items) |inst| switch (inst.op) {
             .method => |mt| {
-                if (!std.mem.eql(u8, mt.name, "IncrementCounter") and !std.mem.eql(u8, mt.name, "DecrementCounter")) continue;
-                var x = mt.res;
-                while (true) switch (f.inst(x).op) {
-                    .load => |p| x = p,
-                    .global => |g| {
-                        if (g == gi) return true;
-                        break;
-                    },
-                    else => break,
-                };
+                const eq = std.mem.eql;
+                if (!eq(u8, mt.name, "IncrementCounter") and !eq(u8, mt.name, "DecrementCounter") and !eq(u8, mt.name, "Append") and !eq(u8, mt.name, "Consume")) continue;
+                _ = try mark(e, &params, origin(f, mt.res));
             },
             else => {},
         };
-        return false;
+        var changed = true;
+        while (changed) {
+            changed = false;
+            for (e.m.functions.items) |f| for (f.insts.items) |inst| switch (inst.op) {
+                .call => |c| {
+                    const callee = e.m.functions.items[c.func];
+                    for (c.args, 0..) |a, k| {
+                        if (!params.contains(.{ callee, @intCast(k) })) continue;
+                        if (try mark(e, &params, origin(f, a))) changed = true;
+                    }
+                },
+                else => {},
+            };
+        }
     }
 
     /// The counter update for IncrementCounter / DecrementCounter / Append /
     /// Consume: returns the index (or counter value) as uint.
     fn counterOp(e: *Emitter, res: Ref, increment: bool, post: bool) Error!Id {
-        const g = e.globalOf(res) orelse return e.unsupported("counters of resources not tied to a global are not supported yet", .{});
+        // An element of an array of buffers: the same element of the
+        // counters.
+        var indices: std.ArrayList(u32) = .empty;
+        var x = res;
+        while (true) switch (e.f.inst(x).op) {
+            .load => |p| x = p,
+            .access => |a| {
+                var k = a.indices.len;
+                while (k > 0) {
+                    k -= 1;
+                    try indices.insert(e.arena, 0, e.val(a.indices[k]));
+                }
+                x = a.base;
+            },
+            else => break,
+        };
+        const g = e.globalOf(x) orelse return e.unsupported("counters of resources not tied to a global are not supported yet", .{});
         const cv = e.counter_vars[g];
         if (cv == 0) return e.unsupported("this buffer has no counter", .{});
         const int_ty = try e.t.scalar(.int);
-        const ptr = try e.opRaw(.access_chain, try e.pointerType(e.bufferSc(), try e.scalarType(.int)), &.{ cv, try e.constUint(0) });
+        var ops: std.ArrayList(u32) = .empty;
+        try ops.append(e.arena, cv);
+        try ops.appendSlice(e.arena, indices.items);
+        try ops.append(e.arena, try e.constUint(0));
+        const ptr = try e.opRaw(.access_chain, try e.pointerType(e.bufferSc(), try e.scalarType(.int)), ops.items);
         const old = try e.op1(if (increment) .atomic_i_add else .atomic_i_sub, int_ty, &.{ ptr, try e.constUint(1), try e.constUint(0), try e.constInt(1) });
         // Decrements report the new value.
         const v = if (post) try e.op1(.i_sub, int_ty, &.{ old, try e.constInt(1) }) else old;
@@ -2779,6 +2867,15 @@ const Emitter = struct {
         return switch (i.op) {
             .global => |g| g,
             .load => |p| e.globalOf(p),
+            .local_var => for (e.f.insts.items) |inst| {
+                if (inst.op == .store and inst.op.store.ptr == r) break e.globalOf(inst.op.store.value);
+            } else null,
+            // A specialized parameter: the global it is bound to.
+            .param => |pi| blk: {
+                if (pi >= e.cur_bindings.len or e.cur_bindings[pi] == 0 or e.cur_bindings[pi] & recipe_tag != 0) break :blk null;
+                for (e.global_vars, 0..) |v, gi| if (v == e.cur_bindings[pi]) break :blk @intCast(gi);
+                break :blk null;
+            },
             else => null,
         };
     }
