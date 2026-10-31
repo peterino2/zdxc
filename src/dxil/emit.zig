@@ -16,6 +16,9 @@ const hash = @import("hash.zig");
 const layout = @import("../ir/layout.zig");
 const signature = @import("signature.zig");
 const texture = @import("../ir/texture.zig");
+const mangle = @import("mangle.zig");
+const rdat = @import("rdat.zig");
+const libinfo = @import("libinfo.zig");
 
 const TypeId = types.TypeId;
 const TypeTable = types.TypeTable;
@@ -112,6 +115,8 @@ const Resource = struct {
     view: bool = false,
     /// The resource type (without array dimensions); 0 for cbuffer blocks.
     rty: TypeId = 0,
+    /// Libraries: the module global standing for the resource.
+    lib_global: ?u32 = null,
 
     const Class = enum(u8) { srv = 0, uav = 1, cbuffer = 2, sampler = 3 };
 };
@@ -198,6 +203,14 @@ const Emitter = struct {
     out_split: []u32 = &.{},
 
     handle_ty: DType = 0,
+
+    /// Libraries: each entry is a function of its own; resources are
+    /// globals whose handles are made in each function that uses them.
+    lib: bool = false,
+    /// The current function's arguments (ray tracing payload / attributes).
+    lib_args: []const Value = &.{},
+    /// Prologue instructions dropped again if unused (resource handles).
+    lib_removable: std.AutoHashMapUnmanaged(u32, void) = .empty,
 
     fn unsupported(e: *Emitter, comptime fmt: []const u8, args: anytype) Error {
         _ = e.diags.report(.{ .severity = .@"error", .loc = .none }, "DXIL code generation: " ++ fmt, args);
@@ -342,7 +355,8 @@ const Emitter = struct {
 
     fn run(e: *Emitter, gpa: Allocator) Error![]u8 {
         const m = e.m;
-        if (m.entries.items.len != 1 or e.profile.kind == .library) return e.unsupported("library targets are not supported yet", .{});
+        if (e.profile.kind == .library) return e.runLibrary(gpa);
+        if (m.entries.items.len != 1) return e.unsupported("several entry points are not supported here", .{});
         const entry = m.entries.items[0];
         e.entry = entry;
         switch (entry.stage) {
@@ -408,6 +422,235 @@ const Emitter = struct {
         };
         const class: Resource.Class = if (kind == 13) .cbuffer else if (r.kind.isWritable() or r.kind == .consume_structured_buffer) .uav else .srv;
         return .{ .global = 0, .class = class, .kind = kind, .elem = r.elem, .rty = ty, .has_counter = r.kind == .append_structured_buffer or r.kind == .consume_structured_buffer };
+    }
+
+    // ------------------------------------------------------------------
+    // Libraries
+
+    const LibFunc = struct {
+        func: u32,
+        name: []const u8,
+        unmangled: []const u8,
+        stage: ir.Stage,
+        entry: ir.Entry,
+        payload_size: u32 = 0,
+        attr_size: u32 = 0,
+        /// Parameter qualifiers for the function annotation (0 in,
+        /// 1 out, 2 inout).
+        quals: []const u32 = &.{},
+    };
+
+    fn shaderKind(stage: ir.Stage) u32 {
+        return switch (stage) {
+            .pixel => 0,
+            .vertex => 1,
+            .geometry => 2,
+            .hull => 3,
+            .domain => 4,
+            .compute => 5,
+            .library => 6,
+            .raygeneration => 7,
+            .intersection => 8,
+            .anyhit => 9,
+            .closesthit => 10,
+            .miss => 11,
+            .callable => 12,
+            .mesh => 13,
+            .amplification => 14,
+        };
+    }
+
+    fn runLibrary(e: *Emitter, gpa: Allocator) Error![]u8 {
+        const m = e.m;
+        e.lib = true;
+        if (m.exports.items.len > 0) return e.unsupported("exported library functions are not supported yet", .{});
+        const i8p = try e.dm.ptrType(try e.dm.intType(8));
+        e.handle_ty = try e.dm.getType(.{ .@"struct" = .{ .name = "dx.types.Handle", .elems = &.{i8p} } });
+        try e.collectResources();
+        // A global per resource, named as dxc mangles it.
+        for (e.resources.items) |*r| {
+            if (r.view) continue;
+            if (r.count != 1) return e.unsupported("resource arrays in libraries are not supported yet", .{});
+            const g = m.globals.items[r.global];
+            const ty = try e.classType(r.*);
+            const name = if (g.space == .resource) try mangle.global(e.arena, e.t, g.name, g.ty) else g.name;
+            const v = try e.dm.addGlobal(name, ty, 0);
+            e.dm.globals.items[v.global].constant = true;
+            r.lib_global = v.global;
+        }
+        var funcs: std.ArrayList(LibFunc) = .empty;
+        for (m.entries.items) |entry| {
+            switch (entry.stage) {
+                .compute, .raygeneration, .intersection, .anyhit, .closesthit, .miss, .callable => {},
+                else => return e.unsupported("{s} shaders in libraries are not supported yet", .{@tagName(entry.stage)}),
+            }
+            e.entry = entry;
+            e.blocks = .empty;
+            e.prologue = .empty;
+            e.next_id = 0;
+            e.private_globals = .empty;
+            e.private_typed = .empty;
+            e.nonuniform = .empty;
+            e.res_locals = .empty;
+            e.rq_locals = .empty;
+            e.forwarded = .empty;
+            e.status_vals = .empty;
+            const hf = m.functions.items[entry.func];
+            const ray = entry.stage.isRayTracing();
+            var params: std.ArrayList(DType) = .empty;
+            var mparams: std.ArrayList(mangle.Param) = .empty;
+            var quals: std.ArrayList(u32) = .empty;
+            var lf: LibFunc = .{ .func = 0, .name = entry.name, .unmangled = entry.name, .stage = entry.stage, .entry = entry };
+            if (ray) for (hf.params, 0..) |p, k| {
+                try params.append(e.arena, try e.dm.ptrType(try e.memoryType(p.ty)));
+                try mparams.append(e.arena, .{ .ty = p.ty });
+                try quals.append(e.arena, if (p.by_ref) 2 else 0);
+                const size = try e.payloadSize(p.ty);
+                if (k == 0) lf.payload_size = size else lf.attr_size = size;
+            };
+            if (ray) lf.name = try mangle.function(e.arena, e.t, entry.name, TypeTable.void_type, mparams.items);
+            lf.quals = quals.items;
+            const fn_ty = try e.dm.fnType(try e.voidTy(), params.items);
+            lf.func = try e.dm.addFunction(.{ .name = lf.name, .ty = fn_ty, .num_blocks = 1 });
+            const args = try e.arena.alloc(Value, params.items.len);
+            for (args, 0..) |*a, k| a.* = .{ .arg = @intCast(k) };
+            e.lib_args = args;
+            try e.buildSignatures(entry);
+            e.cur = try e.newBlock();
+            try e.libHandles();
+            _ = try e.inlineCall(entry.wrapper, &.{});
+            try e.finish(lf.func);
+            try funcs.append(e.arena, lf);
+        }
+        const bitcode = try e.writeLibraryModule(funcs.items);
+        defer gpa.free(bitcode);
+        return e.assembleLibrary(gpa, funcs.items, bitcode);
+    }
+
+    /// Handles of the library's resources for the current function (in
+    /// the prologue; dropped again where unused).
+    fn libHandles(e: *Emitter) Error!void {
+        const i32t = try e.dm.intType(32);
+        for (e.resources.items) |*res| {
+            const lg = res.lib_global orelse continue;
+            const gty = e.dm.globals.items[lg].ty;
+            const loaded = try e.addPrologue(gty, .{ .load = .{ .ptr = .{ .global = lg }, .@"align" = 4 } });
+            try e.lib_removable.put(e.arena, loaded.inst, {});
+            const struct_name = e.dm.types.items[gty].@"struct".name;
+            const create = try e.dxOp(try std.fmt.allocPrint(e.arena, "dx.op.createHandleForLib.{s}", .{struct_name}), e.handle_ty, &.{ i32t, gty }, .nounwind_readonly);
+            var h = try e.addPrologue(e.handle_ty, .{ .call = .{ .callee = create, .args = try e.arena.dupe(Value, &.{ try e.i32Const(160), loaded }) } });
+            try e.lib_removable.put(e.arena, h.inst, {});
+            if (e.self_sm66()) {
+                const props_ty = try e.dm.getType(.{ .@"struct" = .{ .name = "dx.types.ResourceProperties", .elems = &.{ i32t, i32t } } });
+                const annotate = try e.dxOp("dx.op.annotateHandle", e.handle_ty, &.{ i32t, e.handle_ty, props_ty }, .nounwind_readnone);
+                h = try e.addPrologue(e.handle_ty, .{ .call = .{ .callee = annotate, .args = try e.arena.dupe(Value, &.{ try e.i32Const(216), h, try e.propertiesConst(res.*) }) } });
+                try e.lib_removable.put(e.arena, h.inst, {});
+            }
+            res.handle = h;
+        }
+    }
+
+    /// Ray tracing intrinsics (library shaders); null for other names.
+    fn rayIntrinsic(e: *Emitter, frame: *Frame, name: []const u8, ty: TypeId, args: []const Ref) Error!?Lowered {
+        const eq = std.mem.eql;
+        const i32t = try e.dm.intType(32);
+        const i8t = try e.dm.intType(8);
+        const f32t = try e.dm.getType(.float);
+        const void_ty = try e.voidTy();
+        const Sys = struct { []const u8, i64, []const u8, enum { scalar, vector, m34, m43 } };
+        const table = [_]Sys{
+            .{ "DispatchRaysIndex", 145, "dispatchRaysIndex", .vector },        .{ "DispatchRaysDimensions", 146, "dispatchRaysDimensions", .vector },
+            .{ "WorldRayOrigin", 147, "worldRayOrigin", .vector },             .{ "WorldRayDirection", 148, "worldRayDirection", .vector },
+            .{ "ObjectRayOrigin", 149, "objectRayOrigin", .vector },           .{ "ObjectRayDirection", 150, "objectRayDirection", .vector },
+            .{ "RayTMin", 153, "rayTMin", .scalar },                           .{ "RayTCurrent", 154, "rayTCurrent", .scalar },
+            .{ "InstanceID", 141, "instanceID", .scalar },                     .{ "InstanceIndex", 142, "instanceIndex", .scalar },
+            .{ "HitKind", 143, "hitKind", .scalar },                           .{ "RayFlags", 144, "rayFlags", .scalar },
+            .{ "PrimitiveIndex", 161, "primitiveIndex", .scalar },             .{ "GeometryIndex", 213, "geometryIndex", .scalar },
+            .{ "ObjectToWorld3x4", 151, "objectToWorld", .m34 },               .{ "ObjectToWorld", 151, "objectToWorld", .m34 },
+            .{ "ObjectToWorld4x3", 151, "objectToWorld", .m43 },               .{ "WorldToObject3x4", 152, "worldToObject", .m34 },
+            .{ "WorldToObject", 152, "worldToObject", .m34 },                  .{ "WorldToObject4x3", 152, "worldToObject", .m43 },
+        };
+        for (table) |x| {
+            if (!eq(u8, name, x[0])) continue;
+            const rt = try e.scalarTy(e.compOf(ty));
+            const fname = try std.fmt.allocPrint(e.arena, "dx.op.{s}.{s}", .{ x[2], e.overloadName(rt) });
+            // (RayTCurrent changes during intersection shaders.)
+            const attrs: module.FnAttrs = if (x[1] == 154) .nounwind_readonly else .nounwind_readnone;
+            switch (x[3]) {
+                .scalar => {
+                    const f = try e.dxOp(fname, rt, &.{i32t}, attrs);
+                    return try e.list(&.{try e.callOp(f, rt, &.{try e.i32Const(x[1])})});
+                },
+                .vector => {
+                    const f = try e.dxOp(fname, rt, &.{ i32t, i8t }, attrs);
+                    const out = try e.arena.alloc(Value, try e.flatCount(ty));
+                    for (out, 0..) |*o, k| o.* = try e.callOp(f, rt, &.{ try e.i32Const(x[1]), try e.dm.constInt(8, @intCast(k)) });
+                    return .{ .scalars = out };
+                },
+                .m34, .m43 => {
+                    const f = try e.dxOp(fname, rt, &.{ i32t, i32t, i8t }, attrs);
+                    const mt = e.t.get(ty).matrix;
+                    const out = try e.arena.alloc(Value, @as(usize, mt.rows) * mt.cols);
+                    for (0..mt.rows) |r| for (0..mt.cols) |c| {
+                        const row, const col = if (x[3] == .m34) .{ r, c } else .{ c, r };
+                        out[r * mt.cols + c] = try e.callOp(f, rt, &.{ try e.i32Const(x[1]), try e.i32Const(@intCast(row)), try e.dm.constInt(8, @intCast(col)) });
+                    };
+                    return .{ .scalars = out };
+                },
+            }
+        }
+        if (eq(u8, name, "IgnoreHit") or eq(u8, name, "AcceptHitAndEndSearch")) {
+            const ignore = eq(u8, name, "IgnoreHit");
+            const f = try e.dxOp(if (ignore) "dx.op.ignoreHit" else "dx.op.acceptHitAndEndSearch", void_ty, &.{i32t}, .noreturn_nounwind);
+            _ = try e.callOp(f, void_ty, &.{try e.i32Const(if (ignore) 155 else 156)});
+            _ = try e.add(void_ty, .@"unreachable");
+            // What follows is unreachable.
+            e.cur = try e.newBlock();
+            return .none;
+        }
+        if (eq(u8, name, "TraceRay") or eq(u8, name, "CallShader") or eq(u8, name, "ReportHit")) {
+            if (!e.lib) return e.unsupported("'{s}' outside library shaders", .{name});
+            // The payload / parameter / attributes go in struct-typed
+            // memory of their own.
+            const data = args[args.len - 1];
+            const dty_hl = frame.f.inst(data).ty;
+            const dty = try e.memoryType(dty_hl);
+            const ptr_t = try e.dm.ptrType(dty);
+            const mem = try e.addPrologue(ptr_t, .{ .alloca = .{ .elem = dty, .size = try e.i32Const(1) } });
+            const tp: @FieldType(Lowered, "typed") = .{ .base = mem, .dty = dty, .addr_space = 0, .ty = dty_hl };
+            const report = eq(u8, name, "ReportHit");
+            const vals = if (report) try e.scalars(frame, data) else (try e.loadPtr(try e.outPtr(frame, data), dty_hl)).scalars;
+            try e.typedStore(tp, vals, dty_hl);
+            const sname = e.dm.types.items[dty].@"struct".name;
+            if (report) {
+                const i1t = try e.dm.intType(1);
+                const f = try e.dxOp(try std.fmt.allocPrint(e.arena, "dx.op.reportHit.{s}", .{sname}), i1t, &.{ i32t, f32t, i32t, ptr_t }, .nounwind);
+                return try e.list(&.{try e.callOp(f, i1t, &.{ try e.i32Const(158), (try e.scalars(frame, args[0]))[0], (try e.scalars(frame, args[1]))[0], mem })});
+            }
+            if (eq(u8, name, "TraceRay")) {
+                const accel = try e.resourceOf(frame, args[0]);
+                var ps: [16]DType = undefined;
+                ps[0] = i32t;
+                ps[1] = e.handle_ty;
+                for (ps[2..7]) |*p| p.* = i32t;
+                for (ps[7..15]) |*p| p.* = f32t;
+                ps[15] = ptr_t;
+                const f = try e.dxOp(try std.fmt.allocPrint(e.arena, "dx.op.traceRay.{s}", .{sname}), void_ty, &ps, .nounwind);
+                var call_args: std.ArrayList(Value) = .empty;
+                try call_args.appendSlice(e.arena, &.{ try e.i32Const(157), accel.handle });
+                for (args[1..6]) |a| try call_args.append(e.arena, (try e.scalars(frame, a))[0]);
+                try call_args.appendSlice(e.arena, try e.scalars(frame, args[6]));
+                try call_args.append(e.arena, mem);
+                _ = try e.callOp(f, void_ty, call_args.items);
+            } else {
+                const f = try e.dxOp(try std.fmt.allocPrint(e.arena, "dx.op.callShader.{s}", .{sname}), void_ty, &.{ i32t, i32t, ptr_t }, .nounwind);
+                _ = try e.callOp(f, void_ty, &.{ try e.i32Const(159), (try e.scalars(frame, args[0]))[0], mem });
+            }
+            const back = try e.typedLoad(tp, dty_hl);
+            try e.storePtr(try e.outPtr(frame, data), back.scalars, dty_hl);
+            return .none;
+        }
+        return null;
     }
 
     fn collectResources(e: *Emitter) Error!void {
@@ -497,6 +740,12 @@ const Emitter = struct {
         for (e.resources.items) |res| {
             const g = &e.m.globals.items[res.global];
             if (g.binding.explicit) continue;
+            if (e.lib) {
+                // Libraries leave them unbound (-1) until linked.
+                @constCast(g).binding.index = std.math.maxInt(u32);
+                @constCast(g).binding.space = std.math.maxInt(u32);
+                continue;
+            }
             var i: u32 = 0;
             while (true) : (i += 1) {
                 const free = for (0..span(res.count)) |k| {
@@ -636,6 +885,7 @@ const Emitter = struct {
     /// Assigns final instruction indices: prologue first, then blocks in
     /// creation order.
     fn finish(e: *Emitter, func: u32) Error!void {
+        if (e.lib_removable.count() > 0) try e.pruneProlog();
         const map = try e.arena.alloc(u32, e.next_id);
         var n: u32 = 0;
         for (e.prologue.items) |pi| {
@@ -661,6 +911,45 @@ const Emitter = struct {
         const all = [_][]const PInst{e.prologue.items};
         for (all) |items| for (items) |pi| try f.insts.append(e.dm.allocator(), try remapInst(e.arena, map, pi.inst, remap));
         for (e.blocks.items) |blk| for (blk.items) |pi| try f.insts.append(e.dm.allocator(), try remapInst(e.arena, map, pi.inst, remap));
+    }
+
+    /// Drops removable prologue instructions nothing uses (repeatedly: a
+    /// handle's load goes once the handle has).
+    fn pruneProlog(e: *Emitter) Error!void {
+        const used = try e.arena.alloc(bool, e.next_id);
+        var changed = true;
+        while (changed) {
+            changed = false;
+            @memset(used, false);
+            const all = [_][]const PInst{e.prologue.items};
+            for (all) |items| for (items) |pi| markUses(e.arena, pi.inst, used);
+            for (e.blocks.items) |blk| for (blk.items) |pi| markUses(e.arena, pi.inst, used);
+            var k: usize = 0;
+            while (k < e.prologue.items.len) {
+                const pi = e.prologue.items[k];
+                if (e.lib_removable.contains(pi.id) and !used[pi.id]) {
+                    _ = e.prologue.orderedRemove(k);
+                    changed = true;
+                } else k += 1;
+            }
+        }
+        e.lib_removable = .empty;
+    }
+
+    fn markUses(a: Allocator, inst: module.Inst, used: []bool) void {
+        const M = struct {
+            var u: []bool = &.{};
+            fn v(_: []const u32, x: Value) Value {
+                if (x == .inst) u[x.inst] = true;
+                return x;
+            }
+            fn vs(_: Allocator, _: []const u32, xs: []const Value) Allocator.Error![]const Value {
+                for (xs) |x| _ = v(&.{}, x);
+                return xs;
+            }
+        };
+        M.u = used;
+        _ = remapInst(a, &.{}, inst, M) catch {};
     }
 
     fn remapInst(a: Allocator, map: []const u32, inst: module.Inst, comptime R: type) Allocator.Error!module.Inst {
@@ -865,7 +1154,12 @@ const Emitter = struct {
         switch (i.op) {
             .constant => |c| return e.list(&.{try e.constant(i.ty, c)}),
             .param => |p| return frame.params[p],
-            .ray_incoming => return e.unsupported("ray tracing shaders are not supported yet", .{}),
+            .ray_incoming => |k| {
+                // The shader's payload / attribute / parameter argument.
+                const idx: usize = if (k == .attributes) 1 else 0;
+                if (idx >= e.lib_args.len) return e.unsupported("ray tracing shaders outside libraries", .{});
+                return .{ .typed = .{ .base = e.lib_args[idx], .dty = try e.memoryType(i.ty), .addr_space = 0, .ty = i.ty } };
+            },
             .heap_resource => |h| {
                 if (e.t.get(i.ty) != .resource and e.t.get(i.ty) != .sampler) return .none;
                 if (e.profile.minor < 6) return e.unsupported("descriptor heaps need shader model 6.6", .{});
@@ -1449,6 +1743,7 @@ const Emitter = struct {
 
     fn intrinsic(e: *Emitter, frame: *Frame, name: []const u8, ty: TypeId, args: []const Ref) Error!Lowered {
         const eq = std.mem.eql;
+        if (try e.rayIntrinsic(frame, name, ty, args)) |r| return r;
         if (try e.outIntrinsic(frame, name, ty, args)) |r| return r;
         if (eq(u8, name, "DispatchMesh")) {
             const tp = switch (frame.vals[args[3].index()]) {
@@ -3708,9 +4003,38 @@ const Emitter = struct {
         return f;
     }
 
-    fn writeModule(e: *Emitter, entry: ir.Entry) Error![]u8 {
+    /// The LLVM type a resource's metadata (and, in libraries, its global)
+    /// points to: a named struct, an array of them for ranges.
+    fn classType(e: *Emitter, r: Resource) Error!DType {
         const dm = &e.dm;
-        const i32t = try dm.intType(32);
+        const g = e.m.globals.items[r.global];
+        const one: DType = blk: {
+            if (r.kind == 15 or r.class == .cbuffer) {
+                // tbuffers and cbuffers: a struct of one float.
+                const name = if (r.rty != 0) try std.fmt.allocPrint(e.arena, "struct.{s}", .{try e.t.format(e.arena, r.elem)}) else g.name;
+                break :blk try dm.getType(.{ .@"struct" = .{ .name = name, .elems = &.{try dm.getType(.float)} } });
+            }
+            if (r.class == .sampler) break :blk try dm.getType(.{ .@"struct" = .{ .name = if (r.comparison) "struct.SamplerComparisonState" else "struct.SamplerState", .elems = &.{try dm.intType(32)} } });
+            if (r.kind == 16) break :blk try dm.getType(.{ .@"struct" = .{ .name = "struct.RaytracingAccelerationStructure", .elems = &.{try dm.intType(32)} } });
+            var rty = g.ty;
+            while (e.t.get(rty) == .array) rty = e.t.get(rty).array.elem;
+            const rt = e.t.get(rty).resource;
+            const class_name = try std.fmt.allocPrint(e.arena, "class.{s}<{s}>", .{ rt.name, try e.t.format(e.arena, r.elem) });
+            // The class type only names the resource; aggregates get a
+            // placeholder element.
+            var elem_dt = try e.scalarTy(if (r.kind == 11) .uint else if (e.t.shape(r.elem) == null) .int else e.compOf(r.elem));
+            // Typed resources carry their component count in the element
+            // (the validator reads it from here).
+            if (r.kind >= 1 and r.kind <= 10 and e.t.get(r.elem) == .vector) elem_dt = try dm.getType(.{ .vector = .{ .len = e.t.get(r.elem).vector.len, .elem = elem_dt } });
+            break :blk try dm.getType(.{ .@"struct" = .{ .name = class_name, .elems = &.{elem_dt} } });
+        };
+        if (r.count == 1) return one;
+        return dm.getType(.{ .array = .{ .len = if (r.count == std.math.maxInt(u32)) 0 else r.count, .elem = one } });
+    }
+
+    /// `dx.resources`: SRVs, UAVs, CBVs and samplers.
+    fn resourcesMd(e: *Emitter) Error!?module.MdId {
+        const dm = &e.dm;
         const i1t = try dm.intType(1);
         const mdI32 = struct {
             fn f(m: *module.Module, v: i64) !module.MdId {
@@ -3722,13 +4046,6 @@ const Emitter = struct {
                 return m.mdValue(t, try m.constant(.{ .ty = t, .kind = .{ .int = @intFromBool(v) } }));
             }
         }.f;
-        _ = i32t;
-
-        const ident = try dm.mdNode(&.{try dm.mdString("zdxc 0.0.0")});
-        const version = try dm.mdNode(&.{ try mdI32(dm, 1), try mdI32(dm, e.profile.minor) });
-        const val_ver = try dm.mdNode(&.{ try mdI32(dm, 1), try mdI32(dm, 11) });
-        const sm = try dm.mdNode(&.{ try dm.mdString(e.profile.kind.profilePrefix()), try mdI32(dm, e.profile.major), try mdI32(dm, e.profile.minor) });
-
         // Resource lists by class.
         var lists: [4]std.ArrayList(?module.MdId) = .{ .empty, .empty, .empty, .empty };
         for (e.resources.items) |r| {
@@ -3736,61 +4053,32 @@ const Emitter = struct {
             const g = e.m.globals.items[r.global];
             // Ranges: the pointer is to an array; unsized ones have size -1.
             const range: i64 = if (r.count == std.math.maxInt(u32)) -1 else r.count;
-            const rangeTy = struct {
-                fn f(m: *module.Module, n: u32, t: DType) !DType {
-                    if (n == 1) return t;
-                    return m.getType(.{ .array = .{ .len = if (n == std.math.maxInt(u32)) 0 else n, .elem = t } });
-                }
-            }.f;
+            const class_ty = try e.classType(r);
+            // Libraries point at the resource's global and name it.
+            const sym = if (r.lib_global) |lg| try dm.mdValue(try dm.ptrType(class_ty), .{ .global = lg }) else try dm.mdValue(try dm.ptrType(class_ty), try dm.constant(.{ .ty = try dm.ptrType(class_ty), .kind = .undef }));
+            const name = try dm.mdString(if (r.lib_global != null) g.name else "");
+            const b = g.binding;
+            const head = [_]?module.MdId{ try mdI32(dm, r.id), sym, name, try mdI32(dm, @as(i32, @bitCast(b.space))), try mdI32(dm, @as(i32, @bitCast(b.index))), try mdI32(dm, range) };
             if (r.kind == 15) {
                 // tbuffer / TextureBuffer<S>: an SRV of 32-bit elements.
-                const f32t = try dm.getType(.float);
-                const tb_name = if (r.rty != 0) try std.fmt.allocPrint(e.arena, "struct.{s}", .{try e.t.format(e.arena, r.elem)}) else g.name;
-                const tb_ty = try rangeTy(dm, r.count, try dm.getType(.{ .@"struct" = .{ .name = tb_name, .elems = &.{f32t} } }));
-                const undef_tb = try dm.constant(.{ .ty = try dm.ptrType(tb_ty), .kind = .undef });
-                const b = g.binding;
-                try lists[0].append(e.arena, try dm.mdNode(&.{ try mdI32(dm, r.id), try dm.mdValue(try dm.ptrType(tb_ty), undef_tb), try dm.mdString(""), try mdI32(dm, b.space), try mdI32(dm, b.index), try mdI32(dm, range), try mdI32(dm, 15), try mdI32(dm, 0), try dm.mdNode(&.{ try mdI32(dm, 0), try mdI32(dm, 5) }) }));
+                try lists[0].append(e.arena, try dm.mdNode(&(head ++ [_]?module.MdId{ try mdI32(dm, 15), try mdI32(dm, 0), try dm.mdNode(&.{ try mdI32(dm, 0), try mdI32(dm, 5) }) })));
                 continue;
             }
             if (r.class == .cbuffer) {
-                const f32t = try dm.getType(.float);
-                const cb_name = if (r.rty != 0) try std.fmt.allocPrint(e.arena, "struct.{s}", .{try e.t.format(e.arena, r.elem)}) else g.name;
-                const cb_ty = try rangeTy(dm, r.count, try dm.getType(.{ .@"struct" = .{ .name = cb_name, .elems = &.{f32t} } }));
-                const undef_cb = try dm.constant(.{ .ty = try dm.ptrType(cb_ty), .kind = .undef });
-                const b = g.binding;
-                try lists[2].append(e.arena, try dm.mdNode(&.{ try mdI32(dm, r.id), try dm.mdValue(try dm.ptrType(cb_ty), undef_cb), try dm.mdString(""), try mdI32(dm, b.space), try mdI32(dm, b.index), try mdI32(dm, range), try mdI32(dm, try e.cbufferSize(r)), null }));
+                try lists[2].append(e.arena, try dm.mdNode(&(head ++ [_]?module.MdId{ try mdI32(dm, try e.cbufferSize(r)), null })));
                 continue;
             }
             if (r.class == .sampler) {
-                const name = if (r.comparison) "struct.SamplerComparisonState" else "struct.SamplerState";
-                const st = try rangeTy(dm, r.count, try dm.getType(.{ .@"struct" = .{ .name = name, .elems = &.{try dm.intType(32)} } }));
-                const undef_s = try dm.constant(.{ .ty = try dm.ptrType(st), .kind = .undef });
-                const b = g.binding;
-                try lists[3].append(e.arena, try dm.mdNode(&.{ try mdI32(dm, r.id), try dm.mdValue(try dm.ptrType(st), undef_s), try dm.mdString(""), try mdI32(dm, b.space), try mdI32(dm, b.index), try mdI32(dm, range), try mdI32(dm, @intFromBool(r.comparison)), null }));
+                try lists[3].append(e.arena, try dm.mdNode(&(head ++ [_]?module.MdId{ try mdI32(dm, @intFromBool(r.comparison)), null })));
                 continue;
             }
             if (r.kind == 16) {
-                const st = try rangeTy(dm, r.count, try dm.getType(.{ .@"struct" = .{ .name = "struct.RaytracingAccelerationStructure", .elems = &.{try dm.intType(32)} } }));
-                const undef_s = try dm.constant(.{ .ty = try dm.ptrType(st), .kind = .undef });
-                const b = g.binding;
-                try lists[0].append(e.arena, try dm.mdNode(&.{ try mdI32(dm, r.id), try dm.mdValue(try dm.ptrType(st), undef_s), try dm.mdString(""), try mdI32(dm, b.space), try mdI32(dm, b.index), try mdI32(dm, range), try mdI32(dm, 16), try mdI32(dm, 0), try dm.mdNode(&.{ try mdI32(dm, 0), try mdI32(dm, 4) }) }));
+                try lists[0].append(e.arena, try dm.mdNode(&(head ++ [_]?module.MdId{ try mdI32(dm, 16), try mdI32(dm, 0), try dm.mdNode(&.{ try mdI32(dm, 0), try mdI32(dm, 4) }) })));
                 continue;
             }
-            var rty = g.ty;
-            while (e.t.get(rty) == .array) rty = e.t.get(rty).array.elem;
-            const rt = e.t.get(rty).resource;
-            const class_name = try std.fmt.allocPrint(e.arena, "class.{s}<{s}>", .{ rt.name, try e.t.format(e.arena, r.elem) });
-            // The class type only names the resource; aggregates get a
-            // placeholder element.
-            var elem_dt = try e.scalarTy(if (r.kind == 11) .uint else if (e.t.shape(r.elem) == null) .int else e.compOf(r.elem));
-            // Typed resources carry their component count in the element
-            // (the validator reads it from here).
-            if (r.kind >= 1 and r.kind <= 10 and e.t.get(r.elem) == .vector) elem_dt = try dm.getType(.{ .vector = .{ .len = e.t.get(r.elem).vector.len, .elem = elem_dt } });
-            const class_ty = try rangeTy(dm, r.count, try dm.getType(.{ .@"struct" = .{ .name = class_name, .elems = &.{elem_dt} } }));
-            const undef_ptr = try dm.constant(.{ .ty = try dm.ptrType(class_ty), .kind = .undef });
-            const b = g.binding;
             var fields: std.ArrayList(?module.MdId) = .empty;
-            try fields.appendSlice(e.arena, &.{ try mdI32(dm, r.id), try dm.mdValue(try dm.ptrType(class_ty), undef_ptr), try dm.mdString(""), try mdI32(dm, b.space), try mdI32(dm, b.index), try mdI32(dm, range), try mdI32(dm, r.kind) });
+            try fields.appendSlice(e.arena, &head);
+            try fields.append(e.arena, try mdI32(dm, r.kind));
             if (r.class == .uav) {
                 try fields.appendSlice(e.arena, &.{ try mdBool(dm, i1t, false), try mdBool(dm, i1t, r.has_counter), try mdBool(dm, i1t, false) });
             } else try fields.append(e.arena, try mdI32(dm, 0)); // sample count
@@ -3810,6 +4098,192 @@ const Emitter = struct {
             }
             resources = try dm.mdNode(&slots);
         }
+        return resources;
+    }
+
+    /// Per-function flags and compatibility of a library's functions, and
+    /// the module's flags (their union, without function-local ones, plus
+    /// resource-wide ones).
+    fn libAnalysis(e: *Emitter, funcs: []const LibFunc) Error!struct { infos: []libinfo.Info, flags: u64 } {
+        const globals = try e.arena.alloc(?libinfo.GlobalRes, e.dm.globals.items.len);
+        @memset(globals, null);
+        var uavs: u32 = 0;
+        var raw = false;
+        for (e.resources.items) |r| {
+            if (r.view) continue;
+            if (r.class == .uav) uavs += @min(r.count, 9);
+            if ((r.class == .uav or r.class == .srv) and (r.kind == 11 or r.kind == 12)) raw = true;
+            const lg = r.lib_global orelse continue;
+            globals[lg] = .{ .uav = r.class == .uav, .typed_multi = r.kind >= 1 and r.kind <= 10 and try e.flatCount(r.elem) > 1 };
+        }
+        const opts: libinfo.Options = .{ .native16 = e.native16(), .res_may_not_alias = e.profile.minor >= 7, .globals = globals };
+        const infos = try e.arena.alloc(libinfo.Info, funcs.len);
+        var flags: u64 = 0;
+        for (funcs, infos) |lf, *info| {
+            info.* = libinfo.analyze(&e.dm, &e.dm.functions.items[lf.func], opts);
+            flags |= info.flags;
+        }
+        flags &= ~@as(u64, libinfo.bit.local);
+        if (raw) flags |= libinfo.bit.raw_structured;
+        if (uavs > 8) flags |= 1 << 15;
+        return .{ .infos = infos, .flags = flags };
+    }
+
+    fn native16(e: *Emitter) bool {
+        _ = e;
+        return false;
+    }
+
+    fn writeLibraryModule(e: *Emitter, funcs: []const LibFunc) Error![]u8 {
+        const dm = &e.dm;
+        const mdI32 = struct {
+            fn f(m: *module.Module, v: i64) !module.MdId {
+                return m.mdI32(v);
+            }
+        }.f;
+        const ident = try dm.mdNode(&.{try dm.mdString("zdxc 0.0.0")});
+        const version = try dm.mdNode(&.{ try mdI32(dm, 1), try mdI32(dm, e.profile.minor) });
+        const val_ver = try dm.mdNode(&.{ try mdI32(dm, 1), try mdI32(dm, 11) });
+        const sm = try dm.mdNode(&.{ try dm.mdString("lib"), try mdI32(dm, e.profile.major), try mdI32(dm, e.profile.minor) });
+        const resources = try e.resourcesMd();
+        const analysis = try e.libAnalysis(funcs);
+
+        // Function annotations: per parameter (return value first) its
+        // input qualifier.
+        const empty = try dm.mdNode(&.{});
+        var annotations: std.ArrayList(?module.MdId) = .empty;
+        try annotations.append(e.arena, try mdI32(dm, 1));
+        for (funcs) |lf| {
+            var ps: std.ArrayList(?module.MdId) = .empty;
+            const ret_qual: i64 = if (lf.stage.isRayTracing()) 1 else 0;
+            try ps.append(e.arena, try dm.mdNode(&.{ try mdI32(dm, ret_qual), empty, empty }));
+            for (lf.quals) |q| try ps.append(e.arena, try dm.mdNode(&.{ try mdI32(dm, q), empty, empty }));
+            const fty = dm.functions.items[lf.func].ty;
+            try annotations.append(e.arena, try dm.mdValue(try dm.ptrType(fty), .{ .function = lf.func }));
+            try annotations.append(e.arena, try dm.mdNode(ps.items));
+        }
+        const type_annotations = try dm.mdNode(annotations.items);
+
+        // Entries: the library's own (resources, module flags), then each
+        // shader by name.
+        var entries: std.ArrayList(module.MdId) = .empty;
+        var lib_props: ?module.MdId = null;
+        if (analysis.flags != 0) {
+            const i64t = try dm.intType(64);
+            lib_props = try dm.mdNode(&.{ try mdI32(dm, 0), try dm.mdValue(i64t, try dm.constant(.{ .ty = i64t, .kind = .{ .int = @bitCast(analysis.flags) } })) });
+        }
+        try entries.append(e.arena, try dm.mdNode(&.{ null, try dm.mdString(""), null, resources, lib_props }));
+        const order = try e.arena.alloc(usize, funcs.len);
+        for (order, 0..) |*o, k| o.* = k;
+        std.sort.insertion(usize, order, funcs, struct {
+            fn lt(fs: []const LibFunc, a: usize, b: usize) bool {
+                return std.mem.order(u8, fs[a].name, fs[b].name) == .lt;
+            }
+        }.lt);
+        const auto_space = try dm.mdNode(&.{try mdI32(dm, 0)});
+        for (order) |k| {
+            const lf = funcs[k];
+            var props: std.ArrayList(?module.MdId) = .empty;
+            try props.appendSlice(e.arena, &.{ try mdI32(dm, 8), try mdI32(dm, shaderKind(lf.stage)) });
+            if (lf.stage == .compute) {
+                const t = lf.entry.num_threads;
+                try props.appendSlice(e.arena, &.{ try mdI32(dm, 4), try dm.mdNode(&.{ try mdI32(dm, t[0]), try mdI32(dm, t[1]), try mdI32(dm, t[2]) }) });
+            }
+            switch (lf.stage) {
+                .miss, .callable, .anyhit, .closesthit => try props.appendSlice(e.arena, &.{ try mdI32(dm, 6), try mdI32(dm, lf.payload_size) }),
+                else => {},
+            }
+            if (lf.stage == .anyhit or lf.stage == .closesthit) try props.appendSlice(e.arena, &.{ try mdI32(dm, 7), try mdI32(dm, lf.attr_size) });
+            try props.appendSlice(e.arena, &.{ try mdI32(dm, 5), auto_space });
+            const fty = dm.functions.items[lf.func].ty;
+            try entries.append(e.arena, try dm.mdNode(&.{ try dm.mdValue(try dm.ptrType(fty), .{ .function = lf.func }), try dm.mdString(lf.name), null, null, try dm.mdNode(props.items) }));
+        }
+
+        try dm.addNamedMetadata("llvm.ident", &.{ident});
+        try dm.addNamedMetadata("dx.version", &.{version});
+        try dm.addNamedMetadata("dx.valver", &.{val_ver});
+        try dm.addNamedMetadata("dx.shaderModel", &.{sm});
+        if (resources) |r| try dm.addNamedMetadata("dx.resources", &.{r});
+        if (funcs.len > 0) try dm.addNamedMetadata("dx.typeAnnotations", &.{type_annotations});
+        try dm.addNamedMetadata("dx.entryPoints", entries.items);
+        return dm.writeBitcode(dm.arena.child_allocator);
+    }
+
+    /// The library container: feature info, runtime data (RDAT) and the
+    /// program.
+    fn assembleLibrary(e: *Emitter, gpa: Allocator, funcs: []const LibFunc, bitcode: []const u8) Error![]u8 {
+        const dxil_part = try shader.programPart(gpa, e.profile, bitcode);
+        defer gpa.free(dxil_part);
+        const analysis = try e.libAnalysis(funcs);
+        var b = try rdat.Builder.init(gpa);
+        defer b.deinit();
+        // Resources: CBVs, samplers, SRVs, UAVs.
+        var res_index: std.AutoHashMapUnmanaged(u32, u32) = .empty;
+        var count: u32 = 0;
+        for ([_]Resource.Class{ .cbuffer, .sampler, .srv, .uav }) |cls| for (e.resources.items) |r| if (r.class == cls and !r.view) {
+            const bd = e.binding(r);
+            const upper: u32 = if (r.count == std.math.maxInt(u32)) std.math.maxInt(u32) else bd.index +% (r.count - 1);
+            const rdat_class: u32 = switch (r.class) {
+                .srv => 0,
+                .uav => 1,
+                .cbuffer => 2,
+                .sampler => 3,
+            };
+            try b.addResource(.{ .class = rdat_class, .kind = r.kind, .id = r.id, .space = bd.space, .lower = bd.index, .upper = upper, .name = try b.string(e.m.globals.items[r.global].name), .flags = if (r.class == .uav and r.has_counter) 2 else 0 });
+            if (r.lib_global) |lg| try res_index.put(e.arena, lg, count);
+            count += 1;
+        };
+        for (funcs, analysis.infos) |lf, info| {
+            const f = &e.dm.functions.items[lf.func];
+            const name = try b.string(lf.name);
+            const unmangled = try b.string(lf.unmangled);
+            // Resources whose globals the function loads, in table order.
+            var used: std.ArrayList(u32) = .empty;
+            for (f.insts.items) |inst| if (inst.op == .load and inst.op.load.ptr == .global) {
+                if (res_index.get(inst.op.load.ptr.global)) |ri| {
+                    if (std.mem.indexOfScalar(u32, used.items, ri) == null) try used.append(e.arena, ri);
+                }
+            };
+            std.mem.sort(u32, used.items, {}, std.sort.asc(u32));
+            const kind = shaderKind(lf.stage);
+            try b.addFunction(.{
+                .name = name,
+                .unmangled_name = unmangled,
+                .resources = if (used.items.len > 0) try b.array(used.items) else rdat.null_ref,
+                .shader_kind = kind,
+                .payload_size = lf.payload_size,
+                .attribute_size = lf.attr_size,
+                .feature_info1 = @truncate(libinfo.featureInfo(info.flags)),
+                .feature_info2 = @truncate(libinfo.featureInfo(info.flags) >> 32),
+                .shader_stage_flag = info.mask & (@as(u32, 1) << @intCast(kind)),
+                .min_shader_target = (kind << 16) | (6 << 4) | libinfo.minMinor(info, kind),
+            });
+        }
+        const rdat_part = try b.finish();
+        defer gpa.free(rdat_part);
+        var sfi0: [8]u8 = @splat(0);
+        std.mem.writeInt(u64, &sfi0, libinfo.featureInfo(analysis.flags), .little);
+        return container.assemble(gpa, &.{
+            .{ .fourcc = container.fourcc("SFI0"), .data = &sfi0 },
+            .{ .fourcc = container.fourcc("RDAT"), .data = rdat_part },
+            .{ .fourcc = container.fourcc("DXIL"), .data = dxil_part },
+        });
+    }
+
+    fn writeModule(e: *Emitter, entry: ir.Entry) Error![]u8 {
+        const dm = &e.dm;
+        const mdI32 = struct {
+            fn f(m: *module.Module, v: i64) !module.MdId {
+                return m.mdI32(v);
+            }
+        }.f;
+
+        const ident = try dm.mdNode(&.{try dm.mdString("zdxc 0.0.0")});
+        const version = try dm.mdNode(&.{ try mdI32(dm, 1), try mdI32(dm, e.profile.minor) });
+        const val_ver = try dm.mdNode(&.{ try mdI32(dm, 1), try mdI32(dm, 11) });
+        const sm = try dm.mdNode(&.{ try dm.mdString(e.profile.kind.profilePrefix()), try mdI32(dm, e.profile.major), try mdI32(dm, e.profile.minor) });
+
+        const resources = try e.resourcesMd();
 
         // Entry properties: shader flags and thread group size.
         var props: std.ArrayList(?module.MdId) = .empty;

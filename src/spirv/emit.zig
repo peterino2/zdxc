@@ -3192,11 +3192,11 @@ const Emitter = struct {
     /// Whether pointer / resource `r` reaches into a shader record buffer.
     fn inShaderRecord(e: *Emitter, r: Ref) bool {
         var x = r;
-        while (true) switch (e.f.inst(x).op) {
-            .access => |a| x = a.base,
-            .load => |p| x = p,
-            else => break,
-        };
+        while (e.f.inst(x).op == .access) x = e.f.inst(x).op.access.base;
+        if (e.f.inst(x).op == .global) return e.m.globals.items[e.f.inst(x).op.global].shader_record;
+        // ConstantBuffer<T> values (through locals and parameters).
+        const t = e.t.get(e.f.inst(x).ty);
+        if (t != .resource or t.resource.kind != .constant_buffer) return false;
         const g = e.globalOf(x) orelse return false;
         return e.m.globals.items[g].shader_record;
     }

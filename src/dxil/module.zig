@@ -55,7 +55,7 @@ pub const Constant = struct {
 pub const Linkage = enum(u32) { external = 0, internal = 3 };
 
 /// Attribute group for function declarations (e.g. dx.op functions).
-pub const FnAttrs = enum { none, nounwind, nounwind_readnone, nounwind_readonly };
+pub const FnAttrs = enum { none, nounwind, nounwind_readnone, nounwind_readonly, noreturn_nounwind };
 
 pub const Value = union(enum) {
     /// Index into Module.globals (a pointer to the variable).
@@ -73,7 +73,7 @@ pub const RmwOp = enum(u32) { xchg = 0, add = 1, sub = 2, @"and" = 3, nand = 4, 
 
 /// A module-level variable (groupshared memory: address space 3),
 /// declared without an initializer as dxc does.
-pub const GlobalVar = struct { name: []const u8, ty: TypeId, addr_space: u32, ptr_ty: TypeId };
+pub const GlobalVar = struct { name: []const u8, ty: TypeId, addr_space: u32, ptr_ty: TypeId, constant: bool = false };
 
 pub const CastOp = enum(u32) { trunc = 0, zext = 1, sext = 2, fptoui = 3, fptosi = 4, uitofp = 5, sitofp = 6, fptrunc = 7, fpext = 8, ptrtoint = 9, inttoptr = 10, bitcast = 11 };
 
@@ -354,7 +354,7 @@ const Encoder = struct {
         for (e.m.globals.items) |g| {
             // GLOBALVAR: [type, addrspace << 2 | explicit type, init (none),
             //             linkage (external), align 4, section]
-            try e.ops.appendSlice(e.gpa(), &.{ g.ty, (@as(u64, g.addr_space) << 2) | 2, 0, 0, 3, 0 });
+            try e.ops.appendSlice(e.gpa(), &.{ g.ty, (@as(u64, g.addr_space) << 2) | 2 | @intFromBool(g.constant), 0, 0, 3, 0 });
             try e.rec(7);
         }
         for (e.m.functions.items) |f| {
@@ -380,11 +380,11 @@ const Encoder = struct {
     }
 
     fn writeAttributes(e: *Encoder) !void {
-        // Groups 1..3 match FnAttrs order; each applies to the function (index 0xFFFFFFFF).
-        // Attribute kinds: nounwind = 18, readnone = 20, readonly = 21.
+        // Groups 1..4 match FnAttrs order; each applies to the function (index 0xFFFFFFFF).
+        // Attribute kinds: noreturn = 17, nounwind = 18, readnone = 20, readonly = 21.
         const w = &e.w;
         try w.enterBlock(block_paramattr_group, 3);
-        const groups = [_][]const u64{ &.{18}, &.{ 18, 20 }, &.{ 18, 21 } };
+        const groups = [_][]const u64{ &.{18}, &.{ 18, 20 }, &.{ 18, 21 }, &.{ 17, 18 } };
         for (groups, 1..) |kinds, id| {
             try e.push(id);
             try e.push(0xFFFFFFFF);

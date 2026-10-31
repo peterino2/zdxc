@@ -54,10 +54,6 @@ pub fn lowerUnit(arena: Allocator, s: *Sema, opts: Options) Error!ir.Module {
             try l.drain();
             try l.m.exports.append(l.arena, fi);
         }
-        if (l.m.entries.items.len == 0 and l.m.exports.items.len == 0) {
-            l.unsupported(.none, "libraries without shader entry points or exported functions", .{});
-            return error.Unsupported;
-        }
         return l.m;
     }
     const entry_fn = for (s.all_functions.items) |f| {
