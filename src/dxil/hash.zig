@@ -4,7 +4,7 @@
 
 const std = @import("std");
 
-const padding = [_]u8{0x80} ++ [_]u8{0} ** 63;
+const padding: [64]u8 = .{0x80} ++ @as([63]u8, @splat(0));
 
 const shifts = [64]u5{
     7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22,

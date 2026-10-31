@@ -1,71 +1,124 @@
 const std = @import("std");
 const Io = std.Io;
-
 const zdxc = @import("zdxc");
+const shader = zdxc.dxil.shader;
+const container = zdxc.dxil.container;
 
-pub fn main(init: std.process.Init) !void {
-    // Prints to stderr, unbuffered, ignoring potential errors.
-    std.debug.print("All your {s} are belong to us.\n", .{"codebase"});
+const usage =
+    \\OVERVIEW: zdxc - HLSL 2021 to DXIL / SPIR-V compiler
+    \\
+    \\USAGE: zdxc [options] <input>
+    \\
+    \\OPTIONS:
+    \\  -T <profile>        Target profile (cs_6_0 .. cs_6_9, vs_, ps_, gs_)
+    \\  -E <name>           Entry point name (default: main)
+    \\  -Fo <file>          Output object file
+    \\  -spirv              Generate SPIR-V
+    \\  --version           Print version
+    \\
+    \\DEVELOPMENT (temporary, until the frontend lands):
+    \\  -zdxc-empty         Emit an empty shader for -T instead of compiling <input>
+    \\  -zdxc-check-hash    Verify the container hash of <input>
+    \\
+;
 
-    // This is appropriate for anything that lives as long as the process.
-    const arena: std.mem.Allocator = init.arena.allocator();
+const Options = struct {
+    profile: ?[]const u8 = null,
+    entry: []const u8 = "main",
+    output: ?[]const u8 = null,
+    input: ?[]const u8 = null,
+    spirv: bool = false,
+    empty: bool = false,
+    check_hash: bool = false,
+};
 
-    // Accessing command line arguments:
-    const args = try init.minimal.args.toSlice(arena);
-    for (args) |arg| {
-        std.log.info("arg: {s}", .{arg});
+const Cli = struct {
+    io: Io,
+    stderr: *Io.Writer,
+
+    fn fail(cli: Cli, comptime fmt: []const u8, args: anytype) error{Fatal} {
+        cli.stderr.print("zdxc: error: " ++ fmt ++ "\n", args) catch {};
+        cli.stderr.flush() catch {};
+        return error.Fatal;
+    }
+};
+
+pub fn main(init: std.process.Init) !u8 {
+    const arena = init.arena.allocator();
+    const io = init.io;
+    var stderr_buf: [1024]u8 = undefined;
+    var stderr_writer: Io.File.Writer = .init(.stderr(), io, &stderr_buf);
+    var stdout_buf: [1024]u8 = undefined;
+    var stdout_writer: Io.File.Writer = .init(.stdout(), io, &stdout_buf);
+    const cli: Cli = .{ .io = io, .stderr = &stderr_writer.interface };
+
+    run(cli, arena, try init.minimal.args.toSlice(arena), &stdout_writer.interface) catch |err| switch (err) {
+        error.Fatal => return 1,
+        else => return err,
+    };
+    try stdout_writer.interface.flush();
+    return 0;
+}
+
+fn run(cli: Cli, arena: std.mem.Allocator, args: []const [:0]const u8, stdout: *Io.Writer) !void {
+    var opts: Options = .{};
+    var i: usize = 1;
+    while (i < args.len) : (i += 1) {
+        const a = args[i];
+        const next = struct {
+            fn get(c: Cli, as: []const [:0]const u8, idx: *usize, name: []const u8) ![]const u8 {
+                idx.* += 1;
+                if (idx.* >= as.len) return c.fail("missing argument to '{s}'", .{name});
+                return as[idx.*];
+            }
+        }.get;
+        if (std.mem.eql(u8, a, "-T")) {
+            opts.profile = try next(cli, args, &i, a);
+        } else if (std.mem.eql(u8, a, "-E")) {
+            opts.entry = try next(cli, args, &i, a);
+        } else if (std.mem.eql(u8, a, "-Fo")) {
+            opts.output = try next(cli, args, &i, a);
+        } else if (std.mem.eql(u8, a, "-spirv")) {
+            opts.spirv = true;
+        } else if (std.mem.eql(u8, a, "-zdxc-empty")) {
+            opts.empty = true;
+        } else if (std.mem.eql(u8, a, "-zdxc-check-hash")) {
+            opts.check_hash = true;
+        } else if (std.mem.eql(u8, a, "--version")) {
+            try stdout.print("zdxc {s}\n", .{zdxc.version});
+            return;
+        } else if (std.mem.eql(u8, a, "-help") or std.mem.eql(u8, a, "--help")) {
+            try stdout.writeAll(usage);
+            return;
+        } else if (a.len > 0 and a[0] == '-') {
+            return cli.fail("unknown argument: '{s}'", .{a});
+        } else {
+            if (opts.input != null) return cli.fail("more than one input file", .{});
+            opts.input = a;
+        }
     }
 
-    // In order to do I/O operations need an `Io` instance.
-    const io = init.io;
+    if (opts.check_hash) {
+        const path = opts.input orelse return cli.fail("no input file", .{});
+        const bytes = try Io.Dir.cwd().readFileAlloc(cli.io, path, arena, .limited(1 << 30));
+        var view = container.parse(arena, bytes) catch return cli.fail("{s}: not a DXIL container", .{path});
+        _ = &view;
+        if (!container.hashMatches(view.bytes)) return cli.fail("{s}: hash mismatch", .{path});
+        try stdout.print("{s}: hash ok ({d} parts)\n", .{ path, view.parts.items.len });
+        return;
+    }
 
-    // Stdout is for the actual output of your application, for example if you
-    // are implementing gzip, then only the compressed bytes should be sent to
-    // stdout, not any debugging messages.
-    var stdout_buffer: [1024]u8 = undefined;
-    var stdout_file_writer: Io.File.Writer = .init(.stdout(), io, &stdout_buffer);
-    const stdout_writer = &stdout_file_writer.interface;
+    const profile_str = opts.profile orelse return cli.fail("missing -T <profile>", .{});
+    const profile = shader.Profile.parse(profile_str) orelse return cli.fail("unknown profile '{s}'", .{profile_str});
 
-    try zdxc.printAnotherMessage(stdout_writer);
+    if (!opts.empty) return cli.fail("compiling HLSL is not implemented yet (use -zdxc-empty)", .{});
+    if (profile.kind != .compute) return cli.fail("-zdxc-empty supports compute profiles only", .{});
 
-    try stdout_writer.flush(); // Don't forget to flush!
-}
+    const bytes = if (opts.spirv)
+        try zdxc.spirv.builder.buildEmptyCompute(arena, .{ .entry = opts.entry, .num_threads = .{ 1, 1, 1 } })
+    else
+        try shader.buildEmptyCompute(arena, .{ .entry = opts.entry, .profile = profile, .num_threads = .{ 1, 1, 1 } });
 
-test "simple test" {
-    const gpa = std.testing.allocator;
-    var list: std.ArrayList(i32) = .empty;
-    defer list.deinit(gpa); // Try commenting this out and see if zig detects the memory leak!
-    try list.append(gpa, 42);
-    try std.testing.expectEqual(@as(i32, 42), list.pop());
-}
-
-test "fuzz example" {
-    try std.testing.fuzz({}, testOne, .{});
-}
-
-fn testOne(context: void, smith: *std.testing.Smith) !void {
-    _ = context;
-    // Try command `zig build test --fuzz -Doptimize=ReleaseFast` to see if it manages to fail this test case!
-
-    const gpa = std.testing.allocator;
-    var list: std.ArrayList(u8) = .empty;
-    defer list.deinit(gpa);
-    while (!smith.eos()) switch (smith.value(enum { add_data, dup_data })) {
-        .add_data => {
-            const slice = try list.addManyAsSlice(gpa, smith.value(u4));
-            smith.bytes(slice);
-        },
-        .dup_data => {
-            if (list.items.len == 0) continue;
-            if (list.items.len > std.math.maxInt(u32)) return error.SkipZigTest;
-            const len = smith.valueRangeAtMost(u32, 1, @min(32, list.items.len));
-            const off = smith.valueRangeAtMost(u32, 0, @intCast(list.items.len - len));
-            try list.appendSlice(gpa, list.items[off..][0..len]);
-            try std.testing.expectEqualSlices(
-                u8,
-                list.items[off..][0..len],
-                list.items[list.items.len - len ..],
-            );
-        },
-    };
+    const out = opts.output orelse return cli.fail("missing -Fo <file>", .{});
+    try Io.Dir.cwd().writeFile(cli.io, .{ .sub_path = out, .data = bytes });
 }

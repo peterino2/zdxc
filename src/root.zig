@@ -1,18 +1,21 @@
-//! By convention, root.zig is the root source file when making a package.
-const std = @import("std");
-const Io = std.Io;
+//! zdxc: an HLSL 2021 compiler targeting DXIL and SPIR-V.
 
-/// This is a documentation comment to explain the `printAnotherMessage` function below.
-///
-/// Accepting an `Io.Writer` instance is a handy way to write reusable code.
-pub fn printAnotherMessage(writer: *Io.Writer) Io.Writer.Error!void {
-    try writer.print("Run `zig build test` to run the tests.\n", .{});
-}
+pub const dxil = struct {
+    pub const bitstream = @import("dxil/bitstream.zig");
+    pub const container = @import("dxil/container.zig");
+    pub const hash = @import("dxil/hash.zig");
+    pub const module = @import("dxil/module.zig");
+    pub const shader = @import("dxil/shader.zig");
+};
 
-pub fn add(a: i32, b: i32) i32 {
-    return a + b;
-}
+pub const spirv = struct {
+    pub const builder = @import("spirv/builder.zig");
+};
 
-test "basic add functionality" {
-    try std.testing.expect(add(3, 7) == 10);
+pub const version = "0.0.0";
+
+test {
+    const std = @import("std");
+    std.testing.refAllDecls(dxil);
+    std.testing.refAllDecls(spirv);
 }
