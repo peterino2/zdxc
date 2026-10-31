@@ -27,6 +27,7 @@ const StorageClass = enum(u32) { uniform_constant = 0, input = 1, uniform = 2, o
 
 const Capability = enum(u32) {
     shader = 1,
+    geometry = 2,
     float16 = 9,
     float64 = 10,
     int64 = 11,
@@ -35,6 +36,8 @@ const Capability = enum(u32) {
     image_gather_extended = 25,
     storage_image_multisample = 27,
     sample_rate_shading = 35,
+    geometry_streams = 54,
+    multi_viewport = 57,
     min_lod = 42,
     sampled1d = 43,
     image1d = 44,
@@ -479,6 +482,7 @@ const Emitter = struct {
         try e.b.emit(.debug_names, .source, &.{ 5, 600 }); // HLSL
         e.void_id = try e.typeId(TypeTable.void_type);
         try e.cap(.shader);
+        if (entry.stage == .geometry) try e.cap(.geometry);
 
         e.func_ids = try e.arena.alloc(Id, m.functions.items.len);
         for (e.func_ids) |*id| id.* = e.b.newId();
@@ -516,6 +520,25 @@ const Emitter = struct {
         try e.b.emitWithString(.entry_points, .entry_point, &.{ model, wrapper }, entry.name, e.interface_ids.items);
         switch (entry.stage) {
             .compute => try e.b.emit(.execution_modes, .execution_mode, &.{ wrapper, 17, entry.num_threads[0], entry.num_threads[1], entry.num_threads[2] }),
+            .geometry => {
+                const gsi = entry.geometry;
+                try e.b.emit(.execution_modes, .execution_mode, &.{ wrapper, 0, gsi.instance_count }); // Invocations
+                const in_mode: u32 = switch (gsi.input) {
+                    .point => 19,
+                    .line => 20,
+                    .line_adj => 21,
+                    .triangle => 22,
+                    .triangle_adj => 23,
+                };
+                try e.b.emit(.execution_modes, .execution_mode, &.{ wrapper, in_mode });
+                try e.b.emit(.execution_modes, .execution_mode, &.{ wrapper, 26, gsi.max_vertex_count }); // OutputVertices
+                const out_mode: u32 = if (gsi.streams[0]) |k| switch (k) {
+                    .point => 27,
+                    .line => 28,
+                    .triangle => 29,
+                } else 27;
+                try e.b.emit(.execution_modes, .execution_mode, &.{ wrapper, out_mode });
+            },
             .pixel => {
                 try e.b.emit(.execution_modes, .execution_mode, &.{ wrapper, 7 }); // OriginUpperLeft
                 for (entry.outputs.items) |o| if (std.ascii.eqlIgnoreCase(o.semantic, "SV_Depth")) {
@@ -688,6 +711,26 @@ const Emitter = struct {
             if (!(stage == .vertex and input) and !(stage == .pixel)) return .{ .id = 0, .ty = float4 }; // Position
         }
         if (stage == .pixel and input and eq(n, "SV_IsFrontFace")) return .{ .id = 17, .ty = try t.scalar(.bool) }; // FrontFacing
+        if (input and (stage == .geometry or stage == .pixel) and eq(n, "SV_PrimitiveID")) {
+            try e.cap(.geometry);
+            return .{ .id = 7, .ty = uint1 }; // PrimitiveId
+        }
+        if (input and stage == .geometry and eq(n, "SV_GSInstanceID")) return .{ .id = 8, .ty = uint1 }; // InvocationId
+        if ((!input and stage == .geometry) or (input and stage == .pixel)) {
+            if (eq(n, "SV_RenderTargetArrayIndex")) {
+                try e.cap(.geometry);
+                return .{ .id = 9, .ty = uint1 }; // Layer
+            }
+            if (eq(n, "SV_ViewportArrayIndex")) {
+                try e.cap(.geometry);
+                try e.cap(.multi_viewport);
+                return .{ .id = 10, .ty = uint1 }; // ViewportIndex
+            }
+        }
+        if (input and stage == .pixel and eq(n, "SV_SampleIndex")) {
+            try e.cap(.sample_rate_shading);
+            return .{ .id = 18, .ty = uint1 }; // SampleId
+        }
         if (stage == .pixel and !input and eq(n, "SV_Depth")) return .{ .id = 22, .ty = try t.scalar(.float) }; // FragDepth
         if (eq(n, "SV_Target") or eq(n, "SV_VertexID") or eq(n, "SV_InstanceID") or eq(n, "SV_Position")) return null;
         if (el.system_value) return e.unsupported("system value '{s}' is not supported yet", .{n});
@@ -704,13 +747,19 @@ const Emitter = struct {
             for (els, out) |el, *iface| {
                 const bi = try e.builtinFor(el, input, entry.stage);
                 // bool is not allowed in located interface variables.
-                const ty = if (bi) |x| x.ty else if (e.t.component(el.ty) == .bool) try e.t.withComponent(el.ty, .uint) else el.ty;
+                var ty = if (bi) |x| x.ty else if (e.t.component(el.ty) == .bool) try e.t.withComponent(el.ty, .uint) else el.ty;
+                // Geometry inputs per vertex are arrays over the primitive.
+                const vty = ty;
+                if (el.per_vertex) ty = try e.t.array(ty, entry.geometry.input_vertices);
                 const sc: StorageClass = if (input) .input else .output;
                 const ptr = try e.pointerType(sc, try e.typeId(ty));
                 const var_id = e.b.newId();
                 try e.b.emit(.types_globals, .variable, &.{ ptr, var_id, @backingInt(sc) });
                 if (bi) |x| {
                     try e.b.emit(.annotations, .decorate, &.{ var_id, 11, x.id }); // BuiltIn
+                    if (input and entry.stage == .pixel and !e.t.component(x.ty).?.isFloat() and e.t.component(x.ty).? != .bool) {
+                        try e.b.emit(.annotations, .decorate, &.{ var_id, 14 }); // Flat
+                    }
                 } else {
                     const loc = if (std.ascii.eqlIgnoreCase(el.semantic, "SV_Target")) el.semantic_index else location[dir];
                     try e.b.emit(.annotations, .decorate, &.{ var_id, 30, loc }); // Location
@@ -733,9 +782,13 @@ const Emitter = struct {
                         }
                     }
                 }
+                if (!input and entry.stage == .geometry and entry.geometry.streams[1] != null) {
+                    try e.cap(.geometry_streams);
+                    try e.b.emit(.annotations, .decorate, &.{ var_id, 29, el.stream }); // Stream
+                }
                 const name = try std.fmt.allocPrint(e.arena, "{s}.var.{s}{d}", .{ if (input) "in" else "out", el.semantic, el.semantic_index });
                 try e.b.emitWithString(.debug_names, .name, &.{var_id}, name, &.{});
-                iface.* = .{ .var_id = var_id, .ty = ty };
+                iface.* = .{ .var_id = var_id, .ty = vty };
                 try e.interface_ids.append(e.arena, var_id);
             }
         }
@@ -1290,6 +1343,17 @@ const Emitter = struct {
                 const iface = e.inputs[k];
                 const loaded = try e.op1(.load, iface.ty, &.{iface.var_id});
                 e.vals[ri] = try e.reshape(loaded, iface.ty, i.ty);
+            },
+            .input_vertex => |x| {
+                const iface = e.inputs[x.element];
+                const ptr = try e.opRaw(.access_chain, try e.pointerType(.input, try e.typeId(iface.ty)), &.{ iface.var_id, try e.constUint(x.vertex) });
+                e.vals[ri] = try e.reshape(try e.op1(.load, iface.ty, &.{ptr}), iface.ty, i.ty);
+            },
+            .emit, .cut => |stream| {
+                const multi = e.m.entry.?.geometry.streams[1] != null;
+                if (multi) {
+                    try e.b.emit(.functions, if (i.op == .emit) .emit_stream_vertex else .end_stream_primitive, &.{try e.constUint(stream)});
+                } else try e.b.emit(.functions, if (i.op == .emit) .emit_vertex else .end_primitive, &.{});
             },
             .output => |o| {
                 const iface = e.outputs[o.element];

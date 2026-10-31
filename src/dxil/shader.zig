@@ -146,6 +146,7 @@ pub const PsvInfo = struct {
     inputs: []const signature.Element = &.{},
     outputs: []const signature.Element = &.{},
     groupshared_bytes: u32 = 0,
+    max_vertex_count: u16 = 0,
 };
 
 pub fn psvCompute(gpa: Allocator, entry: []const u8, num_threads: [3]u32, resources: []const ResourceBind) ![]u8 {
@@ -168,7 +169,7 @@ pub fn psv(gpa: Allocator, info: PsvInfo) ![]u8 {
     try w(&buf, gpa, 0xFFFFFFFF); // MaximumExpectedWaveLaneCount
     // PSVRuntimeInfo1: stage, UsesViewID, MaxVertexCount, element counts,
     // vector counts.
-    try buf.appendSlice(gpa, &.{ @backingInt(info.kind), 0, 0, 0 });
+    try buf.appendSlice(gpa, &.{ @backingInt(info.kind), 0, @truncate(info.max_vertex_count), @truncate(info.max_vertex_count >> 8) });
     try buf.appendSlice(gpa, &.{ @intCast(info.inputs.len), @intCast(info.outputs.len), 0, @intCast(in_vectors) });
     for (out_vectors) |v| try buf.append(gpa, @intCast(v));
     // PSVRuntimeInfo2
@@ -233,9 +234,13 @@ pub fn psv(gpa: Allocator, info: PsvInfo) ![]u8 {
     }
     // Input-to-output dependency table (no ViewID). Left empty: the
     // validator only checks it against dx.viewIdState, which zdxc omits.
-    if (in_vectors > 0 and out_vectors[0] > 0) {
-        const dwords = ((out_vectors[0] + 7) >> 3) * in_vectors * 4;
-        try buf.appendNTimes(gpa, 0, dwords * 4);
+    // (One per output stream for geometry shaders.)
+    for (out_vectors, 0..) |ov, stream| {
+        if (stream > 0 and info.kind != .geometry) break;
+        if (in_vectors > 0 and ov > 0) {
+            const dwords = ((ov + 7) >> 3) * in_vectors * 4;
+            try buf.appendNTimes(gpa, 0, dwords * 4);
+        }
     }
     return buf.toOwnedSlice(gpa);
 }

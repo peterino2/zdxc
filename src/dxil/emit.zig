@@ -285,7 +285,7 @@ const Emitter = struct {
         const m = e.m;
         const entry = m.entry orelse return e.unsupported("no entry point", .{});
         switch (entry.stage) {
-            .compute, .vertex, .pixel => {},
+            .compute, .vertex, .pixel, .geometry => {},
             else => return e.unsupported("{s} shaders are not supported yet", .{@tagName(entry.stage)}),
         }
         const void_ty = try e.voidTy();
@@ -968,6 +968,13 @@ const Emitter = struct {
             },
             .method => |x| return e.method(frame, x.name, x.res, x.args, i.ty),
             .input => |k| return e.input(k, i.ty),
+            .input_vertex => |x| return e.inputAt(x.element, i.ty, x.vertex),
+            .emit, .cut => |stream| {
+                const i8t = try e.dm.intType(8);
+                const fn_i = try e.dxOp(if (i.op == .emit) "dx.op.emitStream" else "dx.op.cutStream", try e.voidTy(), &.{ try e.dm.intType(32), i8t }, .nounwind);
+                _ = try e.callOp(fn_i, try e.voidTy(), &.{ try e.i32Const(if (i.op == .emit) 97 else 98), try e.dm.constant(.{ .ty = i8t, .kind = .{ .int = stream } }) });
+                return .none;
+            },
             .output => |o| {
                 try e.output(frame, o.element, o.value);
                 return .none;
@@ -2424,6 +2431,7 @@ const Emitter = struct {
         const points: [2]?signature.SigPoint = switch (entry.stage) {
             .vertex => .{ .vs_in, .vs_out },
             .pixel => .{ .ps_in, .ps_out },
+            .geometry => .{ .gs_v_in, .gs_out },
             else => .{ null, null },
         };
         e.in_elem = try e.arena.alloc(?u32, entry.inputs.items.len);
@@ -2441,7 +2449,9 @@ const Emitter = struct {
         for (els, 0..) |el, k| {
             const kind = signature.kindByName(el.semantic);
             if (kind == .invalid) return e.unsupported("semantic '{s}' is not supported yet", .{el.semantic});
-            const interp = signature.interpretation(kind, sp, e.profile.minor);
+            // Geometry inputs that are not per vertex belong to GSIn.
+            const esp: signature.SigPoint = if (sp == .gs_v_in and !el.per_vertex) .gs_in else sp;
+            const interp = signature.interpretation(kind, esp, e.profile.minor);
             switch (interp) {
                 .na => return e.unsupported("semantic '{s}' is not supported as this {s} yet", .{ el.semantic, if (sp.isInput()) "input" else "output" }),
                 .not_in_sig => continue,
@@ -2481,7 +2491,8 @@ const Emitter = struct {
                 .kind = eff_kind,
                 .interpretation = interp,
                 .comp = comp,
-                .interp = interpMode(el.interp, sp, comp, eff_kind),
+                .interp = interpMode(el.interp, esp, comp, eff_kind),
+                .stream = el.stream,
                 .rows = shape.rows,
                 .cols = shape.cols,
                 .indices = indices,
@@ -2498,7 +2509,7 @@ const Emitter = struct {
     /// linear for floats and constant for the rest; SV_Position never
     /// interpolates with perspective.
     fn interpMode(q: types.Interp, sp: signature.SigPoint, comp: signature.CompType, kind: signature.SemanticKind) signature.InterpMode {
-        if (sp == .vs_in or sp == .ps_out) return .undefined;
+        if (sp == .vs_in or sp == .ps_out or sp == .gs_in) return .undefined;
         var m: signature.InterpMode = if (q.nointerpolation)
             .constant
         else if (q.sample)
@@ -2594,6 +2605,8 @@ const Emitter = struct {
             .{ .kind = .view_id, .op = 138, .fname = "dx.op.viewID.i32" },
             .{ .kind = .start_vertex_location, .op = 256, .fname = "dx.op.startVertexLocation.i32" },
             .{ .kind = .start_instance_location, .op = 257, .fname = "dx.op.startInstanceLocation.i32" },
+            .{ .kind = .primitive_id, .op = 108, .fname = "dx.op.primitiveID.i32" },
+            .{ .kind = .gs_instance_id, .op = 100, .fname = "dx.op.gsInstanceID.i32" },
         };
         const out = try e.arena.alloc(Value, try e.flatCount(ty));
         if (kind == .cull_primitive) {
@@ -2612,6 +2625,10 @@ const Emitter = struct {
     }
 
     fn input(e: *Emitter, k: u32, ty: TypeId) Error!Lowered {
+        return e.inputAt(k, ty, null);
+    }
+
+    fn inputAt(e: *Emitter, k: u32, ty: TypeId, vertex: ?u32) Error!Lowered {
         const entry = e.m.entry.?;
         if (entry.stage == .compute) return e.computeInput(k, ty);
         const el = entry.inputs.items[k];
@@ -2622,12 +2639,12 @@ const Emitter = struct {
         const via = sigScalar(se.comp);
         const vt = try e.scalarTy(via);
         const fn_i = try e.dxOp(try std.fmt.allocPrint(e.arena, "dx.op.loadInput.{s}", .{e.overloadName(vt)}), vt, &.{ i32t, i32t, i32t, i8t, i32t }, .nounwind_readnone);
-        const undef = try e.dm.constant(.{ .ty = i32t, .kind = .undef });
+        const vx = if (vertex) |v| try e.i32Const(v) else try e.dm.constant(.{ .ty = i32t, .kind = .undef });
         const out = try e.arena.alloc(Value, try e.flatCount(ty));
         const to = e.compOf(ty);
         for (out, 0..) |*o, c| {
             const rc = try e.sigComponent(el.ty, el.row_major, @intCast(c));
-            const v = try e.callOp(fn_i, vt, &.{ try e.i32Const(4), try e.i32Const(se.id), try e.i32Const(rc[0]), try e.dm.constInt(8, rc[1]), undef });
+            const v = try e.callOp(fn_i, vt, &.{ try e.i32Const(4), try e.i32Const(se.id), try e.i32Const(rc[0]), try e.dm.constInt(8, rc[1]), vx });
             o.* = try e.convertScalar(v, via, to);
             se.usage |= @as(u8, 1) << @intCast(rc[1]);
         }
@@ -2835,6 +2852,13 @@ const Emitter = struct {
             const threads = try dm.mdNode(&.{ try mdI32(dm, entry.num_threads[0]), try mdI32(dm, entry.num_threads[1]), try mdI32(dm, entry.num_threads[2]) });
             try props.appendSlice(e.arena, &.{ try mdI32(dm, 4), threads });
         }
+        if (entry.stage == .geometry) {
+            // GS state: input primitive, max vertex count, stream mask,
+            // output topology, instance count.
+            const gsi = entry.geometry;
+            const state = try dm.mdNode(&.{ try mdI32(dm, @intFromEnum(gsi.input)), try mdI32(dm, gsi.max_vertex_count), try mdI32(dm, streamMask(gsi)), try mdI32(dm, gsTopology(gsi)), try mdI32(dm, gsi.instance_count) });
+            try props.appendSlice(e.arena, &.{ try mdI32(dm, 1), state });
+        }
         const props_node = if (props.items.len > 0) try dm.mdNode(props.items) else null;
         var sigs: ?module.MdId = null;
         if (e.sig_in.len + e.sig_out.len > 0) {
@@ -2918,9 +2942,19 @@ const Emitter = struct {
             },
             else => {},
         }
+        if (entry.stage == .geometry) {
+            const gsi = entry.geometry;
+            std.mem.writeInt(u32, stage_info[0..4], @intFromEnum(gsi.input), .little);
+            std.mem.writeInt(u32, stage_info[4..8], gsTopology(gsi), .little);
+            std.mem.writeInt(u32, stage_info[8..12], streamMask(gsi), .little);
+            for (e.sig_out) |el| {
+                if (el.kind == .position) stage_info[12] = 1; // OutputPositionPresent
+            }
+        }
         const kind: shader.ShaderKind = switch (entry.stage) {
             .vertex => .vertex,
             .pixel => .pixel,
+            .geometry => .geometry,
             else => .compute,
         };
         const psv = try shader.psv(gpa, .{
@@ -2932,6 +2966,7 @@ const Emitter = struct {
             .inputs = e.sig_in,
             .outputs = e.sig_out,
             .groupshared_bytes = if (entry.stage == .compute) e.groupshared_bytes else 0,
+            .max_vertex_count = if (entry.stage == .geometry) @intCast(entry.geometry.max_vertex_count) else 0,
         });
         defer gpa.free(psv);
         const isg1 = try signature.programSignature(gpa, e.sig_in, true);
@@ -2950,6 +2985,24 @@ const Emitter = struct {
         return container.assemble(gpa, &parts);
     }
 };
+
+fn streamMask(g: ir.GeometryInfo) u32 {
+    var m: u32 = 0;
+    for (g.streams, 0..) |st, k| if (st != null) {
+        m |= @as(u32, 1) << @intCast(k);
+    };
+    return if (m == 0) 1 else m;
+}
+
+/// DXIL::PrimitiveTopology of the (first used) output stream.
+fn gsTopology(g: ir.GeometryInfo) u32 {
+    for (g.streams) |st| if (st) |k| return switch (k) {
+        .point => 1,
+        .line => 3,
+        .triangle => 5,
+    };
+    return 1;
+}
 
 fn isResourceType(t: *TypeTable, ty: TypeId) bool {
     return switch (t.get(ty)) {

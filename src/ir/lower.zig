@@ -38,11 +38,14 @@ pub fn lowerUnit(arena: Allocator, s: *Sema, opts: Options) Error!ir.Module {
         l.unsupported(.none, "missing entry point definition", .{});
         return error.Unsupported;
     };
+    if (opts.stage == .geometry) try l.registerStreams(entry_fn);
     const main = try l.functionIndex(entry_fn);
     try l.drain();
     try l.buildEntry(entry_fn, main, opts);
     return l.m;
 }
+
+const Stream = struct { param: u32, ty: TypeId, first: u32, kind: @FieldType(types.Type, "stream") };
 
 const Lowerer = struct {
     arena: Allocator,
@@ -60,6 +63,11 @@ const Lowerer = struct {
     b: ir.Builder = undefined,
     vars: std.AutoHashMapUnmanaged(*const Variable, Ref) = .empty,
     loops: std.ArrayList(struct { brk: BlockId, cont: BlockId }) = .empty,
+    /// Geometry shaders: output elements registered before lowering (by
+    /// stream parameter), and each stream's element layout.
+    early_outputs: std.ArrayList(ir.SigElement) = .empty,
+    streams: std.ArrayList(Stream) = .empty,
+    entry_fn: ?*const semamod.Function = null,
     ret_ty: TypeId = TypeTable.void_type,
 
     fn unsupported(l: *Lowerer, loc: ast.Loc, comptime fmt: []const u8, args: anytype) void {
@@ -76,9 +84,13 @@ const Lowerer = struct {
     /// The IR function for a Sema function, queued for lowering on first use.
     fn functionIndex(l: *Lowerer, f: *const semamod.Function) Error!u32 {
         if (l.funcs.get(f)) |i| return i;
-        const params = try l.arena.alloc(ir.Param, f.params.len);
-        for (f.params, params) |p, *out| out.* = .{ .name = p.name, .ty = p.type, .by_ref = p.dir != .in };
-        const i = try l.m.addFunction(.{ .name = f.name, .params = params, .ret = f.ret });
+        // Stream-output objects exist only at compile time: no parameter.
+        var params: std.ArrayList(ir.Param) = .empty;
+        for (f.params) |p| {
+            if (l.s.types.get(p.type) == .stream) continue;
+            try params.append(l.arena, .{ .name = p.name, .ty = p.type, .by_ref = p.dir != .in });
+        }
+        const i = try l.m.addFunction(.{ .name = f.name, .params = params.items, .ret = f.ret });
         try l.funcs.put(l.arena, f, i);
         try l.pending.append(l.arena, f);
         return i;
@@ -101,8 +113,11 @@ const Lowerer = struct {
         l.b.setBlock(try l.b.newBlock());
         // Parameters: by-value ones get local storage, out / inout ones
         // are the caller's pointers.
+        var ir_index: u32 = 0;
         for (f.params, 0..) |p, i| {
-            const pv = try l.b.add(.{ .op = .{ .param = @intCast(i) }, .ty = p.type, .ptr = if (p.dir != .in) .function else .none });
+            if (l.s.types.get(p.type) == .stream) continue;
+            const pv = try l.b.add(.{ .op = .{ .param = ir_index }, .ty = p.type, .ptr = if (p.dir != .in) .function else .none });
+            ir_index += 1;
             const storage = if (p.dir != .in) pv else blk: {
                 const local = try l.b.add(.{ .op = .local_var, .ty = p.type, .ptr = .function });
                 try l.b.store(local, pv);
@@ -868,7 +883,10 @@ const Lowerer = struct {
             {
                 const vals = try l.arena.alloc(Ref, args.len);
                 const temps = try l.arena.alloc(Ref, args.len);
+                var n_vals: usize = 0;
                 for (args, f.params, 0..) |a, p, i| {
+                    if (l.s.types.get(p.type) == .stream) continue;
+                    n_vals += 1;
                     if (p.dir == .in) {
                         vals[i] = try l.converted(a, p.type);
                     } else {
@@ -878,9 +896,13 @@ const Lowerer = struct {
                         vals[i] = temps[i];
                     }
                 }
-                const res = try l.b.add(.{ .op = .{ .call = .{ .func = fi, .args = vals } }, .ty = ret_ty });
+                // (Stream arguments are dropped.)
+                var packed_vals: std.ArrayList(Ref) = .empty;
+                for (f.params, 0..) |p, i| if (l.s.types.get(p.type) != .stream) try packed_vals.append(l.arena, vals[i]);
+                std.debug.assert(packed_vals.items.len == n_vals);
+                const res = try l.b.add(.{ .op = .{ .call = .{ .func = fi, .args = packed_vals.items } }, .ty = ret_ty });
                 for (args, f.params, 0..) |a, p, i| {
-                    if (p.dir == .in) continue;
+                    if (p.dir == .in or l.s.types.get(p.type) == .stream) continue;
                     const back = try l.b.load(temps[i]);
                     try l.storeTo(a, try l.convert(back, a.ty));
                 }
@@ -894,6 +916,9 @@ const Lowerer = struct {
             .intrinsic => |it| {
                 const name = table.intrinsics[it.index].name;
                 const spec = table.intrinsics[it.index];
+                if (it.object) |_| if (l.s.types.get(callee.kind.member.base.ty) == .stream) {
+                    return l.streamMethod(e, callee.kind.member.base, name, args);
+                };
                 if (it.object) |_| {
                     const obj = callee.kind.member.base;
                     const res = try l.rvalue(obj);
@@ -1173,14 +1198,145 @@ const Lowerer = struct {
         return inits;
     }
 
+    /// One leaf at a time of a signature value of type `ty`: registers
+    /// elements into `list` (when non-null) or writes `value`'s leaves to
+    /// consecutive output elements starting at `next`.
+    fn streamOut(l: *Lowerer, list: ?*std.ArrayList(ir.SigElement), ty: TypeId, semantic: ?[]const u8, attrs: SigAttrs, value: ?Ref, next: *u32, stream: u32, numbered: ?*ir.SigElement, loc: ast.Loc) Error!void {
+        const t = l.types();
+        const leaf = struct {
+            fn f(lw: *Lowerer, lst: ?*std.ArrayList(ir.SigElement), el: ir.SigElement, v: ?Ref, nx: *u32) Error!void {
+                if (lst) |x| try x.append(lw.arena, el) else _ = try lw.b.add(.{ .op = .{ .output = .{ .element = nx.*, .value = v.? } }, .ty = TypeTable.void_type });
+                nx.* += 1;
+            }
+        }.f;
+        const part = struct {
+            fn f(lw: *Lowerer, v: ?Ref, k: usize, fty: TypeId) Error!?Ref {
+                return if (v) |x| try lw.b.add(.{ .op = .{ .extract = .{ .agg = x, .index = @intCast(k) } }, .ty = fty }) else null;
+            }
+        }.f;
+        if (numbered) |num| {
+            // A semantic on a struct numbers its leaves.
+            if (t.get(ty) == .@"struct") {
+                for (t.get(ty).@"struct".fields.items, 0..) |fld, k| try l.streamOut(list, fld.type, null, attrs.field(fld), try part(l, value, k, fld.type), next, stream, num, loc);
+                return;
+            }
+            var el = withAttrs(.{ .semantic = num.semantic, .semantic_index = num.semantic_index, .ty = ty, .system_value = num.system_value }, attrs);
+            el.stream = stream;
+            num.semantic_index += 1;
+            return leaf(l, list, el, value, next);
+        }
+        if (semantic) |sem| {
+            var el = withAttrs(sigElement(sem, ty), attrs);
+            el.stream = stream;
+            if (t.get(ty) == .@"struct") return l.streamOut(list, ty, null, attrs, value, next, stream, &el, loc);
+            return leaf(l, list, el, value, next);
+        }
+        if (t.get(ty) != .@"struct") {
+            l.unsupported(loc, "stream output elements need semantics", .{});
+            return error.Unsupported;
+        }
+        for (t.get(ty).@"struct".fields.items, 0..) |fld, k| try l.streamOut(list, fld.type, fld.semantic, attrs.field(fld), try part(l, value, k, fld.type), next, stream, null, loc);
+    }
+
+    /// Registers the output elements of each stream parameter of the entry
+    /// (in parameter order, as dxc).
+    fn registerStreams(l: *Lowerer, f: *const semamod.Function) Error!void {
+        l.entry_fn = f;
+        for (f.params, 0..) |p, i| {
+            const st = switch (l.s.types.get(p.type)) {
+                .stream => |st| st,
+                else => continue,
+            };
+            const k: u32 = @intCast(l.streams.items.len);
+            if (k >= 4) {
+                l.unsupported(f.loc, "more than four streams", .{});
+                return error.Unsupported;
+            }
+            var next: u32 = @intCast(l.early_outputs.items.len);
+            const first = next;
+            try l.streamOut(&l.early_outputs, st.elem, null, .{}, null, &next, k, null, f.decl.params[i].name_loc);
+            try l.streams.append(l.arena, .{ .param = @intCast(i), .ty = st.elem, .first = first, .kind = st });
+        }
+    }
+
+    /// `stream.Append(v)` / `stream.RestartStrip()`.
+    fn streamMethod(l: *Lowerer, e: *ast.Expr, obj: *ast.Expr, name: []const u8, args: []const *ast.Expr) Error!Ref {
+        if (l.streams.items.len == 0) return l.fail(e, "streams outside geometry shaders");
+        // Which stream: the entry's stream parameter named, or the only one.
+        var k: usize = 0;
+        if (l.streams.items.len > 1) {
+            const r = l.s.resolution(obj) orelse return l.fail(e, "this stream");
+            const ef = l.entry_fn.?;
+            k = for (l.streams.items, 0..) |sm, j| {
+                if (r == .variable and sm.param < ef.param_vars.len and ef.param_vars[sm.param] == r.variable) break j;
+            } else return l.fail(e, "selecting among several streams through a function parameter");
+        }
+        const sm = l.streams.items[k];
+        if (std.mem.eql(u8, name, "Append")) {
+            const v = try l.converted(args[0], sm.ty);
+            var next = sm.first;
+            try l.streamOut(null, sm.ty, null, .{}, v, &next, @intCast(k), null, e.loc);
+            _ = try l.b.add(.{ .op = .{ .emit = @intCast(k) }, .ty = TypeTable.void_type });
+        } else _ = try l.b.add(.{ .op = .{ .cut = @intCast(k) }, .ty = TypeTable.void_type });
+        return .none;
+    }
+
+    /// A per-vertex input value of type `ty` for `vertex`, registering its
+    /// elements when `register` (the first vertex).
+    fn vertexIn(l: *Lowerer, entry: *ir.Entry, ty: TypeId, semantic: ?[]const u8, attrs: SigAttrs, vertex: u32, register: bool, next: *u32, numbered: ?*ir.SigElement, loc: ast.Loc) Error!Ref {
+        const t = l.types();
+        const leaf = struct {
+            fn f(lw: *Lowerer, en: *ir.Entry, el: ir.SigElement, vx: u32, reg: bool, nx: *u32) Error!Ref {
+                var e2 = el;
+                e2.per_vertex = true;
+                if (reg) try en.inputs.append(lw.arena, e2);
+                const r = try lw.b.add(.{ .op = .{ .input_vertex = .{ .element = nx.*, .vertex = vx } }, .ty = el.ty });
+                nx.* += 1;
+                return r;
+            }
+        }.f;
+        if (numbered) |num| {
+            if (t.get(ty) == .@"struct") {
+                const st = t.get(ty).@"struct";
+                const parts = try l.arena.alloc(Ref, st.fields.items.len);
+                for (parts, st.fields.items) |*p, fld| p.* = try l.vertexIn(entry, fld.type, null, attrs.field(fld), vertex, register, next, num, loc);
+                return l.b.add(.{ .op = .{ .construct = parts }, .ty = ty });
+            }
+            const el = withAttrs(.{ .semantic = num.semantic, .semantic_index = num.semantic_index, .ty = ty, .system_value = num.system_value }, attrs);
+            num.semantic_index += 1;
+            return leaf(l, entry, el, vertex, register, next);
+        }
+        if (semantic) |sem| {
+            var el = withAttrs(sigElement(sem, ty), attrs);
+            if (t.get(ty) == .@"struct") return l.vertexIn(entry, ty, null, attrs, vertex, register, next, &el, loc);
+            return leaf(l, entry, el, vertex, register, next);
+        }
+        if (t.get(ty) != .@"struct") {
+            l.unsupported(loc, "per-vertex inputs need semantics", .{});
+            return error.Unsupported;
+        }
+        const st = t.get(ty).@"struct";
+        const parts = try l.arena.alloc(Ref, st.fields.items.len);
+        for (parts, st.fields.items) |*p, fld| p.* = try l.vertexIn(entry, fld.type, fld.semantic, attrs.field(fld), vertex, register, next, null, loc);
+        return l.b.add(.{ .op = .{ .construct = parts }, .ty = ty });
+    }
+
     fn buildEntry(l: *Lowerer, f: *const semamod.Function, main: u32, opts: Options) Error!void {
         const inits = try l.staticInits();
         var entry: ir.Entry = .{ .func = main, .name = opts.entry, .stage = opts.stage };
+        entry.outputs = l.early_outputs;
         for (f.decl.attrs) |a| {
             if (std.ascii.eqlIgnoreCase(a.name, "numthreads") and a.args.len == 3) {
                 for (a.args, 0..) |arg, i| entry.num_threads[i] = @intCast(@max(1, l.s.evalInt(arg) orelse 1));
             }
+            if (std.ascii.eqlIgnoreCase(a.name, "maxvertexcount") and a.args.len == 1) entry.geometry.max_vertex_count = @intCast(@max(1, l.s.evalInt(a.args[0]) orelse 1));
+            if (std.ascii.eqlIgnoreCase(a.name, "instance") and a.args.len == 1) entry.geometry.instance_count = @intCast(@max(1, l.s.evalInt(a.args[0]) orelse 1));
         }
+        for (l.streams.items, 0..) |sm, k| entry.geometry.streams[k] = switch (sm.kind.kind) {
+            .point => .point,
+            .line => .line,
+            .triangle => .triangle,
+        };
         const wrapper = try l.m.addFunction(.{ .name = opts.entry, .params = &.{}, .ret = TypeTable.void_type });
         l.b = .{ .m = &l.m, .f = l.m.functions.items[wrapper] };
         l.b.setBlock(try l.b.newBlock());
@@ -1192,18 +1348,40 @@ const Lowerer = struct {
         };
         const args = try l.arena.alloc(Ref, f.params.len);
         const locals = try l.arena.alloc(Ref, f.params.len);
+        var n_args: usize = 0;
         for (f.decl.params, f.params, 0..) |pd, p, i| {
+            if (l.s.types.get(p.type) == .stream) continue;
+            n_args += 1;
             locals[i] = try l.b.add(.{ .op = .local_var, .ty = p.type, .ptr = .function });
+            const q = pd.quals;
+            if (opts.stage == .geometry and (q.point or q.line or q.triangle or q.lineadj or q.triangleadj) and l.s.types.get(p.type) == .array) {
+                // Per-vertex inputs: one value per vertex of the primitive.
+                const arr = l.s.types.get(p.type).array;
+                entry.geometry.input = if (q.point) .point else if (q.line) .line else if (q.triangle) .triangle else if (q.lineadj) .line_adj else .triangle_adj;
+                entry.geometry.input_vertices = arr.len;
+                const first: u32 = @intCast(entry.inputs.items.len);
+                const verts = try l.arena.alloc(Ref, arr.len);
+                for (verts, 0..) |*v, vx| {
+                    var next = first;
+                    v.* = try l.vertexIn(&entry, arr.elem, semanticOf(pd.semantics), paramAttrs(pd.quals), @intCast(vx), vx == 0, &next, null, pd.name_loc);
+                }
+                try l.b.store(locals[i], try l.b.add(.{ .op = .{ .construct = verts }, .ty = p.type }));
+                args[i] = try l.b.load(locals[i]);
+                continue;
+            }
             if (p.dir != .out) {
                 const v = try l.entryInput(&entry, p.type, semanticOf(pd.semantics), paramAttrs(pd.quals), pd.name_loc, pd.name);
                 try l.b.store(locals[i], v);
             }
             args[i] = if (p.dir == .in) try l.b.load(locals[i]) else locals[i];
         }
-        const ret = try l.b.add(.{ .op = .{ .call = .{ .func = main, .args = args } }, .ty = f.ret });
+        var call_args: std.ArrayList(Ref) = .empty;
+        for (f.params, 0..) |p, i| if (l.s.types.get(p.type) != .stream) try call_args.append(l.arena, args[i]);
+        std.debug.assert(call_args.items.len == n_args);
+        const ret = try l.b.add(.{ .op = .{ .call = .{ .func = main, .args = call_args.items } }, .ty = f.ret });
         if (f.ret != TypeTable.void_type) try l.entryOutput(&entry, f.ret, semanticOf(f.decl.ret_semantics), paramAttrs(f.decl.quals), ret, f.loc, "return value");
         for (f.decl.params, f.params, 0..) |pd, p, i| {
-            if (p.dir == .in) continue;
+            if (p.dir == .in or l.s.types.get(p.type) == .stream) continue;
             const v = try l.b.load(locals[i]);
             try l.entryOutput(&entry, p.type, semanticOf(pd.semantics), paramAttrs(pd.quals), v, pd.name_loc, pd.name);
         }

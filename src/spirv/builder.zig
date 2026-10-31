@@ -190,6 +190,10 @@ pub const Op = enum(u16) {
     group_non_uniform_bitwise_xor = 361,
     group_non_uniform_quad_broadcast = 365,
     group_non_uniform_quad_swap = 366,
+    emit_vertex = 218,
+    end_primitive = 219,
+    emit_stream_vertex = 220,
+    end_stream_primitive = 221,
 };
 
 pub const Section = enum {

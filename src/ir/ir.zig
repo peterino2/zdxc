@@ -107,7 +107,13 @@ pub const Op = union(enum) {
     /// An entry-point input / output element (index into the entry's
     /// signature).
     input: u32,
+    /// A per-vertex input (geometry shaders): element, vertex index.
+    input_vertex: struct { element: u32, vertex: u32 },
     output: struct { element: u32, value: Ref },
+    /// Geometry shaders: emit the vertex written to the outputs of a stream,
+    /// or end its strip.
+    emit: u32,
+    cut: u32,
     phi: []const struct { value: Ref, block: BlockId },
 };
 
@@ -197,6 +203,22 @@ pub const SigElement = struct {
     interp: types.Interp = .{},
     /// Matrices in the element are row_major (signature layout only).
     row_major: bool = false,
+    /// Geometry shader output stream.
+    stream: u32 = 0,
+    /// One value per vertex of the input primitive (geometry shaders).
+    per_vertex: bool = false,
+};
+
+pub const Primitive = enum(u8) { point = 1, line = 2, triangle = 3, line_adj = 6, triangle_adj = 7 };
+
+pub const GeometryInfo = struct {
+    input: Primitive = .triangle,
+    /// Vertices per input primitive.
+    input_vertices: u32 = 3,
+    max_vertex_count: u32 = 1,
+    instance_count: u32 = 1,
+    /// Output topology per stream (null: stream unused).
+    streams: [4]?enum { point, line, triangle } = .{ null, null, null, null },
 };
 
 pub const Entry = struct {
@@ -205,6 +227,7 @@ pub const Entry = struct {
     name: []const u8,
     stage: Stage,
     num_threads: [3]u32 = .{ 1, 1, 1 },
+    geometry: GeometryInfo = .{},
     inputs: std.ArrayList(SigElement) = .empty,
     outputs: std.ArrayList(SigElement) = .empty,
     /// The wrapper with no parameters that reads `inputs`, calls `func`
@@ -367,6 +390,9 @@ fn dumpInst(m: *const Module, f: *const Function, r: Ref, w: *std.Io.Writer) !vo
             try w.print("{s}", .{c.name});
             for (c.args, 0..) |a, i| try w.print("{s} %{d}", .{ if (i > 0) "," else "", a.index() });
         },
+        .input_vertex => |x| try w.print("input {d} vertex {d}", .{ x.element, x.vertex }),
+        .emit => |k| try w.print("emit stream {d}", .{k}),
+        .cut => |k| try w.print("cut stream {d}", .{k}),
         .res_load => |x| try w.print("res_load %{d}[%{d}]", .{ x.res.index(), x.index.index() }),
         .res_store => |x| try w.print("res_store %{d}[%{d}], %{d}", .{ x.res.index(), x.index.index(), x.value.index() }),
         .method => |x| {
