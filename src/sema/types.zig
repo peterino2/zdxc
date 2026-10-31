@@ -342,6 +342,10 @@ pub const Field = struct {
     interp: Interp = .{},
     /// Hidden storage for consecutive bitfields (see StructInfo.bitfields).
     bits: bool = false,
+    /// [[vk::location(n)]], [[vk::index(n)]], [[vk::offset(n)]].
+    vk_location: ?u32 = null,
+    vk_index: ?u32 = null,
+    vk_offset: ?u32 = null,
 };
 
 /// A bitfield member: `width` bits at `offset` in storage field `storage`.

@@ -856,9 +856,9 @@ pub const Parser = struct {
             _ = try p.missingSemi("';' after struct");
             return;
         }
-        // `struct S { ... } a, b;`
+        // `struct S { ... } a, b;` (leading attributes apply to them too).
         const ty = try p.mk(ast.TypeRef, .{ .loc = name_loc, .name = try p.simpleName(name_loc, name.?) });
-        try p.parseDeclaratorsInto(out, &.{}, quals, &.{}, ty, ctx);
+        try p.parseDeclaratorsInto(out, lead_attrs, quals, &.{}, ty, ctx);
     }
 
     /// After a struct body without `;`: does the next line look like a new

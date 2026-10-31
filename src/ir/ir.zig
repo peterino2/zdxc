@@ -129,6 +129,8 @@ pub const Op = union(enum) {
     /// Ray tracing entries: pointer (`ray` space) to the storage of an
     /// incoming value of the instruction's type.
     ray_incoming: RayIncoming,
+    /// SPIR-V specialization constant (index into Module.spec_constants).
+    spec_constant: u32,
     patch_output: struct { element: u32, value: Ref },
     output_vertex: struct { element: u32, vertex: u32 },
     /// Geometry shaders: emit the vertex written to the outputs of a stream,
@@ -215,6 +217,67 @@ pub const Binding = struct {
     index: u32 = 0,
     space: u32 = 0,
     explicit: bool = false,
+    /// `spaceN` was written.
+    space_given: bool = false,
+};
+
+/// Vulkan binding options (-fvk-*-shift, -fvk-bind-globals,
+/// -auto-binding-space).
+pub const VkOptions = struct {
+    /// Per register class (b, t, s, u): shifts by set; `all` applies to
+    /// every set without one of its own.
+    shifts: [4]std.ArrayList(struct { shift: u32, set: ?u32 }) = .{ .empty, .empty, .empty, .empty },
+    bind_globals: ?[2]u32 = null,
+    auto_binding_space: u32 = 0,
+    /// -fvk-auto-shift-bindings: implicit bindings start at their class's
+    /// shift too.
+    auto_shift: bool = false,
+    /// -fvk-stage-io-order=alpha: locations by semantic, not declaration.
+    alpha_io_order: bool = false,
+    /// -fspv-flatten-resource-arrays: one variable (and binding) per
+    /// element of an array of resources.
+    flatten_arrays: bool = false,
+    /// -fvk-bind-register: every resource's (set, binding) by register.
+    bind_register: std.ArrayList(struct { class: u8, index: u32, space: u32, binding: u32, set: u32 }) = .empty,
+
+    pub fn shift(o: VkOptions, class: u8, set: u32) u32 {
+        const k: usize = switch (class) {
+            'b' => 0,
+            't' => 1,
+            's' => 2,
+            'u' => 3,
+            else => return 0,
+        };
+        var all: u32 = 0;
+        for (o.shifts[k].items) |x| {
+            if (x.set) |s0| {
+                if (s0 == set) return x.shift;
+            } else all = x.shift;
+        }
+        return all;
+    }
+};
+
+/// A descriptor declaration, in declaration order: SPIR-V numbers implicit
+/// bindings over all of them, used or not (as dxc).
+pub const BindingDecl = struct {
+    /// The IR global (null: unused; it still takes a binding number).
+    global: ?u32,
+    reg: Binding = .{},
+    /// `register(spaceN)` without a register.
+    space_only: bool = false,
+    /// [[vk::binding(binding, set)]], [[vk::counter_binding(binding)]].
+    vk_binding: ?u32 = null,
+    vk_set: ?u32 = null,
+    vk_counter: ?u32 = null,
+    /// Append / Consume buffers: their counter is numbered right after.
+    acs: bool = false,
+    /// `$Globals`.
+    globals_buffer: bool = false,
+    /// [[vk::combinedImageSampler]]: `s` registers shift like `t` ones.
+    combined: bool = false,
+    /// Resources in the declaration (array elements).
+    count: u32 = 1,
 };
 
 pub const Global = struct {
@@ -228,6 +291,8 @@ pub const Global = struct {
     /// `[[vk::shader_record_ext]]` / `[[vk::shader_record_nv]]` buffers
     /// (SPIR-V ShaderRecordBufferKHR storage).
     shader_record: bool = false,
+    /// `[[vk::push_constant]]` buffers (SPIR-V PushConstant storage).
+    push_constant: bool = false,
 };
 
 pub const Stage = enum {
@@ -266,6 +331,11 @@ pub const SigElement = struct {
     stream: u32 = 0,
     /// One value per vertex of the input primitive (geometry shaders).
     per_vertex: bool = false,
+    /// The semantic as written (`TEXCOORD`, `TEXCOORD3`).
+    spelling: ?[]const u8 = null,
+    /// [[vk::location(n)]], [[vk::index(n)]].
+    vk_location: ?u32 = null,
+    vk_index: ?u32 = null,
 };
 
 pub const Primitive = enum(u8) { point = 1, line = 2, triangle = 3, line_adj = 6, triangle_adj = 7 };
@@ -370,6 +440,11 @@ pub const Module = struct {
     exports: std.ArrayList(u32) = .empty,
     /// Libraries: state object subobjects, in declaration order.
     subobjects: std.ArrayList(Subobject) = .empty,
+    /// [[vk::constant_id(n)]] constants (SPIR-V).
+    spec_constants: std.ArrayList(struct { name: []const u8, ty: TypeId, id: u32, value: Constant }) = .empty,
+    /// Descriptor declarations in declaration order.
+    binding_decls: std.ArrayList(BindingDecl) = .empty,
+    vk: VkOptions = .{},
     /// -enable-16bit-types: half and 16-bit integers are native types.
     native_16bit: bool = false,
     /// Root signatures: version 1.0 or 1.1 (-force-rootsig-ver), and
@@ -530,6 +605,7 @@ fn dumpInst(m: *const Module, f: *const Function, r: Ref, w: *std.Io.Writer) !vo
         .mesh_output => |k| try w.print("mesh output {s}", .{@tagName(k)}),
         .mesh_payload => try w.print("mesh payload", .{}),
         .ray_incoming => |k| try w.print("ray incoming {s}", .{@tagName(k)}),
+        .spec_constant => |k| try w.print("spec constant {d}", .{k}),
         .heap_resource => |h| try w.print("{s}[%{d}]", .{ if (h.sampler) "SamplerDescriptorHeap" else "ResourceDescriptorHeap", h.index.index() }),
         .patch_output => |x| try w.print("patch output {d} = %{d}", .{ x.element, x.value.index() }),
         .output_vertex => |x| try w.print("output {d} vertex {d}", .{ x.element, x.vertex }),

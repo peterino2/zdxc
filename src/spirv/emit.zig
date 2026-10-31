@@ -26,7 +26,7 @@ pub const Error = Allocator.Error || error{Unsupported};
 /// Marks a binding that is a recipe (see Emitter.resourceBinding).
 const recipe_tag: u32 = 0x8000_0000;
 
-const StorageClass = enum(u32) { uniform_constant = 0, input = 1, uniform = 2, output = 3, workgroup = 4, private = 6, function = 7, image = 11, storage_buffer = 12, task_payload_workgroup = 5402, callable_data_khr = 5328, incoming_callable_data_khr = 5329, ray_payload_khr = 5338, hit_attribute_khr = 5339, incoming_ray_payload_khr = 5342, shader_record_buffer_khr = 5343 };
+const StorageClass = enum(u32) { uniform_constant = 0, input = 1, uniform = 2, output = 3, workgroup = 4, private = 6, function = 7, image = 11, storage_buffer = 12, task_payload_workgroup = 5402, callable_data_khr = 5328, incoming_callable_data_khr = 5329, ray_payload_khr = 5338, hit_attribute_khr = 5339, incoming_ray_payload_khr = 5342, shader_record_buffer_khr = 5343, push_constant = 9 };
 
 const Capability = enum(u32) {
     shader = 1,
@@ -110,7 +110,7 @@ pub const TargetEnv = struct {
 pub fn emit(gpa: Allocator, m: *const ir.Module, diags: *diag.Diagnostics, env: TargetEnv) Error![]u8 {
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
-    var e: Emitter = .{ .arena = arena_state.allocator(), .b = .init(gpa), .m = m, .t = m.types, .diags = diags, .spv_minor = env.minor, .universal = env.universal };
+    var e: Emitter = .{ .arena = arena_state.allocator(), .b = .init(gpa), .m = m, .t = m.types, .diags = diags, .spv_minor = env.minor, .universal = env.universal, .vk = m.vk };
     defer e.b.deinit();
     try e.module();
     return e.b.finish(0x00010000 | (@as(u32, env.minor) << 8));
@@ -154,6 +154,16 @@ const Emitter = struct {
     /// on the heap's binding.
     heap_vars: std.AutoHashMapUnmanaged(struct { bool, Id }, Id) = .empty,
     heap_bindings: [2]u32 = .{ 0, 0 },
+    /// Descriptor bindings by global (and of their counters); bindings
+    /// taken, by (set, binding).
+    slots: []?Slot = &.{},
+    counter_slots: []?Slot = &.{},
+    used_bindings: std.AutoHashMapUnmanaged(struct { u32, u32 }, void) = .empty,
+    spec_ids: std.AutoHashMapUnmanaged(u32, Id) = .empty,
+    /// Flattened resource arrays: a variable per element.
+    flat_vars: std.AutoHashMapUnmanaged(u32, []const Id) = .empty,
+    flat_iface: std.ArrayList(Id) = .empty,
+    vk: ir.VkOptions = .{},
     /// Image types by (sampled type, dim, arrayed, ms, sampled, format).
     image_types: std.AutoHashMapUnmanaged([6]u32, Id) = .empty,
     sampled_image_types: std.AutoHashMapUnmanaged(Id, Id) = .empty,
@@ -575,6 +585,33 @@ const Emitter = struct {
         }
     }
 
+    /// A [[vk::constant_id]] constant: OpSpecConstant* with its SpecId.
+    fn specConstant(e: *Emitter, k: u32) Error!Id {
+        if (e.spec_ids.get(k)) |id| return id;
+        const sc = e.m.spec_constants.items[k];
+        const s = storageScalar(e.t.component(sc.ty).?);
+        const ty_id = try e.scalarType(s);
+        const id = e.b.newId();
+        if (s == .bool) {
+            try e.b.emit(.types_globals, if (intOf(sc.value) != 0) .spec_constant_true else .spec_constant_false, &.{ ty_id, id });
+        } else {
+            const bits: u64 = switch (s) {
+                .float => @as(u32, @bitCast(@as(f32, @floatCast(floatOf(sc.value))))),
+                .double => @bitCast(floatOf(sc.value)),
+                .float16 => @as(u16, @bitCast(@as(f16, @floatCast(floatOf(sc.value))))),
+                .int64, .uint64 => @bitCast(intOf(sc.value)),
+                else => @as(u32, @truncate(@as(u64, @bitCast(intOf(sc.value))))),
+            };
+            if (s.size() == 8) {
+                try e.b.emit(.types_globals, .spec_constant, &.{ ty_id, id, @truncate(bits), @truncate(bits >> 32) });
+            } else try e.b.emit(.types_globals, .spec_constant, &.{ ty_id, id, @truncate(bits) });
+        }
+        try e.b.emit(.annotations, .decorate, &.{ id, 1, sc.id }); // SpecId
+        try e.b.emitWithString(.debug_names, .name, &.{id}, sc.name, &.{});
+        try e.spec_ids.put(e.arena, k, id);
+        return id;
+    }
+
     fn floatOf(c: ir.Constant) f64 {
         return switch (c) {
             .int => |i| @floatFromInt(i),
@@ -704,8 +741,9 @@ const Emitter = struct {
         }
         if (e.spv_minor >= 4) {
             // (Shader record buffers only where used: at most one each.)
-            for (e.global_vars, e.m.globals.items) |v, g| if (v != 0 and !g.shader_record) try out.put(e.arena, v, {});
+            for (e.global_vars, e.m.globals.items) |v, g| if (v != 0 and !g.shader_record and !g.push_constant) try out.put(e.arena, v, {});
             for (e.counter_vars) |v| if (v != 0) try out.put(e.arena, v, {});
+            for (e.flat_iface.items) |v| try out.put(e.arena, v, {});
         }
         return out.keys();
     }
@@ -804,21 +842,20 @@ const Emitter = struct {
         const m = e.m;
         e.global_vars = try e.arena.alloc(Id, m.globals.items.len);
 
-        // Registers without an explicit binding take the next free one.
-        var used: std.AutoHashMapUnmanaged(struct { u32, u32 }, void) = .empty;
-        for (m.globals.items) |g| if (g.binding.explicit) try used.put(e.arena, .{ g.binding.space, g.binding.index }, {});
-        var next_free: u32 = 0;
+        try e.findCounterGlobals();
+        try e.assignBindings();
         for (m.globals.items, 0..) |g, gi| {
             switch (g.space) {
-                .resource, .cbuffer => if (g.shader_record) {
-                    // Shader record buffers: std430, no descriptor.
+                .resource, .cbuffer => if (ownStorage(g)) |sc| {
+                    // Shader record buffers and push constants: std430, no
+                    // descriptor.
                     const st = e.t.get(if (g.space == .resource) e.t.get(g.ty).resource.elem else g.ty);
-                    if (st != .@"struct") return e.unsupported("this shader record buffer is not supported yet", .{});
+                    if (st != .@"struct") return e.unsupported("this buffer is not supported yet", .{});
                     const block = e.b.newId();
-                    try e.layoutStruct(block, st.@"struct", .std430, try std.fmt.allocPrint(e.arena, "type.ShaderRecord.{s}", .{g.name}));
+                    try e.layoutStruct(block, st.@"struct", .std430, try std.fmt.allocPrint(e.arena, "type.{s}.{s}", .{ if (sc == .push_constant) "PushConstant" else "ShaderRecord", g.name }));
                     try e.b.emit(.annotations, .decorate, &.{ block, 2 }); // Block
                     const var_id = e.b.newId();
-                    try e.b.emit(.types_globals, .variable, &.{ try e.pointerType(.shader_record_buffer_khr, block), var_id, @backingInt(StorageClass.shader_record_buffer_khr) });
+                    try e.b.emit(.types_globals, .variable, &.{ try e.pointerType(sc, block), var_id, @backingInt(sc) });
                     try e.b.emitWithString(.debug_names, .name, &.{var_id}, g.name, &.{});
                     e.global_vars[gi] = var_id;
                     continue;
@@ -827,17 +864,32 @@ const Emitter = struct {
             }
             switch (g.space) {
                 .resource => {
+                    if (e.vk.flatten_arrays and e.t.get(g.ty) == .array and e.constantlyIndexed(@intCast(gi))) {
+                        // One variable per element, on consecutive bindings.
+                        var et = g.ty;
+                        var n: u32 = 1;
+                        while (e.t.get(et) == .array) : (et = e.t.get(et).array.elem) n *= e.t.get(et).array.len;
+                        if (n == 0) return e.unsupported("flattening unsized resource arrays is not supported", .{});
+                        const p = try e.resourcePointee(et);
+                        const slot = try e.slotOf(@intCast(gi), false);
+                        const ids = try e.arena.alloc(Id, n);
+                        for (ids, 0..) |*id, k| {
+                            id.* = e.b.newId();
+                            try e.b.emit(.types_globals, .variable, &.{ try e.pointerType(p.sc, p.ty), id.*, @backingInt(p.sc) });
+                            try e.b.emit(.annotations, .decorate, &.{ id.*, 34, slot.set }); // DescriptorSet
+                            try e.b.emit(.annotations, .decorate, &.{ id.*, 33, slot.binding + @as(u32, @intCast(k)) }); // Binding
+                            try e.b.emitWithString(.debug_names, .name, &.{id.*}, try std.fmt.allocPrint(e.arena, "{s}[{d}]", .{ g.name, k }), &.{});
+                            if (e.spv_minor >= 4) try e.flat_iface.append(e.arena, id.*);
+                        }
+                        try e.flat_vars.put(e.arena, @intCast(gi), ids);
+                        continue;
+                    }
                     const var_id = e.b.newId();
                     const p = try e.resourcePointee(g.ty);
                     try e.b.emit(.types_globals, .variable, &.{ try e.pointerType(p.sc, p.ty), var_id, @backingInt(p.sc) });
-                    var binding = g.binding.index;
-                    if (!g.binding.explicit) {
-                        while (used.contains(.{ g.binding.space, next_free })) next_free += 1;
-                        binding = next_free;
-                        try used.put(e.arena, .{ g.binding.space, binding }, {});
-                    }
-                    try e.b.emit(.annotations, .decorate, &.{ var_id, 34, g.binding.space }); // DescriptorSet
-                    try e.b.emit(.annotations, .decorate, &.{ var_id, 33, binding }); // Binding
+                    const slot = try e.slotOf(@intCast(gi), false);
+                    try e.b.emit(.annotations, .decorate, &.{ var_id, 34, slot.set }); // DescriptorSet
+                    try e.b.emit(.annotations, .decorate, &.{ var_id, 33, slot.binding }); // Binding
                     try e.b.emitWithString(.debug_names, .name, &.{var_id}, g.name, &.{});
                     e.global_vars[gi] = var_id;
                 },
@@ -852,14 +904,9 @@ const Emitter = struct {
                     const ptr = try e.pointerType(sc, st);
                     const var_id = e.b.newId();
                     try e.b.emit(.types_globals, .variable, &.{ ptr, var_id, @backingInt(sc) });
-                    var binding = g.binding.index;
-                    if (!g.binding.explicit) {
-                        while (used.contains(.{ g.binding.space, next_free })) next_free += 1;
-                        binding = next_free;
-                        try used.put(e.arena, .{ g.binding.space, binding }, {});
-                    }
-                    try e.b.emit(.annotations, .decorate, &.{ var_id, 34, g.binding.space }); // DescriptorSet
-                    try e.b.emit(.annotations, .decorate, &.{ var_id, 33, binding }); // Binding
+                    const slot = try e.slotOf(@intCast(gi), false);
+                    try e.b.emit(.annotations, .decorate, &.{ var_id, 34, slot.set }); // DescriptorSet
+                    try e.b.emit(.annotations, .decorate, &.{ var_id, 33, slot.binding }); // Binding
                     try e.b.emitWithString(.debug_names, .name, &.{st}, try std.fmt.allocPrint(e.arena, "type.{s}", .{g.name}), &.{});
                     try e.b.emitWithString(.debug_names, .name, &.{var_id}, g.name, &.{});
                     e.global_vars[gi] = var_id;
@@ -888,14 +935,11 @@ const Emitter = struct {
                 if (hit) break true;
             } else false;
             if (!used_heap) continue;
-            while (used.contains(.{ 0, next_free })) next_free += 1;
-            try used.put(e.arena, .{ 0, next_free }, {});
-            e.heap_bindings[@intFromBool(sampler)] = next_free;
+            e.heap_bindings[@intFromBool(sampler)] = try e.nextBinding(0);
         }
 
         // Hidden counters (as dxc): a `{ int }` buffer per structured buffer
-        // that uses one, on the next free binding of its set.
-        try e.findCounterGlobals();
+        // that uses one.
         e.counter_vars = try e.arena.alloc(Id, m.globals.items.len);
         @memset(e.counter_vars, 0);
         for (m.globals.items, 0..) |g, gi| {
@@ -925,13 +969,185 @@ const Emitter = struct {
             }
             const var_id = e.b.newId();
             try e.b.emit(.types_globals, .variable, &.{ try e.pointerType(e.bufferSc(), cty), var_id, @backingInt(e.bufferSc()) });
-            while (used.contains(.{ g.binding.space, next_free })) next_free += 1;
-            try used.put(e.arena, .{ g.binding.space, next_free }, {});
-            try e.b.emit(.annotations, .decorate, &.{ var_id, 34, g.binding.space }); // DescriptorSet
-            try e.b.emit(.annotations, .decorate, &.{ var_id, 33, next_free }); // Binding
+            const slot = try e.slotOf(@intCast(gi), true);
+            try e.b.emit(.annotations, .decorate, &.{ var_id, 34, slot.set }); // DescriptorSet
+            try e.b.emit(.annotations, .decorate, &.{ var_id, 33, slot.binding }); // Binding
             try e.b.emitWithString(.debug_names, .name, &.{var_id}, try std.fmt.allocPrint(e.arena, "counter.var.{s}", .{g.name}), &.{});
             e.counter_vars[gi] = var_id;
         }
+    }
+
+    const Slot = struct { set: u32, binding: u32 };
+
+    /// Descriptor set and binding of every resource and counter, as dxc
+    /// numbers them: [[vk::binding]] (and [[vk::counter_binding]]) first,
+    /// then `register()` with the shift options, then the rest in
+    /// declaration order on the next free bindings (Append / Consume
+    /// counters right after their buffer, other counters at the end).
+    fn assignBindings(e: *Emitter) Error!void {
+        const m = e.m;
+        e.slots = try e.arena.alloc(?Slot, m.globals.items.len);
+        e.counter_slots = try e.arena.alloc(?Slot, m.globals.items.len);
+        @memset(e.slots, null);
+        @memset(e.counter_slots, null);
+        const Var = struct {
+            bd: ir.BindingDecl,
+            counter: bool,
+            /// Bindings taken (array elements, when flattened).
+            fn n(v: @This(), flatten: bool) u32 {
+                return if (flatten and !v.counter) v.bd.count else 1;
+            }
+        };
+        var vars: std.ArrayList(Var) = .empty;
+        var declared: std.AutoHashMapUnmanaged(u32, void) = .empty;
+        for (m.binding_decls.items) |bd| {
+            try vars.append(e.arena, .{ .bd = bd, .counter = false });
+            if (bd.acs) try vars.append(e.arena, .{ .bd = bd, .counter = true });
+            if (bd.global) |g| try declared.put(e.arena, g, {});
+        }
+        // Resources with no declaration of their own (none in practice),
+        // and counters of RW structured buffers, in the order first used.
+        for (m.globals.items, 0..) |g, gi| {
+            if (g.space != .resource and g.space != .cbuffer) continue;
+            if (g.shader_record or g.push_constant or declared.contains(@intCast(gi))) continue;
+            try vars.append(e.arena, .{ .bd = .{ .global = @intCast(gi), .reg = g.binding }, .counter = false });
+        }
+        for (m.globals.items, 0..) |_, gi| {
+            if (!e.needsCounter(@intCast(gi))) continue;
+            const acs = for (m.binding_decls.items) |bd| {
+                if (bd.global == @as(u32, @intCast(gi))) break bd.acs;
+            } else false;
+            if (acs) continue;
+            const bd = for (m.binding_decls.items) |bd| {
+                if (bd.global == @as(u32, @intCast(gi))) break bd;
+            } else ir.BindingDecl{ .global = @intCast(gi), .reg = m.globals.items[gi].binding };
+            try vars.append(e.arena, .{ .bd = bd, .counter = true });
+        }
+        const record = struct {
+            fn f(em: *Emitter, v: Var, slot: Slot) void {
+                const g = v.bd.global orelse return;
+                if (v.counter) em.counter_slots[g] = slot else em.slots[g] = slot;
+            }
+        }.f;
+        const default_set = e.vk.auto_binding_space;
+        if (e.vk.bind_register.items.len > 0) {
+            // Every resource bound by its register.
+            for (vars.items) |v| {
+                if (v.counter) return e.unsupported("-fvk-bind-register for RW/Append/Consume StructuredBuffer unimplemented", .{});
+                if (v.bd.reg.explicit) {
+                    const space = if (v.bd.reg.space_given) v.bd.reg.space else default_set;
+                    const hit = for (e.vk.bind_register.items) |br| {
+                        if (br.class == v.bd.reg.class and br.index == v.bd.reg.index and br.space == space) break br;
+                    } else return e.unsupported("missing -fvk-bind-register for resource", .{});
+                    record(e, v, .{ .set = hit.set, .binding = hit.binding });
+                } else if (v.bd.globals_buffer) {
+                    const bg = e.vk.bind_globals orelse return e.unsupported("-fvk-bind-register requires Globals buffer to be bound with -fvk-bind-globals", .{});
+                    record(e, v, .{ .set = bg[1], .binding = bg[0] });
+                } else return e.unsupported("-fvk-bind-register requires register annotations on all resources", .{});
+            }
+            return;
+        }
+        const regSet = struct {
+            fn f(bd: ir.BindingDecl, dflt: u32) u32 {
+                if (bd.vk_set) |s0| return s0;
+                if (bd.vk_binding != null) return dflt;
+                if (bd.reg.explicit or bd.space_only) return if (bd.reg.space_given) bd.reg.space else dflt;
+                return dflt;
+            }
+        }.f;
+        // [[vk::binding]] / [[vk::counter_binding]].
+        for (vars.items) |v| {
+            if (v.counter) {
+                const b = v.bd.vk_counter orelse continue;
+                const set = regSet(v.bd, default_set);
+                try e.useBindings(set, b, 1);
+                record(e, v, .{ .set = set, .binding = b });
+            } else if (v.bd.vk_binding) |b| {
+                const set = v.bd.vk_set orelse default_set;
+                try e.useBindings(set, b, v.n(e.vk.flatten_arrays));
+                record(e, v, .{ .set = set, .binding = b });
+            }
+        }
+        // register(), shifted.
+        for (vars.items) |v| {
+            if (v.counter or v.bd.vk_binding != null or !v.bd.reg.explicit) continue;
+            const set = if (v.bd.reg.space_given) v.bd.reg.space else default_set;
+            const class: u8 = if (v.bd.reg.class == 's' and v.bd.combined) 't' else v.bd.reg.class;
+            const b = v.bd.reg.index + e.vk.shift(class, set);
+            try e.useBindings(set, b, v.n(e.vk.flatten_arrays));
+            record(e, v, .{ .set = set, .binding = b });
+        }
+        // The rest, in order.
+        for (vars.items) |v| {
+            if (v.counter) {
+                if (v.bd.vk_counter != null) continue;
+                const set = regSet(v.bd, default_set);
+                record(e, v, .{ .set = set, .binding = try e.nextBindingFrom(set, if (e.vk.auto_shift) e.vk.shift('u', set) else 0) });
+            } else if (v.bd.vk_binding == null and !v.bd.reg.explicit) {
+                if (v.bd.globals_buffer and e.vk.bind_globals != null) {
+                    const bg = e.vk.bind_globals.?;
+                    record(e, v, .{ .set = bg[1], .binding = bg[0] });
+                    continue;
+                }
+                const set = if (v.bd.space_only and v.bd.reg.space_given) v.bd.reg.space else default_set;
+                const shift = if (e.vk.auto_shift) e.vk.shift(e.implicitClass(v.bd), set) else 0;
+                record(e, v, .{ .set = set, .binding = try e.nextBindings(set, shift, v.n(e.vk.flatten_arrays)) });
+            }
+        }
+    }
+
+    fn useBinding(e: *Emitter, set: u32, binding: u32) Error!void {
+        try e.used_bindings.put(e.arena, .{ set, binding }, {});
+    }
+
+    fn useBindings(e: *Emitter, set: u32, binding: u32, n: u32) Error!void {
+        for (0..n) |k| try e.useBinding(set, binding + @as(u32, @intCast(k)));
+    }
+
+    /// The first `n` consecutive free bindings from `start`.
+    fn nextBindings(e: *Emitter, set: u32, start: u32, n: u32) Error!u32 {
+        var b = start;
+        while (true) : (b += 1) {
+            const free = for (0..n) |k| {
+                if (e.used_bindings.contains(.{ set, b + @as(u32, @intCast(k)) })) break false;
+            } else true;
+            if (free) break;
+        }
+        try e.useBindings(set, b, n);
+        return b;
+    }
+
+    fn nextBinding(e: *Emitter, set: u32) Error!u32 {
+        return e.nextBindingFrom(set, 0);
+    }
+
+    fn nextBindingFrom(e: *Emitter, set: u32, start: u32) Error!u32 {
+        var b: u32 = start;
+        while (e.used_bindings.contains(.{ set, b })) b += 1;
+        try e.useBinding(set, b);
+        return b;
+    }
+
+    /// The register class a resource without one would have.
+    fn implicitClass(e: *Emitter, bd: ir.BindingDecl) u8 {
+        if (bd.globals_buffer) return 'b';
+        const g = bd.global orelse return 't';
+        const glob = e.m.globals.items[g];
+        if (glob.space == .cbuffer) return if (glob.tbuffer) 't' else 'b';
+        var t = glob.ty;
+        while (e.t.get(t) == .array) t = e.t.get(t).array.elem;
+        return switch (e.t.get(t)) {
+            .sampler => 's',
+            .resource => |r| if (r.kind == .constant_buffer) 'b' else if (r.kind.isWritable() or r.kind == .append_structured_buffer or r.kind == .consume_structured_buffer) 'u' else 't',
+            else => 't',
+        };
+    }
+
+    /// The binding of global `gi` (or of its counter).
+    fn slotOf(e: *Emitter, gi: u32, counter: bool) Error!Slot {
+        const s0 = if (counter) e.counter_slots[gi] else e.slots[gi];
+        if (s0) |x| return x;
+        return .{ .set = 0, .binding = try e.nextBinding(0) };
     }
 
     /// Append/Consume buffers, and structured buffers whose counter is
@@ -1169,7 +1385,7 @@ const Emitter = struct {
         e.st.patches = try e.arena.alloc(Interface, entry.patch_constants.items.len);
         if (entry.stage == .hull or entry.stage == .domain) try e.cap(.tessellation);
         // Variables needing a Location, assigned once all exist.
-        const Located = struct { var_id: Id, key: []const u8, count: u32, input: bool, target: ?u32 };
+        const Located = struct { var_id: Id, key: []const u8, count: u32, input: bool, target: ?u32, loc: ?u32 = null, index: ?u32 = null };
         var located: std.ArrayList(Located) = .empty;
         const lists = [_][]const ir.SigElement{ entry.inputs.items, entry.outputs.items, entry.patch_constants.items };
         const ifaces = [_][]Interface{ e.st.inputs, e.st.outputs, e.st.patches };
@@ -1247,7 +1463,7 @@ const Emitter = struct {
                 } else {
                     const key = if (el.semantic_index > 0) try std.fmt.allocPrint(e.arena, "{s}{d}", .{ el.semantic, el.semantic_index }) else el.semantic;
                     const target: ?u32 = if (std.ascii.eqlIgnoreCase(el.semantic, "SV_Target")) el.semantic_index else null;
-                    try located.append(e.arena, .{ .var_id = var_id, .key = key, .count = try e.locationCount(vty), .input = input, .target = target });
+                    try located.append(e.arena, .{ .var_id = var_id, .key = key, .count = try e.locationCount(vty), .input = input, .target = target, .loc = el.vk_location, .index = el.vk_index });
                     // Interpolation (as dxc: pixel inputs and vertex
                     // outputs; integers are always flat).
                     if ((input and entry.stage == .pixel) or (!input and entry.stage == .vertex)) {
@@ -1270,7 +1486,8 @@ const Emitter = struct {
                     try e.cap(.geometry_streams);
                     try e.b.emit(.annotations, .decorate, &.{ var_id, 29, el.stream }); // Stream
                 }
-                const name = try std.fmt.allocPrint(e.arena, "{s}.var.{s}{d}", .{ if (input) "in" else "out", el.semantic, el.semantic_index });
+                // (Named after the semantic as written, as dxc.)
+                const name = if (el.spelling) |sp| try std.fmt.allocPrint(e.arena, "{s}.var.{s}", .{ if (input) "in" else "out", sp }) else try std.fmt.allocPrint(e.arena, "{s}.var.{s}{d}", .{ if (input) "in" else "out", el.semantic, el.semantic_index });
                 try e.b.emitWithString(.debug_names, .name, &.{var_id}, name, &.{});
                 iface.* = .{ .var_id = var_id, .ty = vty, .elem_array = bi != null and e.t.get(bi.?.ty) == .array };
                 try e.useVar(var_id);
@@ -1282,17 +1499,22 @@ const Emitter = struct {
         for ([_]bool{ true, false }) |input| {
             var vars: std.ArrayList(Located) = .empty;
             for (located.items) |x| if (x.input == input) try vars.append(e.arena, x);
-            if ((!input and entry.stage == .hull) or (input and entry.stage == .domain)) {
+            if (e.vk.alpha_io_order or (!input and entry.stage == .hull) or (input and entry.stage == .domain)) {
                 std.sort.insertion(Located, vars.items, {}, struct {
                     fn lt(_: void, a: Located, b: Located) bool {
                         return std.mem.order(u8, a.key, b.key) == .lt;
                     }
                 }.lt);
             }
+            // [[vk::location]] on one needs it on all.
+            var explicit: usize = 0;
+            for (vars.items) |x| explicit += @intFromBool(x.loc != null);
+            if (explicit != 0 and explicit != vars.items.len) return e.unsupported("partial explicit stage {s} location assignment via vk::location(X) unsupported", .{if (input) "input" else "output"});
             var next: u32 = 0;
             for (vars.items) |x| {
-                const loc = x.target orelse next;
+                const loc = x.loc orelse x.target orelse next;
                 try e.b.emit(.annotations, .decorate, &.{ x.var_id, 30, loc }); // Location
+                if (x.index) |ix| try e.b.emit(.annotations, .decorate, &.{ x.var_id, 32, ix }); // Index
                 next = @max(next, loc) + x.count;
             }
         }
@@ -1303,7 +1525,8 @@ const Emitter = struct {
     fn locationCount(e: *Emitter, ty: TypeId) Error!u32 {
         return switch (e.t.get(ty)) {
             .array => |a| a.len * try e.locationCount(a.elem),
-            .matrix => |m| m.rows * (if (m.elem.size() == 8 and m.cols > 2) @as(u32, 2) else 1),
+            // (1xN and Nx1 matrices are vectors.)
+            .matrix => |m| if (m.rows == 1 or m.cols == 1) (if (m.elem.size() == 8 and m.rows * m.cols > 2) @as(u32, 2) else 1) else m.rows * (if (m.elem.size() == 8 and m.cols > 2) @as(u32, 2) else 1),
             .vector => |v| if (v.elem.size() == 8 and v.len > 2) 2 else 1,
             else => 1,
         };
@@ -1624,6 +1847,7 @@ const Emitter = struct {
         const ri = r.index();
         switch (i.op) {
             .constant, .param, .local_var => {},
+            .spec_constant => |k| e.vals[ri] = try e.specConstant(k),
             .ray_incoming => |k| e.vals[ri] = try e.rayVar(switch (k) {
                 .payload => .incoming_ray_payload_khr,
                 .attributes => .hit_attribute_khr,
@@ -1631,8 +1855,9 @@ const Emitter = struct {
             }, i.ty),
             .global => |g| {
                 e.vals[ri] = e.global_vars[g];
-                if (e.m.globals.items[g].shader_record) {
-                    try e.useVar(e.global_vars[g]);
+                if (ownStorage(e.m.globals.items[g]) != null) {
+                    // (Interfaces list them from SPIR-V 1.4.)
+                    if (e.spv_minor >= 4) try e.useVar(e.global_vars[g]);
                     e.ptr_layouts[ri] = .{ .rules = .std430, .row_major = false };
                     return;
                 }
@@ -1742,8 +1967,9 @@ const Emitter = struct {
                     try e.mesh_places.put(e.arena, ri, mp);
                     return;
                 }
-                const shader_record = e.inShaderRecord(a.base);
-                const sc: StorageClass = if (shader_record) .shader_record_buffer_khr else if (into_cb) .uniform else if (into_buffer or (base_pl != null and base_pl.?.rules == .std430)) e.bufferSc() else if (base_pl != null) .uniform else switch (i.ptr) {
+                const own = e.ownBuffer(a.base);
+                const shader_record = own != null;
+                const sc: StorageClass = if (own) |x| x else if (into_cb) .uniform else if (into_buffer or (base_pl != null and base_pl.?.rules == .std430)) e.bufferSc() else if (base_pl != null) .uniform else switch (i.ptr) {
                     .function => .function,
                     .private => .private,
                     .groupshared => if (e.payload_global != null and e.rootGlobal(a.base) == e.payload_global) .task_payload_workgroup else .workgroup,
@@ -2419,7 +2645,43 @@ const Emitter = struct {
 
     /// `array[i]...` into an array of resources: an access chain to the
     /// element (or sub-array) variable.
+    /// Whether every access to resource array `gi` uses constant indices
+    /// (and nothing else uses the array itself).
+    fn constantlyIndexed(e: *Emitter, gi: u32) bool {
+        for (e.m.functions.items) |f| {
+            for (f.insts.items, 0..) |inst, k| {
+                if (inst.op != .global or inst.op.global != gi) continue;
+                for (f.insts.items) |user| switch (user.op) {
+                    .access => |a| if (a.base.index() == k) {
+                        for (a.indices) |x| if (f.inst(x).op != .constant) return false;
+                    },
+                    .call => |c| for (c.args) |x| if (x.index() == k) return false,
+                    .store => |st| if (st.value.index() == k) return false,
+                    else => {},
+                };
+            }
+        }
+        return true;
+    }
+
     fn resourceArrayAccess(e: *Emitter, ri: usize, a: @FieldType(ir.Op, "access"), ty: TypeId) Error!void {
+        if (e.f.inst(a.base).op == .global) if (e.flat_vars.get(e.f.inst(a.base).op.global)) |ids| {
+            // A flattened array: the element's own variable.
+            var at = e.f.inst(a.base).ty;
+            var k: u32 = 0;
+            for (a.indices) |x| {
+                const len = e.t.get(at).array.len;
+                const c = switch (e.f.inst(x).op) {
+                    .constant => |c| c.int,
+                    else => return e.unsupported("dynamic indices into flattened resource arrays are not supported", .{}),
+                };
+                k = k * len + @as(u32, @intCast(c));
+                at = e.t.get(at).array.elem;
+            }
+            if (e.t.get(at) == .array) return e.unsupported("sub-arrays of flattened resource arrays are not supported", .{});
+            e.vals[ri] = ids[k];
+            return;
+        };
         const p = try e.resourcePointee(ty);
         var ops: std.ArrayList(u32) = .empty;
         const id = e.b.newId();
@@ -3189,16 +3451,24 @@ const Emitter = struct {
     }
 
     /// The global a resource value comes from (`load (global g)`).
-    /// Whether pointer / resource `r` reaches into a shader record buffer.
-    fn inShaderRecord(e: *Emitter, r: Ref) bool {
+    /// The storage class of shader record buffers and push constants.
+    fn ownStorage(g: ir.Global) ?StorageClass {
+        if (g.shader_record) return .shader_record_buffer_khr;
+        if (g.push_constant) return .push_constant;
+        return null;
+    }
+
+    /// The storage of the shader record buffer / push constants pointer /
+    /// resource `r` reaches into, if any.
+    fn ownBuffer(e: *Emitter, r: Ref) ?StorageClass {
         var x = r;
         while (e.f.inst(x).op == .access) x = e.f.inst(x).op.access.base;
-        if (e.f.inst(x).op == .global) return e.m.globals.items[e.f.inst(x).op.global].shader_record;
+        if (e.f.inst(x).op == .global) return ownStorage(e.m.globals.items[e.f.inst(x).op.global]);
         // ConstantBuffer<T> values (through locals and parameters).
         const t = e.t.get(e.f.inst(x).ty);
-        if (t != .resource or t.resource.kind != .constant_buffer) return false;
-        const g = e.globalOf(x) orelse return false;
-        return e.m.globals.items[g].shader_record;
+        if (t != .resource or t.resource.kind != .constant_buffer) return null;
+        const g = e.globalOf(x) orelse return null;
+        return ownStorage(e.m.globals.items[g]);
     }
 
     fn globalOf(e: *Emitter, r: Ref) ?u32 {

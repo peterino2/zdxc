@@ -59,6 +59,9 @@ pub const Variable = struct {
     row_major: bool = false,
 };
 
+/// A global variable or a cbuffer / tbuffer block.
+pub const GlobalDecl = union(enum) { variable: *Variable, cbuffer: *const ast.Decl };
+
 /// What an expression refers to, recorded by Sema for lowering
 /// (`Expr.info` is an index into `Sema.resolutions` plus one).
 pub const Resolution = union(enum) {
@@ -185,6 +188,9 @@ pub const Sema = struct {
     /// `static` (and `static const`) globals and static members, in
     /// declaration order.
     static_globals: std.ArrayList(*Variable) = .empty,
+    /// Global variables and cbuffer / tbuffer declarations in declaration
+    /// order (SPIR-V numbers implicit bindings in this order).
+    global_order: std.ArrayList(GlobalDecl) = .empty,
     current_block: ?*const ast.Decl = null,
     loop_depth: u32 = 0,
     switch_depth: u32 = 0,
@@ -1075,6 +1081,15 @@ pub const Sema = struct {
         return TypeTable.error_type;
     }
 
+    /// The constant argument of attribute `name` (`[[vk::location(2)]]`).
+    pub fn vkAttrInt(s: *Sema, attrs: []const ast.Attribute, name: []const u8) ?u32 {
+        for (attrs) |a| if (std.mem.eql(u8, a.name, name) and a.args.len >= 1) {
+            const v = s.evalInt(a.args[0]) orelse return null;
+            return if (v < 0) null else @intCast(v);
+        };
+        return null;
+    }
+
     fn arrayLen(s: *Sema, dim: ?*ast.Expr) Allocator.Error!u32 {
         const e = dim orelse return 0;
         _ = try s.expr(e);
@@ -1280,6 +1295,7 @@ pub const Sema = struct {
                         s.err(sem.loc, "user defined constant buffer slots cannot be target specific", .{});
                     }
                 }
+                if (s.instance_depth == 0) try s.global_order.append(s.arena, .{ .cbuffer = d });
                 s.current_block = d;
                 defer s.current_block = null;
                 for (cb.members) |m| try s.decl(m, .cbuffer);
@@ -1469,7 +1485,7 @@ pub const Sema = struct {
                 for (v.semantics) |sem| if (sem.kind == .semantic) {
                     fsem = sem.values[0];
                 };
-                try info.fields.append(s.arena, .{ .name = v.name, .type = ft, .row_major = isRowMajor(fattrs), .semantic = fsem, .interp = interpOf(v.quals) });
+                try info.fields.append(s.arena, .{ .name = v.name, .type = ft, .row_major = isRowMajor(fattrs), .semantic = fsem, .interp = interpOf(v.quals), .vk_location = s.vkAttrInt(v.attrs, "vk::location"), .vk_index = s.vkAttrInt(v.attrs, "vk::index"), .vk_offset = s.vkAttrInt(v.attrs, "vk::offset") });
             },
             .func => {},
             else => try s.decl(m, .member),
@@ -1871,6 +1887,7 @@ pub const Sema = struct {
         try s.decl_vars.put(s.arena, v, variable);
         if (ctx == .cbuffer) variable.block = s.current_block;
         if (storage == .global_uniform) try s.uniform_globals.append(s.arena, variable);
+        if (storage == .global_uniform or (storage == .global_static and !q.static and ctx == .global)) try s.global_order.append(s.arena, .{ .variable = variable });
         if (storage == .global_static or storage == .constant or storage == .local_static) try s.static_globals.append(s.arena, variable);
         // Unsized arrays take their size from the initializer.
         if (v.init) |init_e| if (!is_auto) {

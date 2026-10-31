@@ -23,6 +23,7 @@ const Options = struct {
     strip_rootsig: bool = false,
     rootsig_define: ?[]const u8 = null,
     rootsig_output: ?[]const u8 = null,
+    vk: zdxc.ir.ir.VkOptions = .{},
     defines: std.ArrayList(front.preproc.Define) = .empty,
     include_dirs: std.ArrayList([]const u8) = .empty,
     empty: bool = false,
@@ -135,6 +136,37 @@ fn parseArgs(cli: Cli, arena: std.mem.Allocator, argv: []const [:0]const u8, std
                     .Qstrip_rootsignature => opts.strip_rootsig = true,
                     .rootsig_define => opts.rootsig_define = v,
                     .Frs => opts.rootsig_output = v,
+                    .fvk_b_shift, .fvk_t_shift, .fvk_s_shift, .fvk_u_shift => {
+                        const k: usize = switch (id) {
+                            .fvk_b_shift => 0,
+                            .fvk_t_shift => 1,
+                            .fvk_s_shift => 2,
+                            else => 3,
+                        };
+                        const shift = std.fmt.parseInt(u32, a.values[0], 10) catch return cli.fail("invalid {s} shift '{s}'", .{ a.spelling, a.values[0] });
+                        const set: ?u32 = if (std.mem.eql(u8, a.values[1], "all")) null else std.fmt.parseInt(u32, a.values[1], 10) catch return cli.fail("invalid {s} space '{s}'", .{ a.spelling, a.values[1] });
+                        try opts.vk.shifts[k].append(arena, .{ .shift = shift, .set = set });
+                    },
+                    .fvk_bind_globals => opts.vk.bind_globals = .{
+                        std.fmt.parseInt(u32, a.values[0], 10) catch return cli.fail("invalid -fvk-bind-globals binding number: {s}", .{a.values[0]}),
+                        std.fmt.parseInt(u32, a.values[1], 10) catch return cli.fail("invalid -fvk-bind-globals set number: {s}", .{a.values[1]}),
+                    },
+                    .fvk_bind_register, .vkbr => {
+                        const reg = a.values[0];
+                        if (reg.len < 2 or std.mem.indexOfScalar(u8, "btsu", reg[0]) == null) return cli.fail("invalid -fvk-bind-register register '{s}'", .{reg});
+                        const num = struct {
+                            fn f(c: Cli, t: []const u8) !u32 {
+                                return std.fmt.parseInt(u32, t, 10) catch c.fail("invalid -fvk-bind-register number '{s}'", .{t});
+                            }
+                        }.f;
+                        try opts.vk.bind_register.append(arena, .{ .class = reg[0], .index = try num(cli, reg[1..]), .space = try num(cli, a.values[1]), .binding = try num(cli, a.values[2]), .set = try num(cli, a.values[3]) });
+                    },
+                    .auto_binding_space => opts.vk.auto_binding_space = std.fmt.parseInt(u32, v, 10) catch return cli.fail("invalid -auto-binding-space '{s}'", .{v}),
+                    .fvk_auto_shift_bindings => opts.vk.auto_shift = true,
+                    .fspv_flatten_resource_arrays => opts.vk.flatten_arrays = true,
+                    .fvk_stage_io_order_EQ => {
+                        if (std.mem.eql(u8, v, "alpha")) opts.vk.alpha_io_order = true else if (!std.mem.eql(u8, v, "decl")) return cli.fail("unknown -fvk-stage-io-order '{s}'", .{v});
+                    },
                     ._SLASH_WX => opts.warnings_as_errors = true,
                     .no_warnings => opts.no_warnings = true,
                     .W_Joined => {
@@ -296,6 +328,7 @@ fn run(cli: Cli, arena: std.mem.Allocator, args: []const [:0]const u8, stdout: *
                         };
                         if (module) |*mm| {
                             mm.native_16bit = opts.enable_16bit;
+                            mm.vk = opts.vk;
                             mm.strip_rootsig = opts.strip_rootsig;
                             if (opts.rootsig_ver) |rv| {
                                 if (std.mem.eql(u8, rv, "rootsig_1_0")) mm.rootsig_version = .v1_0 else if (!std.mem.eql(u8, rv, "rootsig_1_1")) return cli.fail("unknown root signature version '{s}'", .{rv});

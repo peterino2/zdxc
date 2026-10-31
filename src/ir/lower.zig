@@ -55,6 +55,7 @@ pub fn lowerUnit(arena: Allocator, s: *Sema, opts: Options) Error!ir.Module {
             try l.drain();
             try l.m.exports.append(l.arena, fi);
         }
+        try l.bindingDecls();
         return l.m;
     }
     const entry_fn = for (s.all_functions.items) |f| {
@@ -64,6 +65,7 @@ pub fn lowerUnit(arena: Allocator, s: *Sema, opts: Options) Error!ir.Module {
         return error.Unsupported;
     };
     try l.lowerEntry(entry_fn, opts.entry, opts.stage);
+    try l.bindingDecls();
     return l.m;
 }
 
@@ -130,6 +132,96 @@ const Lowerer = struct {
         const main = try l.functionIndex(f);
         try l.drain();
         try l.buildEntry(f, main, .{ .entry = name, .stage = stage });
+    }
+
+    /// `[[vk::constant_id(n)]] const T x = v;` (SPIR-V only).
+    fn isSpecConstant(l: *Lowerer, v: *const Variable) bool {
+        if (!l.s.opts.spirv or v.storage != .global_uniform) return false;
+        const d = v.decl orelse return false;
+        return hasAttr(d.attrs, "vk::constant_id");
+    }
+
+    fn specConstant(l: *Lowerer, v: *const Variable) Error!Ref {
+        const k: u32 = for (l.m.spec_constants.items, 0..) |sc, i| {
+            if (std.mem.eql(u8, sc.name, v.name)) break @intCast(i);
+        } else blk: {
+            const init_e = v.init orelse {
+                l.unsupported(v.loc, "specialization constant '{s}' without an initializer", .{v.name});
+                return error.Unsupported;
+            };
+            const c = l.s.evalConst(init_e) orelse {
+                l.unsupported(v.loc, "specialization constant '{s}' with this initializer is not supported yet", .{v.name});
+                return error.Unsupported;
+            };
+            const value: ir.Constant = switch (c) {
+                .int => |x| .{ .int = x },
+                .float => |x| .{ .float = x },
+                .bool => |x| .{ .int = @intFromBool(x) },
+            };
+            try l.m.spec_constants.append(l.arena, .{ .name = v.name, .ty = v.type, .id = l.s.vkAttrInt(v.decl.?.attrs, "vk::constant_id") orelse 0, .value = value });
+            break :blk @intCast(l.m.spec_constants.items.len - 1);
+        };
+        return l.b.add(.{ .op = .{ .spec_constant = k }, .ty = v.type });
+    }
+
+    /// `[[vk::push_constant]] struct {...} pc;` (SPIR-V only; dxc's DXIL
+    /// keeps it in `$Globals`).
+    fn isPushConstantStruct(l: *Lowerer, v: *const Variable) bool {
+        if (!l.s.opts.spirv or v.storage != .global_uniform) return false;
+        const d = v.decl orelse return false;
+        return hasAttr(d.attrs, "vk::push_constant") and l.s.types.get(v.type) == .@"struct";
+    }
+
+    /// The module's descriptor declarations in declaration order, each with
+    /// its IR global when used.
+    fn bindingDecls(l: *Lowerer) Error!void {
+        var globals_done = false;
+        for (l.s.global_order.items) |gd| switch (gd) {
+            .variable => |v| {
+                if (!isObject(&l.s.types, v.type)) {
+                    if (v.storage != .global_uniform or globals_done or l.isPushConstantStruct(v) or l.isSpecConstant(v)) continue;
+                    globals_done = true;
+                    try l.m.binding_decls.append(l.arena, .{ .global = l.cbuffers.get(0), .globals_buffer = true });
+                    continue;
+                }
+                var et = v.type;
+                while (l.s.types.get(et) == .array) et = l.s.types.get(et).array.elem;
+                const r = switch (l.s.types.get(et)) {
+                    .resource => |r| r,
+                    else => null,
+                };
+                if (r) |res| if (res.kind == .other) continue;
+                const d = v.decl orelse continue;
+                if (isShaderRecord(d.attrs) or hasAttr(d.attrs, "vk::push_constant")) continue;
+                var bd = try l.bindingDecl(d.semantics, d.attrs, l.globals.get(v));
+                var at = v.type;
+                while (l.s.types.get(at) == .array) : (at = l.s.types.get(at).array.elem) bd.count *= @max(1, l.s.types.get(at).array.len);
+                if (r) |res| bd.acs = res.kind == .append_structured_buffer or res.kind == .consume_structured_buffer;
+                try l.m.binding_decls.append(l.arena, bd);
+            },
+            .cbuffer => |d| {
+                const cb = d.kind.cbuffer;
+                if (isShaderRecord(cb.attrs) or hasAttr(cb.attrs, "vk::push_constant")) continue;
+                try l.m.binding_decls.append(l.arena, try l.bindingDecl(cb.semantics, cb.attrs, l.cbuffers.get(@intFromPtr(d))));
+            },
+        };
+    }
+
+    fn bindingDecl(l: *Lowerer, sems: []const ast.Semantic, attrs: []const ast.Attribute, global: ?u32) Error!ir.BindingDecl {
+        var bd: ir.BindingDecl = .{ .global = global };
+        for (sems) |sem| if (sem.kind == .register) {
+            bd.reg = parseBinding(sem.values);
+            bd.space_only = !bd.reg.explicit;
+        };
+        for (attrs) |a| {
+            if (std.mem.eql(u8, a.name, "vk::binding") and a.args.len >= 1) {
+                bd.vk_binding = @intCast(@max(0, l.s.evalInt(a.args[0]) orelse 0));
+                if (a.args.len >= 2) bd.vk_set = @intCast(@max(0, l.s.evalInt(a.args[1]) orelse 0));
+            }
+            if (std.mem.eql(u8, a.name, "vk::counter_binding") and a.args.len >= 1) bd.vk_counter = @intCast(@max(0, l.s.evalInt(a.args[0]) orelse 0));
+            if (std.mem.eql(u8, a.name, "vk::combinedImageSampler")) bd.combined = true;
+        }
+        return bd;
     }
 
     /// The library's subobject declarations (`TriangleHitGroup hg = {...};`).
@@ -295,7 +387,8 @@ const Lowerer = struct {
             binding = parseBinding(sem.values);
         };
         const shader_record = if (v.decl) |d| isShaderRecord(d.attrs) else false;
-        try l.m.globals.append(l.arena, .{ .name = v.name, .ty = v.type, .space = space, .binding = binding, .shader_record = shader_record });
+        const push_constant = if (v.decl) |d| hasAttr(d.attrs, "vk::push_constant") else false;
+        try l.m.globals.append(l.arena, .{ .name = v.name, .ty = v.type, .space = space, .binding = binding, .shader_record = shader_record, .push_constant = push_constant });
         const i: u32 = @intCast(l.m.globals.items.len - 1);
         try l.globals.put(l.arena, v, i);
         return i;
@@ -312,10 +405,12 @@ const Lowerer = struct {
         var binding: ir.Binding = .{};
         var is_tbuffer = false;
         var shader_record = false;
+        var push_constant = false;
         if (v.block) |b| {
             const cb = b.kind.cbuffer;
             is_tbuffer = cb.tbuffer;
             shader_record = isShaderRecord(cb.attrs);
+            push_constant = hasAttr(cb.attrs, "vk::push_constant");
             name = cb.name;
             for (cb.members) |m| if (m.kind == .@"var") {
                 if (l.s.decl_vars.get(&m.kind.@"var")) |mv| try members.append(l.arena, mv);
@@ -325,7 +420,7 @@ const Lowerer = struct {
             };
         } else {
             for (l.s.uniform_globals.items) |g| {
-                if (isObject(&l.s.types, g.type)) continue;
+                if (isObject(&l.s.types, g.type) or l.isPushConstantStruct(g) or l.isSpecConstant(g)) continue;
                 try members.append(l.arena, g);
             }
         }
@@ -333,7 +428,7 @@ const Lowerer = struct {
         info.* = .{ .name = name, .complete = true };
         for (members.items) |mv| try info.fields.append(l.arena, .{ .name = mv.name, .type = mv.type, .row_major = mv.row_major });
         const ty = try l.s.types.intern(.{ .@"struct" = info });
-        try l.m.globals.append(l.arena, .{ .name = name, .ty = ty, .space = .cbuffer, .binding = binding, .tbuffer = is_tbuffer, .shader_record = shader_record });
+        try l.m.globals.append(l.arena, .{ .name = name, .ty = ty, .space = .cbuffer, .binding = binding, .tbuffer = is_tbuffer, .shader_record = shader_record, .push_constant = push_constant });
         const gi: u32 = @intCast(l.m.globals.items.len - 1);
         try l.cbuffers.put(l.arena, key, gi);
         for (members.items, 0..) |mv, fi| try l.cbuffer_members.put(l.arena, mv, .{ .global = gi, .field = @intCast(fi) });
@@ -780,6 +875,7 @@ const Lowerer = struct {
                         return l.bitRead(try l.b.load(try l.bitStorage(l.this_ptr, bf)), bf);
                     },
                     .variable => |v| {
+                        if (l.isSpecConstant(v)) return l.specConstant(v);
                         // Integer `static const` scalars are constants.
                         if (v.storage == .constant and v.init != null and l.s.types.get(v.type) == .scalar and !l.s.types.get(v.type).scalar.isFloat()) {
                             if (l.s.evalInt(v.init.?)) |val| return l.b.constInt(try l.concrete(e.ty), val);
@@ -1303,6 +1399,16 @@ const Lowerer = struct {
                             l.unsupported(e.loc, "resource '{s}' declared as a uniform is not supported yet", .{v.name});
                             return error.Unsupported;
                         }
+                        if (l.isPushConstantStruct(v)) {
+                            // A buffer of its own (SPIR-V push constants).
+                            const g = l.globals.get(v) orelse blk: {
+                                try l.m.globals.append(l.arena, .{ .name = v.name, .ty = v.type, .space = .cbuffer, .push_constant = true });
+                                const gi: u32 = @intCast(l.m.globals.items.len - 1);
+                                try l.globals.put(l.arena, v, gi);
+                                break :blk gi;
+                            };
+                            return l.b.add(.{ .op = .{ .global = g }, .ty = v.type, .ptr = .cbuffer });
+                        }
                         const cm = try l.cbufferMember(v);
                         const glob = l.m.globals.items[cm.global];
                         const base = try l.b.add(.{ .op = .{ .global = cm.global }, .ty = glob.ty, .ptr = .cbuffer });
@@ -1491,11 +1597,13 @@ const Lowerer = struct {
     const SigAttrs = struct {
         interp: Interp = .{},
         row_major: bool = false,
+        vk_location: ?u32 = null,
+        vk_index: ?u32 = null,
 
         /// A field's modifiers, inheriting the enclosing interpolation.
         fn field(outer: SigAttrs, fld: Field) SigAttrs {
             const own: u8 = @bitCast(fld.interp);
-            return .{ .interp = if (own != 0) fld.interp else outer.interp, .row_major = fld.row_major };
+            return .{ .interp = if (own != 0) fld.interp else outer.interp, .row_major = fld.row_major, .vk_location = fld.vk_location, .vk_index = fld.vk_index };
         }
     };
 
@@ -1503,7 +1611,18 @@ const Lowerer = struct {
         var r = el;
         r.interp = attrs.interp;
         r.row_major = attrs.row_major;
+        r.vk_location = attrs.vk_location;
+        r.vk_index = attrs.vk_index;
         return r;
+    }
+
+    /// A parameter's (or, with the function's attributes, the return
+    /// value's) signature modifiers.
+    fn sigAttrs(l: *Lowerer, q: ast.Qualifiers, attrs: []const ast.Attribute) SigAttrs {
+        var a = paramAttrs(q);
+        a.vk_location = l.s.vkAttrInt(attrs, "vk::location");
+        a.vk_index = l.s.vkAttrInt(attrs, "vk::index");
+        return a;
     }
 
     fn addInput(l: *Lowerer, entry: *ir.Entry, el: ir.SigElement) Error!Ref {
@@ -1794,7 +1913,7 @@ const Lowerer = struct {
         const points = try l.arena.alloc(Ref, patch.count);
         for (points, 0..) |*v, k| {
             var next = first;
-            v.* = try l.vertexIn(entry, patch.elem, semanticOf(pd.semantics), paramAttrs(pd.quals), @intCast(k), register and k == 0, &next, null, pd.name_loc);
+            v.* = try l.vertexIn(entry, patch.elem, semanticOf(pd.semantics), l.sigAttrs(pd.quals, pd.attrs), @intCast(k), register and k == 0, &next, null, pd.name_loc);
         }
         try l.b.store(local, try l.b.add(.{ .op = .{ .construct = points }, .ty = l.irType(pty) }));
     }
@@ -1866,7 +1985,7 @@ const Lowerer = struct {
                 args[i] = try l.b.load(locals[i]);
                 continue;
             }
-            if (p.dir != .out) try l.b.store(locals[i], try l.entryInput(entry, p.type, semanticOf(pd.semantics), paramAttrs(pd.quals), pd.name_loc, pd.name));
+            if (p.dir != .out) try l.b.store(locals[i], try l.entryInput(entry, p.type, semanticOf(pd.semantics), l.sigAttrs(pd.quals, pd.attrs), pd.name_loc, pd.name));
             args[i] = if (p.dir == .in) try l.b.load(locals[i]) else locals[i];
         }
         const ret = try l.b.add(.{ .op = .{ .call = .{ .func = pci, .args = args } }, .ty = pcf.ret });
@@ -1875,7 +1994,7 @@ const Lowerer = struct {
         if (pcf.ret != TypeTable.void_type) try l.entryOutput(entry, pcf.ret, semanticOf(pcf.decl.ret_semantics), paramAttrs(pcf.decl.quals), ret, pcf.loc, "return value");
         for (pcf.decl.params, pcf.params, 0..) |pd, p, i| {
             if (p.dir == .in) continue;
-            try l.entryOutput(entry, p.type, semanticOf(pd.semantics), paramAttrs(pd.quals), try l.b.load(locals[i]), pd.name_loc, pd.name);
+            try l.entryOutput(entry, p.type, semanticOf(pd.semantics), l.sigAttrs(pd.quals, pd.attrs), try l.b.load(locals[i]), pd.name_loc, pd.name);
         }
         l.b.terminate(.{ .ret = .none });
         entry.patch_wrapper = wrapper;
@@ -1934,12 +2053,12 @@ const Lowerer = struct {
                     .vertices => {
                         entry.mesh.max_vertices = arr.len;
                         var next: u32 = @intCast(entry.outputs.items.len);
-                        try l.streamOut(&entry.outputs, arr.elem, semanticOf(pd.semantics), paramAttrs(q), null, &next, 0, null, pd.name_loc);
+                        try l.streamOut(&entry.outputs, arr.elem, semanticOf(pd.semantics), l.sigAttrs(q, pd.attrs), null, &next, 0, null, pd.name_loc);
                     },
                     .primitives => {
                         entry.mesh.max_primitives = arr.len;
                         var next: u32 = @intCast(entry.patch_constants.items.len);
-                        try l.streamOut(&entry.patch_constants, arr.elem, semanticOf(pd.semantics), paramAttrs(q), null, &next, 0, null, pd.name_loc);
+                        try l.streamOut(&entry.patch_constants, arr.elem, semanticOf(pd.semantics), l.sigAttrs(q, pd.attrs), null, &next, 0, null, pd.name_loc);
                     },
                     .indices => {
                         entry.mesh.max_primitives = arr.len;
@@ -1969,7 +2088,7 @@ const Lowerer = struct {
                 // Everything else a domain shader reads is per patch.
                 l.patch_io = true;
                 defer l.patch_io = false;
-                try l.b.store(locals[i], try l.entryInput(&entry, p.type, semanticOf(pd.semantics), paramAttrs(pd.quals), pd.name_loc, pd.name));
+                try l.b.store(locals[i], try l.entryInput(&entry, p.type, semanticOf(pd.semantics), l.sigAttrs(pd.quals, pd.attrs), pd.name_loc, pd.name));
                 args[i] = if (p.dir == .in) try l.b.load(locals[i]) else locals[i];
                 continue;
             }
@@ -1982,7 +2101,7 @@ const Lowerer = struct {
                 const verts = try l.arena.alloc(Ref, arr.len);
                 for (verts, 0..) |*v, vx| {
                     var next = first;
-                    v.* = try l.vertexIn(&entry, arr.elem, semanticOf(pd.semantics), paramAttrs(pd.quals), @intCast(vx), vx == 0, &next, null, pd.name_loc);
+                    v.* = try l.vertexIn(&entry, arr.elem, semanticOf(pd.semantics), l.sigAttrs(pd.quals, pd.attrs), @intCast(vx), vx == 0, &next, null, pd.name_loc);
                 }
                 try l.b.store(locals[i], try l.b.add(.{ .op = .{ .construct = verts }, .ty = p.type }));
                 args[i] = try l.b.load(locals[i]);
@@ -1998,7 +2117,7 @@ const Lowerer = struct {
                 continue;
             }
             if (p.dir != .out) {
-                const v = try l.entryInput(&entry, p.type, semanticOf(pd.semantics), paramAttrs(pd.quals), pd.name_loc, pd.name);
+                const v = try l.entryInput(&entry, p.type, semanticOf(pd.semantics), l.sigAttrs(pd.quals, pd.attrs), pd.name_loc, pd.name);
                 try l.b.store(locals[i], v);
             }
             args[i] = if (p.dir == .in) try l.b.load(locals[i]) else locals[i];
@@ -2007,7 +2126,7 @@ const Lowerer = struct {
         for (f.params, 0..) |p, i| if (l.s.types.get(p.type) != .stream) try call_args.append(l.arena, args[i]);
         std.debug.assert(call_args.items.len == n_args);
         const ret = try l.b.add(.{ .op = .{ .call = .{ .func = main, .args = call_args.items } }, .ty = f.ret });
-        if (f.ret != TypeTable.void_type) try l.entryOutput(&entry, f.ret, semanticOf(f.decl.ret_semantics), paramAttrs(f.decl.quals), ret, f.loc, "return value");
+        if (f.ret != TypeTable.void_type) try l.entryOutput(&entry, f.ret, semanticOf(f.decl.ret_semantics), l.sigAttrs(f.decl.quals, f.decl.attrs), ret, f.loc, "return value");
         for (f.decl.params, f.params, 0..) |pd, p, i| {
             if (p.dir == .in or l.s.types.get(p.type) == .stream) continue;
             if (l.b.f.inst(locals[i]).ptr == .mesh) continue;
@@ -2016,7 +2135,7 @@ const Lowerer = struct {
                 try l.b.store(ray_srcs[i], v);
                 continue;
             }
-            try l.entryOutput(&entry, p.type, semanticOf(pd.semantics), paramAttrs(pd.quals), v, pd.name_loc, pd.name);
+            try l.entryOutput(&entry, p.type, semanticOf(pd.semantics), l.sigAttrs(pd.quals, pd.attrs), v, pd.name_loc, pd.name);
         }
         l.b.terminate(.{ .ret = .none });
         entry.wrapper = wrapper;
@@ -2075,6 +2194,11 @@ pub fn stringContents(a: Allocator, lit: []const u8) Allocator.Error![]const u8 
     return out.items;
 }
 
+fn hasAttr(attrs: []const ast.Attribute, name: []const u8) bool {
+    for (attrs) |a| if (std.mem.eql(u8, a.name, name)) return true;
+    return false;
+}
+
 fn isShaderRecord(attrs: []const ast.Attribute) bool {
     for (attrs) |a| {
         if (std.mem.eql(u8, a.name, "vk::shader_record_ext") or std.mem.eql(u8, a.name, "vk::shader_record_nv")) return true;
@@ -2118,6 +2242,7 @@ fn sigElement(semantic: []const u8, ty: TypeId) ir.SigElement {
         .semantic_index = index,
         .ty = ty,
         .system_value = std.ascii.startsWithIgnoreCase(semantic, "SV_"),
+        .spelling = semantic,
     };
 }
 
@@ -2127,6 +2252,7 @@ fn parseBinding(values: []const []const u8) ir.Binding {
     for (values) |v| {
         if (std.mem.startsWith(u8, v, "space")) {
             b.space = std.fmt.parseInt(u32, v[5..], 10) catch 0;
+            b.space_given = true;
         } else if (v.len > 0 and std.mem.indexOfScalar(u8, "bcistu", std.ascii.toLower(v[0])) != null) {
             const end = std.mem.indexOfScalar(u8, v, '[') orelse v.len;
             b.class = std.ascii.toLower(v[0]);
