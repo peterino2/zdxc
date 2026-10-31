@@ -181,6 +181,8 @@ pub const Param = struct {
     by_ref: bool,
     /// in, out, inout (library function annotations).
     dir: enum { in, out, inout } = .in,
+    /// The HLSL type (before patches become arrays), for mangled names.
+    sema_ty: TypeId = 0,
     semantic: ?[]const u8 = null,
 };
 
@@ -192,6 +194,9 @@ pub const Function = struct {
     /// for first.
     entry: u32 = 0,
     ret_semantic: ?[]const u8 = null,
+    /// Declaration order of the HLSL function (libraries define functions
+    /// in this order).
+    decl_order: u32 = std.math.maxInt(u32),
     insts: std.ArrayList(Inst) = .empty,
     blocks: std.ArrayList(Block) = .empty,
 
@@ -320,6 +325,8 @@ pub const Entry = struct {
     /// parameters; reads inputs and output control points, writes patch
     /// constants).
     patch_wrapper: ?u32 = null,
+    /// The HLSL patch constant function.
+    patch_func: ?u32 = null,
     /// The wrapper with no parameters that reads `inputs`, calls `func`
     /// and writes `outputs`.
     wrapper: u32 = 0,

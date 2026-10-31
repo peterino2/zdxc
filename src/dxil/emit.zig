@@ -439,6 +439,9 @@ const Emitter = struct {
         attr_size: u32 = 0,
         /// Function annotation: the return value, then each parameter.
         ann: []const ParamAnn = &.{},
+        /// Graphics entries: signatures; entry properties of the stage.
+        sigs: ?module.MdId = null,
+        stage_props: []const ?module.MdId = &.{},
     };
 
     /// Input qualifier (0 in, 1 out, 2 inout), component type and
@@ -468,6 +471,10 @@ const Emitter = struct {
     fn runLibrary(e: *Emitter, gpa: Allocator) Error![]u8 {
         const m = e.m;
         e.lib = true;
+        // Prerelease shader models get experimental RDAT tables.
+        if (e.profile.minor >= 11 and m.entries.items.len > 0) return e.unsupported("libraries for prerelease shader models (experimental RDAT) are not supported yet", .{});
+        // Prerelease shader models get experimental RDAT tables.
+        if (e.profile.minor >= 11 and m.entries.items.len > 0) return e.unsupported("libraries for prerelease shader models (experimental RDAT) are not supported yet", .{});
         const i8p = try e.dm.ptrType(try e.dm.intType(8));
         e.handle_ty = try e.dm.getType(.{ .@"struct" = .{ .name = "dx.types.Handle", .elems = &.{i8p} } });
         try e.collectResources();
@@ -482,12 +489,44 @@ const Emitter = struct {
             e.dm.globals.items[v.global].constant = true;
             r.lib_global = v.global;
         }
-        var funcs: std.ArrayList(LibFunc) = .empty;
-        for (m.entries.items) |entry| {
+        // Definitions in declaration order (as dxc): create them all first.
+        const Unit = struct { order: u32, kind: enum { entry, patch, exported }, index: u32 };
+        var units: std.ArrayList(Unit) = .empty;
+        for (m.entries.items, 0..) |entry, k| {
             switch (entry.stage) {
-                .compute, .raygeneration, .intersection, .anyhit, .closesthit, .miss, .callable => {},
+                .compute, .raygeneration, .intersection, .anyhit, .closesthit, .miss, .callable, .vertex, .pixel, .geometry, .hull, .domain, .mesh, .amplification => {},
                 else => return e.unsupported("{s} shaders in libraries are not supported yet", .{@tagName(entry.stage)}),
             }
+            try units.append(e.arena, .{ .order = m.functions.items[entry.func].decl_order, .kind = .entry, .index = @intCast(k) });
+            if (entry.patch_func) |pf| try units.append(e.arena, .{ .order = m.functions.items[pf].decl_order, .kind = .patch, .index = @intCast(k) });
+        }
+        for (m.exports.items, 0..) |fi, k| try units.append(e.arena, .{ .order = m.functions.items[fi].decl_order, .kind = .exported, .index = @intCast(k) });
+        std.sort.insertion(Unit, units.items, {}, struct {
+            fn lt(_: void, x: Unit, y: Unit) bool {
+                return x.order < y.order;
+            }
+        }.lt);
+        const entry_fn = try e.arena.alloc(u32, m.entries.items.len);
+        const patch_fn = try e.arena.alloc(u32, m.entries.items.len);
+        const export_fn = try e.arena.alloc(LibFunc, m.exports.items.len);
+        for (units.items) |u| switch (u.kind) {
+            .entry => {
+                const entry = m.entries.items[u.index];
+                const sig = try e.entrySignature(entry);
+                entry_fn[u.index] = try e.dm.addFunction(.{ .name = sig.name, .ty = sig.ty, .num_blocks = 1 });
+            },
+            .patch => {
+                const pf = m.functions.items[m.entries.items[u.index].patch_func.?];
+                const mparams = try e.arena.alloc(mangle.Param, pf.params.len);
+                for (mparams, pf.params) |*mp, p| mp.* = .{ .ty = p.sema_ty };
+                const name = try mangle.function(e.arena, e.t, pf.name, pf.ret, mparams);
+                patch_fn[u.index] = try e.dm.addFunction(.{ .name = name, .ty = try e.dm.fnType(try e.voidTy(), &.{}), .num_blocks = 1 });
+            },
+            .exported => export_fn[u.index] = try e.exportSignature(m.exports.items[u.index]),
+        };
+
+        var funcs: std.ArrayList(LibFunc) = .empty;
+        for (m.entries.items, 0..) |entry, k| {
             e.entry = entry;
             e.blocks = .empty;
             e.prologue = .empty;
@@ -499,44 +538,84 @@ const Emitter = struct {
             e.rq_locals = .empty;
             e.forwarded = .empty;
             e.status_vals = .empty;
-            const hf = m.functions.items[entry.func];
-            const ray = entry.stage.isRayTracing();
-            var params: std.ArrayList(DType) = .empty;
-            var mparams: std.ArrayList(mangle.Param) = .empty;
-            var ann: std.ArrayList(ParamAnn) = .empty;
-            try ann.append(e.arena, .{ .qual = if (ray) 1 else 0 });
-            var lf: LibFunc = .{ .func = 0, .name = entry.name, .unmangled = entry.name, .stage = entry.stage, .entry = entry };
-            if (ray) for (hf.params, 0..) |p, k| {
-                try params.append(e.arena, try e.dm.ptrType(try e.memoryType(p.ty)));
-                try mparams.append(e.arena, .{ .ty = p.ty });
-                try ann.append(e.arena, .{ .qual = if (p.by_ref) 2 else 0 });
-                const size = try e.payloadSize(p.ty);
-                if (k == 0) lf.payload_size = size else lf.attr_size = size;
-            };
-            if (ray) lf.name = try mangle.function(e.arena, e.t, entry.name, TypeTable.void_type, mparams.items);
-            lf.ann = ann.items;
-            const fn_ty = try e.dm.fnType(try e.voidTy(), params.items);
-            lf.func = try e.dm.addFunction(.{ .name = lf.name, .ty = fn_ty, .num_blocks = 1 });
-            const args = try e.arena.alloc(Value, params.items.len);
-            for (args, 0..) |*a, k| a.* = .{ .arg = @intCast(k) };
+            e.payload_global = null;
+            e.payload_local = null;
+            e.groupshared_bytes = 0;
+            e.sig_in = &.{};
+            e.sig_out = &.{};
+            e.sig_pc = &.{};
+            if (entry.stage == .amplification) e.findDispatchPayload();
+            const sig = try e.entrySignature(entry);
+            var lf: LibFunc = .{ .func = entry_fn[k], .name = sig.name, .unmangled = entry.name, .stage = entry.stage, .entry = entry, .ann = sig.ann, .payload_size = sig.payload_size, .attr_size = sig.attr_size };
+            const args = try e.arena.alloc(Value, sig.nparams);
+            for (args, 0..) |*a, j| a.* = .{ .arg = @intCast(j) };
             e.lib_args = args;
             try e.buildSignatures(entry);
             e.cur = try e.newBlock();
             try e.libHandles();
             _ = try e.inlineCall(entry.wrapper, &.{});
             try e.finish(lf.func);
+            var pc_func: ?LibFunc = null;
+            if (entry.patch_wrapper) |pw| {
+                // The patch constant function: a function of its own.
+                e.blocks = .empty;
+                e.prologue = .empty;
+                e.next_id = 0;
+                e.private_globals = .empty;
+                e.private_typed = .empty;
+                e.nonuniform = .empty;
+                e.pc_fn = patch_fn[k];
+                e.cur = try e.newBlock();
+                try e.libHandles();
+                _ = try e.inlineCall(pw, &.{});
+                try e.finish(e.pc_fn.?);
+                const pname = e.dm.functions.items[patch_fn[k]].name;
+                pc_func = .{ .func = patch_fn[k], .name = pname, .unmangled = m.functions.items[entry.patch_func.?].name, .stage = .library, .entry = entry, .ann = &.{.{ .qual = 0 }} };
+            }
+            if (e.sig_in.len + e.sig_out.len + e.sig_pc.len > 0) {
+                lf.sigs = try e.dm.mdNode(&.{ try e.signatureMetadata(e.sig_in), try e.signatureMetadata(e.sig_out), try e.signatureMetadata(e.sig_pc) });
+            }
+            var sp: std.ArrayList(?module.MdId) = .empty;
+            try e.stageProps(entry, &sp);
+            lf.stage_props = sp.items;
             try funcs.append(e.arena, lf);
+            if (pc_func) |pf| try funcs.append(e.arena, pf);
         }
-        for (m.exports.items) |fi| try funcs.append(e.arena, try e.emitExport(fi));
-        // (Definitions in module order.)
+        for (m.exports.items, export_fn) |fi, lf| try funcs.append(e.arena, try e.emitExport(fi, lf));
         std.sort.insertion(LibFunc, funcs.items, {}, struct {
-            fn lt(_: void, a: LibFunc, b: LibFunc) bool {
-                return a.func < b.func;
+            fn lt(_: void, x: LibFunc, y: LibFunc) bool {
+                return x.func < y.func;
             }
         }.lt);
         const bitcode = try e.writeLibraryModule(funcs.items);
         defer gpa.free(bitcode);
         return e.assembleLibrary(gpa, funcs.items, bitcode);
+    }
+
+    const EntrySig = struct { name: []const u8, ty: DType, ann: []const ParamAnn, nparams: usize, payload_size: u32 = 0, attr_size: u32 = 0 };
+
+    /// A library entry's function: ray tracing shaders take their payload
+    /// / attributes by pointer under a mangled name; others take nothing.
+    fn entrySignature(e: *Emitter, entry: ir.Entry) Error!EntrySig {
+        const hf = e.m.functions.items[entry.func];
+        const ray = entry.stage.isRayTracing();
+        var params: std.ArrayList(DType) = .empty;
+        var mparams: std.ArrayList(mangle.Param) = .empty;
+        var ann: std.ArrayList(ParamAnn) = .empty;
+        try ann.append(e.arena, .{ .qual = if (ray) 1 else 0 });
+        var sig: EntrySig = .{ .name = entry.name, .ty = 0, .ann = &.{}, .nparams = 0 };
+        if (ray) for (hf.params, 0..) |p, k| {
+            try params.append(e.arena, try e.dm.ptrType(try e.memoryType(p.ty)));
+            try mparams.append(e.arena, .{ .ty = p.ty });
+            try ann.append(e.arena, .{ .qual = if (p.by_ref) 2 else 0 });
+            const size = try e.payloadSize(p.ty);
+            if (k == 0) sig.payload_size = size else sig.attr_size = size;
+        };
+        if (ray) sig.name = try mangle.function(e.arena, e.t, entry.name, TypeTable.void_type, mparams.items);
+        sig.ann = ann.items;
+        sig.ty = try e.dm.fnType(try e.voidTy(), params.items);
+        sig.nparams = params.items.len;
+        return sig;
     }
 
     /// The LLVM type of a library function argument / result: scalars
@@ -568,22 +647,10 @@ const Emitter = struct {
         return v;
     }
 
-    /// An exported function: a definition of its own taking scalars and
-    /// vectors (out / inout ones by pointer).
-    fn emitExport(e: *Emitter, fi: u32) Error!LibFunc {
+    /// An exported function's definition: scalars and vectors by value,
+    /// structs and out / inout values by pointer, under its mangled name.
+    fn exportSignature(e: *Emitter, fi: u32) Error!LibFunc {
         const f = e.m.functions.items[fi];
-        e.entry = .{ .func = fi, .name = f.name, .stage = .library, .wrapper = std.math.maxInt(u32) };
-        e.blocks = .empty;
-        e.prologue = .empty;
-        e.next_id = 0;
-        e.private_globals = .empty;
-        e.private_typed = .empty;
-        e.nonuniform = .empty;
-        e.res_locals = .empty;
-        e.rq_locals = .empty;
-        e.forwarded = .empty;
-        e.status_vals = .empty;
-        e.lib_args = &.{};
         var params: std.ArrayList(DType) = .empty;
         var mparams: std.ArrayList(mangle.Param) = .empty;
         var ann: std.ArrayList(ParamAnn) = .empty;
@@ -604,6 +671,27 @@ const Emitter = struct {
         const ret_ty = if (ret_void) try e.voidTy() else try e.libValueType(f.ret);
         const name = try mangle.function(e.arena, e.t, f.name, f.ret, mparams.items);
         const func = try e.dm.addFunction(.{ .name = name, .ty = try e.dm.fnType(ret_ty, params.items), .num_blocks = 1 });
+        return .{ .func = func, .name = name, .unmangled = f.name, .stage = .library, .entry = undefined, .ann = ann.items };
+    }
+
+    /// The body of exported function `fi` (its definition made by
+    /// exportSignature).
+    fn emitExport(e: *Emitter, fi: u32, lf0: LibFunc) Error!LibFunc {
+        const f = e.m.functions.items[fi];
+        e.entry = .{ .func = fi, .name = f.name, .stage = .library, .wrapper = std.math.maxInt(u32) };
+        e.blocks = .empty;
+        e.prologue = .empty;
+        e.next_id = 0;
+        e.private_globals = .empty;
+        e.private_typed = .empty;
+        e.nonuniform = .empty;
+        e.res_locals = .empty;
+        e.rq_locals = .empty;
+        e.forwarded = .empty;
+        e.status_vals = .empty;
+        e.lib_args = &.{};
+        const ret_void = f.ret == TypeTable.void_type;
+        const func = lf0.func;
         e.cur = try e.newBlock();
         try e.libHandles();
         // Arguments: components, and local copies of out / inout ones.
@@ -650,7 +738,9 @@ const Emitter = struct {
         };
         _ = try e.add(void_ty, .{ .ret = if (ret_void) null else try e.libJoin(res, f.ret) });
         try e.finish(func);
-        return .{ .func = func, .name = name, .unmangled = f.name, .stage = .library, .entry = e.entry, .ann = ann.items };
+        var lf = lf0;
+        lf.entry = e.entry;
+        return lf;
     }
 
     /// Handles of the library's resources for the current function (in
@@ -4340,10 +4430,7 @@ const Emitter = struct {
             if (lf.stage == .library) continue;
             var props: std.ArrayList(?module.MdId) = .empty;
             try props.appendSlice(e.arena, &.{ try mdI32(dm, 8), try mdI32(dm, shaderKind(lf.stage)) });
-            if (lf.stage == .compute) {
-                const t = lf.entry.num_threads;
-                try props.appendSlice(e.arena, &.{ try mdI32(dm, 4), try dm.mdNode(&.{ try mdI32(dm, t[0]), try mdI32(dm, t[1]), try mdI32(dm, t[2]) }) });
-            }
+            try props.appendSlice(e.arena, lf.stage_props);
             switch (lf.stage) {
                 .miss, .callable, .anyhit, .closesthit => try props.appendSlice(e.arena, &.{ try mdI32(dm, 6), try mdI32(dm, lf.payload_size) }),
                 else => {},
@@ -4351,7 +4438,7 @@ const Emitter = struct {
             if (lf.stage == .anyhit or lf.stage == .closesthit) try props.appendSlice(e.arena, &.{ try mdI32(dm, 7), try mdI32(dm, lf.attr_size) });
             try props.appendSlice(e.arena, &.{ try mdI32(dm, 5), auto_space });
             const fty = dm.functions.items[lf.func].ty;
-            try entries.append(e.arena, try dm.mdNode(&.{ try dm.mdValue(try dm.ptrType(fty), .{ .function = lf.func }), try dm.mdString(lf.name), null, null, try dm.mdNode(props.items) }));
+            try entries.append(e.arena, try dm.mdNode(&.{ try dm.mdValue(try dm.ptrType(fty), .{ .function = lf.func }), try dm.mdString(lf.name), lf.sigs, null, try dm.mdNode(props.items) }));
         }
 
         try dm.addNamedMetadata("llvm.ident", &.{ident});
@@ -4444,28 +4531,15 @@ const Emitter = struct {
         });
     }
 
-    fn writeModule(e: *Emitter, entry: ir.Entry) Error![]u8 {
+    /// Entry properties of the stage: thread group size and the GS / HS /
+    /// DS / MS / AS state.
+    fn stageProps(e: *Emitter, entry: ir.Entry, props: *std.ArrayList(?module.MdId)) Error!void {
         const dm = &e.dm;
         const mdI32 = struct {
             fn f(m: *module.Module, v: i64) !module.MdId {
                 return m.mdI32(v);
             }
         }.f;
-
-        const ident = try dm.mdNode(&.{try dm.mdString("zdxc 0.0.0")});
-        const version = try dm.mdNode(&.{ try mdI32(dm, 1), try mdI32(dm, e.profile.minor) });
-        const val_ver = try dm.mdNode(&.{ try mdI32(dm, 1), try mdI32(dm, 11) });
-        const sm = try dm.mdNode(&.{ try dm.mdString(e.profile.kind.profilePrefix()), try mdI32(dm, e.profile.major), try mdI32(dm, e.profile.minor) });
-
-        const resources = try e.resourcesMd();
-
-        // Entry properties: shader flags and thread group size.
-        var props: std.ArrayList(?module.MdId) = .empty;
-        const flags = e.shaderFlags();
-        if (flags != 0) {
-            const i64t = try dm.intType(64);
-            try props.appendSlice(e.arena, &.{ try mdI32(dm, 0), try dm.mdValue(i64t, try dm.constant(.{ .ty = i64t, .kind = .{ .int = @bitCast(flags) } })) });
-        }
         const threads = try dm.mdNode(&.{ try mdI32(dm, entry.num_threads[0]), try mdI32(dm, entry.num_threads[1]), try mdI32(dm, entry.num_threads[2]) });
         if (entry.stage == .compute) try props.appendSlice(e.arena, &.{ try mdI32(dm, 4), threads });
         const payload_size: u32 = if (entry.mesh.payload) |p| try e.payloadSize(p) else 0;
@@ -4508,6 +4582,31 @@ const Emitter = struct {
             const state = try dm.mdNode(&.{ try mdI32(dm, @intFromEnum(entry.tess.domain)), try mdI32(dm, entry.tess.input_control_points) });
             try props.appendSlice(e.arena, &.{ try mdI32(dm, 2), state });
         }
+    }
+
+    fn writeModule(e: *Emitter, entry: ir.Entry) Error![]u8 {
+        const dm = &e.dm;
+        const mdI32 = struct {
+            fn f(m: *module.Module, v: i64) !module.MdId {
+                return m.mdI32(v);
+            }
+        }.f;
+
+        const ident = try dm.mdNode(&.{try dm.mdString("zdxc 0.0.0")});
+        const version = try dm.mdNode(&.{ try mdI32(dm, 1), try mdI32(dm, e.profile.minor) });
+        const val_ver = try dm.mdNode(&.{ try mdI32(dm, 1), try mdI32(dm, 11) });
+        const sm = try dm.mdNode(&.{ try dm.mdString(e.profile.kind.profilePrefix()), try mdI32(dm, e.profile.major), try mdI32(dm, e.profile.minor) });
+
+        const resources = try e.resourcesMd();
+
+        // Entry properties: shader flags and thread group size.
+        var props: std.ArrayList(?module.MdId) = .empty;
+        const flags = e.shaderFlags();
+        if (flags != 0) {
+            const i64t = try dm.intType(64);
+            try props.appendSlice(e.arena, &.{ try mdI32(dm, 0), try dm.mdValue(i64t, try dm.constant(.{ .ty = i64t, .kind = .{ .int = @bitCast(flags) } })) });
+        }
+        try e.stageProps(entry, &props);
         const props_node = if (props.items.len > 0) try dm.mdNode(props.items) else null;
         var sigs: ?module.MdId = null;
         if (e.sig_in.len + e.sig_out.len + e.sig_pc.len > 0) {
@@ -4536,7 +4635,8 @@ const Emitter = struct {
         for (els, nodes) |el, *n| {
             const idx = try e.arena.alloc(?module.MdId, el.indices.len);
             for (el.indices, idx) |x, *m| m.* = try dm.mdI32(x);
-            const usage: ?module.MdId = if (el.usage != 0) try dm.mdNode(&.{ try dm.mdI32(3), try dm.mdI32(el.usage) }) else null;
+            // (Libraries leave usage masks out, as dxc.)
+            const usage: ?module.MdId = if (el.usage != 0 and !e.lib) try dm.mdNode(&.{ try dm.mdI32(3), try dm.mdI32(el.usage) }) else null;
             const row: i64 = if (el.start_row) |r| r else -1;
             const col: i64 = if (el.start_row != null) el.start_col else -1;
             n.* = try dm.mdNode(&.{

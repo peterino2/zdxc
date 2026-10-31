@@ -152,6 +152,16 @@ fn typeCode(a: Allocator, t: *TypeTable, ty: TypeId, out: *std.ArrayList(u8), na
             try className(a, 'V', try std.fmt.allocPrint(a, "?${s}@{s}@", .{ r.name, args.items }), out, names);
         },
         .sampler => |s| try className(a, 'U', if (s.comparison) "SamplerComparisonState" else "SamplerState", out, names),
+        .patch => |p| {
+            var args: std.ArrayList(u8) = .empty;
+            var inner: Names = .{};
+            const pname = if (p.output) "OutputPatch" else "InputPatch";
+            try inner.add(a, pname);
+            try typeCode(a, t, p.elem, &args, &inner);
+            try args.appendSlice(a, "$0");
+            try number(a, p.count, &args);
+            try className(a, 'V', try std.fmt.allocPrint(a, "?${s}@{s}@", .{ pname, args.items }), out, names);
+        },
         else => try out.append(a, 'X'),
     }
 }

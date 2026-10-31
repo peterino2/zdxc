@@ -215,9 +215,10 @@ const Lowerer = struct {
                 .in => .in,
                 .out => .out,
                 .inout => .inout,
-            }, .semantic = sem });
+            }, .semantic = sem, .sema_ty = p.type });
         }
-        const i = try l.m.addFunction(.{ .name = f.name, .params = params.items, .ret = f.ret, .entry = l.cur_entry, .ret_semantic = semanticOf(f.decl.ret_semantics) });
+        const order: u32 = @intCast(std.mem.indexOfScalar(*semamod.Function, l.s.all_functions.items, @constCast(f)) orelse std.math.maxInt(u32));
+        const i = try l.m.addFunction(.{ .name = f.name, .params = params.items, .ret = f.ret, .entry = l.cur_entry, .ret_semantic = semanticOf(f.decl.ret_semantics), .decl_order = order });
         try l.funcs.put(l.arena, f, i);
         try l.pending.append(l.arena, f);
         return i;
@@ -1843,6 +1844,7 @@ const Lowerer = struct {
             return error.Unsupported;
         };
         const pci = try l.functionIndex(pcf);
+        entry.patch_func = pci;
         try l.drain();
         const wrapper = try l.m.addFunction(.{ .name = try std.fmt.allocPrint(l.arena, "{s}.wrapper", .{name}), .params = &.{}, .ret = TypeTable.void_type, .entry = l.cur_entry });
         l.b = .{ .m = &l.m, .f = l.m.functions.items[wrapper] };
