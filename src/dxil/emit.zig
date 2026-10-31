@@ -45,6 +45,8 @@ const Lowered = union(enum) {
     /// A local holding a resource (index into Emitter.res_locals): an
     /// alias of the one resource stored into it.
     res_local: u32,
+    /// An element of a typed buffer or texture (atomics' destination).
+    texel: struct { res: u32, coords: []const Value },
     /// An array of resources (or a sub-array), with the flattened index so
     /// far.
     res_array: struct { res: u32, index: ?Value = null, ty: TypeId },
@@ -68,6 +70,8 @@ const Ptr = struct {
     bool_storage: bool = false,
     /// Mixed 32-bit component types share i32 storage (floats bitcast).
     mixed: bool = false,
+    /// 3 for groupshared memory.
+    addr_space: u32 = 0,
 };
 
 const Resource = struct {
@@ -80,6 +84,8 @@ const Resource = struct {
     elem: TypeId,
     /// SamplerComparisonState.
     comparison: bool = false,
+    /// Structured UAV with a hidden counter (IncrementCounter, Append...).
+    has_counter: bool = false,
     /// Registers in the range (arrays of resources); maxInt for unsized.
     count: u32 = 1,
     /// An array element's handle made at its use: a copy of the array's
@@ -127,6 +133,7 @@ const Emitter = struct {
     /// 16-bit min-precision values cross the signature.
     uses_min_precision: bool = false,
     uses_view_id: bool = false,
+    groupshared_bytes: u32 = 0,
     /// A typed UAV load of more than one component.
     uses_typed_uav_load: bool = false,
     uses_inner_coverage: bool = false,
@@ -329,7 +336,7 @@ const Emitter = struct {
                 else => return e.unsupported("global '{s}' is not supported yet", .{g.name}),
             };
             const kind: u32 = switch (r.kind) {
-                .structured_buffer, .rw_structured_buffer => 12,
+                .structured_buffer, .rw_structured_buffer, .append_structured_buffer, .consume_structured_buffer => 12,
                 .byte_address_buffer, .rw_byte_address_buffer => 11,
                 .buffer, .rw_buffer => 10,
                 .texture1d, .rw_texture1d => 1,
@@ -343,14 +350,34 @@ const Emitter = struct {
                 .texture_cube_array => 9,
                 else => return e.unsupported("resource type '{s}' is not supported yet", .{r.name}),
             };
-            const class: Resource.Class = if (r.kind.isWritable()) .uav else .srv;
+            const class: Resource.Class = if (r.kind.isWritable() or r.kind == .consume_structured_buffer) .uav else .srv;
             if (g.binding.explicit and g.binding.class != @as(u8, if (class == .uav) 'u' else 't')) {
                 return e.unsupported("binding '{s}' to the wrong register class", .{g.name});
             }
-            try e.resources.append(e.arena, .{ .global = @intCast(gi), .class = class, .id = counts[@backingInt(class)], .kind = kind, .elem = r.elem, .count = count });
+            try e.resources.append(e.arena, .{ .global = @intCast(gi), .class = class, .id = counts[@backingInt(class)], .kind = kind, .elem = r.elem, .count = count, .has_counter = r.kind == .append_structured_buffer or r.kind == .consume_structured_buffer });
             counts[@backingInt(class)] += 1;
             try e.resource_of_global.put(e.arena, @intCast(gi), @intCast(e.resources.items.len - 1));
         }
+        // Counters must be known before handles are made (SM 6.6 encodes
+        // them in the handle's properties).
+        for (e.m.functions.items) |f| for (f.insts.items) |inst| {
+            const mt = switch (inst.op) {
+                .method => |mt| mt,
+                else => continue,
+            };
+            const eq = std.mem.eql;
+            if (!(eq(u8, mt.name, "IncrementCounter") or eq(u8, mt.name, "DecrementCounter"))) continue;
+            var r = mt.res;
+            const g: ?u32 = while (true) switch (f.inst(r).op) {
+                .load => |p| r = p,
+                .access => |a| r = a.base,
+                .global => |gi| break gi,
+                else => break null,
+            };
+            if (g) |gi| if (e.resource_of_global.get(gi)) |ri| {
+                e.resources.items[ri].has_counter = true;
+            };
+        };
         // Unbound resources take the next free register of their class.
         var used: std.AutoHashMapUnmanaged(struct { u8, u32, u32 }, void) = .empty;
         // (Unsized ranges are taken to hold 64 registers here.)
@@ -441,7 +468,7 @@ const Emitter = struct {
     fn resourceProperties(e: *Emitter, res: Resource) Error![2]i64 {
         var basic: i64 = res.kind;
         if (res.class == .uav) basic |= 0x1000;
-        if (res.comparison) basic |= 0x8000;
+        if (res.comparison or res.has_counter) basic |= 0x8000;
         const extra: i64 = switch (res.kind) {
             13 => try e.cbufferSize(res),
             12 => try e.stride(res.elem),
@@ -546,6 +573,15 @@ const Emitter = struct {
             .gep => |*x| {
                 x.ptr = R.v(map, x.ptr);
                 x.indices = try R.vs(a, map, x.indices);
+            },
+            .atomicrmw => |*x| {
+                x.ptr = R.v(map, x.ptr);
+                x.val = R.v(map, x.val);
+            },
+            .cmpxchg => |*x| {
+                x.ptr = R.v(map, x.ptr);
+                x.cmp = R.v(map, x.cmp);
+                x.new = R.v(map, x.new);
             },
             .@"unreachable" => {},
         }
@@ -654,6 +690,19 @@ const Emitter = struct {
         };
     }
 
+    /// The flattened storage shape for `ty` (base not yet set).
+    fn storageFor(e: *Emitter, ty: TypeId) Error!Ptr {
+        const n = try e.flatCount(ty);
+        if (try e.mixedStorage(ty)) {
+            const st = try e.dm.intType(32);
+            return .{ .base = undefined, .array_ty = try e.dm.getType(.{ .array = .{ .len = n, .elem = st } }), .scalar_ty = st, .mixed = true };
+        }
+        const c = try e.uniformScalar(ty);
+        if (c.size() != 4) return e.unsupported("groupshared values of type '{s}' are not supported yet", .{try e.t.format(e.arena, ty)});
+        const st = try e.scalarTy(if (c == .bool) Scalar.int else c);
+        return .{ .base = undefined, .array_ty = try e.dm.getType(.{ .array = .{ .len = n, .elem = st } }), .scalar_ty = st, .bool_storage = c == .bool };
+    }
+
     /// Flattened storage for a value of type `ty`, allocated on entry.
     fn alloca(e: *Emitter, ty: TypeId) Error!Ptr {
         const n = try e.flatCount(ty);
@@ -689,6 +738,19 @@ const Emitter = struct {
                     if (!gop.found_existing) gop.value_ptr.* = try e.alloca(e.m.globals.items[g].ty);
                     return .{ .ptr = gop.value_ptr.* };
                 }
+                if (e.m.globals.items[g].space == .groupshared) {
+                    // Address-space-3 module variables, flattened like locals.
+                    const gop = try e.private_globals.getOrPut(e.arena, g);
+                    if (!gop.found_existing) {
+                        var p = try e.storageFor(e.m.globals.items[g].ty);
+                        const gv = try e.dm.addGlobal(e.m.globals.items[g].name, p.array_ty, 3);
+                        p.base = gv;
+                        p.addr_space = 3;
+                        gop.value_ptr.* = p;
+                        e.groupshared_bytes += @intCast(e.dm.types.items[p.array_ty].array.len * 4);
+                    }
+                    return .{ .ptr = gop.value_ptr.* };
+                }
                 const ri = e.resource_of_global.get(g) orelse return e.unsupported("global '{s}' is not supported yet", .{e.m.globals.items[g].name});
                 if (e.resources.items[ri].class == .cbuffer) return .{ .cbuf = .{ .res = ri } };
                 if (e.resources.items[ri].count != 1) return .{ .res_array = .{ .res = ri, .ty = e.m.globals.items[g].ty } };
@@ -705,6 +767,12 @@ const Emitter = struct {
                 .handle => |h| return .{ .handle = h },
                 .res_local => |k| return e.res_locals.items[k] orelse return e.unsupported("a resource local read before it is assigned", .{}),
                 .res_array => |ra| return .{ .res_array = ra },
+                .texel => |tx| {
+                    const res = e.resources.items[tx.res];
+                    const mip = if (res.class == .uav) try e.dm.constant(.{ .ty = try e.dm.intType(32), .kind = .undef }) else try e.i32Const(0);
+                    if (res.kind == 10) return .{ .scalars = try e.typedBufferLoad(res, tx.coords[0], i.ty) };
+                    return .{ .scalars = try e.textureLoad(res, mip, tx.coords, null, i.ty) };
+                },
                 .cbuf => |c| return e.cbufferLoad(c.res, c.offset, c.dyn_regs, c.row_major, i.ty),
                 .buf => |b| return .{ .scalars = try e.structuredLoad(e.resources.items[b.res], b.index, b.offset, b.dyn, b.row_major, i.ty) },
                 .ptr => |ptr| return e.loadPtr(ptr, i.ty),
@@ -738,7 +806,9 @@ const Emitter = struct {
                 if (frame.vals[a.base.index()] == .cbuf) return e.cbufferAccess(frame, frame.vals[a.base.index()].cbuf, f.inst(a.base).ty, a.indices);
                 if (frame.vals[a.base.index()] == .handle) {
                     const ri = frame.vals[a.base.index()].handle;
-                    if (e.resources.items[ri].kind != 12) return e.unsupported("member access into this resource is not supported yet", .{});
+                    const rk = e.resources.items[ri].kind;
+                    if (rk >= 1 and rk <= 10) return .{ .texel = .{ .res = ri, .coords = try e.scalars(frame, a.indices[0]) } };
+                    if (rk != 12) return e.unsupported("member access into this resource is not supported yet", .{});
                     const start: @FieldType(Lowered, "buf") = .{ .res = ri, .index = (try e.scalars(frame, a.indices[0]))[0] };
                     return e.bufferAccess(frame, start, e.t.get(f.inst(a.base).ty).resource.elem, a.indices[1..]);
                 }
@@ -1001,7 +1071,7 @@ const Emitter = struct {
     fn elementPtr(e: *Emitter, ptr: Ptr, c: u32) Error!Value {
         var idx = try e.i32Const(ptr.offset_const + c);
         if (ptr.offset_dyn) |d| idx = try e.add(try e.dm.intType(32), .{ .binop = .{ .op = .add, .lhs = d, .rhs = idx } });
-        const pt = try e.dm.ptrType(ptr.scalar_ty);
+        const pt = try e.dm.getType(.{ .pointer = .{ .elem = ptr.scalar_ty, .addr_space = ptr.addr_space } });
         return e.add(pt, .{ .gep = .{ .elem = ptr.array_ty, .ptr = ptr.base, .indices = try e.arena.dupe(Value, &.{ try e.i32Const(0), idx }) } });
     }
 
@@ -1088,6 +1158,7 @@ const Emitter = struct {
     fn intrinsic(e: *Emitter, frame: *Frame, name: []const u8, ty: TypeId, args: []const Ref) Error!Lowered {
         const eq = std.mem.eql;
         if (try e.outIntrinsic(frame, name, ty, args)) |r| return r;
+        for (args) |x| if (frame.vals[x.index()] != .scalars) return e.unsupported("intrinsic '{s}' is not supported yet", .{name});
         var a: [4][]const Value = undefined;
         for (args, 0..) |x, k| a[k] = try e.scalars(frame, x);
         const ac = if (args.len > 0) e.compOf(frame.f.inst(args[0]).ty) else e.compOf(ty);
@@ -1096,7 +1167,7 @@ const Emitter = struct {
         const at = try e.scalarTy(ac);
         const fl = ac.isFloat();
         const n = if (args.len > 0) a[0].len else 1;
-        const out = try e.arena.alloc(Value, try e.flatCount(ty));
+        const out = try e.arena.alloc(Value, if (ty == TypeTable.void_type) 0 else try e.flatCount(ty));
         const Unary = struct { name: []const u8, op: i64 };
         const float_unary = [_]Unary{
             .{ .name = "sqrt", .op = 24 },  .{ .name = "rsqrt", .op = 25 },   .{ .name = "sin", .op = 13 },  .{ .name = "cos", .op = 12 },
@@ -1355,6 +1426,7 @@ const Emitter = struct {
             _ = ty;
             return .{ .scalars = a2 };
         }
+        if (std.mem.startsWith(u8, name, "Interlocked")) return try e.atomic(frame, name, args);
         if (eq(u8, name, "asuint") and args.len == 3) {
             // SplitDouble.
             const i32t = try e.dm.intType(32);
@@ -1375,6 +1447,59 @@ const Emitter = struct {
             return .none;
         }
         return null;
+    }
+
+    /// Interlocked*(dest, value(s) [, out original]) on groupshared memory,
+    /// buffer elements and texels.
+    fn atomic(e: *Emitter, frame: *Frame, name: []const u8, args: []const Ref) Error!Lowered {
+        const eq = std.mem.eql;
+        const op_name = name["Interlocked".len..];
+        const dest_ty = frame.f.inst(args[0]).ty;
+        const dc = e.compOf(dest_ty);
+        if (dc.size() != 4 or dc.isFloat()) return e.unsupported("'{s}' on '{s}' is not supported yet", .{ name, try e.t.format(e.arena, dest_ty) });
+        const i32t = try e.dm.intType(32);
+        const is_cmp = std.mem.startsWith(u8, op_name, "Compare");
+        const has_orig = (is_cmp and eq(u8, op_name, "CompareExchange")) or (!is_cmp and args.len == 3);
+        const val = (try e.scalars(frame, args[if (is_cmp) 2 else 1]))[0];
+        const cmp = if (is_cmp) (try e.scalars(frame, args[1]))[0] else null;
+        const orig: Value = switch (frame.vals[args[0].index()]) {
+            .ptr => |p| blk: {
+                if (p.addr_space != 3) return e.unsupported("'{s}' on this variable is not supported yet", .{name});
+                const ptr = try e.elementPtr(p, 0);
+                if (cmp) |cv| {
+                    const pair = try e.dm.getType(.{ .@"struct" = .{ .name = "", .elems = &.{ i32t, try e.dm.intType(1) } } });
+                    const r = try e.add(pair, .{ .cmpxchg = .{ .ptr = ptr, .cmp = cv, .new = val } });
+                    break :blk try e.add(i32t, .{ .extractvalue = .{ .agg = r, .index = 0 } });
+                }
+                const rmw: module.RmwOp = if (eq(u8, op_name, "Add")) .add else if (eq(u8, op_name, "And")) .@"and" else if (eq(u8, op_name, "Or")) .@"or" else if (eq(u8, op_name, "Xor")) .xor else if (eq(u8, op_name, "Min")) (if (dc.isUnsigned()) .umin else .min) else if (eq(u8, op_name, "Max")) (if (dc.isUnsigned()) .umax else .max) else if (eq(u8, op_name, "Exchange")) .xchg else return e.unsupported("'{s}' is not supported yet", .{name});
+                break :blk try e.add(i32t, .{ .atomicrmw = .{ .op = rmw, .ptr = ptr, .val = val } });
+            },
+            .buf => |b| blk: {
+                const res = e.resources.items[b.res];
+                var off = try e.i32Const(b.offset);
+                if (b.dyn) |d| off = try e.add(i32t, .{ .binop = .{ .op = .add, .lhs = d, .rhs = off } });
+                break :blk try e.resourceAtomic(res, &.{ b.index, off }, op_name, dc, val, cmp);
+            },
+            .texel => |tx| try e.resourceAtomic(e.resources.items[tx.res], tx.coords, op_name, dc, val, cmp),
+            else => return e.unsupported("'{s}' on this destination is not supported yet", .{name}),
+        };
+        if (has_orig) try e.storePtr(try e.outPtr(frame, args[args.len - 1]), &.{orig}, frame.f.inst(args[args.len - 1]).ty);
+        return .none;
+    }
+
+    /// dx.op.atomicBinOp / atomicCompareExchange at `coords` (padded with
+    /// undef to three).
+    fn resourceAtomic(e: *Emitter, res: Resource, coords: []const Value, op_name: []const u8, dc: Scalar, val: Value, cmp: ?Value) Error!Value {
+        const eq = std.mem.eql;
+        const i32t = try e.dm.intType(32);
+        const c = try e.padded(coords, coords.len, 3, i32t);
+        if (cmp) |cv| {
+            const fn_i = try e.dxOp("dx.op.atomicCompareExchange.i32", i32t, &.{ i32t, e.handle_ty, i32t, i32t, i32t, i32t, i32t }, .nounwind);
+            return e.callOp(fn_i, i32t, &.{ try e.i32Const(79), res.handle, c[0], c[1], c[2], cv, val });
+        }
+        const op: i64 = if (eq(u8, op_name, "Add")) 0 else if (eq(u8, op_name, "And")) 1 else if (eq(u8, op_name, "Or")) 2 else if (eq(u8, op_name, "Xor")) 3 else if (eq(u8, op_name, "Min")) (if (dc.isUnsigned()) 6 else 4) else if (eq(u8, op_name, "Max")) (if (dc.isUnsigned()) 7 else 5) else if (eq(u8, op_name, "Exchange")) 8 else return e.unsupported("'Interlocked{s}' is not supported yet", .{op_name});
+        const fn_i = try e.dxOp("dx.op.atomicBinOp.i32", i32t, &.{ i32t, e.handle_ty, i32t, i32t, i32t, i32t, i32t }, .nounwind);
+        return e.callOp(fn_i, i32t, &.{ try e.i32Const(78), res.handle, try e.i32Const(op), c[0], c[1], c[2], val });
     }
 
     fn fbin(e: *Emitter, op: module.BinOp, x: Value, y: Value, ty: DType) Error!Value {
@@ -1739,6 +1864,17 @@ const Emitter = struct {
         return out;
     }
 
+    fn typedBufferLoad(e: *Emitter, res: Resource, idx: Value, ty: TypeId) Error![]const Value {
+        const via = try e.texelScalar(res.elem);
+        const st = try e.scalarTy(via);
+        const ret_ty = try e.resRetType(st);
+        const i32t = try e.dm.intType(32);
+        if (res.class == .uav and try e.flatCount(res.elem) > 1) e.uses_typed_uav_load = true;
+        const fn_i = try e.dxOp(try std.fmt.allocPrint(e.arena, "dx.op.bufferLoad.{s}", .{e.overloadName(st)}), ret_ty, &.{ i32t, e.handle_ty, i32t, i32t }, .nounwind_readonly);
+        const call = try e.callOp(fn_i, ret_ty, &.{ try e.i32Const(68), res.handle, idx, try e.dm.constant(.{ .ty = i32t, .kind = .undef }) });
+        return e.resRetComponents(call, st, via, ty);
+    }
+
     fn textureLoad(e: *Emitter, res: Resource, mip: Value, coords: []const Value, offset: ?[]const Value, ty: TypeId) Error![]const Value {
         const via = try e.texelScalar(res.elem);
         const st = try e.scalarTy(via);
@@ -1781,6 +1917,44 @@ const Emitter = struct {
             return e.resourceLoad(frame, res_ref, arg_refs[0], ty);
         }
         if (res.kind == 12 and eq(u8, name, "Load")) return e.resourceLoad(frame, res_ref, arg_refs[0], ty);
+        if (res.kind == 11) {
+            // Byte-address buffers: Load/Load2..4, Store/Store2..4, atomics.
+            if (std.mem.startsWith(u8, name, "Load") and arg_refs.len == 1) return e.resourceLoad(frame, res_ref, arg_refs[0], ty);
+            if (std.mem.startsWith(u8, name, "Store") and arg_refs.len == 2) {
+                try e.resourceStore(frame, res_ref, arg_refs[0], arg_refs[1]);
+                return .none;
+            }
+            if (std.mem.startsWith(u8, name, "Interlocked")) {
+                const op_name = name["Interlocked".len..];
+                const is_cmp = std.mem.startsWith(u8, op_name, "Compare");
+                const off = (try e.scalars(frame, arg_refs[0]))[0];
+                const val = (try e.scalars(frame, arg_refs[if (is_cmp) 2 else 1]))[0];
+                const cmp = if (is_cmp) (try e.scalars(frame, arg_refs[1]))[0] else null;
+                const vty = frame.f.inst(arg_refs[if (is_cmp) 2 else 1]).ty;
+                if (e.compOf(vty).size() != 4) return e.unsupported("64-bit '{s}' is not supported yet", .{name});
+                const orig = try e.resourceAtomic(res.*, &.{off}, op_name, e.compOf(vty), val, cmp);
+                const has_orig = if (is_cmp) eq(u8, op_name, "CompareExchange") else arg_refs.len == 3;
+                if (has_orig) try e.storePtr(try e.outPtr(frame, arg_refs[arg_refs.len - 1]), &.{orig}, frame.f.inst(arg_refs[arg_refs.len - 1]).ty);
+                return .none;
+            }
+        }
+        if (res.kind == 12 and (eq(u8, name, "IncrementCounter") or eq(u8, name, "DecrementCounter") or eq(u8, name, "Append") or eq(u8, name, "Consume"))) {
+            for (e.resources.items) |*r2| if (r2.global == res.global) {
+                r2.has_counter = true;
+            };
+            const i8t = try e.dm.intType(8);
+            const inc = eq(u8, name, "IncrementCounter") or eq(u8, name, "Append");
+            const fn_i = try e.dxOp("dx.op.bufferUpdateCounter", i32t, &.{ i32t, e.handle_ty, i8t }, .nounwind);
+            const n = try e.callOp(fn_i, i32t, &.{ try e.i32Const(70), res.handle, try e.dm.constant(.{ .ty = i8t, .kind = .{ .int = if (inc) 1 else -1 } }) });
+            if (eq(u8, name, "Append")) {
+                try e.structuredStore(res.*, n, 0, null, false, frame.f.inst(arg_refs[0]).ty, try e.scalars(frame, arg_refs[0]));
+                return .none;
+            }
+            if (eq(u8, name, "Consume")) return .{ .scalars = try e.structuredLoad(res.*, n, 0, null, false, ty) };
+            // (BufferUpdateCounter returns the old value for increments and
+            // the new one for decrements, matching HLSL.)
+            return e.list(&.{n});
+        }
         const sh = texture.shape(kind) orelse return e.unsupported("method '{s}' is not supported yet", .{name});
         const call = texture.decode(name, sh, arg_refs.len) orelse return e.unsupported("method '{s}' is not supported yet", .{name});
         if (call.status != null) return e.unsupported("texture methods with a status argument are not supported yet", .{});
@@ -2531,7 +2705,7 @@ const Emitter = struct {
             var fields: std.ArrayList(?module.MdId) = .empty;
             try fields.appendSlice(e.arena, &.{ try mdI32(dm, r.id), try dm.mdValue(try dm.ptrType(class_ty), undef_ptr), try dm.mdString(""), try mdI32(dm, b.space), try mdI32(dm, b.index), try mdI32(dm, range), try mdI32(dm, r.kind) });
             if (r.class == .uav) {
-                try fields.appendSlice(e.arena, &.{ try mdBool(dm, i1t, false), try mdBool(dm, i1t, false), try mdBool(dm, i1t, false) });
+                try fields.appendSlice(e.arena, &.{ try mdBool(dm, i1t, false), try mdBool(dm, i1t, r.has_counter), try mdBool(dm, i1t, false) });
             } else try fields.append(e.arena, try mdI32(dm, 0)); // sample count
             const extra: ?module.MdId = switch (r.kind) {
                 12 => try dm.mdNode(&.{ try mdI32(dm, 1), try mdI32(dm, try e.stride(r.elem)) }),
@@ -2618,7 +2792,7 @@ const Emitter = struct {
                     else => 3,
                 },
                 .uav => switch (r.kind) {
-                    12 => 8,
+                    12 => if (r.has_counter) 9 else 8,
                     11 => 7,
                     else => 6,
                 },
@@ -2657,6 +2831,7 @@ const Emitter = struct {
             .resources = binds.items,
             .inputs = e.sig_in,
             .outputs = e.sig_out,
+            .groupshared_bytes = if (entry.stage == .compute) e.groupshared_bytes else 0,
         });
         defer gpa.free(psv);
         const isg1 = try signature.programSignature(gpa, e.sig_in, true);

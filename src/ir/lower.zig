@@ -920,6 +920,12 @@ const Lowerer = struct {
                 return l.b.add(.{ .op = .{ .access = .{ .base = base, .indices = try l.arena.dupe(Ref, &.{idx}) } }, .ty = e.ty, .ptr = l.b.f.inst(base).ptr });
             },
             .index => |x| {
+                if (t.get(x.base.ty) == .resource) {
+                    // An element of a buffer or texture (atomics' `ref`).
+                    const base = try l.rvalue(x.base);
+                    const idx = try l.indexValue(x.index, t.get(x.base.ty).resource.kind.indexDims());
+                    return l.b.add(.{ .op = .{ .access = .{ .base = base, .indices = try l.arena.dupe(Ref, &.{idx}) } }, .ty = e.ty, .ptr = .resource });
+                }
                 const base = try l.lvalue(x.base);
                 const idx = try l.converted(x.index, try t.scalar(.uint));
                 return l.b.add(.{ .op = .{ .access = .{ .base = base, .indices = try l.arena.dupe(Ref, &.{idx}) } }, .ty = e.ty, .ptr = l.b.f.inst(base).ptr });

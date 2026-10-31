@@ -23,13 +23,14 @@ const Ref = ir.Ref;
 pub const Error = Allocator.Error || error{Unsupported};
 
 /// SPIR-V storage classes.
-const StorageClass = enum(u32) { uniform_constant = 0, input = 1, uniform = 2, output = 3, workgroup = 4, private = 6, function = 7, storage_buffer = 12 };
+const StorageClass = enum(u32) { uniform_constant = 0, input = 1, uniform = 2, output = 3, workgroup = 4, private = 6, function = 7, image = 11, storage_buffer = 12 };
 
 const Capability = enum(u32) {
     shader = 1,
     float16 = 9,
     float64 = 10,
     int64 = 11,
+    int64_atomics = 12,
     int16 = 22,
     image_gather_extended = 25,
     storage_image_multisample = 27,
@@ -93,6 +94,10 @@ const Emitter = struct {
     image_types: std.AutoHashMapUnmanaged([6]u32, Id) = .empty,
     sampled_image_types: std.AutoHashMapUnmanaged(Id, Id) = .empty,
     sampler_type: Id = 0,
+    counter_vars: []Id = &.{},
+    /// Per instruction (current function): texel places (`tex[i]`).
+    texel_places: std.AutoHashMapUnmanaged(u32, struct { res: Ref, coord: Ref, comp: Ref = .none }) = .empty,
+    counter_type: Id = 0,
     resource_arrays: std.AutoHashMapUnmanaged([2]u32, Id) = .empty,
     extensions: std.ArrayList([]const u8) = .empty,
     /// Values selected with NonUniformResourceIndex (and resources reached
@@ -540,6 +545,70 @@ const Emitter = struct {
                 else => return e.unsupported("global '{s}' is not supported yet", .{g.name}),
             }
         }
+
+        // Hidden counters (as dxc): a `{ int }` buffer per structured buffer
+        // that uses one, on the next free binding of its set.
+        e.counter_vars = try e.arena.alloc(Id, m.globals.items.len);
+        @memset(e.counter_vars, 0);
+        for (m.globals.items, 0..) |g, gi| {
+            if (!e.needsCounter(@intCast(gi))) continue;
+            if (e.counter_type == 0) {
+                e.counter_type = e.b.newId();
+                try e.b.emit(.types_globals, .type_struct, &.{ e.counter_type, try e.scalarType(.int) });
+                try e.b.emit(.annotations, .member_decorate, &.{ e.counter_type, 0, 35, 0 }); // Offset 0
+                try e.b.emit(.annotations, .decorate, &.{ e.counter_type, 3 }); // BufferBlock
+                try e.b.emitWithString(.debug_names, .name, &.{e.counter_type}, "type.ACSBuffer.counter", &.{});
+            }
+            const var_id = e.b.newId();
+            try e.b.emit(.types_globals, .variable, &.{ try e.pointerType(.uniform, e.counter_type), var_id, @backingInt(StorageClass.uniform) });
+            while (used.contains(.{ g.binding.space, next_free })) next_free += 1;
+            try used.put(e.arena, .{ g.binding.space, next_free }, {});
+            try e.b.emit(.annotations, .decorate, &.{ var_id, 34, g.binding.space }); // DescriptorSet
+            try e.b.emit(.annotations, .decorate, &.{ var_id, 33, next_free }); // Binding
+            try e.b.emitWithString(.debug_names, .name, &.{var_id}, try std.fmt.allocPrint(e.arena, "counter.var.{s}", .{g.name}), &.{});
+            e.counter_vars[gi] = var_id;
+        }
+    }
+
+    /// Append/Consume buffers, and structured buffers whose counter is
+    /// incremented or decremented somewhere.
+    fn needsCounter(e: *Emitter, gi: u32) bool {
+        const r = switch (e.t.get(e.m.globals.items[gi].ty)) {
+            .resource => |r| r,
+            else => return false,
+        };
+        if (r.kind == .append_structured_buffer or r.kind == .consume_structured_buffer) return true;
+        if (r.kind != .rw_structured_buffer) return false;
+        for (e.m.functions.items) |f| for (f.insts.items) |inst| switch (inst.op) {
+            .method => |mt| {
+                if (!std.mem.eql(u8, mt.name, "IncrementCounter") and !std.mem.eql(u8, mt.name, "DecrementCounter")) continue;
+                var x = mt.res;
+                while (true) switch (f.inst(x).op) {
+                    .load => |p| x = p,
+                    .global => |g| {
+                        if (g == gi) return true;
+                        break;
+                    },
+                    else => break,
+                };
+            },
+            else => {},
+        };
+        return false;
+    }
+
+    /// The counter update for IncrementCounter / DecrementCounter / Append /
+    /// Consume: returns the index (or counter value) as uint.
+    fn counterOp(e: *Emitter, res: Ref, increment: bool, post: bool) Error!Id {
+        const g = e.globalOf(res) orelse return e.unsupported("counters of resources not tied to a global are not supported yet", .{});
+        const cv = e.counter_vars[g];
+        if (cv == 0) return e.unsupported("this buffer has no counter", .{});
+        const int_ty = try e.t.scalar(.int);
+        const ptr = try e.opRaw(.access_chain, try e.pointerType(.uniform, try e.scalarType(.int)), &.{ cv, try e.constUint(0) });
+        const old = try e.op1(if (increment) .atomic_i_add else .atomic_i_sub, int_ty, &.{ ptr, try e.constUint(1), try e.constUint(0), try e.constInt(1) });
+        // Decrements report the new value.
+        const v = if (post) try e.op1(.i_sub, int_ty, &.{ old, try e.constInt(1) }) else old;
+        return e.op1(.bitcast, try e.t.scalar(.uint), &.{v});
     }
 
     /// `float`, `v4float`: dxc's type names inside buffer type names.
@@ -666,6 +735,7 @@ const Emitter = struct {
 
     fn emitFunction(e: *Emitter, f: *const ir.Function, fn_id: Id, bindings: []const Id) Error!void {
         e.f = f;
+        e.texel_places = .empty;
         e.vals = try e.arena.alloc(Id, f.insts.items.len);
         @memset(e.vals, 0);
         e.ptr_layouts = try e.arena.alloc(?PtrLayout, f.insts.items.len);
@@ -861,6 +931,16 @@ const Emitter = struct {
                 };
             },
             .load => |p| {
+                if (e.texel_places.get(p.index())) |tp| {
+                    if (tp.comp == .none) {
+                        e.vals[ri] = try e.imageIndexLoad(tp.res, e.val(tp.coord), i.ty);
+                    } else {
+                        const elem = e.resourceInfo(tp.res).elem;
+                        const whole = try e.imageIndexLoad(tp.res, e.val(tp.coord), elem);
+                        e.vals[ri] = if (e.isScalarLike(elem)) whole else try e.op1(.vector_extract_dynamic, i.ty, &.{ whole, e.val(tp.comp) });
+                    }
+                    return;
+                }
                 // Resources stay as their variables (accessed by chains).
                 if (i.ptr == .none and (e.t.get(i.ty) == .resource or e.t.get(i.ty) == .sampler)) {
                     e.vals[ri] = e.val(p);
@@ -874,6 +954,10 @@ const Emitter = struct {
                 e.vals[ri] = try e.op1(.load, i.ty, &.{e.val(p)});
             },
             .store => |s| {
+                if (e.texel_places.get(s.ptr.index())) |tp| {
+                    if (tp.comp != .none) return e.unsupported("storing one component of a texel is not supported yet", .{});
+                    return e.imageWrite(tp.res, e.val(tp.coord), e.val(s.value));
+                }
                 const target = f.inst(s.ptr);
                 if (target.op == .local_var and isResourceType(e.t, target.ty)) {
                     const old = e.vals[s.ptr.index()];
@@ -890,6 +974,18 @@ const Emitter = struct {
             },
             .access => |a| {
                 if (e.t.get(f.inst(a.base).ty) == .array and isResourceType(e.t, f.inst(a.base).ty)) return e.resourceArrayAccess(ri, a, i.ty);
+                if (e.texel_places.get(a.base.index())) |tp| {
+                    // A component of a texel.
+                    if (tp.comp != .none or a.indices.len != 1) return e.unsupported("this texel access is not supported yet", .{});
+                    try e.texel_places.put(e.arena, ri, .{ .res = tp.res, .coord = tp.coord, .comp = a.indices[0] });
+                    return;
+                }
+                if (e.isImage(a.base)) {
+                    // A texel: read and written as image accesses, or the
+                    // pointer of an atomic (made on use).
+                    try e.texel_places.put(e.arena, ri, .{ .res = a.base, .coord = a.indices[0] });
+                    return;
+                }
                 // Buffers reached through locals or parameters are still
                 // Uniform std430 storage.
                 const into_buffer = e.t.get(f.inst(a.base).ty) == .resource;
@@ -1190,7 +1286,7 @@ const Emitter = struct {
         };
         const elem_ty = switch (r.kind) {
             .byte_address_buffer, .rw_byte_address_buffer => try e.t.scalar(.uint),
-            .structured_buffer, .rw_structured_buffer => r.elem,
+            .structured_buffer, .rw_structured_buffer, .append_structured_buffer, .consume_structured_buffer => r.elem,
             else => return null,
         };
         if (e.isTrueMatrix(elem_ty)) return e.unsupported("buffers of matrices are not supported yet", .{});
@@ -1211,7 +1307,7 @@ const Emitter = struct {
         const st = e.b.newId();
         try e.b.emit(.types_globals, .type_struct, &.{ st, rt });
         try e.b.emit(.annotations, .member_decorate, &.{ st, 0, 35, 0 }); // Offset 0
-        if (!r.kind.isWritable()) try e.b.emit(.annotations, .member_decorate, &.{ st, 0, 24 }); // NonWritable
+        if (!r.kind.isWritable() and r.kind != .consume_structured_buffer) try e.b.emit(.annotations, .member_decorate, &.{ st, 0, 24 }); // NonWritable
         try e.b.emit(.annotations, .decorate, &.{ st, 3 }); // BufferBlock
         try e.b.emitWithString(.debug_names, .name, &.{st}, try std.fmt.allocPrint(e.arena, "type.{s}.{s}", .{ r.name, try e.typeLabel(elem_ty) }), &.{});
         try e.buffer_blocks.put(e.arena, ty, st);
@@ -1233,7 +1329,7 @@ const Emitter = struct {
         switch (e.t.get(ty)) {
             .sampler => return .{ .sc = .uniform_constant, .ty = try e.samplerType() },
             .resource => |r| switch (r.kind) {
-                .structured_buffer, .rw_structured_buffer, .byte_address_buffer, .rw_byte_address_buffer => return .{ .sc = .uniform, .ty = try e.bufferBlockType(ty) },
+                .structured_buffer, .rw_structured_buffer, .append_structured_buffer, .consume_structured_buffer, .byte_address_buffer, .rw_byte_address_buffer => return .{ .sc = .uniform, .ty = try e.bufferBlockType(ty) },
                 else => if (texture.shape(r.kind)) |sh| return .{ .sc = .uniform_constant, .ty = try e.imageType(sh, r.elem) },
             },
             .array => |arr| {
@@ -1287,7 +1383,7 @@ const Emitter = struct {
         const c: Capability = switch (e.t.get(et)) {
             .sampler => .sampled_image_array_non_uniform_indexing,
             .resource => |r| switch (r.kind) {
-                .structured_buffer, .rw_structured_buffer, .byte_address_buffer, .rw_byte_address_buffer => .storage_buffer_array_non_uniform_indexing,
+                .structured_buffer, .rw_structured_buffer, .append_structured_buffer, .consume_structured_buffer, .byte_address_buffer, .rw_byte_address_buffer => .storage_buffer_array_non_uniform_indexing,
                 .buffer => .uniform_texel_buffer_array_non_uniform_indexing,
                 .rw_buffer => .storage_texel_buffer_array_non_uniform_indexing,
                 else => if (r.kind.isWritable()) .storage_image_array_non_uniform_indexing else .sampled_image_array_non_uniform_indexing,
@@ -1474,6 +1570,21 @@ const Emitter = struct {
             try e.getDimensions(res, r, args);
             return 0;
         }
+        if (r.kind == .byte_address_buffer or r.kind == .rw_byte_address_buffer) return e.byteAddressMethod(name, res, args, ty);
+        if (eq(u8, name, "IncrementCounter")) return e.counterOp(res, true, false);
+        if (eq(u8, name, "DecrementCounter")) return e.counterOp(res, false, true);
+        if (eq(u8, name, "Append") or eq(u8, name, "Consume")) {
+            const idx = try e.counterOp(res, eq(u8, name, "Append"), eq(u8, name, "Consume"));
+            const elem = (try e.bufferElemType(e.f.inst(res).ty)).?;
+            const ptr = try e.opRaw(.access_chain, try e.pointerType(.uniform, elem), &.{ e.val(res), try e.constUint(0), idx });
+            const ety = r.elem;
+            if (eq(u8, name, "Append")) {
+                try e.b.emit(.functions, .store, &.{ ptr, try e.toLayout(e.val(args[0]), e.f.inst(args[0]).ty, .std430, false) });
+                _ = ety;
+                return 0;
+            }
+            return e.fromLayout(try e.opRaw(.load, elem, &.{ptr}), ty, .std430, false);
+        }
         if (eq(u8, name, "Load") and (r.kind == .structured_buffer or r.kind == .rw_structured_buffer)) {
             const ptr = try e.bufferElement(res, args[0]);
             const raw = try e.opRaw(.load, try e.layoutTypeId(ty, .std430, false), &.{ptr});
@@ -1586,6 +1697,42 @@ const Emitter = struct {
         return e.texelResult(v, s, ty);
     }
 
+    /// Load/Store(2..4) and atomics on byte-address buffers (uint words).
+    fn byteAddressMethod(e: *Emitter, name: []const u8, res: Ref, args: []const Ref, ty: TypeId) Error!Id {
+        const uint_ty = try e.t.scalar(.uint);
+        const word = struct {
+            fn f(em: *Emitter, base: Id, off: Id, k: u32) Error!Id {
+                const ut = try em.t.scalar(.uint);
+                var idx = try em.op1(.shift_right_logical, ut, &.{ off, try em.constUint(2) });
+                if (k > 0) idx = try em.op1(.i_add, ut, &.{ idx, try em.constUint(k) });
+                return em.opRaw(.access_chain, try em.pointerType(.uniform, try em.scalarType(.uint)), &.{ base, try em.constInt(0), idx });
+            }
+        }.f;
+        const off = try e.convert(e.val(args[0]), e.f.inst(args[0]).ty, uint_ty);
+        if (std.mem.startsWith(u8, name, "Load") and args.len == 1) {
+            const n = e.t.componentCount(ty) orelse return e.unsupported("templated Load is not supported yet", .{});
+            if (e.t.component(ty).? != .uint) return e.unsupported("templated Load is not supported yet", .{});
+            const parts = try e.arena.alloc(Id, n);
+            for (parts, 0..) |*p, k| p.* = try e.op1(.load, uint_ty, &.{try word(e, e.val(res), off, @intCast(k))});
+            return if (n == 1) parts[0] else e.op1(.composite_construct, ty, parts);
+        }
+        if (std.mem.startsWith(u8, name, "Store") and args.len == 2) {
+            const vty = e.f.inst(args[1]).ty;
+            const n = e.t.componentCount(vty) orelse return e.unsupported("templated Store is not supported yet", .{});
+            if (e.t.component(vty).? != .uint) return e.unsupported("templated Store is not supported yet", .{});
+            for (0..n) |k| {
+                const v = if (n == 1) e.val(args[1]) else try e.op1(.composite_extract, uint_ty, &.{ e.val(args[1]), @intCast(k) });
+                try e.b.emit(.functions, .store, &.{ try word(e, e.val(res), off, @intCast(k)), v });
+            }
+            return 0;
+        }
+        if (std.mem.startsWith(u8, name, "Interlocked")) {
+            if (e.t.component(e.f.inst(args[1]).ty).?.size() != 4) return e.unsupported("64-bit '{s}' is not supported yet", .{name});
+            return e.atomicOp(name["Interlocked".len..], try word(e, e.val(res), off, 0), uint_ty, 1, args[1..]);
+        }
+        return e.unsupported("method '{s}' is not supported yet", .{name});
+    }
+
     fn getDimensions(e: *Emitter, res: Ref, r: @FieldType(types.Type, "resource"), args: []const Ref) Error!void {
         const uint_ty = try e.t.scalar(.uint);
         const store = struct {
@@ -1596,7 +1743,7 @@ const Emitter = struct {
             }
         }.f;
         switch (r.kind) {
-            .structured_buffer, .rw_structured_buffer, .byte_address_buffer, .rw_byte_address_buffer => {
+            .structured_buffer, .rw_structured_buffer, .append_structured_buffer, .consume_structured_buffer, .byte_address_buffer, .rw_byte_address_buffer => {
                 const len = try e.op1(.array_length, uint_ty, &.{ e.val(res), 0 });
                 if (r.kind == .byte_address_buffer or r.kind == .rw_byte_address_buffer) {
                     try store(e, args[0], try e.op1(.i_mul, uint_ty, &.{ len, try e.constUint(4) }));
@@ -1794,6 +1941,16 @@ const Emitter = struct {
             try e.b.emit(.functions, .store, &.{ e.val(args[1]), try e.convert(bv, xty, e.f.inst(args[1]).ty) });
             return av;
         }
+        if (std.mem.startsWith(u8, name, "Interlocked")) {
+            const dest = e.f.inst(args[0]);
+            const scope: u32 = if (dest.ptr == .groupshared) 2 else 1; // Workgroup / Device
+            var ptr = e.val(args[0]);
+            if (e.texel_places.get(args[0].index())) |tp| {
+                const s_ = try e.texelScalar(e.resourceInfo(tp.res).elem);
+                ptr = try e.opRaw(.image_texel_pointer, try e.pointerType(.image, try e.scalarType(s_)), &.{ e.val(tp.res), e.val(tp.coord), try e.constUint(0) });
+            }
+            return try e.atomicOp(name["Interlocked".len..], ptr, dest.ty, scope, args[1..]);
+        }
         if (eq(u8, name, "asuint") and args.len == 3) {
             const n = e.t.componentCount(xty).?;
             if (n != 1) return e.unsupported("asuint of double vectors is not supported yet", .{});
@@ -1804,6 +1961,38 @@ const Emitter = struct {
             return 0;
         }
         return null;
+    }
+
+    /// An atomic on `ptr` (to a `dty` scalar); `rest` holds the value(s)
+    /// and, last, the optional out original.
+    fn atomicOp(e: *Emitter, op_name: []const u8, ptr: Id, dty: TypeId, scope: u32, rest: []const Ref) Error!Id {
+        const eq = std.mem.eql;
+        const dc = e.t.component(dty) orelse return e.unsupported("atomics on this destination are not supported yet", .{});
+        if (dc.isFloat()) return e.unsupported("float atomics are not supported yet", .{});
+        if (dc.size() == 8) try e.cap(.int64_atomics);
+        const is_cmp = std.mem.startsWith(u8, op_name, "Compare");
+        const asDest = struct {
+            fn f(em: *Emitter, r: Ref, t: TypeId) Error!Id {
+                return em.convert(em.val(r), em.f.inst(r).ty, t);
+            }
+        }.f;
+        const scope_id = try e.constUint(scope);
+        const sem = try e.constUint(0);
+        var orig: Id = undefined;
+        var n_in: usize = 1;
+        if (is_cmp) {
+            n_in = 2;
+            orig = try e.op1(.atomic_compare_exchange, dty, &.{ ptr, scope_id, sem, sem, try asDest(e, rest[1], dty), try asDest(e, rest[0], dty) });
+        } else {
+            const op: Op = if (eq(u8, op_name, "Add")) .atomic_i_add else if (eq(u8, op_name, "And")) .atomic_and else if (eq(u8, op_name, "Or")) .atomic_or else if (eq(u8, op_name, "Xor")) .atomic_xor else if (eq(u8, op_name, "Min")) (if (dc.isUnsigned()) .atomic_u_min else .atomic_s_min) else if (eq(u8, op_name, "Max")) (if (dc.isUnsigned()) .atomic_u_max else .atomic_s_max) else if (eq(u8, op_name, "Exchange")) .atomic_exchange else return e.unsupported("'Interlocked{s}' is not supported yet", .{op_name});
+            orig = try e.op1(op, dty, &.{ ptr, scope_id, sem, try asDest(e, rest[0], dty) });
+        }
+        const has_orig = if (is_cmp) eq(u8, op_name, "CompareExchange") else rest.len > n_in;
+        if (has_orig) {
+            const out = rest[rest.len - 1];
+            try e.b.emit(.functions, .store, &.{ e.val(out), try e.convert(orig, dty, e.f.inst(out).ty) });
+        }
+        return 0;
     }
 
     fn intrinsic(e: *Emitter, name: []const u8, ty: TypeId, args: []const Ref) Error!Id {

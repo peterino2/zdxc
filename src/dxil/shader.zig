@@ -145,6 +145,7 @@ pub const PsvInfo = struct {
     resources: []const ResourceBind = &.{},
     inputs: []const signature.Element = &.{},
     outputs: []const signature.Element = &.{},
+    groupshared_bytes: u32 = 0,
 };
 
 pub fn psvCompute(gpa: Allocator, entry: []const u8, num_threads: [3]u32, resources: []const ResourceBind) ![]u8 {
@@ -211,7 +212,7 @@ pub fn psv(gpa: Allocator, info: PsvInfo) ![]u8 {
     // PSVRuntimeInfo3: EntryFunctionName
     try w(&buf, gpa, entry_off);
     // PSVRuntimeInfo4
-    try w(&buf, gpa, 0); // NumBytesGroupSharedMemory
+    try w(&buf, gpa, info.groupshared_bytes); // NumBytesGroupSharedMemory
     try w(&buf, gpa, 0); // Flags
 
     try w(&buf, gpa, @intCast(info.resources.len));

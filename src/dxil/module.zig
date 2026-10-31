@@ -58,6 +58,8 @@ pub const Linkage = enum(u32) { external = 0, internal = 3 };
 pub const FnAttrs = enum { none, nounwind, nounwind_readnone, nounwind_readonly };
 
 pub const Value = union(enum) {
+    /// Index into Module.globals (a pointer to the variable).
+    global: u32,
     /// Index into Module.functions.
     function: u32,
     constant: ConstId,
@@ -67,6 +69,12 @@ pub const Value = union(enum) {
 };
 
 pub const BinOp = enum(u32) { add = 0, sub = 1, mul = 2, udiv = 3, sdiv = 4, urem = 5, srem = 6, shl = 7, lshr = 8, ashr = 9, @"and" = 10, @"or" = 11, xor = 12 };
+pub const RmwOp = enum(u32) { xchg = 0, add = 1, sub = 2, @"and" = 3, nand = 4, @"or" = 5, xor = 6, max = 7, min = 8, umax = 9, umin = 10 };
+
+/// A module-level variable (groupshared memory: address space 3),
+/// declared without an initializer as dxc does.
+pub const GlobalVar = struct { name: []const u8, ty: TypeId, addr_space: u32, ptr_ty: TypeId };
+
 pub const CastOp = enum(u32) { trunc = 0, zext = 1, sext = 2, fptoui = 3, fptosi = 4, uitofp = 5, sitofp = 6, fptrunc = 7, fpext = 8, ptrtoint = 9, inttoptr = 10, bitcast = 11 };
 
 pub const Inst = struct {
@@ -88,6 +96,10 @@ pub const Inst = struct {
         store: struct { ptr: Value, val: Value, @"align": u32 },
         /// `ty` is the result pointer type; `elem` the source element type.
         gep: struct { elem: TypeId, ptr: Value, indices: []const Value },
+        /// Sequentially consistent read-modify-write; yields the old value.
+        atomicrmw: struct { op: RmwOp, ptr: Value, val: Value },
+        /// Yields `{ old, success }` (`ty` is that literal struct).
+        cmpxchg: struct { ptr: Value, cmp: Value, new: Value },
         @"unreachable",
     },
 };
@@ -117,6 +129,7 @@ pub const Module = struct {
     types: std.ArrayList(Type) = .empty,
     constants: std.ArrayList(Constant) = .empty,
     functions: std.ArrayList(Function) = .empty,
+    globals: std.ArrayList(GlobalVar) = .empty,
     metadata: std.ArrayList(Metadata) = .empty,
     named_metadata: std.ArrayList(struct { name: []const u8, nodes: []const MdId }) = .empty,
 
@@ -169,6 +182,12 @@ pub const Module = struct {
             if (t == .pointer and t.pointer.elem == elem and t.pointer.addr_space == 0) return @intCast(i);
         }
         unreachable;
+    }
+
+    pub fn addGlobal(m: *Module, name: []const u8, ty: TypeId, addr_space: u32) !Value {
+        const ptr_ty = try m.getType(.{ .pointer = .{ .elem = ty, .addr_space = addr_space } });
+        try m.globals.append(m.allocator(), .{ .name = try m.allocator().dupe(u8, name), .ty = ty, .addr_space = addr_space, .ptr_ty = ptr_ty });
+        return .{ .global = @intCast(m.globals.items.len - 1) };
     }
 
     pub fn constant(m: *Module, c: Constant) !Value {
@@ -268,15 +287,17 @@ const Encoder = struct {
     }
 
     fn moduleValueCount(e: *Encoder) u32 {
-        return @intCast(e.m.functions.items.len + e.m.constants.items.len);
+        return @intCast(e.m.globals.items.len + e.m.functions.items.len + e.m.constants.items.len);
     }
 
-    /// Absolute value ID. Module values: functions, then constants.
+    /// Absolute value ID. Module values: globals, functions, constants.
     fn valueId(e: *Encoder, f: ?*const Function, v: Value) u32 {
+        const nglobals: u32 = @intCast(e.m.globals.items.len);
         const nfuncs: u32 = @intCast(e.m.functions.items.len);
         return switch (v) {
-            .function => |i| i,
-            .constant => |c| nfuncs + c,
+            .global => |i| i,
+            .function => |i| nglobals + i,
+            .constant => |c| nglobals + nfuncs + c,
             .arg => |a| e.moduleValueCount() + a,
             .inst => |i| blk: {
                 const func = f.?;
@@ -292,6 +313,7 @@ const Encoder = struct {
 
     fn typeOf(e: *Encoder, f: ?*const Function, v: Value) TypeId {
         return switch (v) {
+            .global => |i| e.m.globals.items[i].ptr_ty,
             .function => |i| e.m.ptrTypeConst(e.m.functions.items[i].ty),
             .constant => |c| e.m.constants.items[c].ty,
             .arg => |a| e.m.types.items[f.?.ty].function.params[a],
@@ -327,6 +349,12 @@ const Encoder = struct {
         try e.writeTypes();
         try w.recordString(2, &.{}, e.m.triple);
         try w.recordString(3, &.{}, e.m.datalayout);
+        for (e.m.globals.items) |g| {
+            // GLOBALVAR: [type, addrspace << 2 | explicit type, init (none),
+            //             linkage (external), align 4, section]
+            try e.ops.appendSlice(e.gpa(), &.{ g.ty, (@as(u64, g.addr_space) << 2) | 2, 0, 0, 3, 0 });
+            try e.rec(7);
+        }
         for (e.m.functions.items) |f| {
             // FUNCTION: [type, cc, isproto, linkage, paramattr, align, section,
             //            visibility, gc, unnamed_addr, prologue, dllstorage,
@@ -493,7 +521,9 @@ const Encoder = struct {
             }
         }.lt);
         try w.enterBlock(block_value_symtab, 4);
-        for (order) |i| try w.recordString(1, &.{i}, funcs[i].name); // VST_ENTRY
+        const nglobals: u32 = @intCast(e.m.globals.items.len);
+        for (e.m.globals.items, 0..) |g, i| try w.recordString(1, &.{i}, g.name);
+        for (order) |i| try w.recordString(1, &.{nglobals + i}, funcs[i].name); // VST_ENTRY
         try w.endBlock();
     }
 
@@ -587,6 +617,22 @@ const Encoder = struct {
                     try e.rec(43);
                 },
                 .@"unreachable" => try e.rec(15),
+                .atomicrmw => |a| {
+                    // ATOMICRMW: [ptr, val, op, volatile, ordering, scope]
+                    try e.pushValueAndType(f, inst_id, a.ptr);
+                    try e.pushValue(f, inst_id, a.val);
+                    try e.ops.appendSlice(e.gpa(), &.{ @backingInt(a.op), 0, 6, 1 }); // seq_cst, cross-thread
+                    try e.rec(38);
+                },
+                .cmpxchg => |c| {
+                    // CMPXCHG: [ptr, cmp, new, volatile, success ordering,
+                    //           scope, failure ordering, weak]
+                    try e.pushValueAndType(f, inst_id, c.ptr);
+                    try e.pushValueAndType(f, inst_id, c.cmp);
+                    try e.pushValue(f, inst_id, c.new);
+                    try e.ops.appendSlice(e.gpa(), &.{ 0, 6, 1, 6, 0 });
+                    try e.rec(46);
+                },
                 .phi => |p| {
                     try e.push(inst.ty);
                     for (p.incoming) |in| {
