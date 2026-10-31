@@ -1901,7 +1901,7 @@ pub const Sema = struct {
                 s.err(d.loc, "overloading '{s}' is not allowed", .{name});
                 return;
             };
-            if (owner == null) {
+            if (owner == null and f.name.parts.len == 1) {
                 s.err(d.loc, "overloading non-member '{s}' is not allowed", .{name});
                 return;
             }
