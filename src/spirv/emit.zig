@@ -53,6 +53,7 @@ const Capability = enum(u32) {
     geometry_streams = 54,
     multi_viewport = 57,
     min_lod = 42,
+    sparse_residency = 41,
     sampled1d = 43,
     image1d = 44,
     sampled_cube_array = 45,
@@ -2326,6 +2327,8 @@ const Emitter = struct {
             .constant => return e.val(r),
             .construct => |xs| {
                 if (e.t.get(i.ty) != .vector) return null;
+                // 1-vectors are SPIR-V scalars.
+                if (e.isScalarLike(i.ty)) return e.constValue(xs[0]);
                 var ops: std.ArrayList(u32) = .empty;
                 const id = e.b.newId();
                 try ops.appendSlice(e.arena, &.{ try e.typeId(i.ty), id });
@@ -2367,7 +2370,7 @@ const Emitter = struct {
         }
         const sh = texture.shape(r.kind) orelse return e.unsupported("method '{s}' is not supported yet", .{name});
         const call = texture.decode(name, sh, args.len) orelse return e.unsupported("method '{s}' is not supported yet", .{name});
-        if (call.status != null) return e.unsupported("texture methods with a status argument are not supported yet", .{});
+        const status: ?Ref = if (call.status) |k| args[k] else null;
         if (call.offsets4) return e.unsupported("Gather with four offsets is not supported yet", .{});
         if (call.op.implicitLod() and e.m.entry.?.stage != .pixel) return e.unsupported("'{s}' outside pixel shaders is not supported yet", .{name});
         const s = try e.texelScalar(r.elem);
@@ -2439,7 +2442,7 @@ const Emitter = struct {
                 try ops.append(e.arena, mask);
                 try ops.appendSlice(e.arena, extra.items);
             }
-            const v = try e.opRaw(if (sh.rw) .image_read else .image_fetch, try e.vec4Of(s), ops.items);
+            const v = try e.imageOp(if (sh.rw) .image_read else .image_fetch, try e.vec4Of(s), ops.items, status);
             return e.texelResult(v, s, ty);
         }
         if (call.op == .sample_position) return e.unsupported("GetSamplePosition is not supported yet", .{});
@@ -2467,9 +2470,34 @@ const Emitter = struct {
             .gather_cmp => .image_dref_gather,
             else => unreachable,
         };
-        if (call.op.isCmp() and call.op != .gather_cmp) return e.opRaw(op, try e.scalarType(s), ops.items);
-        const v = try e.opRaw(op, try e.vec4Of(s), ops.items);
+        if (call.op.isCmp() and call.op != .gather_cmp) return e.imageOp(op, try e.scalarType(s), ops.items, status);
+        const v = try e.imageOp(op, try e.vec4Of(s), ops.items, status);
         return e.texelResult(v, s, ty);
+    }
+
+    /// An image instruction; with a status argument, its sparse variant
+    /// (the residency code goes to the status).
+    fn imageOp(e: *Emitter, op: Op, result_ty: Id, ops: []const u32, status: ?Ref) Error!Id {
+        const st = status orelse return e.opRaw(op, result_ty, ops);
+        try e.cap(.sparse_residency);
+        const sparse: Op = switch (op) {
+            .image_sample_implicit_lod => .image_sparse_sample_implicit_lod,
+            .image_sample_explicit_lod => .image_sparse_sample_explicit_lod,
+            .image_sample_dref_implicit_lod => .image_sparse_sample_dref_implicit_lod,
+            .image_sample_dref_explicit_lod => .image_sparse_sample_dref_explicit_lod,
+            .image_fetch => .image_sparse_fetch,
+            .image_gather => .image_sparse_gather,
+            .image_dref_gather => .image_sparse_dref_gather,
+            .image_read => .image_sparse_read,
+            else => return e.unsupported("this texture operation with a status argument is not supported yet", .{}),
+        };
+        const int_id = try e.scalarType(.int);
+        const sty = e.b.newId();
+        try e.b.emit(.types_globals, .type_struct, &.{ sty, int_id, result_ty });
+        const r = try e.opRaw(sparse, sty, ops);
+        const code = try e.opRaw(.composite_extract, int_id, &.{ r, 0 });
+        try e.b.emit(.functions, .store, &.{ e.val(st), try e.opRaw(.bitcast, try e.scalarType(.uint), &.{code}) });
+        return e.opRaw(.composite_extract, result_ty, &.{ r, 1 });
     }
 
     /// Load/Store(2..4) and atomics on byte-address buffers (uint words).
@@ -3249,6 +3277,11 @@ const Emitter = struct {
                 acc = if (acc) |s0| try e.op1(.i_add, st, &.{ s0, p }) else p;
             }
             return acc.?;
+        }
+        if (eqn(u8, name, "CheckAccessFullyMapped")) {
+            try e.cap(.sparse_residency);
+            const code = try e.op1(.bitcast, try e.t.scalar(.int), &.{ids[0]});
+            return e.op1(.image_sparse_texels_resident, ty, &.{code});
         }
         if (eqn(u8, name, "IsHelperLane")) return e.op1(.load, ty, &.{try e.builtinInput(23, try e.t.scalar(.bool))}); // HelperInvocation
         if (eqn(u8, name, "clip")) {

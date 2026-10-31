@@ -175,6 +175,11 @@ pub fn decode(name: []const u8, s: Shape, nargs: usize) ?Call {
         c.channel = if (rest.len == 0 or eq(u8, rest, "Red")) 0 else if (eq(u8, rest, "Green")) 1 else if (eq(u8, rest, "Blue")) 2 else if (eq(u8, rest, "Alpha")) 3 else return null;
         const first: u8 = if (c.compare != null) 3 else 2;
         const left = n - first;
+        if (s.offsets() == 0) {
+            // Cubes take no offsets: only a status.
+            if (left == 1) c.status = first;
+            return c;
+        }
         if (left == 1 or left == 2) c.offset = first;
         if (left == 4 or left == 5) {
             c.offset = first;

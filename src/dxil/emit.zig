@@ -165,6 +165,13 @@ const Emitter = struct {
     uses_inner_coverage: bool = false,
     uses_resource_heap: bool = false,
     uses_extended_command_info: bool = false,
+    uses_tiled_resources: bool = false,
+    /// The ResRet of the last texture operation (for status arguments).
+    last_resret: Value = undefined,
+    /// Status values, forwarded through locals within a block: the
+    /// validator wants CheckAccessFullyMapped's operand to be one.
+    status_vals: std.AutoHashMapUnmanaged(Value, void) = .empty,
+    forwarded: std.AutoHashMapUnmanaged(struct { Value, u32 }, struct { v: Value, block: u32 }) = .empty,
     uses_barycentrics: bool = false,
     uses_sampler_heap: bool = false,
 
@@ -1281,6 +1288,10 @@ const Emitter = struct {
         const n = try e.flatCount(ty);
         const out = try e.arena.alloc(Value, n);
         for (out, 0..) |*o, c| {
+            if (ptr.offset_dyn == null) if (e.forwarded.get(.{ ptr.base, ptr.offset_const + @as(u32, @intCast(c)) })) |fw| if (fw.block == e.cur) {
+                o.* = fw.v;
+                continue;
+            };
             const p = try e.elementPtr(ptr, @intCast(c));
             const raw = try e.add(ptr.scalar_ty, .{ .load = .{ .ptr = p, .@"align" = 4 } });
             const ct = e.compOf(try e.componentType(ty, @intCast(c)));
@@ -1297,6 +1308,10 @@ const Emitter = struct {
     fn storePtr(e: *Emitter, ptr: Ptr, vals: []const Value, ty: TypeId) Error!void {
         const void_ty = try e.voidTy();
         for (vals, 0..) |v, c| {
+            if (ptr.offset_dyn == null) {
+                const key = .{ ptr.base, ptr.offset_const + @as(u32, @intCast(c)) };
+                if (e.status_vals.contains(v)) try e.forwarded.put(e.arena, key, .{ .v = v, .block = e.cur }) else _ = e.forwarded.remove(key);
+            } else e.forwarded.clearRetainingCapacity();
             const p = try e.elementPtr(ptr, @intCast(c));
             const ct = e.compOf(try e.componentType(ty, @intCast(c)));
             const sv = if (ptr.bool_storage or (ptr.mixed and ct == .bool))
@@ -1573,6 +1588,14 @@ const Emitter = struct {
                     o.* = try e.callOp(fn_i, i32t, &.{ try e.i32Const(op), a[0][k] });
                 } else o.* = try e.unaryOp(op, "unary", a[0][k], at);
             }
+            return .{ .scalars = out };
+        }
+        if (eq(u8, name, "CheckAccessFullyMapped")) {
+            const i1t = try e.dm.intType(1);
+            const i32t = try e.dm.intType(32);
+            const fn_i = try e.dxOp("dx.op.checkAccessFullyMapped.i32", i1t, &.{ i32t, i32t }, .nounwind_readonly);
+            out[0] = try e.callOp(fn_i, i1t, &.{ try e.i32Const(71), a[0][0] });
+            e.uses_tiled_resources = true;
             return .{ .scalars = out };
         }
         if (eq(u8, name, "IsHelperLane")) {
@@ -2315,6 +2338,7 @@ const Emitter = struct {
         if (res.class == .uav and try e.flatCount(res.elem) > 1) e.uses_typed_uav_load = true;
         const fn_i = try e.dxOp(try std.fmt.allocPrint(e.arena, "dx.op.bufferLoad.{s}", .{e.overloadName(st)}), ret_ty, &.{ i32t, e.handle_ty, i32t, i32t }, .nounwind_readonly);
         const call = try e.callOp(fn_i, ret_ty, &.{ try e.i32Const(68), res.handle, idx, try e.dm.constant(.{ .ty = i32t, .kind = .undef }) });
+        e.last_resret = call;
         return e.resRetComponents(call, st, via, ty);
     }
 
@@ -2328,7 +2352,17 @@ const Emitter = struct {
         const c = try e.padded(coords, coords.len, 3, i32t);
         const o = try e.padded(offset orelse &.{}, if (offset) |x| x.len else 0, 3, i32t);
         const call = try e.callOp(fn_i, ret_ty, &.{ try e.i32Const(66), res.handle, mip, c[0], c[1], c[2], o[0], o[1], o[2] });
+        e.last_resret = call;
         return e.resRetComponents(call, st, via, ty);
+    }
+
+    /// Stores the status (the ResRet's fifth element) of the last texture
+    /// operation into an out argument.
+    fn storeStatus(e: *Emitter, frame: *Frame, status_ref: Ref) Error!void {
+        const i32t = try e.dm.intType(32);
+        const v = try e.add(i32t, .{ .extractvalue = .{ .agg = e.last_resret, .index = 4 } });
+        try e.status_vals.put(e.arena, v, {});
+        try e.storePtr(try e.outPtr(frame, status_ref), &.{v}, try e.t.scalar(.uint));
     }
 
     fn textureStore(e: *Emitter, res: Resource, coords: []const Value, vals: []const Value, vty: TypeId) Error!void {
@@ -2352,11 +2386,13 @@ const Emitter = struct {
         const kind = e.resourceKind(res.*);
         const eq = std.mem.eql;
         const i32t = try e.dm.intType(32);
-        const f32t = try e.dm.getType(.float);
-        const undef_i32 = try e.dm.constant(.{ .ty = i32t, .kind = .undef });
         if (eq(u8, name, "GetDimensions")) return e.getDimensions(frame, res.*, kind, arg_refs);
         if (res.kind == 10 and eq(u8, name, "Load")) {
-            if (arg_refs.len > 1) return e.unsupported("Load with a status argument is not supported yet", .{});
+            if (arg_refs.len > 1) {
+                const r = Lowered{ .scalars = try e.typedBufferLoad(res.*, (try e.scalars(frame, arg_refs[0]))[0], ty) };
+                try e.storeStatus(frame, arg_refs[1]);
+                return r;
+            }
             return e.resourceLoad(frame, res_ref, arg_refs[0], ty);
         }
         if (res.kind == 12 and eq(u8, name, "Load")) return e.resourceLoad(frame, res_ref, arg_refs[0], ty);
@@ -2400,8 +2436,22 @@ const Emitter = struct {
         }
         const sh = texture.shape(kind) orelse return e.unsupported("method '{s}' is not supported yet", .{name});
         const call = texture.decode(name, sh, arg_refs.len) orelse return e.unsupported("method '{s}' is not supported yet", .{name});
-        if (call.status != null) return e.unsupported("texture methods with a status argument are not supported yet", .{});
         if (call.offsets4) return e.unsupported("Gather with four offsets is not supported yet", .{});
+        if (call.status) |k| {
+            // The operation, then its status.
+            var plain = call;
+            plain.status = null;
+            const r = try e.textureCall(frame, res, sh, plain, name, arg_refs, ty);
+            try e.storeStatus(frame, arg_refs[k]);
+            return r;
+        }
+        return e.textureCall(frame, res, sh, call, name, arg_refs, ty);
+    }
+
+    fn textureCall(e: *Emitter, frame: *Frame, res: *Resource, sh: texture.Shape, call: texture.Call, name: []const u8, arg_refs: []const Ref, ty: TypeId) Error!Lowered {
+        const i32t = try e.dm.intType(32);
+        const f32t = try e.dm.getType(.float);
+        const undef_i32 = try e.dm.constant(.{ .ty = i32t, .kind = .undef });
         if (call.op.implicitLod() and e.m.entry.?.stage != .pixel) return e.unsupported("'{s}' outside pixel shaders is not supported yet", .{name});
         const arg = struct {
             fn f(em: *Emitter, fr: *Frame, refs: []const Ref, idx: ?u8) Error!?[]const Value {
@@ -2508,6 +2558,9 @@ const Emitter = struct {
         const fname = try std.fmt.allocPrint(e.arena, "dx.op.{s}.{s}", .{ spec.fname, e.overloadName(st) });
         const fn_i = try e.dxOp(fname, ret_ty, params.items, .nounwind_readonly);
         const result = try e.callOp(fn_i, ret_ty, args.items);
+        e.last_resret = result;
+        // A LOD clamp needs tiled resources.
+        if (call.clamp != null) e.uses_tiled_resources = true;
         return .{ .scalars = try e.resRetComponents(result, st, via, ty) };
     }
 
@@ -3476,6 +3529,7 @@ const Emitter = struct {
         if (e.uses_view_id) flags |= 1 << 21;
         if (e.uses_resource_heap) flags |= 1 << 30;
         if (e.uses_barycentrics) flags |= 1 << 22;
+        if (e.uses_tiled_resources) flags |= 1 << 12;
         if (e.uses_extended_command_info) flags |= 1 << 38;
         if (e.uses_sampler_heap) flags |= 1 << 31;
         if (e.uses_wave) flags |= 1 << 19;
@@ -3491,6 +3545,7 @@ const Emitter = struct {
             .{ 1 << 21, 0x10000 }, .{ 1 << 24, 0x80000 },   .{ 1 << 19, 0x4000 },   .{ 1 << 13, 0x800 },
             .{ 1 << 30, 0x2000000 }, .{ 1 << 31, 0x4000000 },
             .{ 1 << 22, 0x20000 },   .{ 1 << 38, 0x100000000 },
+            .{ 1 << 12, 0x100 },
         };
         var f: u64 = 0;
         for (map) |m| if (flags & m[0] != 0) {
