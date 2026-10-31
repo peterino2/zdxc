@@ -5,7 +5,7 @@ Each entry records the source path and the DXC commit it was copied from.
 
 | File | Source in DXC | DXC commit | License |
 |---|---|---|---|
-| _(none yet; the HLSL intrinsic table and SPIR-V grammar arrive with M0.1)_ | | | |
+| `hlsl-headers/` (all files) | `tools/clang/lib/Headers/hlsl/` | ecb18fb18 | Apache-2.0 WITH LLVM-exception (`hlsl-headers/LICENSE.txt`) |
 
 DXC is distributed under the University of Illinois/NCSA license (LICENSE.TXT
 in the DXC tree); SPIRV-Headers files are under the Khronos MIT-style license.

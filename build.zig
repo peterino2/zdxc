@@ -4,10 +4,16 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    const hlsl_headers = b.createModule(.{
+        .root_source_file = b.path("vendor/hlsl_headers.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
     const mod = b.addModule("zdxc", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
         .optimize = optimize,
+        .imports = &.{.{ .name = "hlsl_headers", .module = hlsl_headers }},
     });
 
     const exe = b.addExecutable(.{
@@ -40,4 +46,11 @@ pub fn build(b: *std.Build) void {
     oracle.setCwd(b.path("."));
     oracle.has_side_effects = true;
     oracle_step.dependOn(&oracle.step);
+
+    const oracle_pp_step = b.step("oracle-pp", "Compare zdxc -P with dxc -P over the DXC test corpus");
+    const oracle_pp = b.addSystemCommand(&.{ "sh", "test/oracle/pp.sh" });
+    oracle_pp.addArtifactArg(exe);
+    oracle_pp.setCwd(b.path("."));
+    oracle_pp.has_side_effects = true;
+    oracle_pp_step.dependOn(&oracle_pp.step);
 }

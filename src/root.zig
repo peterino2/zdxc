@@ -1,5 +1,14 @@
 //! zdxc: an HLSL 2021 compiler targeting DXIL and SPIR-V.
 
+pub const Diagnostics = @import("diag.zig").Diagnostics;
+
+pub const front = struct {
+    pub const source = @import("front/source.zig");
+    pub const lexer = @import("front/lexer.zig");
+    pub const preproc = @import("front/preproc.zig");
+    pub const pp_print = @import("front/pp_print.zig");
+};
+
 pub const dxil = struct {
     pub const bitstream = @import("dxil/bitstream.zig");
     pub const container = @import("dxil/container.zig");
@@ -16,6 +25,8 @@ pub const version = "0.0.0";
 
 test {
     const std = @import("std");
+    std.testing.refAllDecls(front);
     std.testing.refAllDecls(dxil);
     std.testing.refAllDecls(spirv);
+    _ = @import("diag.zig");
 }

@@ -13,6 +13,9 @@ pub const ShaderKind = enum(u8) {
     hull = 3,
     domain = 4,
     compute = 5,
+    library = 6,
+    mesh = 13,
+    amplification = 14,
 
     pub fn profilePrefix(k: ShaderKind) []const u8 {
         return switch (k) {
@@ -22,22 +25,41 @@ pub const ShaderKind = enum(u8) {
             .hull => "hs",
             .domain => "ds",
             .compute => "cs",
+            .library => "lib",
+            .mesh => "ms",
+            .amplification => "as",
         };
     }
 };
+
+/// Highest shader model minor version accepted (matches the oracle dxc).
+pub const max_minor = 11;
 
 pub const Profile = struct {
     kind: ShaderKind,
     major: u8,
     minor: u8,
 
+    /// Parses `<stage>_6_<minor>`, e.g. `cs_6_6` or `lib_6_10`.
     pub fn parse(s: []const u8) ?Profile {
-        if (s.len != 6 or s[2] != '_' or s[4] != '_') return null;
+        var it = std.mem.splitScalar(u8, s, '_');
+        const prefix = it.next() orelse return null;
+        const major_str = it.next() orelse return null;
+        const minor_str = it.next() orelse return null;
+        if (it.next() != null) return null;
         const kind: ShaderKind = for (std.enums.values(ShaderKind)) |k| {
-            if (std.mem.eql(u8, s[0..2], k.profilePrefix())) break k;
+            if (std.mem.eql(u8, prefix, k.profilePrefix())) break k;
         } else return null;
-        if (s[3] != '6' or s[5] < '0' or s[5] > '9') return null;
-        return .{ .kind = kind, .major = 6, .minor = s[5] - '0' };
+        if (!std.mem.eql(u8, major_str, "6")) return null;
+        const minor = std.fmt.parseInt(u8, minor_str, 10) catch return null;
+        if (minor > max_minor) return null;
+        const min_minor: u8 = switch (kind) {
+            .library => 1,
+            .mesh, .amplification => 5,
+            else => 0,
+        };
+        if (minor < min_minor) return null;
+        return .{ .kind = kind, .major = 6, .minor = minor };
     }
 };
 
@@ -157,5 +179,7 @@ test "profile parsing" {
     try std.testing.expectEqual(ShaderKind.compute, p.kind);
     try std.testing.expectEqual(@as(u8, 6), p.minor);
     try std.testing.expect(Profile.parse("cs_5_0") == null);
-    try std.testing.expect(Profile.parse("lib_6_3") == null);
+    try std.testing.expectEqual(ShaderKind.library, Profile.parse("lib_6_3").?.kind);
+    try std.testing.expectEqual(@as(u8, 10), Profile.parse("cs_6_10").?.minor);
+    try std.testing.expect(Profile.parse("ms_6_4") == null);
 }
