@@ -292,7 +292,7 @@ pub const Parser = struct {
     /// allocation), or null if no type starts there.
     fn scanType(p: *const Parser, start: usize) ?usize {
         var i = start;
-        if (p.toks[i].isIdent("unorm") or p.toks[i].isIdent("snorm")) i += 1;
+        while (isTypeAttrWord(p.toks[i])) i += 1;
         if (p.toks[i].isIdent("typename")) return p.scanDependentType(i + 1);
         if (p.toks[i].isIdent("unsigned") or p.toks[i].isIdent("signed")) {
             i += 1;
@@ -453,6 +453,12 @@ pub const Parser = struct {
         defer p.last_quals = words.items;
         while (p.at(.identifier)) {
             const word = p.tok().text;
+            if (inList(&reserved_declspecs, word)) {
+                // dxc reports these and parses on as if they were absent.
+                _ = p.reportAt(p.pos, .@"error", "'{s}' is a reserved keyword in HLSL", .{word});
+                _ = p.advance();
+                continue;
+            }
             const field = qualifierField(word) orelse break;
             if (isContextualQualifier(word)) {
                 const n = p.peek(1);
@@ -476,11 +482,16 @@ pub const Parser = struct {
 
     fn parseType(p: *Parser) Error!*ast.TypeRef {
         var norm: @FieldType(ast.TypeRef, "norm") = .none;
-        if (p.eatIdent("unorm")) {
-            norm = .unorm;
-        } else if (p.eatIdent("snorm")) norm = .snorm;
+        var words: std.ArrayList(ast.QualWord) = .empty;
+        while (isTypeAttrWord(p.tok())) {
+            const w = p.advance();
+            try words.append(p.arena, .{ .loc = w.loc, .word = w.text });
+            if (w.isIdent("unorm")) norm = .unorm;
+            if (w.isIdent("snorm")) norm = .snorm;
+        }
         const t = try p.parseTypeInner();
         if (norm != .none) t.norm = norm;
+        if (words.items.len > 0) t.attr_words = words.items;
         if (p.at(.l_square) and p.peek(1).kind == .l_square) t.attrs = try p.parseAttributes();
         return t;
     }
@@ -507,7 +518,7 @@ pub const Parser = struct {
             var base: []const u8 = "int";
             if (p.at(.identifier) and isBuiltinType(p.tok().text)) base = p.advance().text;
             const name = if (signed) base else try unsignedName(p.arena, base);
-            return p.mk(ast.TypeRef, .{ .loc = start.loc, .name = try p.simpleName(start.loc, name) });
+            return p.mk(ast.TypeRef, .{ .loc = start.loc, .name = try p.simpleName(start.loc, name), .unsigned_spec = !signed });
         }
         const name = try p.parseName();
         if (!p.isTypeName(name.last())) {
@@ -574,14 +585,11 @@ pub const Parser = struct {
             return args.items;
         }
         while (true) {
-            var norm: @FieldType(ast.TypeRef, "norm") = .none;
-            if (p.atIdent("unorm")) norm = .unorm;
-            if (p.atIdent("snorm")) norm = .snorm;
-            if (norm != .none) _ = p.advance();
             _ = p.parseQualifiers(); // e.g. `row_major float4x4`
+            const pre = p.last_quals;
             if (p.isTypeStartAt(p.pos)) {
                 const t = try p.parseType();
-                t.norm = norm;
+                if (pre.len > 0) t.attr_words = try std.mem.concat(p.arena, ast.QualWord, &.{ pre, t.attr_words });
                 t.array_dims = try p.parseArrayDims();
                 try args.append(p.arena, .{ .type = t });
             } else {
@@ -1396,6 +1404,7 @@ pub const Parser = struct {
             if (std.mem.eql(u8, w, "struct") or std.mem.eql(u8, w, "class") or std.mem.eql(u8, w, "typedef") or
                 std.mem.eql(u8, w, "using") or std.mem.eql(u8, w, "enum") or std.mem.eql(u8, w, "_Static_assert"))
                 return true;
+            if (inList(&reserved_declspecs, w)) return true;
             if (qualifierField(w) != null) {
                 if (!isContextualQualifier(w)) return true;
                 const n = p.peek(1);
@@ -1759,6 +1768,21 @@ const qualifier_words = [_][2][]const u8{
     .{ "triangle", "triangle" },                 .{ "lineadj", "lineadj" },                 .{ "triangleadj", "triangleadj" },
     .{ "vertices", "vertices" },                 .{ "indices", "indices" },                 .{ "primitives", "primitives" },
     .{ "payload", "payload" },                   .{ "center", "center" },
+};
+
+/// Type attributes that may precede a type: `unorm float`,
+/// `row_major float4x4`.
+fn isTypeAttrWord(t: Token) bool {
+    return t.isIdent("unorm") or t.isIdent("snorm") or t.isIdent("row_major") or t.isIdent("column_major");
+}
+
+/// C / C++ declaration specifiers dxc's parser rejects as "reserved
+/// keyword in HLSL".
+const reserved_declspecs = [_][]const u8{
+    "volatile",      "signed",        "long",     "short",     "char",     "wchar_t",    "char16_t",
+    "char32_t",      "register",      "mutable",  "constexpr", "friend",   "virtual",    "union",
+    "__declspec",    "__forceinline", "_Alignas", "_Atomic",   "_Complex", "_Imaginary", "_Noreturn",
+    "_Thread_local", "thread_local",  "__int64",  "__int128",  "typeof",   "__thread",   "concept",
 };
 
 /// Qualifiers that are ordinary identifiers unless a type follows.

@@ -23,7 +23,17 @@ pub const Options = struct {
     entry: ?[]const u8 = null,
     spirv: bool = false,
     enable_16bit: bool = false,
+    /// Target shader model 6.x (long vectors need 6.9).
+    sm_minor: u8 = 10,
+    /// Library target (`lib_6_x`): exported functions are the roots of
+    /// translation-unit checks; otherwise `root` (the entry point name).
+    library: bool = true,
+    root: ?[]const u8 = null,
 };
+
+/// Matrix orientation and float normalization written on a type: sugar
+/// that does not change type identity.
+pub const TypeAttrs = struct { orientation: ?[]const u8 = null, norm: ?[]const u8 = null };
 
 pub const Storage = enum { global_uniform, global_static, groupshared, cbuffer, local, local_static, param, constant };
 
@@ -57,6 +67,8 @@ pub const Function = struct {
     defined: bool,
     /// Struct the method belongs to.
     owner: ?*types.StructInfo = null,
+    /// Functions called from the body (call graph for recursion checks).
+    callees: std.ArrayList(*Function) = .empty,
 };
 
 pub const FuncSet = struct {
@@ -115,6 +127,13 @@ pub const Sema = struct {
     scope: *Scope,
     current_fn: ?*Function = null,
     current_struct: ?*types.StructInfo = null,
+    /// Every function and method, in declaration order.
+    all_functions: std.ArrayList(*Function) = .empty,
+    /// Type attributes carried by typedef names (clang's attributed-type
+    /// sugar: `typedef row_major float4x4 rm;`). Keyed by name.
+    typedef_attrs: std.StringHashMapUnmanaged(TypeAttrs) = .empty,
+    /// Type attributes of the last resolveType result.
+    last_attrs: TypeAttrs = .{},
     loop_depth: u32 = 0,
     switch_depth: u32 = 0,
     intrinsic_db: intrinsics.Db,
@@ -176,6 +195,15 @@ pub const Sema = struct {
             if (sym == .template or gop.value_ptr.* == .template) {
                 if (gop.value_ptr.* != .functions) gop.value_ptr.* = sym;
                 return;
+            }
+            // A typedef may be redeclared with the same type (C++).
+            if (sym == .type and gop.value_ptr.* == .type) {
+                const old = gop.value_ptr.type;
+                if (old != sym.type and old != TypeTable.error_type and sym.type != TypeTable.error_type and s.types.get(old) != .@"struct") {
+                    s.err(loc, "typedef redefinition with different types ('{s}' vs '{s}')", .{ s.typeName(sym.type), s.typeName(old) });
+                    return;
+                }
+                if (s.types.get(old) != .@"struct" or old == sym.type) return;
             }
             if (s.scope.kind == .global or s.scope.kind == .namespace or s.scope.kind == .@"struct" or s.scope.kind == .block or s.scope.kind == .function) {
                 s.err(loc, "redefinition of '{s}'", .{name});
@@ -310,6 +338,29 @@ pub const Sema = struct {
         return if (sc == .half and s.opts.enable_16bit) .float16 else sc;
     }
 
+    /// The element type of `vector` / `matrix` must be a scalar.
+    fn requireScalarArg(s: *Sema, arg: ast.TemplateArg, elem: TypeId) bool {
+        if (elem == TypeTable.error_type or s.types.get(elem) == .scalar) return true;
+        s.err(templateArgLoc(arg), "'{s}' cannot be used as a type parameter where a scalar is required", .{s.typeName(elem)});
+        return false;
+    }
+
+    /// A non-type template argument that must be a constant.
+    fn requireConstArg(s: *Sema, arg: ast.TemplateArg) Allocator.Error!?i64 {
+        switch (arg) {
+            .expr => |e| {
+                if (s.evalInt(e)) |v| return v;
+                const t = try s.expr(e);
+                if (t.ty != TypeTable.error_type) s.err(e.loc, "non-type template argument of type '{s}' is not an integral constant expression", .{s.typeName(t.ty)});
+                return null;
+            },
+            .type => |t| {
+                s.err(t.loc, "template argument for non-type template parameter must be an expression", .{});
+                return null;
+            },
+        }
+    }
+
     fn constArg(s: *Sema, arg: ast.TemplateArg) ?i64 {
         return switch (arg) {
             .expr => |e| s.evalInt(e),
@@ -331,7 +382,18 @@ pub const Sema = struct {
     }
 
     pub fn resolveType(s: *Sema, t: *const ast.TypeRef) Allocator.Error!TypeId {
-        const base = if (t.decltype) |e| (try s.expr(e)).ty else try s.resolveTypeName(t);
+        var attrs: TypeAttrs = .{};
+        const base = if (t.decltype) |e| (try s.expr(e)).ty else try s.resolveTypeName(t, &attrs);
+        s.last_attrs = .{};
+        if (t.unsigned_spec) if (s.types.component(base)) |c| {
+            // dxc's IS_BASIC_UNSIGNABLE: 16 / 32 / 64-bit integers.
+            const unsignable = c.isInt() and c != .min12int and !c.isLiteral();
+            if (!unsignable) {
+                s.err(t.loc, "'{s}' cannot be signed or unsigned", .{c.name()});
+                return TypeTable.error_type;
+            }
+        };
+        for (t.attr_words) |w| s.applyTypeAttr(w, base, &attrs);
         var ty = base;
         // Array dimensions on template arguments (`float[3]`).
         var i = t.array_dims.len;
@@ -339,15 +401,44 @@ pub const Sema = struct {
             i -= 1;
             ty = try s.types.array(ty, try s.arrayLen(t.array_dims[i]));
         }
+        s.last_attrs = attrs;
         return ty;
     }
 
-    fn resolveTypeName(s: *Sema, t: *const ast.TypeRef) Allocator.Error!TypeId {
+    /// Applies a type attribute (dxc's handleHLSLTypeAttr checks).
+    fn applyTypeAttr(s: *Sema, w: ast.QualWord, ty: TypeId, a: *TypeAttrs) void {
+        if (ty == TypeTable.error_type) return;
+        if (eql(w.word, "row_major") or eql(w.word, "column_major")) {
+            if (s.types.get(ty) != .matrix) {
+                s.err(w.loc, "'{s}' can only be used with a matrix type", .{w.word});
+            } else if (a.orientation) |o| {
+                if (eql(o, w.word)) {
+                    s.warn(w.loc, "ignored-attributes", "attribute '{s}' is already applied", .{w.word});
+                } else s.err(w.loc, "'row_major' and 'column_major' attributes are not compatible", .{});
+            } else a.orientation = w.word;
+        } else if (eql(w.word, "unorm") or eql(w.word, "snorm")) {
+            const c = s.types.component(ty);
+            if (c == null or !c.?.isFloat()) {
+                s.err(w.loc, "snorm and unorm qualifier can only be used on floating-point types", .{});
+            } else if (a.norm) |n| {
+                if (eql(n, w.word)) {
+                    s.warn(w.loc, "ignored-attributes", "attribute '{s}' is already applied", .{w.word});
+                } else s.err(w.loc, "'unorm' and 'snorm' attributes are not compatible", .{});
+            } else a.norm = w.word;
+        }
+    }
+
+    /// `attrs` receives the attributes the named type carries (a typedef's,
+    /// or a vector / matrix element's normalization).
+    fn resolveTypeName(s: *Sema, t: *const ast.TypeRef, attrs: *TypeAttrs) Allocator.Error!TypeId {
         const n = t.name.last();
         const args = t.args;
         // User types may reuse builtin object names (`struct sampler2D`).
         if (args.len == 0 and t.name.parts.len == 1) {
-            if (s.lookup(n)) |sym| if (sym == .type) return sym.type;
+            if (s.lookup(n)) |sym| if (sym == .type) {
+                if (s.typedef_attrs.get(n)) |ta| attrs.* = ta;
+                return sym.type;
+            };
         }
         if (t.name.parts.len == 1) {
             if (try s.numericTypeByName(n)) |nt| return nt;
@@ -356,18 +447,30 @@ pub const Sema = struct {
             if (std.mem.eql(u8, n, "vector")) {
                 if (args.len == 0) return s.types.vector(.float, 4);
                 const elem = try s.typeArg(args[0]) orelse return TypeTable.error_type;
-                const len = if (args.len > 1) s.constArg(args[1]) orelse 4 else 4;
+                attrs.norm = s.last_attrs.norm;
+                if (!s.requireScalarArg(args[0], elem)) return TypeTable.error_type;
+                const len = if (args.len > 1) try s.requireConstArg(args[1]) orelse return TypeTable.error_type else 4;
                 const comp = s.types.component(elem) orelse return TypeTable.error_type;
-                if (len < 1 or len > 4) return TypeTable.error_type; // long vectors: not modelled
+                const max: i64 = if (s.opts.sm_minor >= 9) 1024 else 4;
+                if (len < 1 or len > max) {
+                    s.err(templateArgLoc(args[1]), "invalid value, valid range is between 1 and {d} inclusive", .{max});
+                    return TypeTable.error_type;
+                }
+                if (len > 4) return TypeTable.error_type; // long vectors: not modelled
                 return s.types.vector(comp, @intCast(len));
             }
             if (std.mem.eql(u8, n, "matrix")) {
                 if (args.len == 0) return s.types.matrix(.float, 4, 4);
                 const elem = try s.typeArg(args[0]) orelse return TypeTable.error_type;
-                const r = if (args.len > 1) s.constArg(args[1]) orelse 4 else 4;
-                const c = if (args.len > 2) s.constArg(args[2]) orelse 4 else 4;
+                attrs.norm = s.last_attrs.norm;
+                if (!s.requireScalarArg(args[0], elem)) return TypeTable.error_type;
+                const r = if (args.len > 1) try s.requireConstArg(args[1]) orelse return TypeTable.error_type else 4;
+                const c = if (args.len > 2) try s.requireConstArg(args[2]) orelse return TypeTable.error_type else 4;
                 const comp = s.types.component(elem) orelse return TypeTable.error_type;
-                if (r < 1 or r > 4 or c < 1 or c > 4) return TypeTable.error_type;
+                if (r < 1 or r > 4 or c < 1 or c > 4) {
+                    s.err(templateArgLoc(args[if (r < 1 or r > 4) 1 else 2]), "invalid value, valid range is between 1 and 4 inclusive", .{});
+                    return TypeTable.error_type;
+                }
                 return s.types.matrix(comp, @intCast(r), @intCast(c));
             }
             if (std.mem.eql(u8, n, "SamplerState") or std.mem.eql(u8, n, "sampler") or std.mem.eql(u8, n, "sampler1D") or std.mem.eql(u8, n, "sampler2D") or std.mem.eql(u8, n, "sampler3D") or std.mem.eql(u8, n, "samplerCUBE") or std.mem.eql(u8, n, "sampler_state")) {
@@ -375,11 +478,43 @@ pub const Sema = struct {
             }
             if (std.mem.eql(u8, n, "SamplerComparisonState")) return s.types.intern(.{ .sampler = .{ .comparison = true } });
             if (types.ResourceKind.fromName(n)) |kind| {
+                const rov = std.mem.startsWith(u8, n, "RasterizerOrdered");
+                const typed = isTextureOrTypedBuffer(kind) or (rov and !std.mem.endsWith(u8, n, "StructuredBuffer") and !std.mem.endsWith(u8, n, "ByteAddressBuffer"));
+                const needs_args = rov or kind.isWritable() or switch (kind) {
+                    .structured_buffer, .constant_buffer, .texture_buffer => true,
+                    else => false,
+                };
+                const max_args: usize = switch (kind) {
+                    .texture2dms, .texture2dms_array, .rw_texture2dms, .rw_texture2dms_array => 2,
+                    .byte_address_buffer, .rw_byte_address_buffer => 0,
+                    else => 1,
+                };
+                if (args.len == 0 and needs_args and kind != .rw_byte_address_buffer) {
+                    s.err(t.loc, "use of class template '{s}' requires template arguments", .{n});
+                    return TypeTable.error_type;
+                }
+                if (args.len > max_args and kind != .other) {
+                    s.err(t.loc, "too many template arguments for class template '{s}'", .{n});
+                    return TypeTable.error_type;
+                }
                 var elem: TypeId = TypeTable.void_type;
                 if (args.len > 0) {
                     elem = try s.typeArg(args[0]) orelse TypeTable.error_type;
                 } else if (isTextureOrTypedBuffer(kind)) {
                     elem = try s.types.vector(.float, 4); // Texture2D == Texture2D<float4>
+                }
+                if (typed and args.len > 0 and elem != TypeTable.error_type) {
+                    switch (s.types.get(elem)) {
+                        .vector => |v| if (v.len > 4 or v.len * v.elem.size() > 16) {
+                            s.err(templateArgLoc(args[0]), "elements of typed buffers and textures must fit in four 32-bit quantities", .{});
+                            return TypeTable.error_type;
+                        },
+                        .scalar => {},
+                        else => {
+                            s.err(templateArgLoc(args[0]), "elements of typed buffers and textures must be scalars or vectors", .{});
+                            return TypeTable.error_type;
+                        },
+                    }
                 }
                 return s.types.intern(.{ .resource = .{ .kind = kind, .elem = elem, .name = n } });
             }
@@ -427,6 +562,16 @@ pub const Sema = struct {
             return 1;
         }
         return @intCast(v);
+    }
+
+    /// Only the outermost array dimension may be unsized.
+    fn checkArrayDims(s: *Sema, loc: Loc, base: TypeId, dims: []const ?*ast.Expr) Allocator.Error!void {
+        if (dims.len < 2) return;
+        for (dims[1..], 1..) |d, i| if (d == null) {
+            const inner = try s.applyArrayDims(base, dims[i + 1 ..]);
+            s.err(loc, "array has incomplete element type '{s} []'", .{s.typeName(inner)});
+            return;
+        };
     }
 
     fn applyArrayDims(s: *Sema, base: TypeId, dims: []const ?*ast.Expr) Allocator.Error!TypeId {
@@ -534,6 +679,60 @@ pub const Sema = struct {
             const found = if (s.global.syms.get(entry)) |sym| sym == .functions else false;
             if (!found) _ = s.diags.report(.{ .severity = .@"error", .loc = .none }, "missing entry point definition", .{});
         }
+        // Whole-program checks run only on an otherwise valid unit (as in
+        // dxc's DiagnoseTranslationUnit).
+        if (s.diags.error_count == 0) try s.checkRecursion();
+    }
+
+    /// Roots of the call graph: exported functions and shader entry points
+    /// for libraries (in declaration order), else the entry point.
+    fn graphRoots(s: *Sema) Allocator.Error![]const *Function {
+        var roots: std.ArrayList(*Function) = .empty;
+        for (s.all_functions.items) |f| {
+            if (!f.defined) continue;
+            if (s.opts.library) {
+                if (f.owner != null) continue;
+                const shader = for (f.decl.attrs) |a| {
+                    if (eql(a.name, "shader")) break true;
+                } else false;
+                if (shader or (f.decl.quals.@"export" and !f.decl.quals.static)) try roots.append(s.arena, f);
+            } else if (s.opts.root) |r| {
+                if (f.owner == null and eql(f.name, r) and s.global.syms.get(r) != null) try roots.append(s.arena, f);
+            }
+        }
+        return roots.items;
+    }
+
+    /// dxc's ValidateNoRecursion for every root; each recursive function is
+    /// reported once.
+    fn checkRecursion(s: *Sema) Allocator.Error!void {
+        var reported: std.AutoHashMapUnmanaged(*Function, void) = .empty;
+        for (try s.graphRoots()) |root| {
+            var memo: std.AutoHashMapUnmanaged(*Function, ?*Function) = .empty;
+            var stack: std.AutoHashMapUnmanaged(*Function, void) = .empty;
+            const rec = try findRecursion(s.arena, &memo, &stack, root) orelse continue;
+            if ((try reported.getOrPut(s.arena, rec)).found_existing) continue;
+            s.err(rec.loc, "recursive functions are not allowed: function '{s}' calls recursive function '{s}'", .{ try s.qualifiedName(root), try s.qualifiedName(rec) });
+        }
+    }
+
+    fn findRecursion(a: Allocator, memo: *std.AutoHashMapUnmanaged(*Function, ?*Function), stack: *std.AutoHashMapUnmanaged(*Function, void), f: *Function) Allocator.Error!?*Function {
+        if (memo.get(f)) |r| return r;
+        if ((try stack.getOrPut(a, f)).found_existing) return f;
+        for (f.callees.items) |c| {
+            if (try findRecursion(a, memo, stack, c)) |r| {
+                try memo.put(a, f, r);
+                return r;
+            }
+        }
+        _ = stack.remove(f);
+        try memo.put(a, f, null);
+        return null;
+    }
+
+    fn qualifiedName(s: *Sema, f: *const Function) Allocator.Error![]const u8 {
+        const owner = f.owner orelse return f.name;
+        return std.fmt.allocPrint(s.arena, "{s}::{s}", .{ owner.name, f.name });
     }
 
     const DeclCtx = enum { global, local, member, cbuffer };
@@ -551,7 +750,7 @@ pub const Sema = struct {
                     const want: u8 = if (cb.tbuffer) 't' else 'b';
                     if (std.ascii.toLower(reg.type) != want) {
                         s.err(sem.loc, "invalid register specification, expected '{c}' binding", .{want});
-                    } else if (reg.profile) {
+                    } else if (reg.profile != null) {
                         s.err(sem.loc, "user defined constant buffer slots cannot be target specific", .{});
                     }
                 }
@@ -567,9 +766,10 @@ pub const Sema = struct {
                     return;
                 }
                 const base = try s.resolveType(td.type);
-                s.checkModifiers(.typedef, td.qual_words, d.loc, base);
+                const attrs = s.checkModifiers(.typedef, td.qual_words, d.loc, base, s.last_attrs);
                 const ty = try s.applyArrayDims(base, td.array_dims);
                 try s.declare(td.name, .{ .type = ty }, d.loc);
+                if (attrs.orientation != null or attrs.norm != null) try s.typedef_attrs.put(s.arena, td.name, attrs);
             },
             .@"enum" => |e| try s.enumDecl(d, e),
             .namespace => |n| {
@@ -685,6 +885,17 @@ pub const Sema = struct {
                     const bs: *StructSema = @ptrCast(@alignCast(bp));
                     sc.parent = bs.scope;
                 }
+            } else if (bt != TypeTable.error_type) {
+                // Builtin types are final; scalars are not classes at all.
+                const base_name: ?[]const u8 = switch (s.types.get(bt)) {
+                    .vector => "vector",
+                    .matrix => "matrix",
+                    .resource => |r| r.name,
+                    .sampler => |sm| if (sm.comparison) "SamplerComparisonState" else "SamplerState",
+                    .scalar, .@"enum" => null,
+                    else => s.typeName(bt),
+                };
+                if (base_name) |n| s.err(b.loc, "base '{s}' is marked 'final'", .{n}) else s.err(b.loc, "expected class name", .{});
             }
         }
 
@@ -708,9 +919,10 @@ pub const Sema = struct {
                     s.err(start, "array dimensions of struct/class members must be explicit", .{});
                     continue;
                 }
-                s.checkModifiers(.field, v.qual_words, start, fbase);
+                _ = s.checkModifiers(.field, v.qual_words, start, fbase, s.last_attrs);
                 const ft = try s.applyArrayDims(fbase, v.array_dims);
-                s.checkSemantics(.field, v.semantics, ft);
+                s.checkSemantics(.field, v.semantics, ft, false);
+                if (s.types.get(fbase) == .string) s.err(v.name_loc, "string declaration may only appear in global scope", .{});
                 for (info.fields.items[base_fields..]) |f| if (std.mem.eql(u8, f.name, v.name)) s.err(v.name_loc, "duplicate member '{s}'", .{v.name});
                 try info.fields.append(s.arena, .{ .name = v.name, .type = ft });
             },
@@ -750,14 +962,16 @@ pub const Sema = struct {
     /// matrix-orientation type-attribute checks. `start` is where the
     /// declaration begins; `ty` is the declared (or return) type before
     /// declarator array dimensions.
-    fn checkModifiers(s: *Sema, kind: DeclKind, words: []const ast.QualWord, start: Loc, ty: TypeId) void {
-        if (words.len == 0) return;
+    /// Returns the declaration's type attributes (`type_attrs` plus any
+    /// orientation written among the qualifiers).
+    fn checkModifiers(s: *Sema, kind: DeclKind, words: []const ast.QualWord, start: Loc, ty: TypeId, type_attrs: TypeAttrs) TypeAttrs {
+        var attrs = type_attrs;
+        if (words.len == 0) return attrs;
         const what = kind.text();
         // Storage classes: the first one wins (typedef counts as one).
         var storage: ?[]const u8 = if (kind == .typedef) "typedef" else null;
         var is_const = false;
         var is_volatile = false;
-        var orientation: ?[]const u8 = null;
         for (words) |w| {
             if (eql(w.word, "static") or eql(w.word, "extern")) {
                 if (storage) |prev| {
@@ -770,13 +984,7 @@ pub const Sema = struct {
             } else if (eql(w.word, "volatile")) {
                 is_volatile = true;
             } else if (eql(w.word, "row_major") or eql(w.word, "column_major")) {
-                if (s.types.get(ty) != .matrix and ty != TypeTable.error_type) {
-                    s.err(w.loc, "'{s}' can only be used with a matrix type", .{w.word});
-                } else if (orientation) |o| {
-                    if (eql(o, w.word)) {
-                        s.warn(w.loc, "ignored-attributes", "attribute '{s}' is already applied", .{w.word});
-                    } else s.err(w.loc, "'row_major' and 'column_major' attributes are not compatible", .{});
-                } else orientation = w.word;
+                s.applyTypeAttr(w, ty, &attrs);
             }
         }
         const is_static = storage != null and eql(storage.?, "static");
@@ -883,18 +1091,46 @@ pub const Sema = struct {
             } else if (!usage_out) s.err(start, "'{s}' object must be an out parameter", .{m.word});
         }
         if (param and !(usage_in and usage_out) and s.types.get(ty) == .stream) s.err(start, "stream-output object must be an inout parameter", .{});
+        return attrs;
     }
 
-    const Register = struct { type: u8, profile: bool };
+    /// Conflicting repeated function attributes. clang applies them in
+    /// reverse order, so the last one written is the one kept.
+    fn checkFunctionAttrs(s: *Sema, attrs: []const ast.Attribute) void {
+        var last_shader: ?[]const u8 = null;
+        var last_wavesize: ?ast.Attribute = null;
+        var i = attrs.len;
+        while (i > 0) {
+            i -= 1;
+            const a = attrs[i];
+            if (std.ascii.eqlIgnoreCase(a.name, "shader") and a.args.len == 1 and a.args[0].kind == .string_lit) {
+                const lit = a.args[0].kind.string_lit;
+                const stage = if (lit.len >= 2) lit[1 .. lit.len - 1] else lit;
+                if (last_shader) |kept| {
+                    if (!eql(kept, stage)) s.err(a.loc, "shader attribute type '{s}' conflicts with shader attribute type '{s}'", .{ stage, kept });
+                } else last_shader = stage;
+            } else if (std.ascii.eqlIgnoreCase(a.name, "wavesize")) {
+                if (last_wavesize) |kept| {
+                    var same = kept.args.len == a.args.len;
+                    if (same) for (kept.args, a.args) |x, y| {
+                        if (s.evalInt(x) != s.evalInt(y)) same = false;
+                    };
+                    if (!same) s.err(a.loc, "shader attribute type 'wavesize' conflicts with shader attribute type 'wavesize'", .{});
+                } else last_wavesize = a;
+            }
+        }
+    }
+
+    const Register = struct { type: u8, profile: ?[]const u8 = null, number: []const u8 = "", offset: []const u8 = "" };
 
     /// Checks the syntax of `register([profile,] Tn[sub] [, spaceN])` as
     /// dxc's parser does; null after an error. A space-only binding has
     /// type 0.
     fn parseRegister(s: *Sema, sem: ast.Semantic) ?Register {
         var vals = sem.values;
-        var profile = false;
+        var profile: ?[]const u8 = null;
         if (vals.len > 0 and isProfileLike(vals[0])) {
-            profile = true;
+            profile = vals[0];
             vals = vals[1..];
         }
         if (vals.len == 0) return null;
@@ -907,13 +1143,14 @@ pub const Sema = struct {
             s.err(sem.loc, "register type is unsupported - available types are 'b', 'c', 'i', 's', 't', 'u'", .{});
             return null;
         }
-        const num = reg[1 .. std.mem.indexOfScalar(u8, reg, '[') orelse reg.len];
+        const bracket = std.mem.indexOfScalar(u8, reg, '[') orelse reg.len;
+        const num = reg[1..bracket];
         if (num.len > 0) _ = std.fmt.parseInt(u32, num, 10) catch {
             s.err(sem.loc, "register number should be an integral numeric string", .{});
             return null;
         };
         if (vals.len > 1 and !s.checkSpace(sem.loc, vals[1])) return null;
-        return .{ .type = reg[0], .profile = profile };
+        return .{ .type = reg[0], .profile = profile, .number = num, .offset = reg[bracket..] };
     }
 
     fn checkSpace(s: *Sema, loc: Loc, text: []const u8) bool {
@@ -930,18 +1167,75 @@ pub const Sema = struct {
 
     /// Semantics and register bindings on a declaration (dxc's
     /// DiagnoseHLSLDecl annotations part and DiagnoseRegisterType).
-    fn checkSemantics(s: *Sema, kind: DeclKind, sems: []const ast.Semantic, ty: TypeId) void {
-        for (sems) |sem| switch (sem.kind) {
+    fn checkSemantics(s: *Sema, kind: DeclKind, sems: []const ast.Semantic, ty: TypeId, in_cbuffer: bool) void {
+        var regs: [8]?Register = @splat(null);
+        for (sems, 0..) |sem, i| switch (sem.kind) {
             .semantic => if (kind == .local_variable or kind == .typedef) {
                 s.err(sem.loc, "semantic is not a valid modifier for a {s}", .{kind.text()});
             },
             .register => {
                 const reg = s.parseRegister(sem) orelse continue;
+                if (i < regs.len) regs[i] = reg;
                 if (reg.type == 0) continue;
                 s.checkRegisterType(sem.loc, ty, std.ascii.toLower(reg.type));
             },
+            .packoffset => s.checkPackoffset(sem, ty, kind == .global_variable and in_cbuffer),
             else => {},
         };
+        // Two bindings in the same register bank and profile that differ.
+        for (sems, 0..) |sem, i| {
+            const a = (if (i < regs.len) regs[i] else null) orelse continue;
+            if (a.type == 0) continue;
+            for (sems[i + 1 ..], i + 1..) |_, j| {
+                const b = (if (j < regs.len) regs[j] else null) orelse continue;
+                const same_profile = a.profile == null or b.profile == null or eql(a.profile.?, b.profile.?);
+                if (same_profile and a.type == b.type and (!eql(a.number, b.number) or !eql(a.offset, b.offset))) {
+                    s.err(sem.loc, "conflicting register semantics", .{});
+                }
+            }
+        }
+    }
+
+    /// `packoffset(c<n>[.component])` (dxc's parser checks plus
+    /// DiagnosePackingOffset).
+    fn checkPackoffset(s: *Sema, sem: ast.Semantic, ty: TypeId, in_cbuffer: bool) void {
+        if (sem.values.len == 0) return;
+        const text = sem.values[0];
+        const dot = std.mem.indexOfScalar(u8, text, '.') orelse text.len;
+        const sub = text[0..dot];
+        if (sub.len == 0 or std.ascii.toLower(sub[0]) != 'c') {
+            s.err(sem.loc, "register type is unsupported - available types are 'b', 'c', 'i', 's', 't', 'u'", .{});
+            return;
+        }
+        if (sub.len > 1) _ = std.fmt.parseInt(u32, sub[1..], 10) catch {
+            s.err(sem.loc, "register number should be an integral numeric string", .{});
+            return;
+        };
+        var offset: u32 = 0;
+        if (dot < text.len) {
+            const comp = text[dot + 1 ..];
+            offset = if (comp.len != 1) 4 else switch (comp[0]) {
+                'r', 'x' => 0,
+                'g', 'y' => 1,
+                'b', 'z' => 2,
+                'a', 'w' => 3,
+                else => 4,
+            };
+            if (offset == 4) {
+                s.err(sem.loc, "packoffset component should indicate offset with one of x, y, z, w, r, g, b, or a", .{});
+                return;
+            }
+        }
+        if (!in_cbuffer) {
+            s.err(sem.loc, "packoffset is only allowed in a constant buffer", .{});
+            return;
+        }
+        if (offset == 0 or ty == TypeTable.error_type) return;
+        switch (s.types.get(ty)) {
+            .scalar, .vector => if (s.types.componentCount(ty).? > 4 - offset) s.err(sem.loc, "register or offset bind not valid", .{}),
+            .matrix, .array, .@"struct" => s.err(sem.loc, "register or offset bind not valid", .{}),
+            else => {},
+        }
     }
 
     fn checkRegisterType(s: *Sema, loc: Loc, ty: TypeId, reg: u8) void {
@@ -977,11 +1271,12 @@ pub const Sema = struct {
         if (std.mem.indexOf(u8, v.name, "::") != null) return; // out-of-line static member definition
         const is_auto = v.type.name.isSimple("auto");
         const base = if (is_auto) TypeTable.error_type else try s.resolveType(v.type);
-        s.checkModifiers(switch (ctx) {
+        _ = s.checkModifiers(switch (ctx) {
             .local => .local_variable,
             .member => .field,
             .global, .cbuffer => .global_variable,
-        }, v.qual_words, if (v.qual_words.len > 0) v.qual_words[0].loc else v.type.loc, base);
+        }, v.qual_words, if (v.qual_words.len > 0) v.qual_words[0].loc else v.type.loc, base, if (is_auto) .{} else s.last_attrs);
+        try s.checkArrayDims(v.name_loc, base, v.array_dims);
         var ty = try s.applyArrayDims(base, v.array_dims);
         if (is_auto) {
             // `auto x = init`: the initializer's type (literals become
@@ -998,7 +1293,12 @@ pub const Sema = struct {
             s.err(v.name_loc, "variable has incomplete type 'void'", .{});
             ty = TypeTable.error_type;
         }
-        s.checkSemantics(if (ctx == .local) .local_variable else if (ctx == .member) .field else .global_variable, v.semantics, ty);
+        s.checkSemantics(if (ctx == .local) .local_variable else if (ctx == .member) .field else .global_variable, v.semantics, ty, ctx == .cbuffer);
+        if (s.types.get(base) == .string) {
+            if (v.array_dims.len > 0) {
+                s.err(v.name_loc, "array of type string is not supported", .{});
+            } else if (ctx != .global) s.err(v.name_loc, "string declaration may only appear in global scope", .{});
+        }
         const q = v.quals;
         const storage: Storage = switch (ctx) {
             .cbuffer => .cbuffer,
@@ -1082,12 +1382,15 @@ pub const Sema = struct {
         // `auto` return types are deduced in HLSL 202x; unconstrained here.
         const ret = if (f.ret.name.isSimple("auto")) TypeTable.error_type else try s.applyArrayDims(try s.resolveType(f.ret), f.ret_dims);
         const params = try s.arena.alloc(Param, f.params.len);
-        s.checkModifiers(if (owner != null) .method else .function, f.qual_words, if (f.qual_words.len > 0) f.qual_words[0].loc else f.ret.loc, ret);
+        _ = s.checkModifiers(if (owner != null) .method else .function, f.qual_words, if (f.qual_words.len > 0) f.qual_words[0].loc else f.ret.loc, ret, s.last_attrs);
+        s.checkFunctionAttrs(f.attrs);
         for (f.params, params) |p, *out| {
             const pbase = try s.resolveType(p.type);
-            s.checkModifiers(.parameter, p.qual_words, if (p.qual_words.len > 0) p.qual_words[0].loc else p.type.loc, pbase);
+            _ = s.checkModifiers(.parameter, p.qual_words, if (p.qual_words.len > 0) p.qual_words[0].loc else p.type.loc, pbase, s.last_attrs);
+            try s.checkArrayDims(p.name_loc, pbase, p.array_dims);
             const pt = try s.applyArrayDims(pbase, p.array_dims);
-            s.checkSemantics(.parameter, p.semantics, pt);
+            s.checkSemantics(.parameter, p.semantics, pt, false);
+            if (s.types.get(pbase) == .string) s.err(p.name_loc, "parameter of type string is not supported", .{});
             out.* = .{
                 .name = p.name,
                 .type = pt,
@@ -1125,9 +1428,14 @@ pub const Sema = struct {
                 s.err(d.loc, "functions that differ only in their return type cannot be overloaded", .{});
             }
             if (func.defined) e.* = func.*;
-        } else try set.funcs.append(s.arena, func);
+        } else {
+            try set.funcs.append(s.arena, func);
+            try s.all_functions.append(s.arena, func);
+        }
         if (mode == .declare_only) return;
-        try s.funcBody(func, f);
+        // A definition completing a prototype keeps the prototype's identity
+        // (call-graph edges attach to it).
+        try s.funcBody(if (existing) |e| (if (func.defined) e else func) else func, f);
     }
 
     fn funcBody(s: *Sema, func: *Function, f: *const ast.FuncDecl) Allocator.Error!void {
@@ -1696,7 +2004,13 @@ pub const Sema = struct {
             },
             .matrix => |m| {
                 const sw = parseMatrixSwizzle(name, m.rows, m.cols) orelse {
-                    s.err(name_loc, "invalid format for matrix subscript '{s}'", .{name});
+                    if (std.mem.indexOf(u8, name, "_m") != null and std.mem.indexOf(u8, name, "_1") != null or
+                        std.mem.indexOf(u8, name, "_m") != null and std.mem.indexOf(u8, name, "_2") != null or
+                        std.mem.indexOf(u8, name, "_m") != null and std.mem.indexOf(u8, name, "_3") != null or
+                        std.mem.indexOf(u8, name, "_m") != null and std.mem.indexOf(u8, name, "_4") != null)
+                    {
+                        s.err(name_loc, "matrix subscript '{s}' mixes one-based and zero-based references", .{name});
+                    } else s.err(name_loc, "invalid format for matrix subscript '{s}'", .{name});
                     return err_typed;
                 };
                 const ty = if (sw.count == 1) try s.types.scalar(m.elem) else try s.types.vector(m.elem, sw.count);
@@ -1785,8 +2099,20 @@ pub const Sema = struct {
         }
         switch (s.types.get(b.ty)) {
             .array => |a| return .{ .ty = a.elem, .lvalue = b.lvalue, .read_only = b.read_only },
-            .vector => |v| return .{ .ty = try s.types.scalar(v.elem), .lvalue = b.lvalue, .read_only = b.read_only },
-            .matrix => |m| return .{ .ty = try s.types.vector(m.elem, m.cols), .lvalue = b.lvalue, .read_only = b.read_only },
+            .vector => |v| {
+                if (s.evalInt(index)) |k| if (k < 0 or k >= v.len) {
+                    s.err(index.loc, "vector element index '{d}' is out of bounds", .{k});
+                    return err_typed;
+                };
+                return .{ .ty = try s.types.scalar(v.elem), .lvalue = b.lvalue, .read_only = b.read_only };
+            },
+            .matrix => |m| {
+                if (s.evalInt(index)) |k| if (k < 0 or k >= m.rows) {
+                    s.err(index.loc, "matrix row index '{d}' is out of bounds", .{k});
+                    return err_typed;
+                };
+                return .{ .ty = try s.types.vector(m.elem, m.cols), .lvalue = b.lvalue, .read_only = b.read_only };
+            },
             .resource => |r| {
                 if (r.kind.indexDims() == 0 or r.elem == TypeTable.void_type) {
                     if (r.kind == .other) return err_typed;
@@ -1961,6 +2287,7 @@ pub const Sema = struct {
             }
         }
         _ = e;
+        if (s.current_fn) |caller| caller.callees.append(s.arena, f) catch {};
         return f.ret;
     }
 
@@ -2038,13 +2365,13 @@ pub const Sema = struct {
             }
             e.ty = target;
             if (target == TypeTable.error_type) return true;
-            const want = s.types.componentCount(target) orelse return true;
+            const want = if (s.types.get(target) == .string) 1 else s.types.componentCount(target) orelse return true;
             const have = s.flatCount(e);
             if (have != want and have != 0) {
                 if (have < want) {
-                    s.err(e.loc, "too few elements in vector initialization (expected {d} elements, have {d})", .{ want, have });
+                    s.err(e.loc, "too few elements in vector initialization (expected {d} element{s}, have {d})", .{ want, if (want == 1) "" else "s", have });
                 } else {
-                    s.err(e.loc, "too many elements in vector initialization (expected {d} elements, have {d})", .{ want, have });
+                    s.err(e.loc, "too many elements in vector initialization (expected {d} element{s}, have {d})", .{ want, if (want == 1) "" else "s", have });
                 }
                 return false;
             }
@@ -2299,6 +2626,7 @@ fn parseMatrixSwizzle(name: []const u8, rows: u8, cols: u8) ?Swizzle {
     var count: u8 = 0;
     var seen: u16 = 0;
     var repeats = false;
+    var form: ?bool = null; // zero-based?
     while (i < name.len) {
         if (name[i] != '_') return null;
         i += 1;
@@ -2307,6 +2635,8 @@ fn parseMatrixSwizzle(name: []const u8, rows: u8, cols: u8) ?Swizzle {
             zero_based = true;
             i += 1;
         }
+        if (form != null and form.? != zero_based) return null; // mixed forms
+        form = zero_based;
         if (i + 2 > name.len) return null;
         var r: i32 = @as(i32, name[i]) - '0';
         var c: i32 = @as(i32, name[i + 1]) - '0';
@@ -2432,6 +2762,13 @@ fn isProfileLike(text: []const u8) bool {
         else => return false,
     };
     return underscore and digit and letter;
+}
+
+fn templateArgLoc(arg: ast.TemplateArg) Loc {
+    return switch (arg) {
+        .expr => |e| e.loc,
+        .type => |t| t.loc,
+    };
 }
 
 fn eql(a: []const u8, b: []const u8) bool {

@@ -43,6 +43,11 @@ pub const TypeRef = struct {
     norm: enum { none, unorm, snorm } = .none,
     /// `__decltype(expr)`: the type of `expr` (`name` is `__decltype`).
     decltype: ?*Expr = null,
+    /// Spelled with `unsigned` (only integer types may be).
+    unsigned_spec: bool = false,
+    /// Type attributes written on this reference, in order: `row_major`,
+    /// `column_major`, `unorm`, `snorm` (template arguments, typedefs).
+    attr_words: []const QualWord = &.{},
 };
 
 /// Storage classes, type qualifiers and parameter / interpolation

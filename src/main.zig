@@ -247,6 +247,9 @@ fn run(cli: Cli, arena: std.mem.Allocator, args: []const [:0]const u8, stdout: *
                         .entry = if (opts.sema or is_lib) null else opts.entry,
                         .spirv = opts.spirv,
                         .enable_16bit = opts.enable_16bit,
+                        .sm_minor = if (profile) |p| p.minor else 10,
+                        .library = is_lib,
+                        .root = opts.entry,
                     });
                     try sema.checkUnit(tu);
                 }
