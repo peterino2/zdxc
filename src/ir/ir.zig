@@ -179,6 +179,9 @@ pub const Param = struct {
     ty: TypeId,
     /// out / inout: passed as a pointer to caller storage.
     by_ref: bool,
+    /// in, out, inout (library function annotations).
+    dir: enum { in, out, inout } = .in,
+    semantic: ?[]const u8 = null,
 };
 
 pub const Function = struct {
@@ -188,6 +191,7 @@ pub const Function = struct {
     /// The entry (index into `Module.entries`) the function was lowered
     /// for first.
     entry: u32 = 0,
+    ret_semantic: ?[]const u8 = null,
     insts: std.ArrayList(Inst) = .empty,
     blocks: std.ArrayList(Block) = .empty,
 
@@ -357,6 +361,8 @@ pub const Module = struct {
     exports: std.ArrayList(u32) = .empty,
     /// Libraries: state object subobjects, in declaration order.
     subobjects: std.ArrayList(Subobject) = .empty,
+    /// -enable-16bit-types: half and 16-bit integers are native types.
+    native_16bit: bool = false,
 
     pub fn addFunction(m: *Module, f: Function) !u32 {
         const p = try m.arena.create(Function);

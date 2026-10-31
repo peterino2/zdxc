@@ -275,6 +275,7 @@ fn run(cli: Cli, arena: std.mem.Allocator, args: []const [:0]const u8, stdout: *
                             error.Unsupported => null,
                             else => |x| return x,
                         };
+                        if (module) |*mm| mm.native_16bit = opts.enable_16bit;
                     }
                 }
             }

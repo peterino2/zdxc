@@ -11,35 +11,51 @@ const TypeId = types.TypeId;
 
 pub const Param = struct { ty: TypeId, by_ref: bool = false };
 
+/// Names already spelled (the function's own first): later uses of a
+/// struct or class template name are back-references (`U1@`, `V1@`).
+const Names = struct {
+    list: std.ArrayList([]const u8) = .empty,
+
+    fn find(n: *Names, name: []const u8) ?usize {
+        for (n.list.items, 0..) |x, k| if (std.mem.eql(u8, x, name)) return k;
+        return null;
+    }
+
+    fn add(n: *Names, a: Allocator, name: []const u8) Allocator.Error!void {
+        if (n.list.items.len < 10 and n.find(name) == null) try n.list.append(a, name);
+    }
+};
+
 /// `\x01?name@@YA<ret><params>Z`.
 pub fn function(a: Allocator, t: *TypeTable, name: []const u8, ret: TypeId, params: []const Param) Allocator.Error![]u8 {
     var out: std.ArrayList(u8) = .empty;
+    var names: Names = .{};
+    try names.add(a, name);
     try out.print(a, "\x01?{s}@@YA", .{name});
-    var refs: std.ArrayList([]const u8) = .empty;
+    // Parameter types spelled with more than one character are numbered;
+    // repeats are back-references.
+    var refs: std.ArrayList(Param) = .empty;
     const rt = t.get(ret);
     if (rt == .@"struct" or rt == .matrix or (rt == .vector and rt.vector.len > 1) or rt == .resource) try out.appendSlice(a, "?A");
-    try typeCode(a, t, ret, &out);
+    try typeCode(a, t, ret, &out, &names);
     if (params.len == 0) {
         try out.append(a, 'X');
     } else {
-        for (params) |p| {
-            var code: std.ArrayList(u8) = .empty;
-            if (p.by_ref) try code.appendSlice(a, "AIA");
-            try typeCode(a, t, p.ty, &code);
-            if (code.items.len == 1) {
-                try out.appendSlice(a, code.items);
-                continue;
-            }
-            // Repeated multi-character types are back-references.
+        for (params) |p0| {
+            // (inout structs are passed as values, as in dxc.)
+            const p: Param = .{ .ty = p0.ty, .by_ref = p0.by_ref and t.get(p0.ty) != .@"struct" };
             const back = for (refs.items, 0..) |r, k| {
-                if (std.mem.eql(u8, r, code.items)) break k;
+                if (r.ty == p.ty and r.by_ref == p.by_ref) break k;
             } else null;
             if (back) |k| if (k < 10) {
                 try out.append(a, '0' + @as(u8, @intCast(k)));
                 continue;
             };
+            var code: std.ArrayList(u8) = .empty;
+            if (p.by_ref) try code.appendSlice(a, "AIA");
+            try typeCode(a, t, p.ty, &code, &names);
             try out.appendSlice(a, code.items);
-            if (back == null) try refs.append(a, code.items);
+            if (code.items.len > 1 and back == null) try refs.append(a, p);
         }
         try out.append(a, '@');
     }
@@ -50,8 +66,10 @@ pub fn function(a: Allocator, t: *TypeTable, name: []const u8, ret: TypeId, para
 /// `\x01?name@@3<type>A` (a global variable).
 pub fn global(a: Allocator, t: *TypeTable, name: []const u8, ty: TypeId) Allocator.Error![]u8 {
     var out: std.ArrayList(u8) = .empty;
+    var names: Names = .{};
+    try names.add(a, name);
     try out.print(a, "\x01?{s}@@3", .{name});
-    try typeCode(a, t, ty, &out);
+    try typeCode(a, t, ty, &out, &names);
     try out.append(a, 'A');
     return out.items;
 }
@@ -92,44 +110,62 @@ fn scalarCode(s: types.Scalar) []const u8 {
     };
 }
 
-fn typeCode(a: Allocator, t: *TypeTable, ty: TypeId, out: *std.ArrayList(u8)) Allocator.Error!void {
+fn typeCode(a: Allocator, t: *TypeTable, ty: TypeId, out: *std.ArrayList(u8), names: *Names) Allocator.Error!void {
     if (ty == TypeTable.void_type) return out.append(a, 'X');
     switch (t.get(ty)) {
         .scalar => |s| try out.appendSlice(a, scalarCode(s)),
-        .@"enum" => |en| try out.print(a, "W4{s}@@", .{en.name}),
+        .@"enum" => |en| try className(a, 'W', try std.fmt.allocPrint(a, "4{s}", .{en.name}), out, names),
         .vector => |v| {
-            try out.print(a, "V?$vector@{s}", .{scalarCode(v.elem)});
-            try out.append(a, '$');
-            try number(a, v.len, out);
-            try out.appendSlice(a, "@@");
+            var args: std.ArrayList(u8) = .empty;
+            try args.appendSlice(a, scalarCode(v.elem));
+            try args.appendSlice(a, "$0");
+            try number(a, v.len, &args);
+            try className(a, 'V', try std.fmt.allocPrint(a, "?$vector@{s}@", .{args.items}), out, names);
         },
         .matrix => |m| {
-            try out.print(a, "V?$matrix@{s}", .{scalarCode(m.elem)});
-            try out.append(a, '$');
-            try number(a, m.rows, out);
-            try out.append(a, '$');
-            try number(a, m.cols, out);
-            try out.appendSlice(a, "@@");
+            var args: std.ArrayList(u8) = .empty;
+            try args.appendSlice(a, scalarCode(m.elem));
+            try args.appendSlice(a, "$0");
+            try number(a, m.rows, &args);
+            try args.appendSlice(a, "$0");
+            try number(a, m.cols, &args);
+            try className(a, 'V', try std.fmt.allocPrint(a, "?$matrix@{s}@", .{args.items}), out, names);
         },
-        .array => |arr| {
+        .array => {
             // Y<dims - 1><dim>...<element>
             var dims: std.ArrayList(u32) = .empty;
             var et = ty;
             while (t.get(et) == .array) : (et = t.get(et).array.elem) try dims.append(a, t.get(et).array.len);
-            _ = arr;
             try out.append(a, 'Y');
             try number(a, dims.items.len - 1, out);
             for (dims.items) |d| try number(a, d, out);
-            try typeCode(a, t, et, out);
+            try typeCode(a, t, et, out, names);
         },
-        .@"struct" => |st| try out.print(a, "U{s}@@", .{st.name}),
+        .@"struct" => |st| try className(a, 'U', st.name, out, names),
         .resource => |r| {
-            if (r.elem == TypeTable.void_type or r.kind == .raytracing_acceleration_structure) return out.print(a, "U{s}@@", .{r.name});
-            try out.print(a, "V?${s}@", .{r.name});
-            try typeCode(a, t, r.elem, out);
-            try out.appendSlice(a, "@@");
+            if (r.elem == TypeTable.void_type or r.kind == .raytracing_acceleration_structure) return className(a, 'U', r.name, out, names);
+            // Template arguments have names of their own.
+            var args: std.ArrayList(u8) = .empty;
+            var inner: Names = .{};
+            try inner.add(a, r.name);
+            try typeCode(a, t, r.elem, &args, &inner);
+            try className(a, 'V', try std.fmt.allocPrint(a, "?${s}@{s}@", .{ r.name, args.items }), out, names);
         },
-        .sampler => |s| try out.appendSlice(a, if (s.comparison) "USamplerComparisonState@@" else "USamplerState@@"),
+        .sampler => |s| try className(a, 'U', if (s.comparison) "SamplerComparisonState" else "SamplerState", out, names),
         else => try out.append(a, 'X'),
     }
+}
+
+/// `<kind><name>@@`, or `<kind><backref>@` for a name already spelled
+/// (template instances `?$name@args@` end in `@` themselves).
+fn className(a: Allocator, kind: u8, name: []const u8, out: *std.ArrayList(u8), names: *Names) Allocator.Error!void {
+    try out.append(a, kind);
+    if (names.find(name)) |k| {
+        try out.append(a, '0' + @as(u8, @intCast(k)));
+        return out.append(a, '@');
+    }
+    try out.appendSlice(a, name);
+    if (name[0] != '?') try out.append(a, '@');
+    try out.append(a, '@');
+    try names.add(a, name);
 }

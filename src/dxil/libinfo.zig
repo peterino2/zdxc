@@ -72,6 +72,8 @@ pub fn analyze(m: *const module.Module, f: *const module.Function, o: Options) I
             if (!std.mem.startsWith(u8, callee.name, "dx.op.")) continue;
             if (inst.op.call.args.len > 0) op = constInt(m, inst.op.call.args[0]);
         }
+        // (dxc ignores vector element instructions here.)
+        if (inst.op == .extractelement or inst.op == .insertelement) continue;
         var types_seen: [8]module.TypeId = undefined;
         var n: usize = 0;
         types_seen[n] = inst.ty;
@@ -184,7 +186,7 @@ pub fn analyze(m: *const module.Module, f: *const module.Function, o: Options) I
         }
     }
     if (has16) fl |= bit.low_precision;
-    if (has16 and o.native16) fl |= bit.native_low_precision;
+    if (o.native16) fl |= bit.native_low_precision;
     if (check_access or lod_clamp) fl |= bit.tiled_resources;
     if (o.res_may_not_alias and uses_uav) fl |= bit.res_may_not_alias;
     info.flags = fl;

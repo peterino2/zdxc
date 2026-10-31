@@ -208,11 +208,16 @@ const Lowerer = struct {
         var params: std.ArrayList(ir.Param) = .empty;
         // Methods take the object first (`this`, by reference).
         if (isMethod(f)) try params.append(l.arena, .{ .name = "this", .ty = try l.s.types.intern(.{ .@"struct" = f.owner.? }), .by_ref = true });
-        for (f.params) |p| {
+        for (f.params, 0..) |p, k| {
             if (l.s.types.get(p.type) == .stream) continue;
-            try params.append(l.arena, .{ .name = p.name, .ty = l.irType(p.type), .by_ref = p.dir != .in });
+            const sem = if (k < f.decl.params.len) semanticOf(f.decl.params[k].semantics) else null;
+            try params.append(l.arena, .{ .name = p.name, .ty = l.irType(p.type), .by_ref = p.dir != .in, .dir = switch (p.dir) {
+                .in => .in,
+                .out => .out,
+                .inout => .inout,
+            }, .semantic = sem });
         }
-        const i = try l.m.addFunction(.{ .name = f.name, .params = params.items, .ret = f.ret, .entry = l.cur_entry });
+        const i = try l.m.addFunction(.{ .name = f.name, .params = params.items, .ret = f.ret, .entry = l.cur_entry, .ret_semantic = semanticOf(f.decl.ret_semantics) });
         try l.funcs.put(l.arena, f, i);
         try l.pending.append(l.arena, f);
         return i;

@@ -34,6 +34,8 @@ pub fn emit(gpa: Allocator, m: *const ir.Module, profile: shader.Profile, diags:
     defer arena_state.deinit();
     var e: Emitter = .{ .arena = arena_state.allocator(), .dm = .init(gpa), .m = m, .t = m.types, .profile = profile, .diags = diags };
     defer e.dm.deinit();
+    // Native 16-bit types are laid out at their own size.
+    if (m.native_16bit) e.dm.datalayout = "e-m:e-p:32:32-i1:32-i8:8-i16:16-i32:32-i64:64-f16:16-f32:32-f64:64-n8:16:32:64";
     return e.run(gpa);
 }
 
@@ -435,10 +437,13 @@ const Emitter = struct {
         entry: ir.Entry,
         payload_size: u32 = 0,
         attr_size: u32 = 0,
-        /// Parameter qualifiers for the function annotation (0 in,
-        /// 1 out, 2 inout).
-        quals: []const u32 = &.{},
+        /// Function annotation: the return value, then each parameter.
+        ann: []const ParamAnn = &.{},
     };
+
+    /// Input qualifier (0 in, 1 out, 2 inout), component type and
+    /// semantic of a library function parameter.
+    const ParamAnn = struct { qual: u32, comp: ?i64 = null, semantic: ?[]const u8 = null };
 
     fn shaderKind(stage: ir.Stage) u32 {
         return switch (stage) {
@@ -463,7 +468,6 @@ const Emitter = struct {
     fn runLibrary(e: *Emitter, gpa: Allocator) Error![]u8 {
         const m = e.m;
         e.lib = true;
-        if (m.exports.items.len > 0) return e.unsupported("exported library functions are not supported yet", .{});
         const i8p = try e.dm.ptrType(try e.dm.intType(8));
         e.handle_ty = try e.dm.getType(.{ .@"struct" = .{ .name = "dx.types.Handle", .elems = &.{i8p} } });
         try e.collectResources();
@@ -499,17 +503,18 @@ const Emitter = struct {
             const ray = entry.stage.isRayTracing();
             var params: std.ArrayList(DType) = .empty;
             var mparams: std.ArrayList(mangle.Param) = .empty;
-            var quals: std.ArrayList(u32) = .empty;
+            var ann: std.ArrayList(ParamAnn) = .empty;
+            try ann.append(e.arena, .{ .qual = if (ray) 1 else 0 });
             var lf: LibFunc = .{ .func = 0, .name = entry.name, .unmangled = entry.name, .stage = entry.stage, .entry = entry };
             if (ray) for (hf.params, 0..) |p, k| {
                 try params.append(e.arena, try e.dm.ptrType(try e.memoryType(p.ty)));
                 try mparams.append(e.arena, .{ .ty = p.ty });
-                try quals.append(e.arena, if (p.by_ref) 2 else 0);
+                try ann.append(e.arena, .{ .qual = if (p.by_ref) 2 else 0 });
                 const size = try e.payloadSize(p.ty);
                 if (k == 0) lf.payload_size = size else lf.attr_size = size;
             };
             if (ray) lf.name = try mangle.function(e.arena, e.t, entry.name, TypeTable.void_type, mparams.items);
-            lf.quals = quals.items;
+            lf.ann = ann.items;
             const fn_ty = try e.dm.fnType(try e.voidTy(), params.items);
             lf.func = try e.dm.addFunction(.{ .name = lf.name, .ty = fn_ty, .num_blocks = 1 });
             const args = try e.arena.alloc(Value, params.items.len);
@@ -522,9 +527,130 @@ const Emitter = struct {
             try e.finish(lf.func);
             try funcs.append(e.arena, lf);
         }
+        for (m.exports.items) |fi| try funcs.append(e.arena, try e.emitExport(fi));
+        // (Definitions in module order.)
+        std.sort.insertion(LibFunc, funcs.items, {}, struct {
+            fn lt(_: void, a: LibFunc, b: LibFunc) bool {
+                return a.func < b.func;
+            }
+        }.lt);
         const bitcode = try e.writeLibraryModule(funcs.items);
         defer gpa.free(bitcode);
         return e.assembleLibrary(gpa, funcs.items, bitcode);
+    }
+
+    /// The LLVM type of a library function argument / result: scalars
+    /// and vectors.
+    fn libValueType(e: *Emitter, ty: TypeId) Error!DType {
+        return switch (e.t.get(ty)) {
+            .scalar, .@"enum" => e.scalarTy(e.compOf(ty)),
+            .vector => |v| if (v.len == 1) e.scalarTy(e.compOf(ty)) else e.dm.getType(.{ .vector = .{ .len = v.len, .elem = try e.scalarTy(e.compOf(ty)) } }),
+            else => e.unsupported("exported functions with values of type '{s}' are not supported yet", .{try e.t.format(e.arena, ty)}),
+        };
+    }
+
+    /// Components of a library argument value (vectors element by
+    /// element).
+    fn libSplit(e: *Emitter, v: Value, ty: TypeId) Error![]const Value {
+        const n = try e.flatCount(ty);
+        if (e.t.get(ty) != .vector or n == 1) return e.arena.dupe(Value, &.{v});
+        const et = try e.scalarTy(e.compOf(ty));
+        const out = try e.arena.alloc(Value, n);
+        for (out, 0..) |*o, k| o.* = try e.add(et, .{ .extractelement = .{ .vec = v, .index = try e.i32Const(@intCast(k)) } });
+        return out;
+    }
+
+    fn libJoin(e: *Emitter, vals: []const Value, ty: TypeId) Error!Value {
+        if (e.t.get(ty) != .vector or vals.len == 1) return vals[0];
+        const vt = try e.libValueType(ty);
+        var v = try e.dm.constant(.{ .ty = vt, .kind = .undef });
+        for (vals, 0..) |c, k| v = try e.add(vt, .{ .insertelement = .{ .vec = v, .val = c, .index = try e.dm.constInt(64, @intCast(k)) } });
+        return v;
+    }
+
+    /// An exported function: a definition of its own taking scalars and
+    /// vectors (out / inout ones by pointer).
+    fn emitExport(e: *Emitter, fi: u32) Error!LibFunc {
+        const f = e.m.functions.items[fi];
+        e.entry = .{ .func = fi, .name = f.name, .stage = .library, .wrapper = std.math.maxInt(u32) };
+        e.blocks = .empty;
+        e.prologue = .empty;
+        e.next_id = 0;
+        e.private_globals = .empty;
+        e.private_typed = .empty;
+        e.nonuniform = .empty;
+        e.res_locals = .empty;
+        e.rq_locals = .empty;
+        e.forwarded = .empty;
+        e.status_vals = .empty;
+        e.lib_args = &.{};
+        var params: std.ArrayList(DType) = .empty;
+        var mparams: std.ArrayList(mangle.Param) = .empty;
+        var ann: std.ArrayList(ParamAnn) = .empty;
+        const ret_void = f.ret == TypeTable.void_type;
+        try ann.append(e.arena, .{ .qual = 1, .comp = if (ret_void) null else try e.compType(e.compOf(f.ret)), .semantic = f.ret_semantic });
+        for (f.params) |p| {
+            // Structs go by pointer.
+            const is_struct = e.t.get(p.ty) == .@"struct";
+            const vt = if (is_struct) try e.memoryType(p.ty) else try e.libValueType(p.ty);
+            try params.append(e.arena, if (p.by_ref or is_struct) try e.dm.ptrType(vt) else vt);
+            try mparams.append(e.arena, .{ .ty = p.ty, .by_ref = p.by_ref });
+            try ann.append(e.arena, .{ .qual = switch (p.dir) {
+                .in => 0,
+                .out => 1,
+                .inout => 2,
+            }, .comp = if (is_struct) null else try e.compType(e.compOf(p.ty)), .semantic = p.semantic });
+        }
+        const ret_ty = if (ret_void) try e.voidTy() else try e.libValueType(f.ret);
+        const name = try mangle.function(e.arena, e.t, f.name, f.ret, mparams.items);
+        const func = try e.dm.addFunction(.{ .name = name, .ty = try e.dm.fnType(ret_ty, params.items), .num_blocks = 1 });
+        e.cur = try e.newBlock();
+        try e.libHandles();
+        // Arguments: components, and local copies of out / inout ones.
+        const args = try e.arena.alloc(Lowered, f.params.len);
+        const copies = try e.arena.alloc(?Ptr, f.params.len);
+        for (f.params, args, copies, 0..) |p, *a, *cp, k| {
+            const arg: Value = .{ .arg = @intCast(k) };
+            if (e.t.get(p.ty) == .@"struct") {
+                const tp: @FieldType(Lowered, "typed") = .{ .base = arg, .dty = try e.memoryType(p.ty), .addr_space = 0, .ty = p.ty };
+                if (!p.by_ref) {
+                    a.* = try e.typedLoad(tp, p.ty);
+                    cp.* = null;
+                    continue;
+                }
+                a.* = tp_copy: {
+                    const local = try e.alloca(p.ty);
+                    try e.storePtr(local, (try e.typedLoad(tp, p.ty)).scalars, p.ty);
+                    cp.* = local;
+                    break :tp_copy .{ .ptr = local };
+                };
+                continue;
+            }
+            if (!p.by_ref) {
+                a.* = .{ .scalars = try e.libSplit(arg, p.ty) };
+                cp.* = null;
+                continue;
+            }
+            const local = try e.alloca(p.ty);
+            const vt = try e.libValueType(p.ty);
+            const cur_v = try e.add(vt, .{ .load = .{ .ptr = arg, .@"align" = 4 } });
+            try e.storePtr(local, try e.libSplit(cur_v, p.ty), p.ty);
+            a.* = .{ .ptr = local };
+            cp.* = local;
+        }
+        const res = try e.inlineCall(fi, args);
+        const void_ty = try e.voidTy();
+        for (f.params, copies, 0..) |p, cp, k| if (cp) |local| {
+            const vals = (try e.loadPtr(local, p.ty)).scalars;
+            if (e.t.get(p.ty) == .@"struct") {
+                try e.typedStore(.{ .base = .{ .arg = @intCast(k) }, .dty = try e.memoryType(p.ty), .addr_space = 0, .ty = p.ty }, vals, p.ty);
+                continue;
+            }
+            _ = try e.add(void_ty, .{ .store = .{ .ptr = .{ .arg = @intCast(k) }, .val = try e.libJoin(vals, p.ty), .@"align" = 4 } });
+        };
+        _ = try e.add(void_ty, .{ .ret = if (ret_void) null else try e.libJoin(res, f.ret) });
+        try e.finish(func);
+        return .{ .func = func, .name = name, .unmangled = f.name, .stage = .library, .entry = e.entry, .ann = ann.items };
     }
 
     /// Handles of the library's resources for the current function (in
@@ -813,7 +939,8 @@ const Emitter = struct {
     /// 6.6 compute, mesh and amplification shaders.
     fn checkDerivatives(e: *Emitter) Error!void {
         switch (e.entry.stage) {
-            .pixel => {},
+            // (Library functions record the use; their callers decide.)
+            .pixel, .library => {},
             .compute, .mesh, .amplification => if (e.profile.minor < 6) return e.unsupported("derivatives outside pixel shaders need shader model 6.6", .{}),
             else => return e.unsupported("derivatives are not available in {s} shaders", .{@tagName(e.entry.stage)}),
         }
@@ -1003,6 +1130,15 @@ const Emitter = struct {
                 x.new = R.v(map, x.new);
             },
             .@"unreachable" => {},
+            .extractelement => |*x| {
+                x.vec = R.v(map, x.vec);
+                x.index = R.v(map, x.index);
+            },
+            .insertelement => |*x| {
+                x.vec = R.v(map, x.vec);
+                x.val = R.v(map, x.val);
+                x.index = R.v(map, x.index);
+            },
         }
         return out;
     }
@@ -2336,8 +2472,39 @@ const Emitter = struct {
             const op: i64 = if (eq(u8, name, "isnan")) 8 else if (eq(u8, name, "isinf")) 9 else if (eq(u8, name, "isfinite")) 10 else 11;
             const i1t = try e.dm.intType(1);
             const i32t = try e.dm.intType(32);
-            const fn_i = try e.dxOp(try std.fmt.allocPrint(e.arena, "dx.op.isSpecialFloat.{s}", .{e.overloadName(at)}), i1t, &.{ i32t, at }, .nounwind_readnone);
-            for (out, a[0]) |*o, x| o.* = try e.convertScalar(try e.callOp(fn_i, i1t, &.{ try e.i32Const(op), x }), .bool, rc);
+            if (e.dm.types.items[at] == .half and e.profile.minor < 9) {
+                // 16-bit overloads need SM 6.9: test the bits (as dxc).
+                const i16t = try e.dm.intType(16);
+                const k = struct {
+                    fn f(em: *Emitter, v: i64) Error!Value {
+                        return em.dm.constInt(16, v);
+                    }
+                }.f;
+                for (out, a[0]) |*o, x| {
+                    const bits = try e.add(i16t, .{ .cast = .{ .op = .bitcast, .val = x } });
+                    const r = switch (op) {
+                        9 => try e.fbin(.@"or", try e.add(i1t, .{ .cmp = .{ .pred = 32, .lhs = bits, .rhs = try k(e, 0x7c00) } }), try e.add(i1t, .{ .cmp = .{ .pred = 32, .lhs = bits, .rhs = try k(e, -1024) } }), i1t),
+                        8 => blk: {
+                            const ex = try e.fbin(.@"and", bits, try k(e, 0x7c00), i16t);
+                            const is_ex = try e.add(i1t, .{ .cmp = .{ .pred = 32, .lhs = ex, .rhs = try k(e, 0x7c00) } });
+                            const man = try e.fbin(.@"and", bits, try k(e, 0x3ff), i16t);
+                            const nz = try e.add(i1t, .{ .cmp = .{ .pred = 33, .lhs = man, .rhs = try k(e, 0) } });
+                            break :blk try e.fbin(.@"and", is_ex, nz, i1t);
+                        },
+                        10 => try e.add(i1t, .{ .cmp = .{ .pred = 33, .lhs = try e.fbin(.@"and", bits, try k(e, 0x7c00), i16t), .rhs = try k(e, 0x7c00) } }),
+                        else => blk: {
+                            const ex = try e.fbin(.@"and", bits, try k(e, 0x7c00), i16t);
+                            const nz = try e.add(i1t, .{ .cmp = .{ .pred = 33, .lhs = ex, .rhs = try k(e, 0) } });
+                            const ninf = try e.add(i1t, .{ .cmp = .{ .pred = 33, .lhs = ex, .rhs = try k(e, 0x7c00) } });
+                            break :blk try e.fbin(.@"and", nz, ninf, i1t);
+                        },
+                    };
+                    o.* = try e.convertScalar(r, .bool, rc);
+                }
+            } else {
+                const fn_i = try e.dxOp(try std.fmt.allocPrint(e.arena, "dx.op.isSpecialFloat.{s}", .{e.overloadName(at)}), i1t, &.{ i32t, at }, .nounwind_readnone);
+                for (out, a[0]) |*o, x| o.* = try e.convertScalar(try e.callOp(fn_i, i1t, &.{ try e.i32Const(op), x }), .bool, rc);
+            }
         } else if (eq(u8, name, "sign")) {
             const i32t = try e.dm.intType(32);
             const z = try e.constant(fk, if (ac.isFloat()) .{ .float = 0 } else .{ .int = 0 });
@@ -3982,25 +4149,9 @@ const Emitter = struct {
         if (e.uses_wave) flags |= 1 << 19;
         if (e.uses_inner_coverage) flags |= 1 << 10;
         if (e.uses_ray_query) flags |= 1 << 25;
+        // UseNativeLowPrecision: set whenever 16-bit types are native.
+        if (e.native16()) flags |= 1 << 23;
         return flags;
-    }
-
-    /// SFI0 feature bits implied by the shader flags.
-    fn featureInfo(flags: u64) u64 {
-        const map = [_][2]u64{
-            .{ 1 << 2, 0x1 },      .{ 1 << 16, 0x4 },     .{ 1 << 15, 0x8 },        .{ 1 << 5, 0x10 },
-            .{ 1 << 11, 0x200 },   .{ 1 << 10, 0x400 },   .{ 1 << 9, 0x2000 },      .{ 1 << 20, 0x8000 },
-            .{ 1 << 21, 0x10000 }, .{ 1 << 24, 0x80000 },   .{ 1 << 19, 0x4000 },   .{ 1 << 13, 0x800 },
-            .{ 1 << 30, 0x2000000 }, .{ 1 << 31, 0x4000000 },
-            .{ 1 << 22, 0x20000 },   .{ 1 << 38, 0x100000000 },
-            .{ 1 << 12, 0x100 },     .{ 1 << 29, 0x1000000 },
-            .{ 1 << 25, 0x100000 },
-        };
-        var f: u64 = 0;
-        for (map) |m| if (flags & m[0] != 0) {
-            f |= m[1];
-        };
-        return f;
     }
 
     /// The LLVM type a resource's metadata (and, in libraries, its global)
@@ -4130,8 +4281,7 @@ const Emitter = struct {
     }
 
     fn native16(e: *Emitter) bool {
-        _ = e;
-        return false;
+        return e.m.native_16bit;
     }
 
     fn writeLibraryModule(e: *Emitter, funcs: []const LibFunc) Error![]u8 {
@@ -4155,9 +4305,13 @@ const Emitter = struct {
         try annotations.append(e.arena, try mdI32(dm, 1));
         for (funcs) |lf| {
             var ps: std.ArrayList(?module.MdId) = .empty;
-            const ret_qual: i64 = if (lf.stage.isRayTracing()) 1 else 0;
-            try ps.append(e.arena, try dm.mdNode(&.{ try mdI32(dm, ret_qual), empty, empty }));
-            for (lf.quals) |q| try ps.append(e.arena, try dm.mdNode(&.{ try mdI32(dm, q), empty, empty }));
+            for (lf.ann) |pa| {
+                // Field annotation: semantic (tag 4), component type (7).
+                var fa: std.ArrayList(?module.MdId) = .empty;
+                if (pa.semantic) |sem| try fa.appendSlice(e.arena, &.{ try mdI32(dm, 4), try dm.mdString(sem) });
+                if (pa.comp) |ct| try fa.appendSlice(e.arena, &.{ try mdI32(dm, 7), try mdI32(dm, ct) });
+                try ps.append(e.arena, try dm.mdNode(&.{ try mdI32(dm, pa.qual), if (fa.items.len > 0) try dm.mdNode(fa.items) else empty, empty }));
+            }
             const fty = dm.functions.items[lf.func].ty;
             try annotations.append(e.arena, try dm.mdValue(try dm.ptrType(fty), .{ .function = lf.func }));
             try annotations.append(e.arena, try dm.mdNode(ps.items));
@@ -4183,6 +4337,7 @@ const Emitter = struct {
         const auto_space = try dm.mdNode(&.{try mdI32(dm, 0)});
         for (order) |k| {
             const lf = funcs[k];
+            if (lf.stage == .library) continue;
             var props: std.ArrayList(?module.MdId) = .empty;
             try props.appendSlice(e.arena, &.{ try mdI32(dm, 8), try mdI32(dm, shaderKind(lf.stage)) });
             if (lf.stage == .compute) {
@@ -4255,8 +4410,8 @@ const Emitter = struct {
                 .attribute_size = lf.attr_size,
                 .feature_info1 = @truncate(libinfo.featureInfo(info.flags)),
                 .feature_info2 = @truncate(libinfo.featureInfo(info.flags) >> 32),
-                .shader_stage_flag = info.mask & (@as(u32, 1) << @intCast(kind)),
-                .min_shader_target = (kind << 16) | (6 << 4) | libinfo.minMinor(info, kind),
+                .shader_stage_flag = if (lf.stage == .library) info.mask & 0xffff else info.mask & (@as(u32, 1) << @intCast(kind)),
+                .min_shader_target = (kind << 16) | (6 << 4) | libinfo.minMinor(info, if (lf.stage == .library) null else kind),
             });
         }
         for (e.m.subobjects.items) |so| {
@@ -4501,7 +4656,7 @@ const Emitter = struct {
         const psg1 = try signature.programSignature(gpa, e.sig_pc, entry.stage == .domain, domain);
         defer gpa.free(psg1);
         var sfi0: [8]u8 = @splat(0);
-        std.mem.writeInt(u64, &sfi0, featureInfo(e.shaderFlags()), .little);
+        std.mem.writeInt(u64, &sfi0, libinfo.featureInfo(e.shaderFlags()), .little);
         var parts: std.ArrayList(container.Part) = .empty;
         try parts.appendSlice(e.arena, &.{
             .{ .fourcc = container.fourcc("SFI0"), .data = &sfi0 },

@@ -103,6 +103,8 @@ pub const Inst = struct {
         /// Yields `{ old, success }` (`ty` is that literal struct).
         cmpxchg: struct { ptr: Value, cmp: Value, new: Value },
         @"unreachable",
+        extractelement: struct { vec: Value, index: Value },
+        insertelement: struct { vec: Value, val: Value, index: Value },
     },
 };
 
@@ -630,6 +632,17 @@ const Encoder = struct {
                     try e.rec(43);
                 },
                 .@"unreachable" => try e.rec(15),
+                .extractelement => |x| {
+                    try e.pushValueAndType(f, inst_id, x.vec);
+                    try e.pushValueAndType(f, inst_id, x.index);
+                    try e.rec(6); // INST_EXTRACTELT
+                },
+                .insertelement => |x| {
+                    try e.pushValueAndType(f, inst_id, x.vec);
+                    try e.pushValue(f, inst_id, x.val);
+                    try e.pushValueAndType(f, inst_id, x.index);
+                    try e.rec(7); // INST_INSERTELT
+                },
                 .atomicrmw => |a| {
                     // ATOMICRMW: [ptr, val, op, volatile, ordering, scope]
                     try e.pushValueAndType(f, inst_id, a.ptr);
