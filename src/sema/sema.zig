@@ -2946,3 +2946,81 @@ test "valid code has no diagnostics" {
         \\}
     , .{}, &.{});
 }
+
+test "operator checks follow CheckBinOpForHLSL" {
+    try expectDiags(
+        \\struct S { float a; };
+        \\Texture2D t;
+        \\void f(S x, S y, float a[2], float b[2], bool bb, min16int m, double d, int e, float2x4 mat, float2 v, float4x4 m44, float4x1 m41) {
+        \\  x + y;
+        \\  x == y;
+        \\  t == t;
+        \\  a == b;
+        \\  bb += true;
+        \\  bb |= true;
+        \\  m / m;
+        \\  d % d;
+        \\  ~1.5;
+        \\  e << 1.5;
+        \\  v = mat;
+        \\  m44 += m41;
+        \\  v + mat;
+        \\  x[0];
+        \\}
+    , .{}, &.{
+        "4: error: scalar, vector, or matrix expected",
+        "5: error: operator cannot be used with user-defined type 'S'",
+        "6: error: operator cannot be used with built-in type 'Texture2D<vector<float, 4> >'",
+        "7: error: equality operators cannot be used with array types",
+        "8: error: operator cannot be used with a bool lvalue",
+        "10: error: signed integer division is not supported on minimum-precision types, cast to int to use 32-bit division",
+        "11: error: modulo cannot be used with doubles, cast to float first",
+        "12: error: int or unsigned int type required",
+        "13: error: int or unsigned int type required",
+        "14: error: cannot convert from 'matrix<float, 2, 4>' to 'vector<float, 2>'",
+        "15: error: cannot convert from 'matrix<float, 4, 1>' to 'matrix<float, 4, 4>'",
+        "16: error: cannot convert from 'matrix<float, 2, 4>' to 'vector<float, 2>'",
+        "17: error: type 'S' does not provide a subscript operator",
+    });
+}
+
+test "registers, resource indexing and type attributes" {
+    try expectDiags(
+        \\Texture2D<float4> t : register(u0);
+        \\RWBuffer<float> rw : register(t1);
+        \\float4 c : register(x0);
+        \\SamplerState s0 : register(s0) : register(s1);
+        \\Buffer<float4> b;
+        \\Buffer<float3x3> bm;
+        \\typedef column_major float4x4 cm;
+        \\typedef row_major cm rcm;
+        \\matrix<snorm unorm float, 2, 2> sn;
+        \\float4 f() {
+        \\  float4 r = b[int2(1, 2)];
+        \\  r += t.mips[0][1];
+        \\  float2 v; v[2] = 1;
+        \\  return r + t.Bogus;
+        \\}
+    , .{}, &.{
+        "1: error: invalid register specification, expected 't' or 's' binding",
+        "2: error: invalid register specification, expected 'u' binding",
+        "3: error: register type is unsupported - available types are 'b', 'c', 'i', 's', 't', 'u'",
+        "4: error: conflicting register semantics",
+        "6: error: elements of typed buffers and textures must be scalars or vectors",
+        "8: error: 'row_major' and 'column_major' attributes are not compatible",
+        "9: error: 'unorm' and 'snorm' attributes are not compatible",
+        "11: error: no viable overloaded operator[] for type 'Buffer<vector<float, 4> >'",
+        "12: error: no viable overloaded operator[] for type 'Texture2D<vector<float, 4> >::mips_slice_type'",
+        "13: error: vector element index '2' is out of bounds",
+        "14: error: no member named 'Bogus' in 'Texture2D<vector<float, 4> >'",
+    });
+}
+
+test "recursion is reported from exported functions" {
+    try expectDiags(
+        \\void recurse(inout float4 f) { recurse(f); }
+        \\export void entry(inout float4 f) { recurse(f); }
+    , .{}, &.{
+        "1: error: recursive functions are not allowed: function 'entry' calls recursive function 'recurse'",
+    });
+}
