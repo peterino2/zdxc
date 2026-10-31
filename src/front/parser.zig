@@ -11,7 +11,8 @@ const Allocator = std.mem.Allocator;
 const ast = @import("ast.zig");
 const lexer = @import("lexer.zig");
 const source = @import("source.zig");
-const Diagnostics = @import("../diag.zig").Diagnostics;
+const Diag = @import("../diag.zig");
+const Diagnostics = Diag.Diagnostics;
 const Preprocessor = @import("preproc.zig").Preprocessor;
 const Token = lexer.Token;
 const Kind = lexer.Kind;
@@ -42,6 +43,8 @@ pub const Parser = struct {
     pub fn fromPreprocessor(arena: Allocator, diags: *Diagnostics, pp: *Preprocessor) !Parser {
         var toks: std.ArrayList(Token) = .empty;
         while (true) {
+            // Preprocessor diagnostics are ordered by the token being produced.
+            diags.position = toks.items.len;
             const t = try pp.next();
             try toks.append(arena, t);
             if (t.kind == .eof) break;
@@ -52,7 +55,7 @@ pub const Parser = struct {
     pub fn parseTranslationUnit(p: *Parser) Allocator.Error!ast.TranslationUnit {
         try p.pushScope();
         var decls: std.ArrayList(*ast.Decl) = .empty;
-        while (p.tok().kind != .eof) {
+        while (p.tok().kind != .eof and !p.diags.stoppedAt(p.pos)) {
             const start = p.pos;
             p.parseDeclInto(&decls, .global) catch |e| switch (e) {
                 error.OutOfMemory => return error.OutOfMemory,
@@ -100,14 +103,81 @@ pub const Parser = struct {
         return true;
     }
 
+    /// Report an error at the current token (highlighting it).
     fn fail(p: *Parser, comptime fmt: []const u8, args: anytype) error{Syntax} {
-        p.diags.err(p.tok().loc, fmt, args);
+        _ = p.reportAt(p.pos, .@"error", fmt, args);
         return error.Syntax;
+    }
+
+    fn reportAt(p: *Parser, index: usize, sev: Diag.Severity, comptime fmt: []const u8, args: anytype) ?*Diag.Diagnostic {
+        const t = p.toks[index];
+        p.diags.position = index;
+        // At end of input, point just past the last real token (as clang).
+        if (t.kind == .eof and index > 0) {
+            const prev = p.toks[index - 1];
+            const loc = if (prev.loc.isMacro()) prev.loc else prev.loc.advance(@intCast(prev.text.len));
+            return p.diags.report(.{ .severity = sev, .loc = loc }, fmt, args);
+        }
+        const len: u32 = if (t.kind == .eof) 0 else @intCast(t.text.len);
+        return p.diags.report(.{ .severity = sev, .loc = t.loc, .len = len }, fmt, args);
+    }
+
+    /// Location just past the previous token (where a missing `;` goes).
+    fn afterPrevious(p: *const Parser) Loc {
+        if (p.pos == 0) return p.tok().loc;
+        const prev = p.toks[p.pos - 1];
+        if (prev.loc.isMacro()) return prev.loc;
+        return prev.loc.advance(@intCast(prev.text.len));
     }
 
     fn expect(p: *Parser, kind: Kind, what: []const u8) Error!Token {
         if (p.at(kind)) return p.advance();
-        return p.fail("expected {s}, found '{s}'", .{ what, describe(p.tok()) });
+        switch (kind) {
+            .semi => return p.missingSemi(what),
+            .r_paren, .r_square, .r_brace => {
+                const d = p.reportAt(p.pos, .@"error", "expected {s}", .{what});
+                if (p.findOpener(kind)) |i| {
+                    const opener = p.toks[i];
+                    p.diags.note(d, opener.loc, 1, "to match this '{s}'", .{opener.text});
+                }
+                return error.Syntax;
+            },
+            else => return p.fail("expected {s}, found '{s}'", .{ what, describe(p.tok()) }),
+        }
+    }
+
+    /// A missing `;` is reported just after the previous token with a
+    /// fix-it. When the next token starts a new line (or closes a block),
+    /// parsing continues as if the `;` were there, avoiding cascades.
+    fn missingSemi(p: *Parser, what: []const u8) Error!Token {
+        p.diags.position = p.pos;
+        _ = p.diags.report(.{ .severity = .@"error", .loc = p.afterPrevious(), .fixit = ";" }, "expected {s}", .{what});
+        const t = p.tok();
+        if (t.flags.bol or t.kind == .r_brace or t.kind == .eof) return .{ .kind = .semi, .text = ";", .loc = t.loc };
+        return error.Syntax;
+    }
+
+    /// Index of the unmatched opener for closing token `close`, scanning
+    /// back from the current position.
+    fn findOpener(p: *const Parser, close: Kind) ?usize {
+        const open: Kind = switch (close) {
+            .r_paren => .l_paren,
+            .r_square => .l_square,
+            .r_brace => .l_brace,
+            else => return null,
+        };
+        var depth: u32 = 0;
+        var i = p.pos;
+        while (i > 0) {
+            i -= 1;
+            const k = p.toks[i].kind;
+            if (k == close) depth += 1;
+            if (k == open) {
+                if (depth == 0) return i;
+                depth -= 1;
+            }
+        }
+        return null;
     }
 
     fn expectIdent(p: *Parser, what: []const u8) Error!Token {
@@ -404,7 +474,8 @@ pub const Parser = struct {
         }
         const name = try p.parseName();
         if (!p.isTypeName(name.last())) {
-            p.diags.err(start.loc, "unknown type name '{s}'", .{name.last()});
+            p.diags.position = p.pos;
+            _ = p.diags.report(.{ .severity = .@"error", .loc = start.loc, .len = @intCast(start.text.len) }, "unknown type name '{s}'", .{name.last()});
             return error.Syntax;
         }
         var args: []const ast.TemplateArg = &.{};
@@ -524,6 +595,10 @@ pub const Parser = struct {
                     continue;
                 }
                 try cur.appendSlice(p.arena, a.text);
+            }
+            if (kind == .access and cur.items.len == 0 and values.items.len == 1) {
+                // `read()` needs at least one stage.
+                _ = p.reportAt(p.pos, .@"error", "expected identifier", .{});
             }
             _ = p.advance();
             try values.append(p.arena, cur.items);
@@ -670,7 +745,7 @@ pub const Parser = struct {
         if (p.eat(.l_brace)) {
             try p.pushScope();
             var list: std.ArrayList(*ast.Decl) = .empty;
-            while (!p.at(.r_brace) and !p.at(.eof)) {
+            while (!p.at(.r_brace) and !p.at(.eof) and !p.diags.stoppedAt(p.pos)) {
                 const before = p.pos;
                 // Access specifiers: `public:`.
                 if ((p.atIdent("public") or p.atIdent("private") or p.atIdent("protected")) and p.peek(1).kind == .colon) {
@@ -712,9 +787,27 @@ pub const Parser = struct {
 
         if (ctx == .typedef) return;
         if (p.eat(.semi)) return;
+        if (members != null and p.startsNewDeclAfterStruct()) {
+            // `struct S { ... }` followed by an unrelated declaration on a
+            // new line: the `;` is missing.
+            _ = try p.missingSemi("';' after struct");
+            return;
+        }
         // `struct S { ... } a, b;`
         const ty = try p.mk(ast.TypeRef, .{ .loc = name_loc, .name = try p.simpleName(name_loc, name.?) });
         try p.parseDeclaratorsInto(out, &.{}, quals, &.{}, ty, ctx);
+    }
+
+    /// After a struct body without `;`: does the next line look like a new
+    /// declaration rather than declarators for the struct?
+    fn startsNewDeclAfterStruct(p: *const Parser) bool {
+        const t = p.tok();
+        if (!t.flags.bol and t.kind != .eof) return false;
+        if (t.kind == .eof or t.kind == .l_square or t.kind == .pragma) return true;
+        if (t.kind != .identifier) return false;
+        if (isReserved(t.text) or qualifierField(t.text) != null) return true;
+        // `Type name` on the next line.
+        return p.peek(1).kind == .identifier or p.peek(1).kind == .colon_colon or p.peek(1).kind == .less;
     }
 
     /// Declare a name in the scope enclosing an open template scope (so a
@@ -735,7 +828,7 @@ pub const Parser = struct {
         const sems = try p.parseSemantics(false, &bitfield);
         _ = try p.expect(.l_brace, "'{'");
         var members: std.ArrayList(*ast.Decl) = .empty;
-        while (!p.at(.r_brace) and !p.at(.eof)) {
+        while (!p.at(.r_brace) and !p.at(.eof) and !p.diags.stoppedAt(p.pos)) {
             const before = p.pos;
             p.parseDeclInto(&members, .member) catch |e| switch (e) {
                 error.OutOfMemory => return error.OutOfMemory,
@@ -799,7 +892,7 @@ pub const Parser = struct {
         const name = try p.expectIdent("namespace name");
         _ = try p.expect(.l_brace, "'{'");
         var decls: std.ArrayList(*ast.Decl) = .empty;
-        while (!p.at(.r_brace) and !p.at(.eof)) {
+        while (!p.at(.r_brace) and !p.at(.eof) and !p.diags.stoppedAt(p.pos)) {
             const before = p.pos;
             p.parseDeclInto(&decls, .global) catch |e| switch (e) {
                 error.OutOfMemory => return error.OutOfMemory,
@@ -843,6 +936,8 @@ pub const Parser = struct {
     }
 
     fn parseStaticAssert(p: *Parser) Error!*ast.Decl {
+        // Parsed for recovery, but not part of HLSL 2021 (dxc rejects it).
+        _ = p.reportAt(p.pos, .@"error", "'static_assert' requires HLSL 202x; zdxc implements HLSL 2021", .{});
         const kw = p.advance();
         _ = try p.expect(.l_paren, "'('");
         const cond = try p.parseAssign();
@@ -928,7 +1023,7 @@ pub const Parser = struct {
             if (template_params.len > 0 and qualified_var == null) try p.declareNameOuter(name.text, .template_func, true);
             if (!p.eat(.comma)) break;
         }
-        _ = try p.expect(.semi, "';'");
+        _ = try p.expect(.semi, "';' at end of declaration");
     }
 
     /// Skip a balanced `open ... close` group (legacy annotations and state
@@ -1063,7 +1158,7 @@ pub const Parser = struct {
         try p.pushScope();
         defer p.popScope();
         var stmts: std.ArrayList(*ast.Stmt) = .empty;
-        while (!p.at(.r_brace) and !p.at(.eof)) {
+        while (!p.at(.r_brace) and !p.at(.eof) and !p.diags.stoppedAt(p.pos)) {
             const before = p.pos;
             const s = p.parseStmt() catch |e| switch (e) {
                 error.OutOfMemory => return error.OutOfMemory,
@@ -1145,7 +1240,7 @@ pub const Parser = struct {
                 _ = try p.expect(.l_paren, "'('");
                 const cond = try p.parseExpr();
                 _ = try p.expect(.r_paren, "')'");
-                _ = try p.expect(.semi, "';'");
+                _ = try p.expect(.semi, "';' after do/while statement");
                 return p.mkStmt(t.loc, attrs, .{ .do_while = .{ .body = body, .cond = cond } });
             }
             if (std.mem.eql(u8, w, "switch")) {
@@ -1170,7 +1265,7 @@ pub const Parser = struct {
             }
             if (std.mem.eql(u8, w, "break") or std.mem.eql(u8, w, "continue") or std.mem.eql(u8, w, "discard")) {
                 _ = p.advance();
-                _ = try p.expect(.semi, "';'");
+                _ = try p.expect(.semi, if (w[0] == 'b') "';' after break statement" else if (w[0] == 'c') "';' after continue statement" else "';' after discard statement");
                 const kind: ast.Stmt.Kind = if (w[0] == 'b') .@"break" else if (w[0] == 'c') .@"continue" else .discard;
                 return p.mkStmt(t.loc, attrs, kind);
             }
@@ -1178,7 +1273,7 @@ pub const Parser = struct {
                 _ = p.advance();
                 var value: ?*ast.Expr = null;
                 if (!p.at(.semi)) value = if (p.at(.l_brace)) try p.parseInitializer() else try p.parseExpr();
-                _ = try p.expect(.semi, "';'");
+                _ = try p.expect(.semi, "';' after return statement");
                 return p.mkStmt(t.loc, attrs, .{ .@"return" = value });
             }
         }
@@ -1221,13 +1316,23 @@ pub const Parser = struct {
     fn parseSimpleStmt(p: *Parser, in_for: bool) Error!*ast.Stmt {
         _ = in_for;
         const t = p.tok();
+        // `Unknown x;`: two identifiers in a row where the first is not a
+        // known name. Report it once and treat it as a type from here on.
+        if (t.kind == .identifier and !isReserved(t.text) and p.lookupName(t.text) == null and !isBuiltinType(t.text)) {
+            const n1 = p.peek(1);
+            const n2 = p.peek(2).kind;
+            if (n1.kind == .identifier and !isReserved(n1.text) and (n2 == .semi or n2 == .equal or n2 == .comma or n2 == .l_square or n2 == .colon)) {
+                _ = p.reportAt(p.pos, .@"error", "unknown type name '{s}'", .{t.text});
+                try p.declareName(t.text, .type);
+            }
+        }
         if (p.startsLocalDecl()) {
             var decls: std.ArrayList(*ast.Decl) = .empty;
             try p.parseDeclInto(&decls, .local);
             return p.mkStmt(t.loc, &.{}, .{ .decl = decls.items });
         }
         const e = try p.parseExpr();
-        _ = try p.expect(.semi, "';'");
+        _ = try p.expect(.semi, "';' after expression");
         return p.mkStmt(t.loc, &.{}, .{ .expr = e });
     }
 
@@ -1927,4 +2032,56 @@ test "C++-isms found in the corpus" {
         \\        (= d 1)})
         \\    (var float2x2 m = (cast float2x2 0))})
     );
+}
+
+test "diagnostics: include chain, macro backtrace, ordering, fix-its" {
+    const gpa = testing.allocator;
+    var t: TestParse = .{};
+    try t.mfs.put(gpa, "./inc.h", "#define SQR(x) ((x) * (x)\nfloat f(float a) { return SQR(a); }\n");
+    defer t.mfs.deinit(gpa);
+    defer t.deinit();
+    _ = try t.run(
+        \\#include "inc.h"
+        \\#define FOO 1
+        \\#define FOO 2
+        \\float x = 1.0
+        \\float y = (x + 2;
+        \\#include "missing.h"
+        \\int never = ;
+    );
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    try t.diags.render(&t.sm, &out.writer, .{});
+    try testing.expectEqualStrings(
+        \\In file included from t.hlsl:1:
+        \\./inc.h:2:33: error: expected ')'
+        \\float f(float a) { return SQR(a); }
+        \\                                ^
+        \\./inc.h:2:27: note: to match this '('
+        \\float f(float a) { return SQR(a); }
+        \\                          ^
+        \\./inc.h:1:16: note: expanded from macro 'SQR'
+        \\#define SQR(x) ((x) * (x)
+        \\               ^
+        \\t.hlsl:3:9: warning: 'FOO' macro redefined [-Wmacro-redefined]
+        \\#define FOO 2
+        \\        ^~~
+        \\t.hlsl:2:9: note: previous definition is here
+        \\#define FOO 1
+        \\        ^~~
+        \\t.hlsl:4:14: error: expected ';' at end of declaration
+        \\float x = 1.0
+        \\             ^
+        \\             ;
+        \\t.hlsl:5:17: error: expected ')'
+        \\float y = (x + 2;
+        \\                ^
+        \\t.hlsl:5:11: note: to match this '('
+        \\float y = (x + 2;
+        \\          ^
+        \\t.hlsl:6:10: fatal error: 'missing.h' file not found
+        \\#include "missing.h"
+        \\         ^~~~~~~~~~~
+        \\
+    , out.written());
 }

@@ -21,6 +21,14 @@ const usage =
     \\  -Fi <file>            Output file for -P
     \\  -HV 2021              HLSL version (only 2021 is supported)
     \\  -enable-16bit-types   Enable 16-bit types
+    \\  -WX                   Treat warnings as errors
+    \\  -no-warnings          Suppress warnings
+    \\  -Wno-<group>          Disable a warning group (e.g. -Wno-macro-redefined)
+    \\  -fdiagnostics-format=<clang|msvc|vi>
+    \\                        Diagnostic location style (msvc: file(line,col))
+    \\  -fcolor-diagnostics, -fno-color-diagnostics
+    \\                        Force colors on or off (default: on for terminals)
+    \\  -ferror-limit=<n>     Stop after n errors (default 20, 0 = no limit)
     \\  --version             Print version
     \\
     \\DEVELOPMENT (temporary, until the frontend lands):
@@ -47,6 +55,12 @@ const Options = struct {
     empty: bool = false,
     check_hash: bool = false,
     lex: bool = false,
+    warnings_as_errors: bool = false,
+    no_warnings: bool = false,
+    disabled_warnings: std.ArrayList([]const u8) = .empty,
+    diag_format: zdxc.diag.Format = .clang,
+    color: ?bool = null,
+    error_limit: u32 = 20,
     parse: bool = false,
     dump_ast: bool = false,
 };
@@ -117,6 +131,21 @@ fn parseArgs(cli: Cli, arena: std.mem.Allocator, args: []const [:0]const u8, std
             opts.spirv = true;
         } else if (std.mem.eql(u8, a, "-enable-16bit-types")) {
             opts.enable_16bit = true;
+        } else if (std.mem.eql(u8, a, "-WX")) {
+            opts.warnings_as_errors = true;
+        } else if (std.mem.eql(u8, a, "-no-warnings")) {
+            opts.no_warnings = true;
+        } else if (std.mem.startsWith(u8, a, "-Wno-")) {
+            try opts.disabled_warnings.append(arena, a["-Wno-".len..]);
+        } else if (std.mem.startsWith(u8, a, "-fdiagnostics-format=")) {
+            const v = a["-fdiagnostics-format=".len..];
+            opts.diag_format = std.meta.stringToEnum(zdxc.diag.Format, v) orelse return cli.fail("unknown diagnostics format '{s}'", .{v});
+        } else if (std.mem.eql(u8, a, "-fcolor-diagnostics")) {
+            opts.color = true;
+        } else if (std.mem.eql(u8, a, "-fno-color-diagnostics")) {
+            opts.color = false;
+        } else if (std.mem.startsWith(u8, a, "-ferror-limit=")) {
+            opts.error_limit = std.fmt.parseInt(u32, a["-ferror-limit=".len..], 10) catch return cli.fail("invalid -ferror-limit value", .{});
         } else if (std.mem.eql(u8, a, "-zdxc-empty")) {
             opts.empty = true;
         } else if (std.mem.eql(u8, a, "-zdxc-check-hash")) {
@@ -187,6 +216,10 @@ fn run(cli: Cli, arena: std.mem.Allocator, args: []const [:0]const u8, stdout: *
         var disk: front.source.DiskFs = .{ .io = cli.io };
         var sm = front.source.SourceManager.init(arena, disk.fileSystem());
         var diags = zdxc.Diagnostics.init(arena);
+        diags.warnings_as_errors = opts.warnings_as_errors;
+        diags.suppress_warnings = opts.no_warnings;
+        diags.error_limit = opts.error_limit;
+        for (opts.disabled_warnings.items) |g| try diags.disableGroup(g);
         var pp = front.preproc.Preprocessor.init(arena, &sm, &diags, .{
             .defines = opts.defines.items,
             .include_dirs = opts.include_dirs.items,
@@ -204,7 +237,8 @@ fn run(cli: Cli, arena: std.mem.Allocator, args: []const [:0]const u8, stdout: *
                 if (opts.dump_ast) try front.ast_dump.dumpUnit(stdout, tu);
             } else try front.pp_print.print(&pp, &out.writer);
         }
-        try diags.render(&sm, cli.stderr);
+        const color = opts.color orelse (Io.File.stderr().supportsAnsiEscapeCodes(cli.io) catch false);
+        try diags.render(&sm, cli.stderr, .{ .format = opts.diag_format, .color = color });
         try cli.stderr.flush();
         if (diags.hasErrors()) return error.Fatal;
         if (opts.pp_output) |path| {

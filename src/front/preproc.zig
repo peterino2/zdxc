@@ -8,6 +8,7 @@ const Allocator = std.mem.Allocator;
 const source = @import("source.zig");
 const lexer = @import("lexer.zig");
 const Diagnostics = @import("../diag.zig").Diagnostics;
+const Report = @import("../diag.zig").Report;
 const Token = lexer.Token;
 const Kind = lexer.Kind;
 const Loc = source.Loc;
@@ -119,16 +120,9 @@ const IncludeFrame = struct {
     cond_base: usize,
 };
 
-const LineOverride = struct {
-    /// Physical line of the #line directive.
-    phys_line: u32,
-    line: u32,
-    name: ?[]const u8,
-};
-
 pub const Error = Allocator.Error;
 
-pub const PresumedLoc = struct { file: []const u8, line: u32 };
+pub const PresumedLoc = source.PresumedLoc;
 
 const max_include_depth = 200;
 /// Nesting limit for macro-argument pre-expansion (`F(F(F(...)))`) and for
@@ -152,7 +146,6 @@ pub const Preprocessor = struct {
     conds: std.ArrayList(Cond) = .empty,
     pushback: std.ArrayList(Raw) = .empty,
     pragma_once: std.StringHashMapUnmanaged(void) = .empty,
-    line_overrides: std.AutoHashMapUnmanaged(source.FileId, std.ArrayList(LineOverride)) = .empty,
     counter: u32 = 0,
     main_file: ?source.FileId = null,
     isolated_depth: u32 = 0,
@@ -188,6 +181,11 @@ pub const Preprocessor = struct {
     }
 
     fn enterFileId(pp: *Preprocessor, id: source.FileId) !void {
+        return pp.enterFileFrom(id, .none);
+    }
+
+    fn enterFileFrom(pp: *Preprocessor, id: source.FileId, included_from: Loc) !void {
+        pp.sm.setIncludedFrom(id, included_from);
         const f = pp.sm.file(id);
         try pp.includes.append(pp.arena, .{
             .lex = .init(f.text, id),
@@ -269,6 +267,8 @@ pub const Preprocessor = struct {
     }
 
     fn lexRaw(pp: *Preprocessor) Error!Raw {
+        // After a fatal error (or too many errors) nothing more is produced.
+        if (pp.diags.stopped) return .{ .tok = .{ .kind = .eof, .text = "", .loc = .none }, .from_file = true };
         if (pp.pushback.pop()) |r| return r;
         while (pp.contexts.items.len > 0) {
             const ctx = &pp.contexts.items[pp.contexts.items.len - 1];
@@ -358,7 +358,11 @@ pub const Preprocessor = struct {
 
         const result = try pp.substitute(m, args);
         for (result, 0..) |*t, i| {
-            t.loc = name.loc;
+            // Each expanded token gets a macro location recording where it
+            // was spelled and which expansion produced it.
+            const is_arg = t.flags.from_arg;
+            t.flags.from_arg = false;
+            t.loc = try pp.sm.addExpansion(.{ .spelling = t.loc, .expansion = name.loc, .macro_name = m.name, .is_arg = is_arg });
             if (i == 0) {
                 t.flags.space = name.flags.space;
                 t.flags.bol = name.flags.bol;
@@ -390,7 +394,7 @@ pub const Preprocessor = struct {
         if (std.mem.eql(u8, body, "once")) {
             const file = pp.currentLexer().?.file;
             if (file == pp.main_file) {
-                pp.diags.warn(loc, "#pragma once in main file", .{});
+                _ = pp.diags.report(.{ .severity = .warning, .loc = loc, .group = "pragma-once-outside-header" }, "#pragma once in main file", .{});
             } else {
                 try pp.pragma_once.put(pp.arena, try pp.fileKey(pp.sm.file(file).path), {});
             }
@@ -537,7 +541,9 @@ pub const Preprocessor = struct {
                             try out.append(pp.arena, t);
                             try paste.append(pp.arena, false);
                             for (a[p]) |at| {
-                                try out.append(pp.arena, at);
+                                var c = at;
+                                c.flags.from_arg = true;
+                                try out.append(pp.arena, c);
                                 try paste.append(pp.arena, false);
                             }
                         }
@@ -559,6 +565,7 @@ pub const Preprocessor = struct {
                     }
                     for (toks, 0..) |at, j| {
                         var c = at;
+                        c.flags.from_arg = true;
                         if (j == 0) c.flags.space = t.flags.space;
                         try out.append(pp.arena, c);
                         try paste.append(pp.arena, false);
@@ -644,8 +651,7 @@ pub const Preprocessor = struct {
     }
 
     pub fn presumedLoc(pp: *const Preprocessor, loc: Loc) PresumedLoc {
-        if (loc.isNone()) return .{ .file = "<unknown>", .line = 0 };
-        return pp.applyLineOverrides(loc.file, pp.sm.lineCol(loc).line);
+        return pp.sm.presumedLoc(loc);
     }
 
     /// Tracks the physical line of the previous lookup so that a stream of
@@ -657,28 +663,16 @@ pub const Preprocessor = struct {
         line_index: u32 = 0,
     };
 
-    pub fn presumedLocCursor(pp: *const Preprocessor, loc: Loc, cursor: *LineCursor) PresumedLoc {
-        if (loc.isNone()) return .{ .file = "<unknown>", .line = 0 };
+    pub fn presumedLocCursor(pp: *const Preprocessor, loc_in: Loc, cursor: *LineCursor) PresumedLoc {
+        if (loc_in.isNone()) return .{ .file = "<unknown>", .line = 0 };
+        const loc = pp.sm.fileLoc(loc_in);
         const starts = pp.sm.file(loc.file).line_starts;
         if (cursor.file != loc.file or starts[cursor.line_index] > loc.offset) {
             cursor.* = .{ .file = loc.file, .line_index = pp.sm.lineCol(loc).line - 1 };
         } else {
             while (cursor.line_index + 1 < starts.len and starts[cursor.line_index + 1] <= loc.offset) cursor.line_index += 1;
         }
-        return pp.applyLineOverrides(loc.file, cursor.line_index + 1);
-    }
-
-    fn applyLineOverrides(pp: *const Preprocessor, file: source.FileId, phys: u32) PresumedLoc {
-        var result: PresumedLoc = .{ .file = pp.sm.file(file).path, .line = phys };
-        if (pp.line_overrides.count() == 0) return result;
-        if (pp.line_overrides.get(file)) |list| {
-            for (list.items) |ov| {
-                if (ov.phys_line >= phys) break;
-                result.line = ov.line + (phys - ov.phys_line - 1);
-                if (ov.name) |n| result.file = n;
-            }
-        }
-        return result;
+        return pp.sm.presumedLine(loc.file, cursor.line_index + 1);
     }
 
     // ---------------------------------------------------------------------
@@ -740,7 +734,7 @@ pub const Preprocessor = struct {
             try pp.handleInclude(name);
         } else if (std.mem.eql(u8, d, "if")) {
             const v = try pp.evalCondition(name);
-            try pp.conds.append(pp.arena, .{ .taken = v, .seen_else = false, .loc = hash.loc });
+            try pp.conds.append(pp.arena, .{ .taken = v, .seen_else = false, .loc = name.loc });
             if (!v) try pp.skipGroup();
         } else if (std.mem.eql(u8, d, "ifdef") or std.mem.eql(u8, d, "ifndef")) {
             const toks = try pp.directiveTokens();
@@ -749,7 +743,7 @@ pub const Preprocessor = struct {
                 pp.diags.err(name.loc, "macro name missing", .{});
             } else v = pp.macros.contains(toks[0].text);
             if (d.len == 6) v = !v; // ifndef
-            try pp.conds.append(pp.arena, .{ .taken = v, .seen_else = false, .loc = hash.loc });
+            try pp.conds.append(pp.arena, .{ .taken = v, .seen_else = false, .loc = name.loc });
             if (!v) try pp.skipGroup();
         } else if (std.mem.eql(u8, d, "elif") or std.mem.eql(u8, d, "else")) {
             // Reached from an active group: the chain is done, skip the rest.
@@ -771,9 +765,9 @@ pub const Preprocessor = struct {
         } else if (std.mem.eql(u8, d, "pragma")) {
             return pp.handlePragma(lx.restOfLine(), hash.loc);
         } else if (std.mem.eql(u8, d, "error")) {
-            pp.diags.err(hash.loc, "{s}", .{lx.restOfLine()});
+            pp.diags.err(name.loc, "{s}", .{lx.restOfLine()});
         } else if (std.mem.eql(u8, d, "warning")) {
-            pp.diags.warn(hash.loc, "{s}", .{lx.restOfLine()});
+            _ = pp.diags.report(.{ .severity = .warning, .loc = name.loc, .group = "#warnings" }, "{s}", .{lx.restOfLine()});
         } else if (std.mem.eql(u8, d, "line")) {
             try pp.handleLine(name);
         } else {
@@ -939,10 +933,12 @@ pub const Preprocessor = struct {
         for (body) |*t| t.flags.bol = false;
         m.body = body;
         if (pp.macros.get(name.text)) |old| {
+            const len: u32 = @intCast(name.text.len);
             if (old.builtin != .none) {
-                pp.diags.warn(name.loc, "redefining builtin macro", .{});
+                _ = pp.diags.report(.{ .severity = .warning, .loc = name.loc, .len = len, .group = "builtin-macro-redefined" }, "redefining builtin macro", .{});
             } else if (!old.sameDefinition(m)) {
-                pp.diags.warn(name.loc, "'{s}' macro redefined", .{name.text});
+                const d = pp.diags.report(.{ .severity = .warning, .loc = name.loc, .len = len, .group = "macro-redefined" }, "'{s}' macro redefined", .{name.text});
+                if (!old.loc.isNone()) pp.diags.note(d, old.loc, len, "previous definition is here", .{});
             }
         }
         try pp.defineMacro(name.text, m);
@@ -952,13 +948,23 @@ pub const Preprocessor = struct {
         const lx = pp.currentLexer().?;
         var spelled: []const u8 = undefined;
         var angled = false;
+        // Location and length of the file name, for diagnostics and the
+        // include chain.
+        var name_loc = directive.loc;
+        var name_len: u32 = @intCast(directive.text.len);
         if (lx.headerName()) |h| {
             spelled = h.text[1 .. h.text.len - 1];
             angled = true;
+            name_loc = h.loc;
+            name_len = @intCast(h.text.len);
             pp.skipRestOfLine();
         } else {
             const raw = try pp.directiveTokens();
             const toks = try pp.expandIsolated(raw);
+            if (raw.len > 0) {
+                name_loc = raw[0].loc;
+                name_len = @intCast(raw[0].text.len);
+            }
             if (toks.len >= 1 and toks[0].kind == .string and toks[0].text.len >= 2) {
                 spelled = toks[0].text[1 .. toks[0].text.len - 1];
             } else if (toks.len >= 2 and toks[0].kind == .less) {
@@ -981,10 +987,11 @@ pub const Preprocessor = struct {
             return;
         }
         const id = try pp.resolveInclude(spelled, angled) orelse {
+            const r: Report = .{ .severity = .fatal, .loc = name_loc, .len = name_len };
             if (angled and try pp.resolveInclude(spelled, false) != null) {
-                pp.diags.add(.fatal, directive.loc, "'{s}' file not found with <angled> include; use \"quotes\" instead", .{spelled});
+                _ = pp.diags.report(r, "'{s}' file not found with <angled> include; use \"quotes\" instead", .{spelled});
             } else {
-                pp.diags.add(.fatal, directive.loc, "'{s}' file not found", .{spelled});
+                _ = pp.diags.report(r, "'{s}' file not found", .{spelled});
             }
             return;
         };
@@ -994,7 +1001,7 @@ pub const Preprocessor = struct {
             if (pp.macros.contains(guard)) return;
         }
         if (pp.pragma_once.contains(try pp.fileKey(pp.sm.file(id).path))) return;
-        try pp.enterFileId(id);
+        try pp.enterFileFrom(id, name_loc);
     }
 
     /// Search order (matching dxc):
@@ -1117,9 +1124,7 @@ pub const Preprocessor = struct {
             name = try unquoteString(pp.arena, toks[1].text);
         }
         const file = pp.currentLexer().?.file;
-        const gop = try pp.line_overrides.getOrPut(pp.arena, file);
-        if (!gop.found_existing) gop.value_ptr.* = .empty;
-        try gop.value_ptr.append(pp.arena, .{
+        try pp.sm.addLineOverride(file, .{
             .phys_line = pp.sm.lineCol(directive.loc).line,
             .line = n,
             .name = name,

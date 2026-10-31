@@ -6,16 +6,44 @@ const scan = @import("scan.zig");
 
 pub const FileId = u32;
 
+/// A source location. Either a file location (`file` is a FileId,
+/// `offset` a byte offset), or a macro location (`file` has the top bit set
+/// and `offset` indexes SourceManager.expansions), as in clang.
 pub const Loc = struct {
     file: FileId,
-    /// Byte offset into the file's (line-spliced) text.
+    /// Byte offset into the file's (line-spliced) text, or an expansion
+    /// index for macro locations.
     offset: u32,
 
     pub const none: Loc = .{ .file = std.math.maxInt(FileId), .offset = 0 };
+    const macro_bit: FileId = 1 << 31;
 
     pub fn isNone(l: Loc) bool {
         return l.file == none.file;
     }
+
+    pub fn isMacro(l: Loc) bool {
+        return !l.isNone() and l.file & macro_bit != 0;
+    }
+
+    pub fn advance(l: Loc, n: u32) Loc {
+        if (l.isNone() or l.isMacro()) return l;
+        return .{ .file = l.file, .offset = l.offset + n };
+    }
+};
+
+/// One token produced by a macro expansion.
+pub const Expansion = struct {
+    /// Where the token was spelled: in the macro definition, or for
+    /// argument tokens at the invocation. May itself be a macro location.
+    spelling: Loc,
+    /// Location of the macro name being expanded (may be a macro location
+    /// for nested expansions).
+    expansion: Loc,
+    macro_name: []const u8,
+    /// The token came from a macro argument: it is reported at its own
+    /// spelling rather than at the macro name.
+    is_arg: bool,
 };
 
 /// Reads files on behalf of the compiler (real filesystem, or in-memory for
@@ -88,9 +116,22 @@ pub const File = struct {
     text: []const u8,
     line_starts: []const u32,
     content: *Content,
+    /// Location of the `#include` that entered this file (none for the
+    /// main file and pseudo-files).
+    included_from: Loc = .none,
 };
 
 pub const LineCol = struct { line: u32, col: u32 };
+
+/// A `#line` directive: lines after `phys_line` are renumbered from `line`.
+pub const LineOverride = struct {
+    phys_line: u32,
+    line: u32,
+    name: ?[]const u8,
+};
+
+/// File name and line as remapped by `#line`.
+pub const PresumedLoc = struct { file: []const u8, line: u32 };
 
 pub const SourceManager = struct {
     arena: std.heap.ArenaAllocator,
@@ -98,6 +139,8 @@ pub const SourceManager = struct {
     fs: FileSystem,
     /// path -> contents, or null if the path could not be read.
     cache: std.StringHashMapUnmanaged(?*Content) = .empty,
+    expansions: std.ArrayList(Expansion) = .empty,
+    line_overrides: std.AutoHashMapUnmanaged(FileId, std.ArrayList(LineOverride)) = .empty,
 
     pub fn init(gpa: Allocator, fs: FileSystem) SourceManager {
         return .{ .arena = .init(gpa), .fs = fs };
@@ -145,7 +188,8 @@ pub const SourceManager = struct {
     /// offsets refer to the spliced text.
     fn makeContent(sm: *SourceManager, raw: []const u8) !*Content {
         const a = sm.allocator();
-        const no_bom = if (std.mem.startsWith(u8, raw, "\xEF\xBB\xBF")) raw[3..] else raw;
+        const utf8 = try decodeUtf16(a, raw) orelse raw;
+        const no_bom = if (std.mem.startsWith(u8, utf8, "\xEF\xBB\xBF")) utf8[3..] else utf8;
         const text = try spliceLines(a, no_bom);
         var starts: std.ArrayList(u32) = .empty;
         try starts.ensureTotalCapacity(a, text.len / 32 + 16);
@@ -171,8 +215,69 @@ pub const SourceManager = struct {
         return &sm.files.items[id];
     }
 
-    /// 1-based line and column.
-    pub fn lineCol(sm: *const SourceManager, loc: Loc) LineCol {
+    pub fn addLineOverride(sm: *SourceManager, id: FileId, ov: LineOverride) !void {
+        const a = sm.allocator();
+        const gop = try sm.line_overrides.getOrPut(a, id);
+        if (!gop.found_existing) gop.value_ptr.* = .empty;
+        try gop.value_ptr.append(a, ov);
+    }
+
+    /// File name and line of `loc` after `#line` remapping.
+    pub fn presumedLoc(sm: *const SourceManager, loc: Loc) PresumedLoc {
+        if (loc.isNone()) return .{ .file = "<unknown>", .line = 0 };
+        const fl = sm.fileLoc(loc);
+        return sm.presumedLine(fl.file, sm.lineCol(fl).line);
+    }
+
+    pub fn presumedLine(sm: *const SourceManager, id: FileId, phys: u32) PresumedLoc {
+        var result: PresumedLoc = .{ .file = sm.file(id).path, .line = phys };
+        if (sm.line_overrides.count() == 0) return result;
+        if (sm.line_overrides.get(id)) |list| {
+            for (list.items) |ov| {
+                if (ov.phys_line >= phys) break;
+                result.line = ov.line + (phys - ov.phys_line - 1);
+                if (ov.name) |n| result.file = n;
+            }
+        }
+        return result;
+    }
+
+    pub fn setIncludedFrom(sm: *SourceManager, id: FileId, loc: Loc) void {
+        sm.files.items[id].included_from = loc;
+    }
+
+    /// Record a macro-expanded token and return its macro location.
+    pub fn addExpansion(sm: *SourceManager, e: Expansion) !Loc {
+        try sm.expansions.append(sm.allocator(), e);
+        return .{ .file = Loc.macro_bit, .offset = @intCast(sm.expansions.items.len - 1) };
+    }
+
+    pub fn expansion(sm: *const SourceManager, loc: Loc) *const Expansion {
+        std.debug.assert(loc.isMacro());
+        return &sm.expansions.items[loc.offset];
+    }
+
+    /// The file location a (possibly macro) location is reported at: the
+    /// outermost expansion point, or for argument tokens their own position.
+    pub fn fileLoc(sm: *const SourceManager, loc: Loc) Loc {
+        var l = loc;
+        while (l.isMacro()) {
+            const e = sm.expansion(l);
+            l = if (e.is_arg) e.spelling else e.expansion;
+        }
+        return l;
+    }
+
+    /// Where the token was actually written.
+    pub fn spellingLoc(sm: *const SourceManager, loc: Loc) Loc {
+        var l = loc;
+        while (l.isMacro()) l = sm.expansion(l).spelling;
+        return l;
+    }
+
+    /// 1-based line and column (macro locations are resolved to fileLoc).
+    pub fn lineCol(sm: *const SourceManager, loc_in: Loc) LineCol {
+        const loc = sm.fileLoc(loc_in);
         const f = sm.file(loc.file);
         const idx = std.sort.upperBound(u32, f.line_starts, loc.offset, struct {
             fn cmp(target: u32, x: u32) std.math.Order {
@@ -184,7 +289,8 @@ pub const SourceManager = struct {
     }
 
     /// Text of the line containing `loc`, without the newline.
-    pub fn lineText(sm: *const SourceManager, loc: Loc) []const u8 {
+    pub fn lineText(sm: *const SourceManager, loc_in: Loc) []const u8 {
+        const loc = sm.fileLoc(loc_in);
         const f = sm.file(loc.file);
         const lc = sm.lineCol(loc);
         const start = f.line_starts[lc.line - 1];
@@ -193,6 +299,22 @@ pub const SourceManager = struct {
         return f.text[start..end];
     }
 };
+
+/// UTF-16 text with a byte-order mark is converted to UTF-8 (as dxc does);
+/// returns null for anything else.
+fn decodeUtf16(a: Allocator, raw: []const u8) !?[]const u8 {
+    if (raw.len < 2) return null;
+    const little = raw[0] == 0xFF and raw[1] == 0xFE;
+    const big = raw[0] == 0xFE and raw[1] == 0xFF;
+    if (!little and !big) return null;
+    const units = try a.alloc(u16, (raw.len - 2) / 2);
+    for (units, 0..) |*u, i| {
+        const b = raw[2 + 2 * i ..][0..2];
+        u.* = if (little) std.mem.readInt(u16, b, .little) else std.mem.readInt(u16, b, .big);
+    }
+    // Lone surrogates make the text invalid; fall back to the raw bytes.
+    return std.unicode.utf16LeToUtf8Alloc(a, units) catch null;
+}
 
 fn spliceLines(a: Allocator, raw: []const u8) ![]const u8 {
     if (std.mem.indexOfScalar(u8, raw, '\\') == null) return raw;
@@ -242,6 +364,16 @@ test "files are read once per path" {
     try std.testing.expectEqual(sm.file(a).content, sm.file(b).content);
     try std.testing.expect(try sm.load("missing.h") == null);
     try std.testing.expect(try sm.load("missing.h") == null);
+}
+
+test "UTF-16 sources are decoded" {
+    var mfs: MemoryFs = .{};
+    var sm = SourceManager.init(std.testing.allocator, mfs.fileSystem());
+    defer sm.deinit();
+    const id = try sm.addFile("le.hlsl", "\xFF\xFEi\x00n\x00t\x00");
+    try std.testing.expectEqualStrings("int", sm.file(id).text);
+    const id2 = try sm.addFile("be.hlsl", "\xFE\xFF\x00x");
+    try std.testing.expectEqualStrings("x", sm.file(id2).text);
 }
 
 test "line splicing" {

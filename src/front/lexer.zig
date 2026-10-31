@@ -80,7 +80,9 @@ pub const Flags = packed struct(u8) {
     space: bool = false,
     /// Painted by the preprocessor: never macro-expand this identifier.
     no_expand: bool = false,
-    _: u5 = 0,
+    /// Transient, during macro substitution: the token came from an argument.
+    from_arg: bool = false,
+    _: u4 = 0,
 };
 
 pub const Token = struct {
