@@ -9,6 +9,7 @@ const ir = @import("../ir/ir.zig");
 const types = @import("../sema/types.zig");
 const builder = @import("builder.zig");
 const diag = @import("../diag.zig");
+const layout = @import("../ir/layout.zig");
 
 const Builder = builder.Builder;
 const Id = builder.Id;
@@ -42,6 +43,8 @@ const Emitter = struct {
     diags: *diag.Diagnostics,
 
     value_types: std.AutoHashMapUnmanaged(TypeId, Id) = .empty,
+    /// Explicitly laid out variants of arrays and structs (cbuffers).
+    layout_types: std.AutoHashMapUnmanaged(TypeId, Id) = .empty,
     pointer_types: std.AutoHashMapUnmanaged(struct { StorageClass, Id }, Id) = .empty,
     function_types: std.StringHashMapUnmanaged(Id) = .empty,
     constants: std.AutoHashMapUnmanaged(struct { Id, u64 }, Id) = .empty,
@@ -147,6 +150,40 @@ const Emitter = struct {
             else => return e.unsupported("type '{s}' is not supported yet", .{try e.t.format(e.arena, ty)}),
         };
         try e.value_types.put(e.arena, ty, id);
+        return id;
+    }
+
+    /// `ty` with explicit (cbuffer) layout decorations: array strides and
+    /// member offsets. Scalars and vectors are the plain types.
+    fn layoutTypeId(e: *Emitter, ty: TypeId) Error!Id {
+        switch (e.t.get(ty)) {
+            // Externally visible storage holds bools as uints.
+            .scalar, .vector, .@"enum" => return e.typeId(if (e.t.component(ty) == .bool) try e.t.withComponent(ty, .uint) else ty),
+            else => {},
+        }
+        if (e.layout_types.get(ty)) |id| return id;
+        const id = e.b.newId();
+        switch (e.t.get(ty)) {
+            .array => |a| {
+                const elem = try e.layoutTypeId(a.elem);
+                try e.b.emit(.types_globals, .type_array, &.{ id, elem, try e.constUint(a.len) });
+                const stride = layout.arrayStride(e.t, a.elem, .vk_relaxed) catch return e.unsupported("constant buffer member type", .{});
+                try e.b.emit(.annotations, .decorate, &.{ id, 6, stride }); // ArrayStride
+            },
+            .@"struct" => |s| {
+                var ops: std.ArrayList(u32) = .empty;
+                try ops.append(e.arena, id);
+                for (s.fields.items) |f| try ops.append(e.arena, try e.layoutTypeId(f.type));
+                try e.b.emit(.types_globals, .type_struct, ops.items);
+                const offs = layout.fieldOffsets(e.arena, e.t, s, .vk_relaxed) catch return e.unsupported("constant buffer member type '{s}'", .{s.name});
+                for (s.fields.items, offs, 0..) |f, o, k| {
+                    try e.b.emit(.annotations, .member_decorate, &.{ id, @intCast(k), 35, o }); // Offset
+                    try e.b.emitWithString(.debug_names, .member_name, &.{ id, @intCast(k) }, f.name, &.{});
+                }
+            },
+            else => return e.unsupported("constant buffer members of type '{s}' are not supported yet", .{try e.t.format(e.arena, ty)}),
+        }
+        try e.layout_types.put(e.arena, ty, id);
         return id;
     }
 
@@ -297,10 +334,10 @@ const Emitter = struct {
                             // Buffers hold bools as uints.
                             if (e.t.component(elem_ty) == .bool) elem_ty = try e.t.withComponent(elem_ty, .uint);
                             const elem = try e.typeId(elem_ty);
-                            const layout = try e.std430(elem_ty);
+                            const elem_layout = try e.std430(elem_ty);
                             const rt = e.b.newId();
                             try e.b.emit(.types_globals, .type_runtime_array, &.{ rt, elem });
-                            try e.b.emit(.annotations, .decorate, &.{ rt, 6, layout.size }); // ArrayStride
+                            try e.b.emit(.annotations, .decorate, &.{ rt, 6, elem_layout.size }); // ArrayStride
                             const st = e.b.newId();
                             try e.b.emit(.types_globals, .type_struct, &.{ st, rt });
                             try e.b.emit(.annotations, .member_decorate, &.{ st, 0, 35, 0 }); // Offset 0
@@ -321,6 +358,24 @@ const Emitter = struct {
                     }
                     try e.b.emit(.annotations, .decorate, &.{ var_id, 34, g.binding.space }); // DescriptorSet
                     try e.b.emit(.annotations, .decorate, &.{ var_id, 33, binding }); // Binding
+                    try e.b.emitWithString(.debug_names, .name, &.{var_id}, g.name, &.{});
+                    e.global_vars[gi] = var_id;
+                },
+                .cbuffer => {
+                    const st = try e.layoutTypeId(g.ty);
+                    try e.b.emit(.annotations, .decorate, &.{ st, 2 }); // Block
+                    const ptr = try e.pointerType(.uniform, st);
+                    const var_id = e.b.newId();
+                    try e.b.emit(.types_globals, .variable, &.{ ptr, var_id, @backingInt(StorageClass.uniform) });
+                    var binding = g.binding.index;
+                    if (!g.binding.explicit) {
+                        while (used.contains(.{ g.binding.space, next_free })) next_free += 1;
+                        binding = next_free;
+                        try used.put(e.arena, .{ g.binding.space, binding }, {});
+                    }
+                    try e.b.emit(.annotations, .decorate, &.{ var_id, 34, g.binding.space }); // DescriptorSet
+                    try e.b.emit(.annotations, .decorate, &.{ var_id, 33, binding }); // Binding
+                    try e.b.emitWithString(.debug_names, .name, &.{st}, try std.fmt.allocPrint(e.arena, "type.{s}", .{g.name}), &.{});
                     try e.b.emitWithString(.debug_names, .name, &.{var_id}, g.name, &.{});
                     e.global_vars[gi] = var_id;
                 },
@@ -538,6 +593,15 @@ const Emitter = struct {
                     e.vals[ri] = e.val(p);
                     return;
                 }
+                if (f.inst(p).ptr == .cbuffer and e.t.component(i.ty) == .bool and e.t.shape(i.ty) != null) {
+                    const stored = try e.t.withComponent(i.ty, .uint);
+                    const raw = try e.op1(.load, stored, &.{e.val(p)});
+                    e.vals[ri] = try e.convert(raw, stored, i.ty);
+                    return;
+                }
+                if (f.inst(p).ptr == .cbuffer and try e.layoutTypeId(i.ty) != try e.typeId(i.ty)) {
+                    return e.unsupported("loading whole arrays or structs from constant buffers is not supported yet", .{});
+                }
                 e.vals[ri] = try e.op1(.load, i.ty, &.{e.val(p)});
             },
             .store => |s| try e.b.emit(.functions, .store, &.{ e.val(s.ptr), e.val(s.value) }),
@@ -546,9 +610,10 @@ const Emitter = struct {
                     .function => .function,
                     .private => .private,
                     .groupshared => .workgroup,
+                    .cbuffer => .uniform,
                     else => return e.unsupported("access into this storage is not supported yet", .{}),
                 };
-                const ptr_ty = try e.pointerType(sc, try e.typeId(i.ty));
+                const ptr_ty = try e.pointerType(sc, if (i.ptr == .cbuffer) try e.layoutTypeId(i.ty) else try e.typeId(i.ty));
                 var ops: std.ArrayList(u32) = .empty;
                 try ops.appendSlice(e.arena, &.{ ptr_ty, 0, e.val(a.base) });
                 // Indices into 1-vectors (SPIR-V scalars) are dropped.

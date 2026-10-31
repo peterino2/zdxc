@@ -27,6 +27,7 @@ pub const dxil = struct {
 pub const ir = struct {
     pub const ir = @import("ir/ir.zig");
     pub const lower = @import("ir/lower.zig");
+    pub const layout = @import("ir/layout.zig");
 };
 
 pub const sema = struct {

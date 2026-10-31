@@ -51,6 +51,8 @@ pub const Variable = struct {
     decl: ?*const ast.VarDecl = null,
     /// Position among the function's parameters (storage == .param).
     param_index: u32 = 0,
+    /// The `cbuffer` / `tbuffer` declaration holding the variable.
+    block: ?*const ast.Decl = null,
 };
 
 /// What an expression refers to, recorded by Sema for lowering
@@ -158,6 +160,9 @@ pub const Sema = struct {
     resolutions: std.ArrayList(Resolution) = .empty,
     /// Variable of each checked variable declaration (for lowering).
     decl_vars: std.AutoHashMapUnmanaged(*const ast.VarDecl, *Variable) = .empty,
+    /// Global uniforms outside cbuffers (dxc's `$Globals`), in order.
+    uniform_globals: std.ArrayList(*Variable) = .empty,
+    current_block: ?*const ast.Decl = null,
     loop_depth: u32 = 0,
     switch_depth: u32 = 0,
     intrinsic_db: intrinsics.Db,
@@ -778,6 +783,8 @@ pub const Sema = struct {
                         s.err(sem.loc, "user defined constant buffer slots cannot be target specific", .{});
                     }
                 }
+                s.current_block = d;
+                defer s.current_block = null;
                 for (cb.members) |m| try s.decl(m, .cbuffer);
                 if (cb.name.len > 0 and s.scope.syms.get(cb.name) == null) {
                     // The buffer name is not usable as a value; reserve it.
@@ -1351,6 +1358,8 @@ pub const Sema = struct {
         };
         try s.declare(v.name, .{ .variable = variable }, v.name_loc);
         try s.decl_vars.put(s.arena, v, variable);
+        if (ctx == .cbuffer) variable.block = s.current_block;
+        if (storage == .global_uniform) try s.uniform_globals.append(s.arena, variable);
         // Unsized arrays take their size from the initializer.
         if (v.init) |init_e| if (!is_auto) {
             if (s.types.get(ty) == .array and s.types.get(ty).array.len == 0 and init_e.kind == .init_list) {

@@ -38,7 +38,7 @@ pub const BlockId = enum(u32) {
 };
 
 /// Where a pointer points.
-pub const Space = enum { none, function, private, groupshared, resource, input, output };
+pub const Space = enum { none, function, private, groupshared, resource, input, output, cbuffer };
 
 pub const BinaryOp = enum {
     add,

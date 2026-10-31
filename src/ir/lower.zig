@@ -49,6 +49,10 @@ const Lowerer = struct {
     funcs: std.AutoHashMapUnmanaged(*const semamod.Function, u32) = .empty,
     pending: std.ArrayList(*const semamod.Function) = .empty,
     globals: std.AutoHashMapUnmanaged(*const Variable, u32) = .empty,
+    /// cbuffer globals by declaration (0: `$Globals`), and where each
+    /// member variable lives.
+    cbuffers: std.AutoHashMapUnmanaged(usize, u32) = .empty,
+    cbuffer_members: std.AutoHashMapUnmanaged(*const Variable, struct { global: u32, field: u32 }) = .empty,
 
     // Per function.
     b: ir.Builder = undefined,
@@ -120,10 +124,7 @@ const Lowerer = struct {
         const space: ir.Space = switch (v.storage) {
             .groupshared => .groupshared,
             .global_static, .constant => if (l.s.types.get(v.type) == .resource or l.s.types.get(v.type) == .sampler) .resource else .private,
-            .global_uniform, .cbuffer => {
-                l.unsupported(v.loc, "constant buffer variable '{s}' is not supported yet", .{v.name});
-                return error.Unsupported;
-            },
+            .global_uniform, .cbuffer => unreachable, // see cbufferMember
             else => unreachable,
         };
         var binding: ir.Binding = .{};
@@ -135,6 +136,49 @@ const Lowerer = struct {
         const i: u32 = @intCast(l.m.globals.items.len - 1);
         try l.globals.put(l.arena, v, i);
         return i;
+    }
+
+    /// The cbuffer global holding `v` (created with all its members on
+    /// first use, since their layout depends on every member).
+    fn cbufferMember(l: *Lowerer, v: *const Variable) Error!struct { global: u32, field: u32 } {
+        if (l.cbuffer_members.get(v)) |m| return .{ .global = m.global, .field = m.field };
+        const key: usize = if (v.block) |b| @intFromPtr(b) else 0;
+        if (l.cbuffers.contains(key)) unreachable; // members are registered with their block
+        var members: std.ArrayList(*const Variable) = .empty;
+        var name: []const u8 = "$Globals";
+        var binding: ir.Binding = .{};
+        if (v.block) |b| {
+            const cb = b.kind.cbuffer;
+            if (cb.tbuffer) {
+                l.unsupported(v.loc, "tbuffer variables are not supported yet", .{});
+                return error.Unsupported;
+            }
+            name = cb.name;
+            for (cb.members) |m| if (m.kind == .@"var") {
+                if (l.s.decl_vars.get(&m.kind.@"var")) |mv| try members.append(l.arena, mv);
+            };
+            for (cb.semantics) |sem| if (sem.kind == .register) {
+                binding = parseBinding(sem.values);
+            };
+        } else {
+            for (l.s.uniform_globals.items) |g| {
+                if (l.s.types.get(g.type) == .resource or l.s.types.get(g.type) == .sampler) continue;
+                try members.append(l.arena, g);
+            }
+        }
+        const info = try l.arena.create(@import("../sema/types.zig").StructInfo);
+        info.* = .{ .name = name, .complete = true };
+        for (members.items) |mv| try info.fields.append(l.arena, .{ .name = mv.name, .type = mv.type });
+        const ty = try l.s.types.intern(.{ .@"struct" = info });
+        try l.m.globals.append(l.arena, .{ .name = name, .ty = ty, .space = .cbuffer, .binding = binding });
+        const gi: u32 = @intCast(l.m.globals.items.len - 1);
+        try l.cbuffers.put(l.arena, key, gi);
+        for (members.items, 0..) |mv, fi| try l.cbuffer_members.put(l.arena, mv, .{ .global = gi, .field = @intCast(fi) });
+        const m = l.cbuffer_members.get(v) orelse {
+            l.unsupported(v.loc, "constant buffer variable '{s}' is not supported yet", .{v.name});
+            return error.Unsupported;
+        };
+        return .{ .global = m.global, .field = m.field };
     }
 
     // ------------------------------------------------------------------
@@ -605,6 +649,25 @@ const Lowerer = struct {
         switch (r) {
             .function => |f| {
                 const fi = try l.functionIndex(f);
+                // Missing trailing arguments take the parameters' defaults.
+                var full = args;
+                if (args.len < f.params.len) {
+                    const all = try l.arena.alloc(*ast.Expr, f.params.len);
+                    @memcpy(all[0..args.len], args);
+                    for (all[args.len..], f.decl.params[args.len..]) |*a, pd| {
+                        a.* = pd.init orelse return l.fail(e, "this call");
+                    }
+                    full = all;
+                }
+                return l.userCall(f, fi, full, ret_ty);
+            },
+            else => return l.callOther(e, r, callee, args, ret_ty),
+        }
+    }
+
+    fn userCall(l: *Lowerer, f: *const semamod.Function, fi: u32, args: []const *ast.Expr, ret_ty: TypeId) Error!Ref {
+        {
+            {
                 const vals = try l.arena.alloc(Ref, args.len);
                 const temps = try l.arena.alloc(Ref, args.len);
                 for (args, f.params, 0..) |a, p, i| {
@@ -624,7 +687,12 @@ const Lowerer = struct {
                     try l.storeTo(a, try l.convert(back, a.ty));
                 }
                 return res;
-            },
+            }
+        }
+    }
+
+    fn callOther(l: *Lowerer, e: *ast.Expr, r: semamod.Resolution, callee: *ast.Expr, args: []const *ast.Expr, ret_ty: TypeId) Error!Ref {
+        switch (r) {
             .intrinsic => |it| {
                 const name = table.intrinsics[it.index].name;
                 if (it.object) |_| {
@@ -659,6 +727,17 @@ const Lowerer = struct {
                 if (l.vars.get(v)) |p| return p;
                 switch (v.storage) {
                     .local, .param, .local_static => return l.fail(e, "this variable"),
+                    .global_uniform, .cbuffer => {
+                        if (l.s.types.get(v.type) == .resource or l.s.types.get(v.type) == .sampler) {
+                            l.unsupported(e.loc, "resource '{s}' declared as a uniform is not supported yet", .{v.name});
+                            return error.Unsupported;
+                        }
+                        const cm = try l.cbufferMember(v);
+                        const glob = l.m.globals.items[cm.global];
+                        const base = try l.b.add(.{ .op = .{ .global = cm.global }, .ty = glob.ty, .ptr = .cbuffer });
+                        const idx = try l.b.constInt(try t.scalar(.uint), cm.field);
+                        return l.b.add(.{ .op = .{ .access = .{ .base = base, .indices = try l.arena.dupe(Ref, &.{idx}) } }, .ty = v.type, .ptr = .cbuffer });
+                    },
                     else => {},
                 }
                 const g = try l.globalIndex(v);
