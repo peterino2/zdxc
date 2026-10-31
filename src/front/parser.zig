@@ -1555,47 +1555,51 @@ fn isFloatLiteral(text: []const u8) bool {
 }
 
 /// Words that can never be identifiers.
+const reserved_words = [_][]const u8{
+    "if",            "else",    "for",      "while",       "do",        "switch", "case",
+    "default",       "break",   "continue", "return",      "discard",   "struct", "class",
+    "interface",     "cbuffer", "tbuffer",  "typedef",     "namespace", "enum",   "template",
+    "typename",      "true",    "false",    "this",        "sizeof",    "static", "const",
+    "uniform",       "extern",  "volatile", "groupshared", "inline",    "using",  "operator",
+    "static_assert", "inout",   "in",       "out",
+};
+
+/// Qualifier keywords and their ast.Qualifiers field names.
+const qualifier_words = [_][2][]const u8{
+    .{ "const", "const" },                       .{ "static", "static" },                   .{ "uniform", "uniform" },
+    .{ "extern", "extern" },                     .{ "volatile", "volatile" },               .{ "precise", "precise" },
+    .{ "groupshared", "groupshared" },           .{ "shared", "shared" },                   .{ "in", "in" },
+    .{ "out", "out" },                           .{ "inout", "in" },                        .{ "row_major", "row_major" },
+    .{ "column_major", "column_major" },         .{ "nointerpolation", "nointerpolation" }, .{ "linear", "linear" },
+    .{ "centroid", "centroid" },                 .{ "sample", "sample" },                   .{ "noperspective", "noperspective" },
+    .{ "globallycoherent", "globallycoherent" }, .{ "reordercoherent", "reordercoherent" }, .{ "inline", "inline" },
+    .{ "export", "export" },                     .{ "point", "point" },                     .{ "line", "line" },
+    .{ "triangle", "triangle" },                 .{ "lineadj", "lineadj" },                 .{ "triangleadj", "triangleadj" },
+    .{ "vertices", "vertices" },                 .{ "indices", "indices" },                 .{ "primitives", "primitives" },
+    .{ "payload", "payload" },
+};
+
+/// Qualifiers that are ordinary identifiers unless a type follows.
+const contextual_words = [_][]const u8{
+    "precise",  "shared",        "row_major",        "column_major",    "nointerpolation", "linear",     "centroid",
+    "sample",   "noperspective", "globallycoherent", "reordercoherent", "export",          "point",      "line",
+    "triangle", "lineadj",       "triangleadj",      "vertices",        "indices",         "primitives", "payload",
+};
+
 fn isReserved(w: []const u8) bool {
-    const words = [_][]const u8{
-        "if",            "else",    "for",      "while",       "do",        "switch", "case",
-        "default",       "break",   "continue", "return",      "discard",   "struct", "class",
-        "interface",     "cbuffer", "tbuffer",  "typedef",     "namespace", "enum",   "template",
-        "typename",      "true",    "false",    "this",        "sizeof",    "static", "const",
-        "uniform",       "extern",  "volatile", "groupshared", "inline",    "using",  "operator",
-        "static_assert", "inout",   "in",       "out",
-    };
-    for (words) |k| if (std.mem.eql(u8, w, k)) return true;
-    return false;
+    const info = word_map.get(w) orelse return false;
+    return info.reserved;
 }
 
 /// Maps a qualifier keyword to its ast.Qualifiers field name.
 fn qualifierField(w: []const u8) ?[]const u8 {
-    const map = [_][2][]const u8{
-        .{ "const", "const" },                       .{ "static", "static" },                   .{ "uniform", "uniform" },
-        .{ "extern", "extern" },                     .{ "volatile", "volatile" },               .{ "precise", "precise" },
-        .{ "groupshared", "groupshared" },           .{ "shared", "shared" },                   .{ "in", "in" },
-        .{ "out", "out" },                           .{ "inout", "in" },                        .{ "row_major", "row_major" },
-        .{ "column_major", "column_major" },         .{ "nointerpolation", "nointerpolation" }, .{ "linear", "linear" },
-        .{ "centroid", "centroid" },                 .{ "sample", "sample" },                   .{ "noperspective", "noperspective" },
-        .{ "globallycoherent", "globallycoherent" }, .{ "reordercoherent", "reordercoherent" }, .{ "inline", "inline" },
-        .{ "export", "export" },                     .{ "point", "point" },                     .{ "line", "line" },
-        .{ "triangle", "triangle" },                 .{ "lineadj", "lineadj" },                 .{ "triangleadj", "triangleadj" },
-        .{ "vertices", "vertices" },                 .{ "indices", "indices" },                 .{ "primitives", "primitives" },
-        .{ "payload", "payload" },
-    };
-    for (map) |e| if (std.mem.eql(u8, w, e[0])) return e[1];
-    return null;
+    const info = word_map.get(w) orelse return null;
+    return info.qualifier;
 }
 
-/// Qualifiers that are ordinary identifiers unless a type follows.
 fn isContextualQualifier(w: []const u8) bool {
-    const words = [_][]const u8{
-        "precise",  "shared",        "row_major",        "column_major",    "nointerpolation", "linear",     "centroid",
-        "sample",   "noperspective", "globallycoherent", "reordercoherent", "export",          "point",      "line",
-        "triangle", "lineadj",       "triangleadj",      "vertices",        "indices",         "primitives", "payload",
-    };
-    for (words) |k| if (std.mem.eql(u8, w, k)) return true;
-    return false;
+    const info = word_map.get(w) orelse return false;
+    return info.contextual;
 }
 
 const scalar_types = [_][]const u8{
@@ -1675,19 +1679,61 @@ const template_types = [_][]const u8{
 /// Builtin function templates called with explicit arguments.
 const template_funcs = [_][]const u8{ "RawBufferLoad", "RawBufferStore", "static_pointer_cast", "reinterpret_pointer_cast" };
 
+/// Everything known about a keyword or builtin name, from one lookup.
+const WordInfo = struct {
+    reserved: bool = false,
+    qualifier: ?[]const u8 = null,
+    contextual: bool = false,
+    scalar: bool = false,
+    numeric_scalar: bool = false,
+    object: bool = false,
+    template: bool = false,
+};
+
 fn inList(list: []const []const u8, w: []const u8) bool {
     for (list) |k| if (std.mem.eql(u8, w, k)) return true;
     return false;
 }
 
+/// Compile-time map over every keyword and builtin type / template name;
+/// replaces linear scans of the lists above (a third of parse time).
+const word_map = blk: {
+    @setEvalBranchQuota(1_000_000);
+    var words: []const []const u8 = &(reserved_words ++ contextual_words ++ scalar_types ++ object_types ++ template_types ++ template_funcs);
+    for (qualifier_words) |q| words = words ++ &[_][]const u8{q[0]};
+    var kvs: [words.len]struct { []const u8, WordInfo } = undefined;
+    var n: usize = 0;
+    outer: for (words) |w| {
+        for (kvs[0..n]) |kv| if (std.mem.eql(u8, kv[0], w)) continue :outer;
+        var info: WordInfo = .{
+            .reserved = inList(&reserved_words, w),
+            .contextual = inList(&contextual_words, w),
+            .scalar = inList(&scalar_types, w),
+            .numeric_scalar = inList(&scalar_types, w) and !std.mem.endsWith(u8, w, "_packed"),
+            .object = inList(&object_types, w),
+            .template = inList(&template_types, w) or inList(&template_funcs, w),
+        };
+        for (qualifier_words) |q| {
+            if (std.mem.eql(u8, q[0], w)) info.qualifier = q[1];
+        }
+        kvs[n] = .{ w, info };
+        n += 1;
+    }
+    const final = kvs[0..n].*;
+    break :blk std.StaticStringMap(WordInfo).initComptime(final);
+};
+
 fn isNumericScalar(w: []const u8) bool {
-    return inList(&scalar_types, w) and !std.mem.endsWith(u8, w, "_packed");
+    const info = word_map.get(w) orelse return false;
+    return info.numeric_scalar;
 }
 
 /// Scalars, `<scalar><1-4>` vectors, `<scalar><1-4>x<1-4>` matrices and
 /// builtin object types.
 pub fn isBuiltinType(w: []const u8) bool {
-    if (inList(&scalar_types, w) or inList(&object_types, w)) return true;
+    if (word_map.get(w)) |info| {
+        if (info.scalar or info.object) return true;
+    }
     if (w.len < 2) return false;
     const last = w[w.len - 1];
     if (last < '1' or last > '4') return false;
@@ -1698,7 +1744,8 @@ pub fn isBuiltinType(w: []const u8) bool {
 }
 
 fn isBuiltinTemplate(w: []const u8) bool {
-    return inList(&template_types, w) or inList(&template_funcs, w);
+    const info = word_map.get(w) orelse return false;
+    return info.template;
 }
 
 fn unsignedName(a: Allocator, base: []const u8) Allocator.Error![]const u8 {

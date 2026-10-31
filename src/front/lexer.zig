@@ -95,8 +95,9 @@ pub const Token = struct {
         return t.kind == kind;
     }
 
-    pub fn isIdent(t: Token, name: []const u8) bool {
-        return t.kind == .identifier and std.mem.eql(u8, t.text, name);
+    pub inline fn isIdent(t: Token, name: []const u8) bool {
+        // Length first: most keyword checks fail on it without a call.
+        return t.kind == .identifier and t.text.len == name.len and std.mem.eql(u8, t.text, name);
     }
 };
 

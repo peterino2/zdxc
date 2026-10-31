@@ -1,7 +1,7 @@
 //! Preprocessor benchmark: lexes / preprocesses a set of files in-process
 //! and reports the best-of-N wall time and throughput.
 //!
-//! Usage: pp_bench [-mode lex|pp|print] [-iters N] <file-list.txt>
+//! Usage: pp_bench [-mode lex|load|pp|print|parse] [-iters N] <file-list.txt>
 //! The file list has one path per line. File contents are read once and
 //! served from memory, so disk I/O is excluded from the timings.
 
@@ -10,7 +10,7 @@ const Io = std.Io;
 const zdxc = @import("zdxc");
 const front = zdxc.front;
 
-const Mode = enum { lex, load, pp, print };
+const Mode = enum { lex, load, pp, print, parse };
 
 /// Serves each path from memory after the first read.
 const CachedFs = struct {
@@ -105,6 +105,11 @@ fn runOne(gpa: std.mem.Allocator, cfs: *CachedFs, path: []const u8, mode: Mode) 
     var diags = zdxc.Diagnostics.init(arena);
     var pp = front.preproc.Preprocessor.init(arena, &sm, &diags, .{});
     if (!try pp.enterMainFile(path)) return 0;
+    if (mode == .parse) {
+        var parser = try front.parser.Parser.fromPreprocessor(arena, &diags, &pp);
+        const tu = try parser.parseTranslationUnit();
+        return tu.decls.len + diags.error_count;
+    }
     if (mode == .print) {
         var out: Io.Writer.Allocating = .init(arena);
         try front.pp_print.print(&pp, &out.writer);
