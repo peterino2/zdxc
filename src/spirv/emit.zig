@@ -40,6 +40,16 @@ const Capability = enum(u32) {
     image_gather_extended = 25,
     storage_image_multisample = 27,
     sample_rate_shading = 35,
+    derivative_control = 51,
+    clip_distance = 32,
+    cull_distance = 33,
+    draw_parameters = 4427,
+    multi_view = 4439,
+    fragment_shading_rate_khr = 4422,
+    stencil_export_ext = 5013,
+    shader_viewport_index_layer_ext = 5254,
+    fragment_fully_covered_ext = 5265,
+    fragment_barycentric_khr = 5284,
     geometry_streams = 54,
     multi_viewport = 57,
     min_lod = 42,
@@ -172,9 +182,11 @@ const Emitter = struct {
     const Interface = struct {
         var_id: Id,
         ty: TypeId,
-        /// TessLevelOuter / TessLevelInner: float[4] / float[2] builtins
-        /// holding a shorter array (or a scalar), accessed element-wise.
-        tess_level: bool = false,
+        /// An array builtin holding the value's components from `base` on
+        /// (TessLevelOuter / TessLevelInner, ClipDistance / CullDistance
+        /// shared by several elements, SampleMask), accessed element-wise.
+        elem_array: bool = false,
+        base: u32 = 0,
     };
     const LayoutKey = struct { TypeId, layout.Rules, bool };
     const MeshPlace = struct { kind: ir.MeshOutput, index: Ref = .none, offset: u32 = 0, ty: TypeId };
@@ -642,9 +654,14 @@ const Emitter = struct {
             },
             .pixel => {
                 try e.b.emit(.execution_modes, .execution_mode, &.{ wrapper, 7 }); // OriginUpperLeft
-                for (entry.outputs.items) |o| if (std.ascii.eqlIgnoreCase(o.semantic, "SV_Depth")) {
-                    try e.b.emit(.execution_modes, .execution_mode, &.{ wrapper, 12 }); // DepthReplacing
-                };
+                for (entry.outputs.items) |o| {
+                    const eqi = std.ascii.eqlIgnoreCase;
+                    if (eqi(o.semantic, "SV_Depth") or eqi(o.semantic, "SV_DepthLessEqual") or eqi(o.semantic, "SV_DepthGreaterEqual")) {
+                        try e.b.emit(.execution_modes, .execution_mode, &.{ wrapper, 12 }); // DepthReplacing
+                    }
+                    if (eqi(o.semantic, "SV_DepthLessEqual")) try e.b.emit(.execution_modes, .execution_mode, &.{ wrapper, 15 }); // DepthLess
+                    if (eqi(o.semantic, "SV_DepthGreaterEqual")) try e.b.emit(.execution_modes, .execution_mode, &.{ wrapper, 14 }); // DepthGreater
+                }
             },
             else => {},
         }
@@ -874,6 +891,49 @@ const Emitter = struct {
         }
         if (stage == .domain and input and eq(n, "SV_DomainLocation")) return .{ .id = 13, .ty = try t.vector(.float, 3) }; // TessCoord
         if (stage == .hull and input and eq(n, "SV_OutputControlPointID")) return .{ .id = 8, .ty = uint1 }; // InvocationId
+        if (input and eq(n, "SV_ViewID")) {
+            try e.cap(.multi_view);
+            try e.extension("SPV_KHR_multiview");
+            return .{ .id = 4440, .ty = uint1 }; // ViewIndex
+        }
+        if (stage == .vertex and input and (eq(n, "SV_StartVertexLocation") or eq(n, "SV_StartInstanceLocation"))) {
+            try e.cap(.draw_parameters);
+            try e.extension("SPV_KHR_shader_draw_parameters");
+            return .{ .id = if (eq(n, "SV_StartVertexLocation")) 4424 else 4425, .ty = uint1 }; // BaseVertex / BaseInstance
+        }
+        if (!input and (stage == .vertex or stage == .domain) and (eq(n, "SV_ViewportArrayIndex") or eq(n, "SV_RenderTargetArrayIndex"))) {
+            try e.cap(.shader_viewport_index_layer_ext);
+            try e.extension("SPV_EXT_shader_viewport_index_layer");
+            return .{ .id = if (eq(n, "SV_ViewportArrayIndex")) 10 else 9, .ty = uint1 }; // ViewportIndex / Layer
+        }
+        if (eq(n, "SV_ShadingRate") and ((input and stage == .pixel) or (!input and (stage == .vertex or stage == .geometry or stage == .mesh)))) {
+            try e.cap(.fragment_shading_rate_khr);
+            try e.extension("SPV_KHR_fragment_shading_rate");
+            return .{ .id = if (input) 4444 else 4432, .ty = uint1 }; // ShadingRateKHR / PrimitiveShadingRateKHR
+        }
+        if (stage == .pixel) {
+            if (eq(n, "SV_Coverage")) return .{ .id = 20, .ty = try t.array(uint1, 1) }; // SampleMask
+            if (input and eq(n, "SV_InnerCoverage")) {
+                try e.cap(.fragment_fully_covered_ext);
+                try e.extension("SPV_EXT_fragment_fully_covered");
+                return .{ .id = 5264, .ty = try t.scalar(.bool) }; // FullyCoveredEXT
+            }
+            if (!input and eq(n, "SV_StencilRef")) {
+                try e.cap(.stencil_export_ext);
+                try e.extension("SPV_EXT_shader_stencil_export");
+                return .{ .id = 5014, .ty = uint1 }; // FragStencilRefEXT
+            }
+            if (!input and (eq(n, "SV_DepthLessEqual") or eq(n, "SV_DepthGreaterEqual"))) return .{ .id = 22, .ty = try t.scalar(.float) }; // FragDepth
+            if (input and eq(n, "SV_Barycentrics")) {
+                try e.cap(.fragment_barycentric_khr);
+                try e.extension("SPV_KHR_fragment_shader_barycentric");
+                return .{ .id = if (el.interp.noperspective) 5287 else 5286, .ty = try t.vector(.float, 3) }; // BaryCoord{NoPersp}KHR
+            }
+        }
+        if (!input and stage == .geometry) {
+            if (eq(n, "SV_PrimitiveID")) return .{ .id = 7, .ty = uint1 }; // PrimitiveId
+            if (eq(n, "SV_IsFrontFace")) return null; // a located variable
+        }
         if (eq(n, "SV_Target") or eq(n, "SV_VertexID") or eq(n, "SV_InstanceID") or eq(n, "SV_Position")) return null;
         if (el.system_value) return e.unsupported("system value '{s}' is not supported yet", .{n});
         return null;
@@ -892,7 +952,47 @@ const Emitter = struct {
         for (lists, ifaces, 0..) |els, out, li| {
             const patch = li == 2;
             const input = if (patch) entry.stage == .domain else li == 0;
-            for (els, out) |el, *iface| {
+            // ClipDistance / CullDistance: one float array per direction,
+            // the elements packed in semantic index order (as dxc).
+            const ClipSlot = struct { kind: u1, base: u32 };
+            const slots = try e.arena.alloc(?ClipSlot, els.len);
+            @memset(slots, null);
+            var clip_vars: [2]Id = .{ 0, 0 };
+            var totals: [2]u32 = .{ 0, 0 };
+            for (0..2) |kind| {
+                var order: std.ArrayList(usize) = .empty;
+                // (Vertex shader inputs are ordinary located variables.)
+                if (input and entry.stage == .vertex) break;
+                for (els, 0..) |el, k| {
+                    const want = if (kind == 0) "SV_ClipDistance" else "SV_CullDistance";
+                    if (std.ascii.eqlIgnoreCase(el.semantic, want)) try order.append(e.arena, k);
+                }
+                if (order.items.len == 0) continue;
+                std.sort.insertion(usize, order.items, els, struct {
+                    fn lt(xs: []const ir.SigElement, a: usize, b: usize) bool {
+                        return xs[a].semantic_index < xs[b].semantic_index;
+                    }
+                }.lt);
+                for (order.items) |k| {
+                    if (els[k].per_vertex) return e.unsupported("per-vertex {s} inputs are not supported yet", .{els[k].semantic});
+                    slots[k] = .{ .kind = @intCast(kind), .base = totals[kind] };
+                    totals[kind] += e.t.componentCount(els[k].ty) orelse return e.unsupported("{s} of this type", .{els[k].semantic});
+                }
+                try e.cap(if (kind == 0) .clip_distance else .cull_distance);
+                const arr = try e.t.array(try e.t.scalar(.float), totals[kind]);
+                const sc: StorageClass = if (input) .input else .output;
+                const v = e.b.newId();
+                try e.b.emit(.types_globals, .variable, &.{ try e.pointerType(sc, try e.typeId(arr)), v, @backingInt(sc) });
+                try e.b.emit(.annotations, .decorate, &.{ v, 11, if (kind == 0) 3 else 4 }); // BuiltIn ClipDistance / CullDistance
+                try e.b.emitWithString(.debug_names, .name, &.{v}, if (kind == 0) "gl_ClipDistance" else "gl_CullDistance", &.{});
+                try e.interface_ids.append(e.arena, v);
+                clip_vars[kind] = v;
+            }
+            for (els, out, 0..) |el, *iface, ek| {
+                if (slots[ek]) |sl| {
+                    iface.* = .{ .var_id = clip_vars[sl.kind], .ty = try e.t.array(try e.t.scalar(.float), totals[sl.kind]), .elem_array = true, .base = sl.base };
+                    continue;
+                }
                 const bi = try e.builtinFor(el, input, entry.stage);
                 // bool is not allowed in located interface variables.
                 var ty = if (bi) |x| x.ty else if (e.t.component(el.ty) == .bool) try e.t.withComponent(el.ty, .uint) else el.ty;
@@ -907,8 +1007,8 @@ const Emitter = struct {
                 const sc: StorageClass = if (input) .input else .output;
                 if (bi != null and input and !el.per_vertex) {
                     // One variable per input builtin, shared by its uses.
-                    iface.* = .{ .var_id = try e.builtinInput(bi.?.id, ty), .ty = vty, .tess_level = bi.?.id == 11 or bi.?.id == 12 };
-                    if (iface.tess_level) try e.b.emit(.annotations, .decorate, &.{ iface.var_id, 15 }); // Patch
+                    iface.* = .{ .var_id = try e.builtinInput(bi.?.id, ty), .ty = vty, .elem_array = e.t.get(ty) == .array };
+                    if (bi.?.id == 11 or bi.?.id == 12) try e.b.emit(.annotations, .decorate, &.{ iface.var_id, 15 }); // Patch
                     continue;
                 }
                 const ptr = try e.pointerType(sc, try e.typeId(ty));
@@ -948,7 +1048,7 @@ const Emitter = struct {
                 }
                 const name = try std.fmt.allocPrint(e.arena, "{s}.var.{s}{d}", .{ if (input) "in" else "out", el.semantic, el.semantic_index });
                 try e.b.emitWithString(.debug_names, .name, &.{var_id}, name, &.{});
-                iface.* = .{ .var_id = var_id, .ty = vty, .tess_level = bi != null and (bi.?.id == 11 or bi.?.id == 12) };
+                iface.* = .{ .var_id = var_id, .ty = vty, .elem_array = bi != null and e.t.get(bi.?.ty) == .array };
                 try e.interface_ids.append(e.arena, var_id);
             }
         }
@@ -1665,11 +1765,7 @@ const Emitter = struct {
                 try e.b.emit(.functions, .store, &.{ ptr, v });
             },
             .method => |x| e.vals[ri] = try e.method(x.name, x.res, x.args, i.ty),
-            .input => |k| {
-                const iface = e.inputs[k];
-                const loaded = try e.op1(.load, iface.ty, &.{iface.var_id});
-                e.vals[ri] = try e.reshape(loaded, iface.ty, i.ty);
-            },
+            .input => |k| e.vals[ri] = try e.loadInterface(e.inputs[k], .input, i.ty),
             .input_vertex => |x| {
                 const iface = e.inputs[x.element];
                 const ptr = try e.opRaw(.access_chain, try e.pointerType(.input, try e.typeId(iface.ty)), &.{ iface.var_id, try e.constUint(x.vertex) });
@@ -1722,6 +1818,7 @@ const Emitter = struct {
             },
             .output => |o| {
                 const iface = e.outputs[o.element];
+                if (iface.elem_array) return e.storeInterface(iface, f.inst(o.value).ty, e.val(o.value));
                 const v = try e.reshape(e.val(o.value), f.inst(o.value).ty, iface.ty);
                 if (e.m.entry.?.outputs.items[o.element].per_vertex) {
                     // Hull output control points: this invocation's element.
@@ -1881,30 +1978,52 @@ const Emitter = struct {
 
     /// Reads an interface variable as a value of type `ty`.
     fn loadInterface(e: *Emitter, iface: Interface, sc: StorageClass, ty: TypeId) Error!Id {
-        if (!iface.tess_level) return e.reshape(try e.op1(.load, iface.ty, &.{iface.var_id}), iface.ty, ty);
-        const ft = try e.t.scalar(.float);
-        const n: u32 = if (e.t.get(ty) == .array) e.t.get(ty).array.len else 1;
+        if (!iface.elem_array) return e.reshape(try e.op1(.load, iface.ty, &.{iface.var_id}), iface.ty, ty);
+        const et = try e.t.scalar(e.t.component(e.t.get(iface.ty).array.elem).?);
+        const n = e.t.componentCount(ty).?;
         const parts = try e.arena.alloc(Id, n);
         for (parts, 0..) |*p, k| {
-            const ptr = try e.opRaw(.access_chain, try e.pointerType(sc, try e.typeId(ft)), &.{ iface.var_id, try e.constUint(@intCast(k)) });
-            p.* = try e.op1(.load, ft, &.{ptr});
+            const ptr = try e.opRaw(.access_chain, try e.pointerType(sc, try e.typeId(et)), &.{ iface.var_id, try e.constUint(iface.base + @as(u32, @intCast(k))) });
+            p.* = try e.convert(try e.op1(.load, et, &.{ptr}), et, (try e.rawLeafScalar(ty, @intCast(k))));
         }
-        if (e.t.get(ty) != .array) return parts[0];
-        return e.op1(.composite_construct, ty, parts);
+        return e.composeFlat(ty, parts);
+    }
+
+    /// The scalar type of flattened component `k` of `ty`.
+    fn rawLeafScalar(e: *Emitter, ty: TypeId, k: u32) Error!TypeId {
+        var cur = ty;
+        var kk = k;
+        while (true) switch (e.t.get(cur)) {
+            .scalar, .@"enum" => return cur,
+            .vector, .matrix => return e.t.scalar(e.t.component(cur).?),
+            .array => |a| {
+                kk %= e.t.componentCount(a.elem).?;
+                cur = a.elem;
+            },
+            .@"struct" => |st| for (st.fields.items) |fld| {
+                const n = e.t.componentCount(fld.type).?;
+                if (kk < n) {
+                    cur = fld.type;
+                    break;
+                }
+                kk -= n;
+            },
+            else => return e.unsupported("values of type '{s}' are not supported here yet", .{try e.t.format(e.arena, ty)}),
+        };
     }
 
     /// Writes value `v` of type `ty` to an output interface variable.
     fn storeInterface(e: *Emitter, iface: Interface, ty: TypeId, v: Id) Error!void {
-        if (!iface.tess_level) {
+        if (!iface.elem_array) {
             try e.b.emit(.functions, .store, &.{ iface.var_id, try e.reshape(v, ty, iface.ty) });
             return;
         }
-        const ft = try e.t.scalar(.float);
-        const n: u32 = if (e.t.get(ty) == .array) e.t.get(ty).array.len else 1;
+        const et = try e.t.scalar(e.t.component(e.t.get(iface.ty).array.elem).?);
+        const n = e.t.componentCount(ty).?;
         for (0..n) |k| {
-            const ptr = try e.opRaw(.access_chain, try e.pointerType(.output, try e.typeId(ft)), &.{ iface.var_id, try e.constUint(@intCast(k)) });
-            const x = if (e.t.get(ty) == .array) try e.op1(.composite_extract, ft, &.{ v, @intCast(k) }) else v;
-            try e.b.emit(.functions, .store, &.{ ptr, x });
+            const ptr = try e.opRaw(.access_chain, try e.pointerType(.output, try e.typeId(et)), &.{ iface.var_id, try e.constUint(iface.base + @as(u32, @intCast(k))) });
+            const x = try e.flatComponent(v, ty, @intCast(k));
+            try e.b.emit(.functions, .store, &.{ ptr, try e.convert(x[0], x[1], et) });
         }
     }
 
@@ -2904,7 +3023,7 @@ const Emitter = struct {
         }
         // Component-wise intrinsics on matrices apply row by row (GLSL
         // instructions take scalars and vectors).
-        const whole = [_][]const u8{ "mul", "transpose", "determinant", "any", "all", "length", "dot" };
+        const whole = [_][]const u8{ "mul", "transpose", "determinant", "any", "all", "length", "dot", "clip" };
         const component_wise = for (whole) |w| {
             if (std.mem.eql(u8, w, name)) break false;
         } else true;
@@ -3002,11 +3121,19 @@ const Emitter = struct {
             const one = try e.splatConst(ty, .{ .float = 1 });
             return e.op1(.ext_inst, ty, &.{ e.glslSet(), 43, ids[0], zero, one });
         }
-        if (std.mem.eql(u8, name, "dot") and fl) return e.op1(.dot, ty, ids);
+        if (std.mem.eql(u8, name, "dot") and fl) {
+            // 1-vectors are SPIR-V scalars.
+            if (e.isScalarLike(tys[0]) or e.isScalarLike(tys[1])) return e.op1(.f_mul, ty, &.{ try e.convert(ids[0], tys[0], ty), try e.convert(ids[1], tys[1], ty) });
+            return e.op1(.dot, ty, ids);
+        }
         const deriv = for ([_][]const u8{ "ddx", "ddy", "ddx_coarse", "ddy_coarse", "ddx_fine", "ddy_fine", "fwidth" }) |d| {
             if (eqn(u8, name, d)) break true;
         } else false;
         if (deriv and e.m.entry.?.stage != .pixel) return e.unsupported("derivatives outside pixel shaders are not supported yet", .{});
+        if (eqn(u8, name, "ddx_fine") or eqn(u8, name, "ddy_fine")) {
+            try e.cap(.derivative_control);
+            return e.op1(if (eqn(u8, name, "ddx_fine")) .dpdx_fine else .dpdy_fine, ty, ids);
+        }
         if (std.mem.eql(u8, name, "ddx") or std.mem.eql(u8, name, "ddx_coarse")) return e.op1(.dpdx, ty, ids);
         if (std.mem.eql(u8, name, "ddy") or std.mem.eql(u8, name, "ddy_coarse")) return e.op1(.dpdy, ty, ids);
         if (std.mem.eql(u8, name, "fwidth")) return e.op1(.fwidth, ty, ids);
@@ -3019,10 +3146,136 @@ const Emitter = struct {
             const one = try e.splatConst(ty, .{ .float = 1 });
             return e.op1(.f_div, ty, &.{ one, ids[0] });
         }
-        if (std.mem.eql(u8, name, "GroupMemoryBarrierWithGroupSync")) {
-            // Workgroup execution and memory scope, AcquireRelease |
-            // WorkgroupMemory semantics.
-            try e.b.emit(.functions, .control_barrier, &.{ try e.constUint(2), try e.constUint(2), try e.constUint(0x108) });
+        // Barriers: (scope, semantics) as dxc: AcquireRelease with
+        // workgroup memory (Group), uniform and image memory (Device) or
+        // all three (All).
+        const barriers = [_]struct { []const u8, u32, u32, bool }{
+            .{ "GroupMemoryBarrierWithGroupSync", 2, 0x108, true },  .{ "GroupMemoryBarrier", 2, 0x108, false },
+            .{ "DeviceMemoryBarrierWithGroupSync", 1, 0x848, true }, .{ "DeviceMemoryBarrier", 1, 0x848, false },
+            .{ "AllMemoryBarrierWithGroupSync", 1, 0x948, true },    .{ "AllMemoryBarrier", 1, 0x948, false },
+        };
+        for (barriers) |b| if (eqn(u8, name, b[0])) {
+            if (b[3]) {
+                try e.b.emit(.functions, .control_barrier, &.{ try e.constUint(2), try e.constUint(b[1]), try e.constUint(b[2]) });
+            } else try e.b.emit(.functions, .memory_barrier, &.{ try e.constUint(b[1]), try e.constUint(b[2]) });
+            return 0;
+        };
+        const bool_ty = try e.t.withComponent(ty, .bool);
+        if (eqn(u8, name, "any") or eqn(u8, name, "all")) {
+            const is_any = eqn(u8, name, "any");
+            const at = tys[0];
+            if (e.isTrueMatrix(at)) {
+                // Row by row, combined.
+                const m = e.t.get(at).matrix;
+                const rt = try e.t.vector(m.elem, m.cols);
+                var acc: ?Id = null;
+                for (0..m.rows) |r| {
+                    const v = try e.intrinsicOn(name, ty, &.{try e.row(ids[0], rt, @intCast(r))}, &.{rt});
+                    acc = if (acc) |a| try e.op1(if (is_any) .logical_or else .logical_and, ty, &.{ a, v }) else v;
+                }
+                return acc.?;
+            }
+            const b = if (e.compOf(at) == .bool) ids[0] else try e.convert(ids[0], at, try e.t.withComponent(at, .bool));
+            if (e.isScalarLike(at)) return b;
+            return e.op1(if (is_any) .any else .all, ty, &.{b});
+        }
+        if (eqn(u8, name, "and") or eqn(u8, name, "or")) {
+            const x = try e.convert(ids[0], tys[0], bool_ty);
+            const y = try e.convert(ids[1], tys[1], bool_ty);
+            return e.op1(if (eqn(u8, name, "and")) .logical_and else .logical_or, ty, &.{ x, y });
+        }
+        if (eqn(u8, name, "select") and ids.len == 3) {
+            var c = try e.convert(ids[0], tys[0], try e.t.withComponent(tys[0], .bool));
+            // A scalar condition over vectors: splatted (before SPIR-V 1.4).
+            if (e.isScalarLike(tys[0]) and !e.isScalarLike(ty)) {
+                const n = e.t.componentCount(ty).?;
+                const copies = try e.arena.alloc(Id, n);
+                @memset(copies, c);
+                c = try e.op1(.composite_construct, try e.t.withComponent(ty, .bool), copies);
+            }
+            return e.op1(.select, ty, &.{ c, try e.convert(ids[1], tys[1], ty), try e.convert(ids[2], tys[2], ty) });
+        }
+        if (eqn(u8, name, "isnan")) return e.op1(.is_nan, ty, ids);
+        if (eqn(u8, name, "isinf")) return e.op1(.is_inf, ty, ids);
+        if (eqn(u8, name, "isfinite") or eqn(u8, name, "isnormal")) {
+            const nan = try e.op1(.is_nan, ty, ids);
+            const inf = try e.op1(.is_inf, ty, ids);
+            var r = try e.op1(.logical_not, ty, &.{try e.op1(.logical_or, ty, &.{ nan, inf })});
+            if (eqn(u8, name, "isnormal")) {
+                // Not zero or subnormal either.
+                const at = tys[0];
+                const min_normal: f64 = switch (e.compOf(at)) {
+                    .float16 => 6.103515625e-05,
+                    .double => 2.2250738585072014e-308,
+                    else => 1.1754943508222875e-38,
+                };
+                const abs = try e.op1(.ext_inst, at, &.{ e.glslSet(), 4, ids[0] });
+                const big = try e.op1(.f_ord_greater_than_equal, ty, &.{ abs, try e.splatConst(at, .{ .float = min_normal }) });
+                r = try e.op1(.logical_and, ty, &.{ r, big });
+            }
+            return r;
+        }
+        if (eqn(u8, name, "fmod")) return e.op1(.f_rem, ty, ids);
+        if (eqn(u8, name, "firstbitlow")) return e.op1(.ext_inst, ty, &.{ e.glslSet(), 73, ids[0] }); // FindILsb
+        if (eqn(u8, name, "firstbithigh")) return e.op1(.ext_inst, ty, &.{ e.glslSet(), if (e.compOf(tys[0]).isUnsigned()) 75 else 74, ids[0] }); // FindUMsb / FindSMsb
+        if (eqn(u8, name, "f32tof16") or eqn(u8, name, "f16tof32")) {
+            // PackHalf2x16 / UnpackHalf2x16, a component at a time.
+            const to16 = eqn(u8, name, "f32tof16");
+            const n = e.t.componentCount(ty).?;
+            const parts = try e.arena.alloc(Id, n);
+            const ft = try e.t.scalar(.float);
+            const ut = try e.t.scalar(.uint);
+            for (parts, 0..) |*p, k| {
+                const x = if (n == 1) ids[0] else try e.op1(.composite_extract, if (to16) ft else ut, &.{ ids[0], @intCast(k) });
+                if (to16) {
+                    const pair = try e.op1(.composite_construct, try e.t.vector(.float, 2), &.{ x, try e.constant(ft, .{ .float = 0 }) });
+                    p.* = try e.op1(.ext_inst, ut, &.{ e.glslSet(), 58, pair });
+                } else {
+                    const pair = try e.op1(.ext_inst, try e.t.vector(.float, 2), &.{ e.glslSet(), 62, x });
+                    p.* = try e.op1(.composite_extract, ft, &.{ pair, 0 });
+                }
+            }
+            return if (n == 1) parts[0] else e.op1(.composite_construct, ty, parts);
+        }
+        if (eqn(u8, name, "dot") and !fl) {
+            // Integer dot product: the sum of the products.
+            const n = e.t.componentCount(tys[0]).?;
+            const st = try e.t.scalar(arg_c);
+            var acc: ?Id = null;
+            for (0..n) |k| {
+                const x = if (n == 1) ids[0] else try e.op1(.composite_extract, st, &.{ ids[0], @intCast(k) });
+                const y = if (n == 1) ids[1] else try e.op1(.composite_extract, st, &.{ ids[1], @intCast(k) });
+                const p = try e.op1(.i_mul, st, &.{ x, y });
+                acc = if (acc) |s0| try e.op1(.i_add, st, &.{ s0, p }) else p;
+            }
+            return acc.?;
+        }
+        if (eqn(u8, name, "IsHelperLane")) return e.op1(.load, ty, &.{try e.builtinInput(23, try e.t.scalar(.bool))}); // HelperInvocation
+        if (eqn(u8, name, "clip")) {
+            // Discard when any component is negative.
+            const at = tys[0];
+            const bt = try e.t.scalar(.bool);
+            const c = if (e.isTrueMatrix(at)) blk: {
+                const m = e.t.get(at).matrix;
+                const rt = try e.t.vector(m.elem, m.cols);
+                var acc: ?Id = null;
+                for (0..m.rows) |r| {
+                    const neg = try e.op1(.f_ord_less_than, try e.t.withComponent(rt, .bool), &.{ try e.row(ids[0], rt, @intCast(r)), try e.splatConst(rt, .{ .float = 0 }) });
+                    const v = try e.op1(.any, bt, &.{neg});
+                    acc = if (acc) |a| try e.op1(.logical_or, bt, &.{ a, v }) else v;
+                }
+                break :blk acc.?;
+            } else blk: {
+                const neg = try e.op1(.f_ord_less_than, try e.t.withComponent(at, .bool), &.{ ids[0], try e.splatConst(at, .{ .float = 0 }) });
+                break :blk if (e.isScalarLike(at)) neg else try e.op1(.any, bt, &.{neg});
+            };
+            const kill_l = e.b.newId();
+            const merge_l = e.b.newId();
+            try e.b.emit(.functions, .selection_merge, &.{ merge_l, 0 });
+            try e.b.emit(.functions, .branch_conditional, &.{ c, kill_l, merge_l });
+            try e.b.emit(.functions, .label, &.{kill_l});
+            try e.b.emit(.functions, .kill, &.{});
+            try e.b.emit(.functions, .label, &.{merge_l});
             return 0;
         }
         return e.unsupported("intrinsic '{s}' is not supported yet", .{name});

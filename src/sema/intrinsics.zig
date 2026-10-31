@@ -122,6 +122,10 @@ const Bindings = struct {
     names: [8][]const u8 = undefined,
     values: [8]u8 = undefined,
     n: usize = 0,
+    /// The widest shape of the arguments declared `<>`: all such types of
+    /// an intrinsic share their dimensions (dxc's r / c), scalars
+    /// splatting to the widest.
+    any_shape: ?TypeTable.Shape = null,
 
     fn get(b: *const Bindings, name: []const u8) ?u8 {
         for (b.names[0..b.n], b.values[0..b.n]) |k, v| if (std.mem.eql(u8, k, name)) return v;
@@ -184,6 +188,11 @@ fn matchOne(sema: anytype, it: *const table.Intrinsic, object: ?TypeId, args: []
     }
 
     var bindings: Bindings = .{};
+    for (args[0..it.params.len], 1..) |a, i| {
+        if (!specs[i].any_layout) continue;
+        const sh = t.shape(a.ty) orelse continue;
+        if (bindings.any_shape == null or sh.count() > bindings.any_shape.?.count()) bindings.any_shape = sh;
+    }
     var cost: u32 = 0;
     const out_params = try sema.arena.alloc(bool, args.len);
     @memset(out_params, false);
@@ -273,10 +282,9 @@ fn layoutType(sema: anytype, ls: *const table.Spec, comp: Scalar, group: usize, 
         // widest one).
         var shape: ?TypeTable.Shape = null;
         if (group > 0 and group - 1 < args.len) shape = t.shape(args[group - 1].ty);
-        if (shape == null) {
-            // Look for any argument in this layout group.
-            return try t.scalar(comp);
-        }
+        // A scalar (or no argument of its own) takes the shared shape.
+        if (shape == null or shape.?.count() == 1) shape = bindings.any_shape orelse shape;
+        if (shape == null) return try t.scalar(comp);
         return try t.withShape(comp, shape.?);
     }
     if (ls.dims.len == 0) return try t.scalar(comp);

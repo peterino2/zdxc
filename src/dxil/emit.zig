@@ -164,6 +164,8 @@ const Emitter = struct {
     uses_typed_uav_load: bool = false,
     uses_inner_coverage: bool = false,
     uses_resource_heap: bool = false,
+    uses_extended_command_info: bool = false,
+    uses_barycentrics: bool = false,
     uses_sampler_heap: bool = false,
 
     sig_in: []signature.Element = &.{},
@@ -593,7 +595,7 @@ const Emitter = struct {
             .int16 => 2,
             .uint16 => 3,
             .float16 => 8,
-            .bool => 1,
+            .bool => 5, // stored as U32
             .int64 => 6,
             .uint64 => 7,
             .double => 10,
@@ -1573,6 +1575,60 @@ const Emitter = struct {
             }
             return .{ .scalars = out };
         }
+        if (eq(u8, name, "IsHelperLane")) {
+            const i1t = try e.dm.intType(1);
+            const i32t = try e.dm.intType(32);
+            const fn_i = try e.dxOp("dx.op.isHelperLane.i1", i1t, &.{i32t}, .nounwind_readonly);
+            out[0] = try e.callOp(fn_i, i1t, &.{try e.i32Const(221)});
+            return .{ .scalars = out };
+        }
+        if (eq(u8, name, "firstbitlow") or eq(u8, name, "firstbithigh")) {
+            const i32t = try e.dm.intType(32);
+            const bits: i64 = @as(i64, ac.size()) * 8;
+            for (out, 0..) |*o, k| {
+                const op: i64 = if (eq(u8, name, "firstbitlow")) 32 else if (ac.isUnsigned()) 33 else 34;
+                const fn_i = try e.dxOp(try std.fmt.allocPrint(e.arena, "dx.op.unaryBits.{s}", .{e.overloadName(at)}), i32t, &.{ i32t, at }, .nounwind_readnone);
+                const r = try e.callOp(fn_i, i32t, &.{ try e.i32Const(op), a[0][k] });
+                if (op == 32) {
+                    o.* = r;
+                    continue;
+                }
+                // FirstbitHi counts from the top bit; HLSL from bit 0.
+                const flipped = try e.add(i32t, .{ .binop = .{ .op = .sub, .lhs = try e.i32Const(bits - 1), .rhs = r } });
+                const none = try e.add(try e.dm.intType(1), .{ .cmp = .{ .pred = 32, .lhs = r, .rhs = try e.i32Const(-1) } });
+                o.* = try e.select(none, try e.i32Const(-1), flipped, i32t);
+            }
+            return .{ .scalars = out };
+        }
+        if (eq(u8, name, "f32tof16") or eq(u8, name, "f16tof32")) {
+            const i32t = try e.dm.intType(32);
+            const ft = try e.dm.getType(.float);
+            const to16 = eq(u8, name, "f32tof16");
+            const fn_i = if (to16)
+                try e.dxOp("dx.op.legacyF32ToF16", i32t, &.{ i32t, ft }, .nounwind_readnone)
+            else
+                try e.dxOp("dx.op.legacyF16ToF32", ft, &.{ i32t, i32t }, .nounwind_readnone);
+            for (out, 0..) |*o, k| o.* = try e.callOp(fn_i, if (to16) i32t else ft, &.{ try e.i32Const(if (to16) 130 else 131), a[0][k] });
+            return .{ .scalars = out };
+        }
+        if (eq(u8, name, "and") or eq(u8, name, "or")) {
+            const i1t = try e.dm.intType(1);
+            for (out, 0..) |*o, k| {
+                const x = try e.convertScalar(a[0][if (a[0].len == 1) 0 else k], e.compOf(frame.f.inst(args[0]).ty), .bool);
+                const y = try e.convertScalar(a[1][if (a[1].len == 1) 0 else k], e.compOf(frame.f.inst(args[1]).ty), .bool);
+                o.* = try e.add(i1t, .{ .binop = .{ .op = if (eq(u8, name, "and")) .@"and" else .@"or", .lhs = x, .rhs = y } });
+            }
+            return .{ .scalars = out };
+        }
+        if (eq(u8, name, "select") and args.len == 3) {
+            for (out, 0..) |*o, k| {
+                const c = try e.convertScalar(a[0][if (a[0].len == 1) 0 else k], ac, .bool);
+                const tv = a[1][if (a[1].len == 1) 0 else k];
+                const fv = a[2][if (a[2].len == 1) 0 else k];
+                o.* = try e.select(c, tv, fv, try e.valueType(tv));
+            }
+            return .{ .scalars = out };
+        }
         if (eq(u8, name, "any") or eq(u8, name, "all")) {
             const i1t = try e.dm.intType(1);
             var acc: ?Value = null;
@@ -1583,10 +1639,17 @@ const Emitter = struct {
             out[0] = acc.?;
             return .{ .scalars = out };
         }
-        if (eq(u8, name, "GroupMemoryBarrierWithGroupSync") or eq(u8, name, "GroupMemoryBarrier") or eq(u8, name, "AllMemoryBarrierWithGroupSync") or eq(u8, name, "DeviceMemoryBarrierWithGroupSync")) {
+        const barriers = [_]struct { []const u8, i64 }{
+            .{ "GroupMemoryBarrierWithGroupSync", 9 }, .{ "GroupMemoryBarrier", 8 },
+            .{ "AllMemoryBarrierWithGroupSync", 11 },  .{ "AllMemoryBarrier", 10 },
+            .{ "DeviceMemoryBarrierWithGroupSync", 3 }, .{ "DeviceMemoryBarrier", 2 },
+        };
+        const barrier: ?i64 = for (barriers) |b| {
+            if (eq(u8, name, b[0])) break b[1];
+        } else null;
+        if (barrier) |flags| {
             // Barrier flags: SyncThreadGroup 1, AccessUAVGlobal 2,
             // AccessGroupShared 8 (as dxc).
-            const flags: i64 = if (eq(u8, name, "GroupMemoryBarrierWithGroupSync")) 9 else if (eq(u8, name, "GroupMemoryBarrier")) 8 else if (eq(u8, name, "AllMemoryBarrierWithGroupSync")) 11 else 3;
             const i32t = try e.dm.intType(32);
             const fn_i = try e.dxOp("dx.op.barrier", try e.voidTy(), &.{ i32t, i32t }, .nounwind);
             _ = try e.callOp(fn_i, try e.voidTy(), &.{ try e.i32Const(80), try e.i32Const(flags) });
@@ -1915,8 +1978,8 @@ const Emitter = struct {
                 const real = try e.select(ge, frc, try e.fbin(.sub, neg_zero, frc, at), at);
                 o.* = try e.fbin(.mul, real, y, at);
             }
-        } else if (eq(u8, name, "isnan") or eq(u8, name, "isinf") or eq(u8, name, "isfinite")) {
-            const op: i64 = if (eq(u8, name, "isnan")) 8 else if (eq(u8, name, "isinf")) 9 else 10;
+        } else if (eq(u8, name, "isnan") or eq(u8, name, "isinf") or eq(u8, name, "isfinite") or eq(u8, name, "isnormal")) {
+            const op: i64 = if (eq(u8, name, "isnan")) 8 else if (eq(u8, name, "isinf")) 9 else if (eq(u8, name, "isfinite")) 10 else 11;
             const i1t = try e.dm.intType(1);
             const i32t = try e.dm.intType(32);
             const fn_i = try e.dxOp(try std.fmt.allocPrint(e.arena, "dx.op.isSpecialFloat.{s}", .{e.overloadName(at)}), i1t, &.{ i32t, at }, .nounwind_readnone);
@@ -2859,6 +2922,7 @@ const Emitter = struct {
             const shape = try e.sigShape(el.ty, el.row_major);
             var comp = try e.sigCompType(el.ty);
             if (kind == .is_front_face and comp == .i1) comp = .u32;
+            if (kind == .barycentrics) e.uses_barycentrics = true;
             if (comp == .f16 or comp == .i16 or comp == .u16) e.uses_min_precision = true;
             const eff_kind: signature.SemanticKind = if (interp == .arb) .arbitrary else kind;
             map[k] = @intCast(out.items.len);
@@ -3016,6 +3080,7 @@ const Emitter = struct {
         }
         if (kind == .view_id) e.uses_view_id = true;
         if (kind == .inner_coverage) e.uses_inner_coverage = true;
+        if (kind == .start_vertex_location or kind == .start_instance_location) e.uses_extended_command_info = true;
         if (kind == .domain_location) {
             const ft = try e.dm.getType(.float);
             const fn_i = try e.dxOp("dx.op.domainLocation.f32", ft, &.{ i32t, try e.dm.intType(8) }, .nounwind_readnone);
@@ -3410,6 +3475,8 @@ const Emitter = struct {
         };
         if (e.uses_view_id) flags |= 1 << 21;
         if (e.uses_resource_heap) flags |= 1 << 30;
+        if (e.uses_barycentrics) flags |= 1 << 22;
+        if (e.uses_extended_command_info) flags |= 1 << 38;
         if (e.uses_sampler_heap) flags |= 1 << 31;
         if (e.uses_wave) flags |= 1 << 19;
         if (e.uses_inner_coverage) flags |= 1 << 10;
@@ -3423,6 +3490,7 @@ const Emitter = struct {
             .{ 1 << 11, 0x200 },   .{ 1 << 10, 0x400 },   .{ 1 << 9, 0x2000 },      .{ 1 << 20, 0x8000 },
             .{ 1 << 21, 0x10000 }, .{ 1 << 24, 0x80000 },   .{ 1 << 19, 0x4000 },   .{ 1 << 13, 0x800 },
             .{ 1 << 30, 0x2000000 }, .{ 1 << 31, 0x4000000 },
+            .{ 1 << 22, 0x20000 },   .{ 1 << 38, 0x100000000 },
         };
         var f: u64 = 0;
         for (map) |m| if (flags & m[0] != 0) {
