@@ -166,6 +166,7 @@ const Emitter = struct {
     uses_resource_heap: bool = false,
     uses_extended_command_info: bool = false,
     uses_tiled_resources: bool = false,
+    uses_mesh_derivatives: bool = false,
     /// The ResRet of the last texture operation (for status arguments).
     last_resret: Value = undefined,
     /// Status values, forwarded through locals within a block: the
@@ -546,6 +547,17 @@ const Emitter = struct {
             index,
             nu,
         });
+    }
+
+    /// Derivatives (and implicit-LOD sampling): pixel shaders, and from SM
+    /// 6.6 compute, mesh and amplification shaders.
+    fn checkDerivatives(e: *Emitter) Error!void {
+        switch (e.m.entry.?.stage) {
+            .pixel => {},
+            .compute, .mesh, .amplification => if (e.profile.minor < 6) return e.unsupported("derivatives outside pixel shaders need shader model 6.6", .{}),
+            else => return e.unsupported("derivatives are not available in {s} shaders", .{@tagName(e.m.entry.?.stage)}),
+        }
+        if (e.m.entry.?.stage == .mesh or e.m.entry.?.stage == .amplification) e.uses_mesh_derivatives = true;
     }
 
     /// The ResourceProperties constant annotating `res`'s handles.
@@ -1694,7 +1706,7 @@ const Emitter = struct {
         const is_deriv = eq(u8, name, "fwidth") or for (derivs) |d| {
             if (eq(u8, name, d.name)) break true;
         } else false;
-        if (is_deriv and e.m.entry.?.stage != .pixel) return e.unsupported("derivatives outside pixel shaders are not supported yet", .{});
+        if (is_deriv) try e.checkDerivatives();
         for (derivs) |d| if (eq(u8, name, d.name)) {
             for (out, 0..) |*o, k| o.* = try e.unaryOp(d.op, "unary", a[0][k], at);
             return .{ .scalars = out };
@@ -2436,7 +2448,19 @@ const Emitter = struct {
         }
         const sh = texture.shape(kind) orelse return e.unsupported("method '{s}' is not supported yet", .{name});
         const call = texture.decode(name, sh, arg_refs.len) orelse return e.unsupported("method '{s}' is not supported yet", .{name});
-        if (call.offsets4) return e.unsupported("Gather with four offsets is not supported yet", .{});
+        if (call.offsets4) {
+            // Four offsets: a gather per offset, component k of the k-th.
+            if (call.status != null) return e.unsupported("Gather with four offsets and a status is not supported yet", .{});
+            const out = try e.arena.alloc(Value, try e.flatCount(ty));
+            for (0..4) |k| {
+                var one = call;
+                one.offsets4 = false;
+                one.offset = call.offset.? + @as(u8, @intCast(k));
+                const r = try e.textureCall(frame, res, sh, one, name, arg_refs, ty);
+                if (k < out.len) out[k] = r.scalars[k];
+            }
+            return .{ .scalars = out };
+        }
         if (call.status) |k| {
             // The operation, then its status.
             var plain = call;
@@ -2452,7 +2476,7 @@ const Emitter = struct {
         const i32t = try e.dm.intType(32);
         const f32t = try e.dm.getType(.float);
         const undef_i32 = try e.dm.constant(.{ .ty = i32t, .kind = .undef });
-        if (call.op.implicitLod() and e.m.entry.?.stage != .pixel) return e.unsupported("'{s}' outside pixel shaders is not supported yet", .{name});
+        if (call.op.implicitLod()) try e.checkDerivatives();
         const arg = struct {
             fn f(em: *Emitter, fr: *Frame, refs: []const Ref, idx: ?u8) Error!?[]const Value {
                 return if (idx) |k| try em.scalars(fr, refs[k]) else null;
@@ -3530,6 +3554,7 @@ const Emitter = struct {
         if (e.uses_resource_heap) flags |= 1 << 30;
         if (e.uses_barycentrics) flags |= 1 << 22;
         if (e.uses_tiled_resources) flags |= 1 << 12;
+        if (e.uses_mesh_derivatives) flags |= 1 << 29;
         if (e.uses_extended_command_info) flags |= 1 << 38;
         if (e.uses_sampler_heap) flags |= 1 << 31;
         if (e.uses_wave) flags |= 1 << 19;
@@ -3545,7 +3570,7 @@ const Emitter = struct {
             .{ 1 << 21, 0x10000 }, .{ 1 << 24, 0x80000 },   .{ 1 << 19, 0x4000 },   .{ 1 << 13, 0x800 },
             .{ 1 << 30, 0x2000000 }, .{ 1 << 31, 0x4000000 },
             .{ 1 << 22, 0x20000 },   .{ 1 << 38, 0x100000000 },
-            .{ 1 << 12, 0x100 },
+            .{ 1 << 12, 0x100 },     .{ 1 << 29, 0x1000000 },
         };
         var f: u64 = 0;
         for (map) |m| if (flags & m[0] != 0) {

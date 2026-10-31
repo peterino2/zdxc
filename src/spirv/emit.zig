@@ -50,6 +50,8 @@ const Capability = enum(u32) {
     shader_viewport_index_layer_ext = 5254,
     fragment_fully_covered_ext = 5265,
     fragment_barycentric_khr = 5284,
+    compute_derivative_group_quads = 5288,
+    compute_derivative_group_linear = 5350,
     geometry_streams = 54,
     multi_viewport = 57,
     min_lod = 42,
@@ -140,6 +142,8 @@ const Emitter = struct {
     /// on the heap's binding.
     heap_vars: std.AutoHashMapUnmanaged(struct { bool, Id }, Id) = .empty,
     heap_bindings: [2]u32 = .{ 0, 0 },
+    /// Compute derivatives' execution mode (0: none).
+    derivative_mode: u32 = 0,
     /// Image types by (sampled type, dim, arrayed, ms, sampled, format).
     image_types: std.AutoHashMapUnmanaged([6]u32, Id) = .empty,
     sampled_image_types: std.AutoHashMapUnmanaged(Id, Id) = .empty,
@@ -666,6 +670,7 @@ const Emitter = struct {
             },
             else => {},
         }
+        if (e.derivative_mode != 0) try e.b.emit(.execution_modes, .execution_mode, &.{ wrapper, e.derivative_mode });
         for (m.functions.items, e.func_ids) |f, id| {
             if (!e.hasResourceParams(f)) try e.b.emitWithString(.debug_names, .name, &.{id}, f.name, &.{});
         }
@@ -1977,6 +1982,27 @@ const Emitter = struct {
         }
     }
 
+    /// Derivatives outside pixel shaders: compute-like stages, over quads
+    /// of the thread group (or linearly, as dxc).
+    fn checkDerivatives(e: *Emitter) Error!void {
+        const entry = e.m.entry.?;
+        switch (entry.stage) {
+            .pixel => return,
+            .compute, .mesh, .amplification => {},
+            else => return e.unsupported("derivatives are not available in {s} shaders", .{@tagName(entry.stage)}),
+        }
+        if (e.derivative_mode != 0) return;
+        try e.extension("SPV_KHR_compute_shader_derivatives");
+        const t = entry.num_threads;
+        if (t[0] % 2 == 0 and t[1] % 2 == 0) {
+            try e.cap(.compute_derivative_group_quads);
+            e.derivative_mode = 5289; // DerivativeGroupQuadsKHR
+        } else {
+            try e.cap(.compute_derivative_group_linear);
+            e.derivative_mode = 5290; // DerivativeGroupLinearKHR
+        }
+    }
+
     /// Reads an interface variable as a value of type `ty`.
     fn loadInterface(e: *Emitter, iface: Interface, sc: StorageClass, ty: TypeId) Error!Id {
         if (!iface.elem_array) return e.reshape(try e.op1(.load, iface.ty, &.{iface.var_id}), iface.ty, ty);
@@ -2371,8 +2397,8 @@ const Emitter = struct {
         const sh = texture.shape(r.kind) orelse return e.unsupported("method '{s}' is not supported yet", .{name});
         const call = texture.decode(name, sh, args.len) orelse return e.unsupported("method '{s}' is not supported yet", .{name});
         const status: ?Ref = if (call.status) |k| args[k] else null;
-        if (call.offsets4) return e.unsupported("Gather with four offsets is not supported yet", .{});
-        if (call.op.implicitLod() and e.m.entry.?.stage != .pixel) return e.unsupported("'{s}' outside pixel shaders is not supported yet", .{name});
+
+        if (call.op.implicitLod()) try e.checkDerivatives();
         const s = try e.texelScalar(r.elem);
         const img = try e.loadImage(res);
         const coord = e.val(args[call.coord]);
@@ -2414,7 +2440,23 @@ const Emitter = struct {
             mask |= 0x2;
             try extra.append(e.arena, lod_from_coord.?);
         }
-        if (call.offset) |k| {
+        if (call.offsets4) {
+            // Four offsets: ConstOffsets, an array of constants.
+            const k = call.offset.?;
+            const ot = try e.t.vector(.int, 2);
+            const arr_ty = try e.t.array(ot, 4);
+            var ops: std.ArrayList(u32) = .empty;
+            const id = e.b.newId();
+            try ops.appendSlice(e.arena, &.{ try e.typeId(arr_ty), id });
+            for (0..4) |j| {
+                const c = (try e.constValue(args[k + j])) orelse return e.unsupported("Gather with four offsets that are not constants is not supported yet", .{});
+                try ops.append(e.arena, c);
+            }
+            try e.b.emit(.types_globals, .constant_composite, ops.items);
+            try e.cap(.image_gather_extended);
+            mask |= 0x20;
+            try extra.append(e.arena, id);
+        } else if (call.offset) |k| {
             if (try e.constValue(args[k])) |c| {
                 mask |= 0x8;
                 try extra.append(e.arena, c);
@@ -3157,7 +3199,7 @@ const Emitter = struct {
         const deriv = for ([_][]const u8{ "ddx", "ddy", "ddx_coarse", "ddy_coarse", "ddx_fine", "ddy_fine", "fwidth" }) |d| {
             if (eqn(u8, name, d)) break true;
         } else false;
-        if (deriv and e.m.entry.?.stage != .pixel) return e.unsupported("derivatives outside pixel shaders are not supported yet", .{});
+        if (deriv) try e.checkDerivatives();
         if (eqn(u8, name, "ddx_fine") or eqn(u8, name, "ddy_fine")) {
             try e.cap(.derivative_control);
             return e.op1(if (eqn(u8, name, "ddx_fine")) .dpdx_fine else .dpdy_fine, ty, ids);
