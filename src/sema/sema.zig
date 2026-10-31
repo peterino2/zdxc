@@ -787,7 +787,13 @@ pub const Sema = struct {
             },
             .using_namespace => |n| {
                 // Bring the namespace's names into this scope.
-                const sym = s.lookupName(n) orelse return s.err(d.loc, "unknown namespace '{s}'", .{n.last()});
+                const sym = s.lookupName(n) orelse {
+                    // dxc's builtin `dx` namespace (HitObject, linalg, ...)
+                    // exists in every shader model; its contents are not
+                    // modelled as a scope here.
+                    if (eql(n.parts[0], "dx")) return;
+                    return s.err(d.loc, "unknown namespace '{s}'", .{n.last()});
+                };
                 if (sym != .namespace) return s.err(d.loc, "'{s}' is not a namespace", .{n.last()});
                 var it = sym.namespace.syms.iterator();
                 while (it.next()) |kv| {
@@ -1332,9 +1338,6 @@ pub const Sema = struct {
             // diagnosed again (clang marks it invalid).
             if (!try s.checkInitializer(ty, init_e)) variable.type = TypeTable.error_type;
         };
-        if (v.init == null and q.@"const" and ctx == .local) {
-            s.err(v.name_loc, "default initialization of an object of const type '{s}'", .{s.typeName(ty)});
-        }
     }
 
     /// The expression designates (part of) a groupshared variable.
@@ -1588,6 +1591,14 @@ pub const Sema = struct {
         if (text[0] == '\'') return true;
         const lit = scanLiteral(text);
         const suffix = text[lit.end..];
+        if (lit.float) if (fixedFloatSuffix(text)) |suf| if (suf.ptr == suffix.ptr) {
+            s.warn(loc.advance(@intCast(lit.end)), "hlsl-202x-extensions", "fixed-size floating-point literal suffix '{s}' is a HLSL 202x extension", .{suf});
+            if (suf[1] == '1' and !s.opts.enable_16bit) {
+                s.err(loc.advance(@intCast(lit.end)), "16-bit floating-point literal suffix '{s}' requires '-enable-16bit-types'", .{suf});
+                return false;
+            }
+            return true;
+        };
         const ok = if (lit.float)
             suffix.len == 0 or (suffix.len == 1 and std.mem.indexOfScalar(u8, "fFhHlL", suffix[0]) != null)
         else
@@ -1649,7 +1660,10 @@ pub const Sema = struct {
                 // is still an lvalue (`(Derived)x = y`).
                 const ft = s.types.get(from.ty);
                 const tt = s.types.get(target);
-                const related = target == from.ty or (ft == .@"struct" and tt == .@"struct" and (derivesFrom(ft.@"struct", tt.@"struct") or derivesFrom(tt.@"struct", ft.@"struct")));
+                // So is a numeric cast that keeps the component type
+                // (`((int3)i4).x = 1`).
+                const same_comp = s.types.component(from.ty) != null and s.types.component(from.ty) == s.types.component(target);
+                const related = target == from.ty or same_comp or (ft == .@"struct" and tt == .@"struct" and (derivesFrom(ft.@"struct", tt.@"struct") or derivesFrom(tt.@"struct", ft.@"struct")));
                 return .{ .ty = target, .lvalue = from.lvalue and related, .read_only = from.read_only };
             },
             .member => |m| return s.memberExpr(e, m.base, m.name, m.name_loc),
@@ -2336,6 +2350,17 @@ pub const Sema = struct {
         };
     }
 
+    fn hasUnmodelledMember(s: *Sema, ty: TypeId) bool {
+        return switch (s.types.get(ty)) {
+            .@"error" => true,
+            .array => |a| s.hasUnmodelledMember(a.elem),
+            .@"struct" => |info| for (info.fields.items) |f| {
+                if (s.hasUnmodelledMember(f.type)) break true;
+            } else false,
+            else => false,
+        };
+    }
+
     fn explicitConvertible(s: *Sema, from: TypeId, to: TypeId) bool {
         if (to == TypeTable.void_type) return true;
         if (s.conversionCost(from, to) != null) return true;
@@ -2350,6 +2375,8 @@ pub const Sema = struct {
         // Scalar to aggregate (`(S)0`), and flattening casts between
         // aggregates with enough components.
         if (fc == 1 and tc != null) return true;
+        // Structs with members this checker does not model (long vectors).
+        if (tc == null and s.types.get(to) == .@"struct" and s.hasUnmodelledMember(to)) return true;
         if (fc != null and tc != null and fc.? >= tc.?) return true;
         if (s.types.get(to) == .@"enum" and s.types.isNumeric(from)) return true;
         return false;
@@ -2554,6 +2581,15 @@ fn scanLiteral(text: []const u8) struct { end: usize, float: bool, inf: bool = f
     return .{ .end = i, .float = float };
 }
 
+/// `f16` / `f32` / `f64` (any case) at the end of a float literal.
+fn fixedFloatSuffix(text: []const u8) ?[]const u8 {
+    if (text.len < 4) return null;
+    const suf = text[text.len - 3 ..];
+    if (suf[0] != 'f' and suf[0] != 'F') return null;
+    for ([_][]const u8{ "16", "32", "64" }) |w| if (std.mem.eql(u8, suf[1..], w)) return suf;
+    return null;
+}
+
 fn isIntSuffix(suffix: []const u8) bool {
     const valid = [_][]const u8{ "", "u", "l", "ul", "lu", "ll", "ull", "llu" };
     var buf: [3]u8 = undefined;
@@ -2583,6 +2619,11 @@ fn intLiteralType(text: []const u8) Scalar {
 }
 
 fn floatLiteralType(text: []const u8) Scalar {
+    if (fixedFloatSuffix(text)) |suf| return switch (suf[1]) {
+        '1' => .half, // f16: float16_t with 16-bit types
+        '3' => .float,
+        else => .double,
+    };
     const last = text[text.len - 1];
     return switch (last) {
         'f', 'F' => .float,

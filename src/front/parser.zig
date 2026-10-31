@@ -699,6 +699,18 @@ pub const Parser = struct {
         const save = p.pos;
         const lead_quals = p.parseQualifiers();
         const t = p.tok();
+        // Legacy effect syntax, skipped with dxc's deprecation warnings.
+        if (isTechniqueWord(t)) {
+            _ = p.reportAt(p.pos, .warning, "effect technique ignored - effect syntax is deprecated and will be removed in HLSL 2026", .{});
+            while (!p.at(.l_brace) and !p.at(.eof)) _ = p.advance();
+            if (p.at(.l_brace)) try p.skipBalanced(.l_brace, .r_brace);
+            return;
+        }
+        if (isEffectObjectWord(t) and p.peek(1).kind == .identifier) {
+            _ = p.reportAt(p.pos, .warning, "effect object ignored - effect syntax is deprecated and will be removed in HLSL 2026", .{});
+            p.skipDeclaration();
+            return;
+        }
         if (t.isIdent("struct") or t.isIdent("class") or t.isIdent("interface")) {
             return p.parseStructDeclInto(out, attrs, lead_quals, template_params, ctx);
         }
@@ -1060,9 +1072,16 @@ pub const Parser = struct {
             // Legacy effect syntax: `<annotations>` and `{ state block }`.
             if (ctx != .local and p.at(.less)) try p.skipBalanced(.less, .greater);
             var init_expr: ?*ast.Expr = null;
-            if (ctx != .local and p.at(.l_brace)) {
+            if (p.at(.l_brace)) {
+                _ = p.reportAt(p.pos, .warning, "effect state block ignored - effect syntax is deprecated and will be removed in HLSL 2026", .{});
                 try p.skipBalanced(.l_brace, .r_brace);
-            } else if (p.eat(.equal)) init_expr = try p.parseInitializer();
+            } else if (p.eat(.equal)) {
+                if (p.atIdent("sampler_state")) {
+                    _ = p.reportAt(p.pos, .warning, "effect sampler_state assignment ignored - effect syntax is deprecated and will be removed in HLSL 2026", .{});
+                    _ = p.advance();
+                    if (p.at(.l_brace)) try p.skipBalanced(.l_brace, .r_brace);
+                } else init_expr = try p.parseInitializer();
+            }
             try out.append(p.arena, try p.mk(ast.Decl, .{ .loc = name.loc, .kind = .{ .@"var" = .{
                 .attrs = attrs,
                 .template_params = template_params,
@@ -1086,6 +1105,20 @@ pub const Parser = struct {
 
     /// Skip a balanced `open ... close` group (legacy annotations and state
     /// blocks, which zdxc ignores like dxc does).
+    /// Skips to just past the `;` ending a declaration (outside braces).
+    fn skipDeclaration(p: *Parser) void {
+        var depth: u32 = 0;
+        while (!p.at(.eof)) {
+            const t = p.advance();
+            switch (t.kind) {
+                .l_brace => depth += 1,
+                .r_brace => depth -|= 1,
+                .semi => if (depth == 0) return,
+                else => {},
+            }
+        }
+    }
+
     fn skipBalanced(p: *Parser, open: Kind, close: Kind) Error!void {
         _ = try p.expect(open, "group");
         var depth: u32 = 1;
@@ -1405,6 +1438,7 @@ pub const Parser = struct {
                 std.mem.eql(u8, w, "using") or std.mem.eql(u8, w, "enum") or std.mem.eql(u8, w, "_Static_assert"))
                 return true;
             if (inList(&reserved_declspecs, w)) return true;
+            if (isEffectObjectWord(t) and p.peek(1).kind == .identifier) return true;
             if (qualifierField(w) != null) {
                 if (!isContextualQualifier(w)) return true;
                 const n = p.peek(1);
@@ -1769,6 +1803,21 @@ const qualifier_words = [_][2][]const u8{
     .{ "vertices", "vertices" },                 .{ "indices", "indices" },                 .{ "primitives", "primitives" },
     .{ "payload", "payload" },                   .{ "center", "center" },
 };
+
+fn isTechniqueWord(t: Token) bool {
+    return t.isIdent("technique") or t.isIdent("Technique") or t.isIdent("technique10") or t.isIdent("technique11");
+}
+
+/// dxc's g_DeprecatedEffectObjectNames.
+fn isEffectObjectWord(t: Token) bool {
+    const names = [_][]const u8{
+        "texture",         "Texture",          "pixelshader",    "PixelShader",       "vertexshader",
+        "VertexShader",    "pixelfragment",    "vertexfragment", "ComputeShader",     "DomainShader",
+        "GeometryShader",  "HullShader",       "BlendState",     "DepthStencilState", "DepthStencilView",
+        "RasterizerState", "RenderTargetView",
+    };
+    return t.kind == .identifier and inList(&names, t.text);
+}
 
 /// Type attributes that may precede a type: `unorm float`,
 /// `row_major float4x4`.
