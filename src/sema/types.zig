@@ -315,6 +315,10 @@ pub const ResourceKind = enum(u8) {
 pub const Field = struct {
     name: []const u8,
     type: TypeId,
+    /// Matrices in the field are row_major (layout only).
+    row_major: bool = false,
+    /// The field's semantic (`float4 pos : SV_Position;`).
+    semantic: ?[]const u8 = null,
 };
 
 /// A struct's layout-relevant information. Methods live in Sema.

@@ -168,7 +168,7 @@ const Lowerer = struct {
         }
         const info = try l.arena.create(@import("../sema/types.zig").StructInfo);
         info.* = .{ .name = name, .complete = true };
-        for (members.items) |mv| try info.fields.append(l.arena, .{ .name = mv.name, .type = mv.type });
+        for (members.items) |mv| try info.fields.append(l.arena, .{ .name = mv.name, .type = mv.type, .row_major = mv.row_major });
         const ty = try l.s.types.intern(.{ .@"struct" = info });
         try l.m.globals.append(l.arena, .{ .name = name, .ty = ty, .space = .cbuffer, .binding = binding });
         const gi: u32 = @intCast(l.m.globals.items.len - 1);
@@ -331,7 +331,14 @@ const Lowerer = struct {
         const t = l.types();
         const inst = l.b.f.inst(v);
         if (inst.ty == target) return v;
-        const fs = t.shape(inst.ty) orelse return v; // objects, structs: same type
+        // Derived structs convert to a base: its fields are a prefix.
+        if (t.get(inst.ty) == .@"struct" and t.get(target) == .@"struct") {
+            const tf = t.get(target).@"struct".fields.items;
+            const parts = try l.arena.alloc(Ref, tf.len);
+            for (parts, tf, 0..) |*p, fld, k| p.* = try l.b.add(.{ .op = .{ .extract = .{ .agg = v, .index = @intCast(k) } }, .ty = fld.type });
+            return l.b.add(.{ .op = .{ .construct = parts }, .ty = target });
+        }
+        const fs = t.shape(inst.ty) orelse return v; // objects: same type
         const ts = t.shape(target) orelse return v;
         const tc = t.component(target).?;
         // Constants convert at compile time.
@@ -356,36 +363,133 @@ const Lowerer = struct {
             if (ts.count() == 1 and ts.kind == .scalar) return k;
             return l.b.add(.{ .op = .{ .splat = k }, .ty = target });
         }
-        // Shape first, in the source component type.
-        var cur = v;
-        if (fs.count() == 1 and ts.count() > 1) {
-            const sc = if (fs.kind == .scalar) cur else try l.b.add(.{ .op = .{ .extract = .{ .agg = cur, .index = 0 } }, .ty = try t.scalar(t.component(inst.ty).?) });
-            const conv = try l.convert(sc, try t.scalar(tc));
-            return l.b.add(.{ .op = .{ .splat = conv }, .ty = target });
+        const sc = t.component(inst.ty).?;
+        // Scalar sources splat.
+        if (fs.count() == 1) {
+            const target_scalar = try t.scalar(tc);
+            var one = try l.component(v, 0);
+            if (l.b.f.inst(one).ty != target_scalar) one = try l.b.add(.{ .op = .{ .convert = one }, .ty = target_scalar });
+            if (ts.kind == .scalar) return one;
+            if (ts.count() == 1) return l.b.add(.{ .op = .{ .construct = try l.arena.dupe(Ref, &.{one}) }, .ty = target });
+            return l.b.add(.{ .op = .{ .splat = one }, .ty = target });
         }
-        if (ts.kind == .scalar and fs.kind != .scalar) {
-            cur = try l.b.add(.{ .op = .{ .extract = .{ .agg = cur, .index = 0 } }, .ty = try t.scalar(t.component(inst.ty).?) });
-        } else if (ts.kind == .vector and fs.kind == .vector and ts.cols < fs.cols) {
+        // Truncation to a scalar keeps the first component.
+        if (ts.kind == .scalar) return l.convert(try l.component(v, 0), target);
+        // Same shape: component conversion.
+        if (fs.kind == ts.kind and fs.rows == ts.rows and fs.cols == ts.cols) {
+            if (fs.kind == .matrix) {
+                // Row by row (SPIR-V converts vectors, not matrices).
+                const rows = try l.arena.alloc(Ref, fs.rows);
+                const src_row = try t.vector(sc, fs.cols);
+                const dst_row = try t.vector(tc, fs.cols);
+                for (rows, 0..) |*r, i| {
+                    const row = try l.b.add(.{ .op = .{ .extract = .{ .agg = v, .index = @intCast(i) } }, .ty = src_row });
+                    r.* = try l.b.add(.{ .op = .{ .convert = row }, .ty = dst_row });
+                }
+                return l.flatConstruct(target, rows, fs.cols);
+            }
+            return l.b.add(.{ .op = .{ .convert = v }, .ty = target });
+        }
+        // Vector truncation keeps a shuffle.
+        if (fs.kind == .vector and ts.kind == .vector) {
             const comps = try l.arena.alloc(u8, ts.cols);
             for (comps, 0..) |*c, i| c.* = @intCast(i);
-            cur = try l.b.add(.{ .op = .{ .shuffle = .{ .vec = cur, .components = comps } }, .ty = try t.vector(t.component(inst.ty).?, ts.cols) });
-        } else if (fs.kind != ts.kind or fs.rows != ts.rows or fs.cols != ts.cols) {
-            if (!(fs.count() == 1 and ts.count() == 1)) {
-                l.unsupported(.none, "conversion from '{s}' to '{s}' is not supported yet", .{ l.s.typeName(inst.ty), l.s.typeName(target) });
+            const sh = try l.b.add(.{ .op = .{ .shuffle = .{ .vec = v, .components = comps } }, .ty = try t.vector(sc, ts.cols) });
+            return l.convert(sh, target);
+        }
+        // Other reshapes (matrix truncation, vector <-> matrix) go through
+        // components: matrices map (row, col) to (row, col), everything else
+        // flattened index to index.
+        const n = ts.count();
+        const comps = try l.arena.alloc(Ref, n);
+        for (comps, 0..) |*c, k| {
+            const src: u32 = if (fs.kind == .matrix and ts.kind == .matrix)
+                @intCast((k / ts.cols) * fs.cols + k % ts.cols)
+            else
+                @intCast(k);
+            c.* = try l.convert(try l.component(v, src), try t.scalar(tc));
+        }
+        return l.b.add(.{ .op = .{ .construct = comps }, .ty = target });
+    }
+
+    /// Scalar component `k` of a scalar / vector / matrix value (matrices in
+    /// row-major order: `extract` on a matrix yields a row).
+    fn component(l: *Lowerer, v: Ref, k: u32) Error!Ref {
+        const t = l.types();
+        const ty = l.b.f.inst(v).ty;
+        const c = t.component(ty).?;
+        switch (t.get(ty)) {
+            .scalar, .@"enum" => return v,
+            .vector => return l.b.add(.{ .op = .{ .extract = .{ .agg = v, .index = k } }, .ty = try t.scalar(c) }),
+            .matrix => |m| {
+                const row = try l.b.add(.{ .op = .{ .extract = .{ .agg = v, .index = k / m.cols } }, .ty = try t.vector(c, m.cols) });
+                return l.b.add(.{ .op = .{ .extract = .{ .agg = row, .index = k % m.cols } }, .ty = try t.scalar(c) });
+            },
+            else => return error.Unsupported,
+        }
+    }
+
+    /// A vector or matrix from its rows (`per_row` components each).
+    fn flatConstruct(l: *Lowerer, ty: TypeId, rows: []const Ref, per_row: u32) Error!Ref {
+        // Constructors take scalars: split the rows.
+        const t = l.types();
+        var comps: std.ArrayList(Ref) = .empty;
+        for (rows) |r| for (0..per_row) |k| try comps.append(l.arena, try l.component(r, @intCast(k)));
+        _ = t;
+        return l.b.add(.{ .op = .{ .construct = comps.items }, .ty = ty });
+    }
+
+    /// Appends the scalar components of `v` (structs and arrays member by
+    /// member).
+    fn flatten(l: *Lowerer, v: Ref, out: *std.ArrayList(Ref)) Error!void {
+        const t = l.types();
+        const ty = l.b.f.inst(v).ty;
+        switch (t.get(ty)) {
+            .scalar, .@"enum" => try out.append(l.arena, v),
+            .vector, .matrix => for (0..t.componentCount(ty).?) |k| try out.append(l.arena, try l.component(v, @intCast(k))),
+            .array => |a| for (0..a.len) |i| try l.flatten(try l.b.add(.{ .op = .{ .extract = .{ .agg = v, .index = @intCast(i) } }, .ty = a.elem }), out),
+            .@"struct" => |st| for (st.fields.items, 0..) |f, i| try l.flatten(try l.b.add(.{ .op = .{ .extract = .{ .agg = v, .index = @intCast(i) } }, .ty = f.type }), out),
+            else => {
+                l.unsupported(.none, "flattening values of type '{s}' is not supported yet", .{l.s.typeName(ty)});
                 return error.Unsupported;
-            }
-            if (fs.kind != .scalar) cur = try l.b.add(.{ .op = .{ .extract = .{ .agg = cur, .index = 0 } }, .ty = try t.scalar(t.component(inst.ty).?) });
+            },
         }
-        const cur_ty = l.b.f.inst(cur).ty;
-        if (cur_ty == target) return cur;
-        const same_shape_target = try t.withComponent(cur_ty, tc);
-        if (same_shape_target != cur_ty) cur = try l.b.add(.{ .op = .{ .convert = cur }, .ty = same_shape_target });
-        if (same_shape_target != target) {
-            // float1 <-> float
-            if (ts.kind == .scalar) return l.b.add(.{ .op = .{ .extract = .{ .agg = cur, .index = 0 } }, .ty = target });
-            return l.b.add(.{ .op = .{ .construct = try l.arena.dupe(Ref, &.{cur}) }, .ty = target });
+    }
+
+    /// A value of `ty` built from flattened scalars, consumed from `next`.
+    fn fromFlat(l: *Lowerer, ty: TypeId, comps: []const Ref, next: *usize) Error!Ref {
+        const t = l.types();
+        switch (t.get(ty)) {
+            .scalar, .@"enum" => {
+                defer next.* += 1;
+                return l.convert(comps[next.*], ty);
+            },
+            .vector, .matrix => {
+                const n = t.componentCount(ty).?;
+                const sc = try t.scalar(t.component(ty).?);
+                const parts = try l.arena.alloc(Ref, n);
+                for (parts) |*p| {
+                    p.* = try l.convert(comps[next.*], sc);
+                    next.* += 1;
+                }
+                if (n == 1 and t.get(ty) == .vector) return l.b.add(.{ .op = .{ .construct = parts }, .ty = ty });
+                return l.b.add(.{ .op = .{ .construct = parts }, .ty = ty });
+            },
+            .array => |a| {
+                const parts = try l.arena.alloc(Ref, a.len);
+                for (parts) |*p| p.* = try l.fromFlat(a.elem, comps, next);
+                return l.b.add(.{ .op = .{ .construct = parts }, .ty = ty });
+            },
+            .@"struct" => |st| {
+                const parts = try l.arena.alloc(Ref, st.fields.items.len);
+                for (parts, st.fields.items) |*p, f| p.* = try l.fromFlat(f.type, comps, next);
+                return l.b.add(.{ .op = .{ .construct = parts }, .ty = ty });
+            },
+            else => {
+                l.unsupported(.none, "building values of type '{s}' is not supported yet", .{l.s.typeName(ty)});
+                return error.Unsupported;
+            },
         }
-        return cur;
     }
 
     fn rvalue(l: *Lowerer, e: *ast.Expr) Error!Ref {
@@ -580,42 +684,54 @@ const Lowerer = struct {
     }
 
     fn convertExplicit(l: *Lowerer, v: Ref, target: TypeId) Error!Ref {
-        // Explicit casts additionally allow truncation to fewer components,
-        // which `convert` already performs.
-        return l.convert(v, target);
+        const t = l.types();
+        const from = l.b.f.inst(v).ty;
+        if (from == target) return v;
+        const aggregate = switch (t.get(target)) {
+            .@"struct", .array => true,
+            else => switch (t.get(from)) {
+                .@"struct", .array => true,
+                else => false,
+            },
+        };
+        if (!aggregate) return l.convert(v, target);
+        // Aggregate casts: `(S)0` replicates a scalar; otherwise the source's
+        // flattened components fill the target in order.
+        var comps: std.ArrayList(Ref) = .empty;
+        try l.flatten(v, &comps);
+        const need = t.componentCount(target) orelse return error.Unsupported;
+        if (comps.items.len == 1) {
+            while (comps.items.len < need) try comps.append(l.arena, comps.items[0]);
+        }
+        if (comps.items.len < need) return error.Unsupported;
+        var next: usize = 0;
+        return l.fromFlat(target, comps.items, &next);
     }
 
     fn construct(l: *Lowerer, e: *ast.Expr, ty: TypeId, args: []const *ast.Expr) Error!Ref {
         const t = l.types();
-        const comp = t.component(ty) orelse return l.fail(e, "this constructor");
-        const scalar_ty = try t.scalar(comp);
         var comps: std.ArrayList(Ref) = .empty;
-        for (args) |a| {
-            const v = try l.rvalue(a);
-            const vt = l.b.f.inst(v).ty;
-            const n = t.componentCount(vt) orelse return l.fail(a, "this constructor argument");
-            if (t.get(vt) == .scalar or t.get(vt) == .@"enum") {
-                try comps.append(l.arena, try l.convert(v, scalar_ty));
-            } else {
-                const ec = try t.scalar(t.component(vt).?);
-                for (0..n) |i| {
-                    const x = try l.b.add(.{ .op = .{ .extract = .{ .agg = v, .index = @intCast(i) } }, .ty = ec });
-                    try comps.append(l.arena, try l.convert(x, scalar_ty));
-                }
-            }
+        for (args) |a| try l.flatten(try l.rvalue(a), &comps);
+        if (comps.items.len == 0) return l.fail(e, "this constructor");
+        const need = t.componentCount(ty) orelse return l.fail(e, "this constructor");
+        if (comps.items.len == 1 and need > 1) {
+            const sc = try l.convert(comps.items[0], try t.scalar(t.component(ty).?));
+            return l.b.add(.{ .op = .{ .splat = sc }, .ty = ty });
         }
-        if (t.get(ty) == .scalar) return comps.items[0];
-        if (comps.items.len == 1) return l.b.add(.{ .op = .{ .splat = comps.items[0] }, .ty = ty });
-        return l.b.add(.{ .op = .{ .construct = comps.items }, .ty = ty });
+        var next: usize = 0;
+        return l.fromFlat(ty, comps.items, &next);
     }
 
     fn initList(l: *Lowerer, e: *ast.Expr, ty: TypeId) Error!Ref {
-        const t = l.types();
-        if (t.shape(ty) == null) return l.fail(e, "this initializer list");
-        // Flatten the list's scalars into a constructor of `ty`.
+        // The list's scalars, in order, fill `ty`.
         var flat: std.ArrayList(*ast.Expr) = .empty;
         try flattenList(l.arena, e, &flat);
-        return l.construct(e, ty, flat.items);
+        var comps: std.ArrayList(Ref) = .empty;
+        for (flat.items) |x| try l.flatten(try l.rvalue(x), &comps);
+        const need = l.types().componentCount(ty) orelse return l.fail(e, "this initializer list");
+        if (comps.items.len < need) return l.fail(e, "this initializer list");
+        var next: usize = 0;
+        return l.fromFlat(ty, comps.items, &next);
     }
 
     fn member(l: *Lowerer, e: *ast.Expr, base: *ast.Expr, name: []const u8) Error!Ref {
@@ -632,6 +748,14 @@ const Lowerer = struct {
                 }
                 if (comps.len == 1) return l.b.add(.{ .op = .{ .extract = .{ .agg = v, .index = comps[0] } }, .ty = ty });
                 return l.b.add(.{ .op = .{ .shuffle = .{ .vec = v, .components = comps } }, .ty = ty });
+            },
+            .matrix => |m| {
+                const v = try l.rvalue(base);
+                const ks = matrixSwizzle(l.arena, name, m.cols) orelse return l.fail(e, "this matrix swizzle");
+                if (ks.len == 1) return l.component(v, ks[0]);
+                const parts = try l.arena.alloc(Ref, ks.len);
+                for (parts, ks) |*p, k| p.* = try l.component(v, k);
+                return l.b.add(.{ .op = .{ .construct = parts }, .ty = try l.concrete(e.ty) });
             },
             .@"struct" => {
                 if (isAddressable(base)) return l.b.load(try l.lvalue(e));
@@ -771,7 +895,20 @@ const Lowerer = struct {
                 _ = try l.b.add(.{ .op = .{ .res_store = .{ .res = res, .index = idx, .value = value } }, .ty = TypeTable.void_type });
                 return;
             },
-            .member => |m| if (t.get(m.base.ty) == .vector or t.get(m.base.ty) == .scalar) {
+            .member => |m| if (t.get(m.base.ty) == .matrix) {
+                const mt = t.get(m.base.ty).matrix;
+                const ks = matrixSwizzle(l.arena, m.name, mt.cols) orelse return error.Unsupported;
+                var whole = try l.rvalue(m.base);
+                const row_ty = try t.vector(mt.elem, mt.cols);
+                for (ks, 0..) |k, i| {
+                    const part = if (ks.len == 1) value else try l.component(value, @intCast(i));
+                    const r = k / mt.cols;
+                    const row = try l.b.add(.{ .op = .{ .extract = .{ .agg = whole, .index = r } }, .ty = row_ty });
+                    const new_row = try l.b.add(.{ .op = .{ .insert = .{ .agg = row, .value = part, .index = k % mt.cols } }, .ty = row_ty });
+                    whole = try l.b.add(.{ .op = .{ .insert = .{ .agg = whole, .value = new_row, .index = r } }, .ty = m.base.ty });
+                }
+                return l.storeTo(m.base, whole);
+            } else if (t.get(m.base.ty) == .vector or t.get(m.base.ty) == .scalar) {
                 // Swizzle store: read, replace the named components, write.
                 const comps = swizzleComponents(m.name) orelse return error.Unsupported;
                 if (t.get(m.base.ty) == .scalar) return l.storeTo(m.base, value);
@@ -785,11 +922,98 @@ const Lowerer = struct {
             },
             else => {},
         }
+        if (lhs.kind == .cast and t.get(lhs.ty) == .@"struct" and lhs.ty != lhs.kind.cast.operand.ty) {
+            // `(Base)derived = v`: the base's fields are a prefix.
+            const base_ptr = try l.lvalue(lhs.kind.cast.operand);
+            const space = l.b.f.inst(base_ptr).ptr;
+            for (t.get(lhs.ty).@"struct".fields.items, 0..) |fld, k| {
+                const idx = try l.b.constInt(try t.scalar(.uint), @intCast(k));
+                const p = try l.b.add(.{ .op = .{ .access = .{ .base = base_ptr, .indices = try l.arena.dupe(Ref, &.{idx}) } }, .ty = fld.type, .ptr = space });
+                try l.b.store(p, try l.b.add(.{ .op = .{ .extract = .{ .agg = value, .index = @intCast(k) } }, .ty = fld.type }));
+            }
+            return;
+        }
         try l.b.store(try l.lvalue(lhs), value);
     }
 
     // ------------------------------------------------------------------
     // Entry point
+
+    /// An entry input of type `ty`: one signature element, or for structs
+    /// without a semantic one per field (recursively).
+    fn entryInput(l: *Lowerer, entry: *ir.Entry, ty: TypeId, semantic: ?[]const u8, loc: ast.Loc, what: []const u8) Error!Ref {
+        if (semantic) |sem| if (l.s.types.get(ty) == .@"struct") {
+            // A semantic on a struct numbers its fields: X, X1, X2, ...
+            var el = sigElement(sem, ty);
+            return l.structInput(entry, ty, el.semantic, &el.semantic_index);
+        };
+        if (semantic) |sem| {
+            try entry.inputs.append(l.arena, sigElement(sem, ty));
+            return l.b.add(.{ .op = .{ .input = @intCast(entry.inputs.items.len - 1) }, .ty = ty });
+        }
+        switch (l.s.types.get(ty)) {
+            .@"struct" => |st| {
+                const parts = try l.arena.alloc(Ref, st.fields.items.len);
+                for (parts, st.fields.items) |*p, fld| p.* = try l.entryInput(entry, fld.type, fld.semantic, loc, fld.name);
+                return l.b.add(.{ .op = .{ .construct = parts }, .ty = ty });
+            },
+            else => {
+                l.unsupported(loc, "entry parameter '{s}' needs a semantic", .{what});
+                return error.Unsupported;
+            },
+        }
+    }
+
+    fn structInput(l: *Lowerer, entry: *ir.Entry, ty: TypeId, name: []const u8, index: *u32) Error!Ref {
+        const st = l.s.types.get(ty).@"struct";
+        const parts = try l.arena.alloc(Ref, st.fields.items.len);
+        for (parts, st.fields.items) |*p, fld| {
+            if (l.s.types.get(fld.type) == .@"struct") {
+                p.* = try l.structInput(entry, fld.type, name, index);
+                continue;
+            }
+            try entry.inputs.append(l.arena, .{ .semantic = name, .semantic_index = index.*, .ty = fld.type, .system_value = std.ascii.startsWithIgnoreCase(name, "SV_") });
+            index.* += 1;
+            p.* = try l.b.add(.{ .op = .{ .input = @intCast(entry.inputs.items.len - 1) }, .ty = fld.type });
+        }
+        return l.b.add(.{ .op = .{ .construct = parts }, .ty = ty });
+    }
+
+    fn structOutput(l: *Lowerer, entry: *ir.Entry, ty: TypeId, name: []const u8, index: *u32, value: Ref) Error!void {
+        const st = l.s.types.get(ty).@"struct";
+        for (st.fields.items, 0..) |fld, k| {
+            const v = try l.b.add(.{ .op = .{ .extract = .{ .agg = value, .index = @intCast(k) } }, .ty = fld.type });
+            if (l.s.types.get(fld.type) == .@"struct") {
+                try l.structOutput(entry, fld.type, name, index, v);
+                continue;
+            }
+            try entry.outputs.append(l.arena, .{ .semantic = name, .semantic_index = index.*, .ty = fld.type, .system_value = std.ascii.startsWithIgnoreCase(name, "SV_") });
+            index.* += 1;
+            _ = try l.b.add(.{ .op = .{ .output = .{ .element = @intCast(entry.outputs.items.len - 1), .value = v } }, .ty = TypeTable.void_type });
+        }
+    }
+
+    fn entryOutput(l: *Lowerer, entry: *ir.Entry, ty: TypeId, semantic: ?[]const u8, value: Ref, loc: ast.Loc, what: []const u8) Error!void {
+        if (semantic) |sem| if (l.s.types.get(ty) == .@"struct") {
+            var el = sigElement(sem, ty);
+            return l.structOutput(entry, ty, el.semantic, &el.semantic_index, value);
+        };
+        if (semantic) |sem| {
+            try entry.outputs.append(l.arena, sigElement(sem, ty));
+            _ = try l.b.add(.{ .op = .{ .output = .{ .element = @intCast(entry.outputs.items.len - 1), .value = value } }, .ty = TypeTable.void_type });
+            return;
+        }
+        switch (l.s.types.get(ty)) {
+            .@"struct" => |st| for (st.fields.items, 0..) |fld, k| {
+                const v = try l.b.add(.{ .op = .{ .extract = .{ .agg = value, .index = @intCast(k) } }, .ty = fld.type });
+                try l.entryOutput(entry, fld.type, fld.semantic, v, loc, fld.name);
+            },
+            else => {
+                l.unsupported(loc, "entry {s} needs a semantic", .{what});
+                return error.Unsupported;
+            },
+        }
+    }
 
     fn buildEntry(l: *Lowerer, f: *const semamod.Function, main: u32, opts: Options) Error!void {
         var entry: ir.Entry = .{ .func = main, .name = opts.entry, .stage = opts.stage };
@@ -804,32 +1028,19 @@ const Lowerer = struct {
         const args = try l.arena.alloc(Ref, f.params.len);
         const locals = try l.arena.alloc(Ref, f.params.len);
         for (f.decl.params, f.params, 0..) |pd, p, i| {
-            const sem = semanticOf(pd.semantics) orelse {
-                l.unsupported(pd.name_loc, "entry parameter '{s}' needs a semantic", .{pd.name});
-                return error.Unsupported;
-            };
             locals[i] = try l.b.add(.{ .op = .local_var, .ty = p.type, .ptr = .function });
             if (p.dir != .out) {
-                try entry.inputs.append(l.arena, sigElement(sem, p.type));
-                const v = try l.b.add(.{ .op = .{ .input = @intCast(entry.inputs.items.len - 1) }, .ty = p.type });
+                const v = try l.entryInput(&entry, p.type, semanticOf(pd.semantics), pd.name_loc, pd.name);
                 try l.b.store(locals[i], v);
             }
             args[i] = if (p.dir == .in) try l.b.load(locals[i]) else locals[i];
         }
         const ret = try l.b.add(.{ .op = .{ .call = .{ .func = main, .args = args } }, .ty = f.ret });
-        if (f.ret != TypeTable.void_type) {
-            const sem = semanticOf(f.decl.ret_semantics) orelse {
-                l.unsupported(f.loc, "entry return value needs a semantic", .{});
-                return error.Unsupported;
-            };
-            try entry.outputs.append(l.arena, sigElement(sem, f.ret));
-            _ = try l.b.add(.{ .op = .{ .output = .{ .element = @intCast(entry.outputs.items.len - 1), .value = ret } }, .ty = TypeTable.void_type });
-        }
+        if (f.ret != TypeTable.void_type) try l.entryOutput(&entry, f.ret, semanticOf(f.decl.ret_semantics), ret, f.loc, "return value");
         for (f.decl.params, f.params, 0..) |pd, p, i| {
             if (p.dir == .in) continue;
-            try entry.outputs.append(l.arena, sigElement(semanticOf(pd.semantics).?, p.type));
             const v = try l.b.load(locals[i]);
-            _ = try l.b.add(.{ .op = .{ .output = .{ .element = @intCast(entry.outputs.items.len - 1), .value = v } }, .ty = TypeTable.void_type });
+            try l.entryOutput(&entry, p.type, semanticOf(pd.semantics), v, pd.name_loc, pd.name);
         }
         l.b.terminate(.{ .ret = .none });
         entry.wrapper = wrapper;
@@ -901,6 +1112,33 @@ fn swizzleComponents(name: []const u8) ?[]const u8 {
         };
     }
     return out[0..name.len];
+}
+
+/// `_m01_m10` (zero-based) or `_12_21` (one-based) -> row-major component
+/// indices.
+fn matrixSwizzle(a: Allocator, name: []const u8, cols: u8) ?[]const u32 {
+    var out: std.ArrayList(u32) = .empty;
+    var i: usize = 0;
+    while (i < name.len) {
+        if (name[i] != '_') return null;
+        i += 1;
+        var zero = false;
+        if (i < name.len and name[i] == 'm') {
+            zero = true;
+            i += 1;
+        }
+        if (i + 2 > name.len) return null;
+        var r: u32 = name[i] -% '0';
+        var c: u32 = name[i + 1] -% '0';
+        if (!zero) {
+            r -%= 1;
+            c -%= 1;
+        }
+        if (r > 3 or c > 3) return null;
+        out.append(a, r * cols + c) catch return null;
+        i += 2;
+    }
+    return if (out.items.len == 0) null else out.items;
 }
 
 fn isAddressable(e: *const ast.Expr) bool {

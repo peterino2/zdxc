@@ -42,7 +42,10 @@ const Lowered = union(enum) {
     handle: u32,
     /// A place in a constant buffer: byte offset plus a dynamic register
     /// offset.
-    cbuf: struct { res: u32, offset: u32 = 0, dyn_regs: ?Value = null },
+    cbuf: struct { res: u32, offset: u32 = 0, dyn_regs: ?Value = null, row_major: bool = false },
+    /// A place inside a structured buffer element: element index plus byte
+    /// offset (constant and dynamic).
+    buf: struct { res: u32, index: Value, offset: u32 = 0, dyn: ?Value = null, row_major: bool = false },
 };
 
 /// Pointer into a flattened local: alloca `base` of `[n x scalar]`, at
@@ -55,6 +58,8 @@ const Ptr = struct {
     offset_dyn: ?Value = null,
     /// bools are stored as i32.
     bool_storage: bool = false,
+    /// Mixed 32-bit component types share i32 storage (floats bitcast).
+    mixed: bool = false,
 };
 
 const Resource = struct {
@@ -304,6 +309,7 @@ const Emitter = struct {
     }
 
     fn createHandles(e: *Emitter) Error!void {
+        if (e.resources.items.len == 0) return;
         const i32t = try e.dm.intType(32);
         const i1t = try e.dm.intType(1);
         const i8t = try e.dm.intType(8);
@@ -360,11 +366,9 @@ const Emitter = struct {
         return .{ basic, extra };
     }
 
-    /// Structured buffer element stride (tightly packed scalars).
+    /// Structured buffer element stride (packed layout).
     fn stride(e: *Emitter, ty: TypeId) Error!i64 {
-        const n = try e.flatCount(ty);
-        const c = try e.uniformScalar(ty);
-        return @as(i64, n) * c.size();
+        return layout.sizeOf(e.t, ty, false, .dx_packed) catch e.unsupported("buffer element type '{s}'", .{try e.t.format(e.arena, ty)});
     }
 
     /// DXIL ComponentType of a typed buffer element.
@@ -571,6 +575,12 @@ const Emitter = struct {
             },
             .local_var => {
                 const n = try e.flatCount(i.ty);
+                if (try e.mixedStorage(i.ty)) {
+                    const st = try e.dm.intType(32);
+                    const arr = try e.dm.getType(.{ .array = .{ .len = n, .elem = st } });
+                    const base = try e.addPrologue(try e.dm.ptrType(arr), .{ .alloca = .{ .elem = arr, .size = try e.i32Const(1) } });
+                    return .{ .ptr = .{ .base = base, .array_ty = arr, .scalar_ty = st, .mixed = true } };
+                }
                 const c = try e.uniformScalar(i.ty);
                 const store_c = if (c == .bool) Scalar.int else c;
                 const st = try e.scalarTy(store_c);
@@ -581,20 +591,33 @@ const Emitter = struct {
             },
             .load => |p| switch (frame.vals[p.index()]) {
                 .handle => |h| return .{ .handle = h },
-                .cbuf => |c| return e.cbufferLoad(c.res, c.offset, c.dyn_regs, i.ty),
-                .ptr => |ptr| return e.loadPtr(ptr, try e.flatCount(i.ty)),
+                .cbuf => |c| return e.cbufferLoad(c.res, c.offset, c.dyn_regs, c.row_major, i.ty),
+                .buf => |b| return .{ .scalars = try e.structuredLoad(e.resources.items[b.res], b.index, b.offset, b.dyn, b.row_major, i.ty) },
+                .ptr => |ptr| return e.loadPtr(ptr, i.ty),
                 else => return e.unsupported("internal: load from a non-pointer", .{}),
             },
             .store => |s| {
+                if (frame.vals[s.ptr.index()] == .buf) {
+                    const b = frame.vals[s.ptr.index()].buf;
+                    try e.structuredStore(e.resources.items[b.res], b.index, b.offset, b.dyn, b.row_major, f.inst(s.value).ty, try e.scalars(frame, s.value));
+                    return .none;
+                }
                 const ptr = switch (frame.vals[s.ptr.index()]) {
                     .ptr => |p| p,
                     else => return e.unsupported("internal: store to a non-pointer", .{}),
                 };
-                try e.storePtr(ptr, try e.scalars(frame, s.value));
+                try e.storePtr(ptr, try e.scalars(frame, s.value), f.inst(s.value).ty);
                 return .none;
             },
             .access => |a| {
                 if (frame.vals[a.base.index()] == .cbuf) return e.cbufferAccess(frame, frame.vals[a.base.index()].cbuf, f.inst(a.base).ty, a.indices);
+                if (frame.vals[a.base.index()] == .handle) {
+                    const ri = frame.vals[a.base.index()].handle;
+                    if (e.resources.items[ri].kind != 12) return e.unsupported("member access into this resource is not supported yet", .{});
+                    const start: @FieldType(Lowered, "buf") = .{ .res = ri, .index = (try e.scalars(frame, a.indices[0]))[0] };
+                    return e.bufferAccess(frame, start, e.t.get(f.inst(a.base).ty).resource.elem, a.indices[1..]);
+                }
+                if (frame.vals[a.base.index()] == .buf) return e.bufferAccess(frame, frame.vals[a.base.index()].buf, f.inst(a.base).ty, a.indices);
                 var ptr = switch (frame.vals[a.base.index()]) {
                     .ptr => |p| p,
                     else => return e.unsupported("access into this storage is not supported yet", .{}),
@@ -796,21 +819,52 @@ const Emitter = struct {
         };
     }
 
-    fn loadPtr(e: *Emitter, ptr: Ptr, n: u32) Error!Lowered {
+    /// Whether `ty`'s components differ in type (all 32-bit), so storage is
+    /// i32 with bitcasts.
+    fn mixedStorage(e: *Emitter, ty: TypeId) Error!bool {
+        const n = try e.flatCount(ty);
+        var first: ?Scalar = null;
+        var mixed = false;
+        for (0..n) |k| {
+            const c = e.compOf(try e.componentType(ty, @intCast(k)));
+            const mc: Scalar = if (c == .bool) .int else c;
+            if (mc.size() != 4) {
+                if (first != null and first.? != mc) return e.unsupported("structs mixing 32-bit and other component sizes are not supported yet", .{});
+            }
+            if (first != null and first.? != mc) mixed = true;
+            if (first == null) first = mc;
+        }
+        return mixed;
+    }
+
+    fn loadPtr(e: *Emitter, ptr: Ptr, ty: TypeId) Error!Lowered {
+        const n = try e.flatCount(ty);
         const out = try e.arena.alloc(Value, n);
         for (out, 0..) |*o, c| {
             const p = try e.elementPtr(ptr, @intCast(c));
             const raw = try e.add(ptr.scalar_ty, .{ .load = .{ .ptr = p, .@"align" = 4 } });
-            o.* = if (ptr.bool_storage) try e.add(try e.dm.intType(1), .{ .cmp = .{ .pred = 33, .lhs = raw, .rhs = try e.i32Const(0) } }) else raw;
+            const ct = e.compOf(try e.componentType(ty, @intCast(c)));
+            o.* = if (ptr.bool_storage or (ptr.mixed and ct == .bool))
+                try e.add(try e.dm.intType(1), .{ .cmp = .{ .pred = 33, .lhs = raw, .rhs = try e.i32Const(0) } })
+            else if (ptr.mixed and ct.isFloat())
+                try e.add(try e.scalarTy(ct), .{ .cast = .{ .op = .bitcast, .val = raw } })
+            else
+                raw;
         }
         return .{ .scalars = out };
     }
 
-    fn storePtr(e: *Emitter, ptr: Ptr, vals: []const Value) Error!void {
+    fn storePtr(e: *Emitter, ptr: Ptr, vals: []const Value, ty: TypeId) Error!void {
         const void_ty = try e.voidTy();
         for (vals, 0..) |v, c| {
             const p = try e.elementPtr(ptr, @intCast(c));
-            const sv = if (ptr.bool_storage) try e.add(ptr.scalar_ty, .{ .cast = .{ .op = .zext, .val = v } }) else v;
+            const ct = e.compOf(try e.componentType(ty, @intCast(c)));
+            const sv = if (ptr.bool_storage or (ptr.mixed and ct == .bool))
+                try e.add(ptr.scalar_ty, .{ .cast = .{ .op = .zext, .val = v } })
+            else if (ptr.mixed and ct.isFloat())
+                try e.add(ptr.scalar_ty, .{ .cast = .{ .op = .bitcast, .val = v } })
+            else
+                v;
             _ = try e.add(void_ty, .{ .store = .{ .ptr = p, .val = sv, .@"align" = 4 } });
         }
     }
@@ -998,6 +1052,41 @@ const Emitter = struct {
             }
             return .{ .scalars = out };
         }
+        if (eq(u8, name, "mul") and args.len == 2) {
+            // Flattened row-major: vectors on the left are rows, on the
+            // right columns.
+            const at0 = frame.f.inst(args[0]).ty;
+            const bt0 = frame.f.inst(args[1]).ty;
+            const as = e.t.shape(at0).?;
+            const bs = e.t.shape(bt0).?;
+            if (as.count() == 1 or bs.count() == 1) {
+                const sv = if (as.count() == 1) a[0][0] else a[1][0];
+                const other = if (as.count() == 1) a[1] else a[0];
+                for (out, other) |*o, x| o.* = try e.add(rt, .{ .binop = .{ .op = .mul, .lhs = x, .rhs = sv } });
+                return .{ .scalars = out };
+            }
+            const ar: u32 = if (as.kind == .vector) 1 else as.rows;
+            const ak: u32 = as.cols;
+            const bc: u32 = if (bs.kind == .vector) 1 else bs.cols;
+            for (0..ar) |ii| for (0..bc) |j| {
+                var acc: ?Value = null;
+                for (0..ak) |kk| {
+                    const x = a[0][ii * ak + kk];
+                    const y = if (bs.kind == .vector) a[1][kk] else a[1][kk * bc + j];
+                    const p = try e.add(rt, .{ .binop = .{ .op = .mul, .lhs = x, .rhs = y } });
+                    acc = if (acc) |s0| try e.add(rt, .{ .binop = .{ .op = .add, .lhs = s0, .rhs = p } }) else p;
+                }
+                out[ii * bc + j] = acc.?;
+            };
+            return .{ .scalars = out };
+        }
+        if (eq(u8, name, "transpose")) {
+            const as = e.t.shape(frame.f.inst(args[0]).ty).?;
+            for (0..as.cols) |c| for (0..as.rows) |r| {
+                out[c * as.rows + r] = a[0][r * as.cols + c];
+            };
+            return .{ .scalars = out };
+        }
         if (eq(u8, name, "rcp")) {
             for (out, 0..) |*o, k| o.* = try e.add(at, .{ .binop = .{ .op = .sdiv, .lhs = try e.constant(try e.t.scalar(ac), .{ .float = 1 }), .rhs = a[0][k] } });
             return .{ .scalars = out };
@@ -1067,7 +1156,7 @@ const Emitter = struct {
 
     fn cbufferSize(e: *Emitter, res: Resource) Error!i64 {
         const g = e.m.globals.items[res.global];
-        return layout.sizeOf(e.t, g.ty, .dx_legacy) catch e.unsupported("constant buffer '{s}' contains types that are not supported yet", .{g.name});
+        return layout.sizeOf(e.t, g.ty, false, .dx_legacy) catch e.unsupported("constant buffer '{s}' contains types that are not supported yet", .{g.name});
     }
 
     /// Byte offset of a member / element inside a constant buffer.
@@ -1081,10 +1170,11 @@ const Emitter = struct {
                     const k: u32 = @intCast(xi.op.constant.int);
                     const offs = layout.fieldOffsets(e.arena, e.t, st, .dx_legacy) catch return e.unsupported("constant buffer member types", .{});
                     c.offset += offs[k];
+                    c.row_major = st.fields.items[k].row_major;
                     cur = st.fields.items[k].type;
                 },
                 .array => |arr| {
-                    const stride_b = layout.arrayStride(e.t, arr.elem, .dx_legacy) catch return e.unsupported("constant buffer array element types", .{});
+                    const stride_b = layout.arrayStride(e.t, arr.elem, c.row_major, .dx_legacy) catch return e.unsupported("constant buffer array element types", .{});
                     if (xi.op == .constant) {
                         c.offset += @as(u32, @intCast(xi.op.constant.int)) * stride_b;
                     } else {
@@ -1102,9 +1192,9 @@ const Emitter = struct {
                 },
                 .matrix => |mt| {
                     if (xi.op != .constant) return e.unsupported("dynamic indexing of constant buffer matrices", .{});
-                    // Row r of a column-major matrix: component r of each column.
-                    _ = mt;
-                    return e.unsupported("row access into constant buffer matrices", .{});
+                    if (!c.row_major) return e.unsupported("row access into column-major constant buffer matrices", .{});
+                    c.offset += @as(u32, @intCast(xi.op.constant.int)) * 16;
+                    cur = try e.t.vector(mt.elem, mt.cols);
                 },
                 else => return e.unsupported("indexing this constant buffer member", .{}),
             }
@@ -1112,7 +1202,7 @@ const Emitter = struct {
         return .{ .cbuf = c };
     }
 
-    fn cbufferLoad(e: *Emitter, ri: u32, offset: u32, dyn_regs: ?Value, ty: TypeId) Error!Lowered {
+    fn cbufferLoad(e: *Emitter, ri: u32, offset: u32, dyn_regs: ?Value, row_major: bool, ty: TypeId) Error!Lowered {
         const res = e.resources.items[ri];
         const n = try e.flatCount(ty);
         const out = try e.arena.alloc(Value, n);
@@ -1125,7 +1215,7 @@ const Emitter = struct {
             const c = e.compOf(comp_ty);
             const mem_c: Scalar = if (c == .bool) .uint else c;
             if (mem_c.size() != 4) return e.unsupported("{d}-bit constant buffer members are not supported yet", .{mem_c.size() * 8});
-            const off = offset + (layout.componentOffset(e.arena, e.t, ty, @intCast(k), .dx_legacy) catch return e.unsupported("constant buffer member types", .{}));
+            const off = offset + (layout.componentOffset(e.arena, e.t, ty, row_major, @intCast(k), .dx_legacy) catch return e.unsupported("constant buffer member types", .{}));
             const reg = off / 16;
             const st = try e.scalarTy(mem_c);
             const same_kind = (mem_c.isFloat() == cache_c.isFloat());
@@ -1180,9 +1270,123 @@ const Emitter = struct {
         return e.dm.getType(.{ .@"struct" = .{ .name = name, .elems = &.{ scalar, scalar, scalar, scalar, i32t } } });
     }
 
+    /// `buffer[i].member...` in a structured buffer: byte offsets in the
+    /// packed element layout.
+    fn bufferAccess(e: *Emitter, frame: *Frame, start: @FieldType(Lowered, "buf"), elem_ty: TypeId, indices: []const Ref) Error!Lowered {
+        var b = start;
+        var cur = elem_ty;
+        const i32t = try e.dm.intType(32);
+        for (indices) |x| {
+            const xi = frame.f.inst(x);
+            switch (e.t.get(cur)) {
+                .@"struct" => |st| {
+                    const k: u32 = @intCast(xi.op.constant.int);
+                    const offs = layout.fieldOffsets(e.arena, e.t, st, .dx_packed) catch return e.unsupported("buffer member types", .{});
+                    b.offset += offs[k];
+                    b.row_major = st.fields.items[k].row_major;
+                    cur = st.fields.items[k].type;
+                },
+                .array, .vector => {
+                    const elem = if (e.t.get(cur) == .array) e.t.get(cur).array.elem else try e.t.scalar(e.t.get(cur).vector.elem);
+                    const stride_b = layout.arrayStride(e.t, elem, b.row_major, .dx_packed) catch return e.unsupported("buffer element types", .{});
+                    if (xi.op == .constant) {
+                        b.offset += @as(u32, @intCast(xi.op.constant.int)) * stride_b;
+                    } else {
+                        const idx = (try e.scalars(frame, x))[0];
+                        const bytes = try e.add(i32t, .{ .binop = .{ .op = .mul, .lhs = idx, .rhs = try e.i32Const(stride_b) } });
+                        b.dyn = if (b.dyn) |d| try e.add(i32t, .{ .binop = .{ .op = .add, .lhs = d, .rhs = bytes } }) else bytes;
+                    }
+                    cur = elem;
+                },
+                else => return e.unsupported("indexing this buffer member is not supported yet", .{}),
+            }
+        }
+        return .{ .buf = b };
+    }
+
+    /// Loads a value of `ty` at a byte offset of a structured buffer
+    /// element: contiguous components of one type are read together.
+    fn structuredLoad(e: *Emitter, res: Resource, idx: Value, base: u32, dyn: ?Value, row_major: bool, ty: TypeId) Error![]const Value {
+        const n = try e.flatCount(ty);
+        const out = try e.arena.alloc(Value, n);
+        const i32t = try e.dm.intType(32);
+        const i8t = try e.dm.intType(8);
+        var k: u32 = 0;
+        while (k < n) {
+            const c0 = e.compOf(try e.componentType(ty, k));
+            const mem: Scalar = if (c0 == .bool) .uint else c0;
+            const off0 = layout.componentOffset(e.arena, e.t, ty, row_major, k, .dx_packed) catch return e.unsupported("buffer element types", .{});
+            var count: u32 = 1;
+            while (k + count < n and count < 4) : (count += 1) {
+                const cn = e.compOf(try e.componentType(ty, k + count));
+                const mn: Scalar = if (cn == .bool) .uint else cn;
+                const on = layout.componentOffset(e.arena, e.t, ty, row_major, k + count, .dx_packed) catch break;
+                if (mn != mem or on != off0 + count * mem.size()) break;
+            }
+            const st = try e.scalarTy(mem);
+            const ret_ty = try e.resRetType(st);
+            var off = try e.i32Const(base + off0);
+            if (dyn) |d| off = try e.add(i32t, .{ .binop = .{ .op = .add, .lhs = d, .rhs = off } });
+            const call = if (e.profile.minor >= 2) blk: {
+                const fn_i = try e.dxOp(try std.fmt.allocPrint(e.arena, "dx.op.rawBufferLoad.{s}", .{e.overloadName(st)}), ret_ty, &.{ i32t, e.handle_ty, i32t, i32t, i8t, i32t }, .nounwind_readonly);
+                const mask = try e.dm.constant(.{ .ty = i8t, .kind = .{ .int = (@as(i64, 1) << @intCast(count)) - 1 } });
+                break :blk try e.callOp(fn_i, ret_ty, &.{ try e.i32Const(139), res.handle, idx, off, mask, try e.i32Const(mem.size()) });
+            } else blk: {
+                const fn_i = try e.dxOp(try std.fmt.allocPrint(e.arena, "dx.op.bufferLoad.{s}", .{e.overloadName(st)}), ret_ty, &.{ i32t, e.handle_ty, i32t, i32t }, .nounwind_readonly);
+                break :blk try e.callOp(fn_i, ret_ty, &.{ try e.i32Const(68), res.handle, idx, off });
+            };
+            for (0..count) |j| {
+                const v = try e.add(st, .{ .extractvalue = .{ .agg = call, .index = @intCast(j) } });
+                const cj = e.compOf(try e.componentType(ty, k + @as(u32, @intCast(j))));
+                out[k + j] = if (cj == .bool) try e.convertScalar(v, .uint, .bool) else v;
+            }
+            k += count;
+        }
+        return out;
+    }
+
+    fn structuredStore(e: *Emitter, res: Resource, idx: Value, base: u32, dyn: ?Value, row_major: bool, ty: TypeId, vals: []const Value) Error!void {
+        const n: u32 = @intCast(vals.len);
+        const i32t = try e.dm.intType(32);
+        const i8t = try e.dm.intType(8);
+        const void_ty = try e.voidTy();
+        var k: u32 = 0;
+        while (k < n) {
+            const c0 = e.compOf(try e.componentType(ty, k));
+            const mem: Scalar = if (c0 == .bool) .uint else c0;
+            const off0 = layout.componentOffset(e.arena, e.t, ty, row_major, k, .dx_packed) catch return e.unsupported("buffer element types", .{});
+            var count: u32 = 1;
+            while (k + count < n and count < 4) : (count += 1) {
+                const cn = e.compOf(try e.componentType(ty, k + count));
+                const mn: Scalar = if (cn == .bool) .uint else cn;
+                const on = layout.componentOffset(e.arena, e.t, ty, row_major, k + count, .dx_packed) catch break;
+                if (mn != mem or on != off0 + count * mem.size()) break;
+            }
+            const st = try e.scalarTy(mem);
+            const undef_v = try e.dm.constant(.{ .ty = st, .kind = .undef });
+            var comps: [4]Value = .{ undef_v, undef_v, undef_v, undef_v };
+            for (0..count) |j| {
+                const cj = e.compOf(try e.componentType(ty, k + @as(u32, @intCast(j))));
+                comps[j] = if (cj == .bool) try e.convertScalar(vals[k + j], .bool, .uint) else vals[k + j];
+            }
+            var off = try e.i32Const(base + off0);
+            if (dyn) |d| off = try e.add(i32t, .{ .binop = .{ .op = .add, .lhs = d, .rhs = off } });
+            const mask = try e.dm.constant(.{ .ty = i8t, .kind = .{ .int = (@as(i64, 1) << @intCast(count)) - 1 } });
+            if (e.profile.minor >= 2) {
+                const fn_i = try e.dxOp(try std.fmt.allocPrint(e.arena, "dx.op.rawBufferStore.{s}", .{e.overloadName(st)}), void_ty, &.{ i32t, e.handle_ty, i32t, i32t, st, st, st, st, i8t, i32t }, .nounwind);
+                _ = try e.callOp(fn_i, void_ty, &.{ try e.i32Const(140), res.handle, idx, off, comps[0], comps[1], comps[2], comps[3], mask, try e.i32Const(mem.size()) });
+            } else {
+                const fn_i = try e.dxOp(try std.fmt.allocPrint(e.arena, "dx.op.bufferStore.{s}", .{e.overloadName(st)}), void_ty, &.{ i32t, e.handle_ty, i32t, i32t, st, st, st, st, i8t }, .nounwind);
+                _ = try e.callOp(fn_i, void_ty, &.{ try e.i32Const(69), res.handle, idx, off, comps[0], comps[1], comps[2], comps[3], mask });
+            }
+            k += count;
+        }
+    }
+
     fn resourceLoad(e: *Emitter, frame: *Frame, res_ref: Ref, index_ref: Ref, ty: TypeId) Error!Lowered {
         const res = try e.resourceOf(frame, res_ref);
         const idx = (try e.scalars(frame, index_ref))[0];
+        if (res.kind == 12) return .{ .scalars = try e.structuredLoad(res.*, idx, 0, null, false, ty) };
         const n = try e.flatCount(ty);
         const c = try e.uniformScalar(ty);
         const mem_c = if (c == .bool) Scalar.uint else c;
@@ -1227,6 +1431,7 @@ const Emitter = struct {
         const res = try e.resourceOf(frame, res_ref);
         const idx = (try e.scalars(frame, index_ref))[0];
         const vals = try e.scalars(frame, value_ref);
+        if (res.kind == 12) return e.structuredStore(res.*, idx, 0, null, false, frame.f.inst(value_ref).ty, vals);
         const vt = frame.f.inst(value_ref).ty;
         const c = try e.uniformScalar(vt);
         const mem_c = if (c == .bool) Scalar.uint else c;
@@ -1344,7 +1549,9 @@ const Emitter = struct {
             }
             const rt = e.t.get(g.ty).resource;
             const class_name = try std.fmt.allocPrint(e.arena, "class.{s}<{s}>", .{ rt.name, try e.t.format(e.arena, r.elem) });
-            const elem_dt = try e.scalarTy(if (r.kind == 11) .uint else try e.uniformScalar(r.elem));
+            // The class type only names the resource; aggregates get a
+            // placeholder element.
+            const elem_dt = try e.scalarTy(if (r.kind == 11) .uint else if (e.t.shape(r.elem) == null) .int else e.compOf(r.elem));
             const class_ty = try dm.getType(.{ .@"struct" = .{ .name = class_name, .elems = &.{elem_dt} } });
             const undef_ptr = try dm.constant(.{ .ty = try dm.ptrType(class_ty), .kind = .undef });
             const b = g.binding;

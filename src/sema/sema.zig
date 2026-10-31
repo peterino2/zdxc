@@ -53,6 +53,8 @@ pub const Variable = struct {
     param_index: u32 = 0,
     /// The `cbuffer` / `tbuffer` declaration holding the variable.
     block: ?*const ast.Decl = null,
+    /// Matrices in the variable are row_major (layout only).
+    row_major: bool = false,
 };
 
 /// What an expression refers to, recorded by Sema for lowering
@@ -956,12 +958,16 @@ pub const Sema = struct {
                     s.err(start, "array dimensions of struct/class members must be explicit", .{});
                     continue;
                 }
-                _ = s.checkModifiers(.field, v.qual_words, start, fbase, s.last_attrs);
+                const fattrs = s.checkModifiers(.field, v.qual_words, start, fbase, s.last_attrs);
                 const ft = try s.applyArrayDims(fbase, v.array_dims);
                 s.checkSemantics(.field, v.semantics, ft, false);
                 if (s.types.get(fbase) == .string) s.err(v.name_loc, "string declaration may only appear in global scope", .{});
                 for (info.fields.items[base_fields..]) |f| if (std.mem.eql(u8, f.name, v.name)) s.err(v.name_loc, "duplicate member '{s}'", .{v.name});
-                try info.fields.append(s.arena, .{ .name = v.name, .type = ft });
+                var fsem: ?[]const u8 = null;
+                for (v.semantics) |sem| if (sem.kind == .semantic) {
+                    fsem = sem.values[0];
+                };
+                try info.fields.append(s.arena, .{ .name = v.name, .type = ft, .row_major = isRowMajor(fattrs), .semantic = fsem });
             },
             .func => {},
             else => try s.decl(m, .member),
@@ -1308,7 +1314,7 @@ pub const Sema = struct {
         if (std.mem.indexOf(u8, v.name, "::") != null) return; // out-of-line static member definition
         const is_auto = v.type.name.isSimple("auto");
         const base = if (is_auto) TypeTable.error_type else try s.resolveType(v.type);
-        _ = s.checkModifiers(switch (ctx) {
+        const decl_attrs = s.checkModifiers(switch (ctx) {
             .local => .local_variable,
             .member => .field,
             .global, .cbuffer => .global_variable,
@@ -1355,6 +1361,7 @@ pub const Sema = struct {
             .read_only = read_only,
             .init = v.init,
             .decl = v,
+            .row_major = isRowMajor(decl_attrs),
         };
         try s.declare(v.name, .{ .variable = variable }, v.name_loc);
         try s.decl_vars.put(s.arena, v, variable);
@@ -2867,6 +2874,10 @@ fn templateArgLoc(arg: ast.TemplateArg) Loc {
         .expr => |e| e.loc,
         .type => |t| t.loc,
     };
+}
+
+fn isRowMajor(a: TypeAttrs) bool {
+    return if (a.orientation) |o| eql(o, "row_major") else false;
 }
 
 fn eql(a: []const u8, b: []const u8) bool {
