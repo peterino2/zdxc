@@ -3382,6 +3382,26 @@ const Emitter = struct {
             const ret_ty = try e.resRetType(st);
             var off = try e.i32Const(base + off0);
             if (dyn) |d| off = try e.add(i32t, .{ .binop = .{ .op = .add, .lhs = d, .rhs = off } });
+            if (e.profile.minor < 3 and mem.size() == 8) {
+                // No 64-bit loads before SM 6.3: i32 words joined in pairs
+                // (as dxc).
+                count = @min(count, 2);
+                const wt = try e.resRetType(i32t);
+                const words = if (e.profile.minor >= 2) blk: {
+                    const fn_w = try e.dxOp("dx.op.rawBufferLoad.i32", wt, &.{ i32t, e.handle_ty, i32t, i32t, i8t, i32t }, .nounwind_readonly);
+                    break :blk try e.callOp(fn_w, wt, &.{ try e.i32Const(139), res.handle, idx, off, try e.dm.constant(.{ .ty = i8t, .kind = .{ .int = (@as(i64, 1) << @intCast(2 * count)) - 1 } }), try e.i32Const(8) });
+                } else blk: {
+                    const fn_w = try e.dxOp("dx.op.bufferLoad.i32", wt, &.{ i32t, e.handle_ty, i32t, i32t }, .nounwind_readonly);
+                    break :blk try e.callOp(fn_w, wt, &.{ try e.i32Const(68), res.handle, idx, off });
+                };
+                for (0..count) |j| {
+                    const lo = try e.add(i32t, .{ .extractvalue = .{ .agg = words, .index = @intCast(2 * j) } });
+                    const hi = try e.add(i32t, .{ .extractvalue = .{ .agg = words, .index = @intCast(2 * j + 1) } });
+                    out[k + j] = try e.joinWords(lo, hi, mem);
+                }
+                k += count;
+                continue;
+            }
             const call = if (e.profile.minor >= 2) blk: {
                 const fn_i = try e.dxOp(try std.fmt.allocPrint(e.arena, "dx.op.rawBufferLoad.{s}", .{e.overloadName(st)}), ret_ty, &.{ i32t, e.handle_ty, i32t, i32t, i8t, i32t }, .nounwind_readonly);
                 const mask = try e.dm.constant(.{ .ty = i8t, .kind = .{ .int = (@as(i64, 1) << @intCast(count)) - 1 } });
@@ -3418,6 +3438,29 @@ const Emitter = struct {
                 if (mn != mem or on != off0 + count * mem.size()) break;
             }
             const st = try e.scalarTy(mem);
+            if (e.profile.minor < 3 and mem.size() == 8) {
+                // No 64-bit stores before SM 6.3: i32 words (as dxc).
+                count = @min(count, 2);
+                const undef_w = try e.dm.constant(.{ .ty = i32t, .kind = .undef });
+                var ws: [4]Value = .{ undef_w, undef_w, undef_w, undef_w };
+                for (0..count) |j| {
+                    const w = try e.splitWords(vals[k + j], mem);
+                    ws[2 * j] = w[0];
+                    ws[2 * j + 1] = w[1];
+                }
+                var woff = try e.i32Const(base + off0);
+                if (dyn) |d| woff = try e.add(i32t, .{ .binop = .{ .op = .add, .lhs = d, .rhs = woff } });
+                const wmask = try e.dm.constant(.{ .ty = i8t, .kind = .{ .int = (@as(i64, 1) << @intCast(2 * count)) - 1 } });
+                if (e.profile.minor >= 2) {
+                    const fn_w = try e.dxOp("dx.op.rawBufferStore.i32", void_ty, &.{ i32t, e.handle_ty, i32t, i32t, i32t, i32t, i32t, i32t, i8t, i32t }, .nounwind);
+                    _ = try e.callOp(fn_w, void_ty, &.{ try e.i32Const(140), res.handle, idx, woff, ws[0], ws[1], ws[2], ws[3], wmask, try e.i32Const(8) });
+                } else {
+                    const fn_w = try e.dxOp("dx.op.bufferStore.i32", void_ty, &.{ i32t, e.handle_ty, i32t, i32t, i32t, i32t, i32t, i32t, i8t }, .nounwind);
+                    _ = try e.callOp(fn_w, void_ty, &.{ try e.i32Const(69), res.handle, idx, woff, ws[0], ws[1], ws[2], ws[3], wmask });
+                }
+                k += count;
+                continue;
+            }
             const undef_v = try e.dm.constant(.{ .ty = st, .kind = .undef });
             var comps: [4]Value = .{ undef_v, undef_v, undef_v, undef_v };
             for (0..count) |j| {

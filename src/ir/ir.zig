@@ -234,6 +234,11 @@ pub const VkOptions = struct {
     auto_shift: bool = false,
     /// -fvk-stage-io-order=alpha: locations by semantic, not declaration.
     alpha_io_order: bool = false,
+    /// -fvk-use-gl-layout, -fvk-use-dx-layout, -fvk-use-scalar-layout.
+    layout: enum { default, gl, dx, scalar } = .default,
+    /// -fvk-invert-y, -fvk-use-dx-position-w.
+    invert_y: bool = false,
+    dx_position_w: bool = false,
     /// -fspv-flatten-resource-arrays: one variable (and binding) per
     /// element of an array of resources.
     flatten_arrays: bool = false,

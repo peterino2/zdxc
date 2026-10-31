@@ -1485,7 +1485,10 @@ pub const Sema = struct {
                 for (v.semantics) |sem| if (sem.kind == .semantic) {
                     fsem = sem.values[0];
                 };
-                try info.fields.append(s.arena, .{ .name = v.name, .type = ft, .row_major = isRowMajor(fattrs), .semantic = fsem, .interp = interpOf(v.quals), .vk_location = s.vkAttrInt(v.attrs, "vk::location"), .vk_index = s.vkAttrInt(v.attrs, "vk::index"), .vk_offset = s.vkAttrInt(v.attrs, "vk::offset") });
+                if (s.opts.spirv) if (s.vkAttrInt(v.attrs, "vk::offset")) |vo| if (vo % 16 != 0 and s.types.get(ft) == .@"struct") {
+                    s.warn(v.name_loc, null, "The offset provided in the attribute should be 16-byte aligned.", .{});
+                };
+                try info.fields.append(s.arena, .{ .name = v.name, .type = ft, .row_major = isRowMajor(fattrs), .semantic = fsem, .interp = interpOf(v.quals), .vk_location = s.vkAttrInt(v.attrs, "vk::location"), .vk_index = s.vkAttrInt(v.attrs, "vk::index"), .vk_offset = if (s.opts.spirv) s.vkAttrInt(v.attrs, "vk::offset") else null });
             },
             .func => {},
             else => try s.decl(m, .member),

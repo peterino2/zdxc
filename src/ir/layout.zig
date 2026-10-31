@@ -23,7 +23,10 @@ const TypeId = types.TypeId;
 const TypeTable = types.TypeTable;
 const Allocator = std.mem.Allocator;
 
-pub const Rules = enum { dx_legacy, vk_relaxed, std430, dx_packed };
+/// `vk_relaxed` / `std430`: relaxed GLSL std140 / std430 (dxc's Vulkan
+/// defaults); `gl_std140` / `gl_std430`: strict ones (-fvk-use-gl-layout);
+/// `scalar`: scalar block layout (-fvk-use-scalar-layout).
+pub const Rules = enum { dx_legacy, vk_relaxed, std430, dx_packed, gl_std140, gl_std430, scalar };
 
 pub const Error = error{Unsupported} || Allocator.Error;
 
@@ -58,8 +61,9 @@ pub fn matrixStride(t: *const TypeTable, ty: TypeId, row_major: bool, rules: Rul
     const s = scalarSize(t, ty);
     return switch (rules) {
         .dx_legacy, .vk_relaxed => 16,
-        .std430 => vectorAlign(mv.len, s),
-        .dx_packed => mv.len * s,
+        .gl_std140 => roundUp(vectorAlign(mv.len, s), 16),
+        .std430, .gl_std430 => vectorAlign(mv.len, s),
+        .dx_packed, .scalar => mv.len * s,
     };
 }
 
@@ -69,17 +73,17 @@ pub fn alignOf(t: *const TypeTable, ty: TypeId, row_major: bool, rules: Rules) E
         // (The base alignment; relaxed placement packs 32-bit vectors
         // tighter, see `place`.)
         .vector => |v| return switch (rules) {
-            .std430, .vk_relaxed => vectorAlign(v.len, scalarSize(t, ty)),
+            .std430, .vk_relaxed, .gl_std140, .gl_std430 => vectorAlign(v.len, scalarSize(t, ty)),
             else => scalarSize(t, ty),
         },
         .matrix => return switch (rules) {
             .dx_legacy, .vk_relaxed => 16,
-            .std430 => matrixStride(t, ty, row_major, rules),
-            .dx_packed => scalarSize(t, ty),
+            .std430, .gl_std140, .gl_std430 => matrixStride(t, ty, row_major, rules),
+            .dx_packed, .scalar => scalarSize(t, ty),
         },
         .array => |a| return switch (rules) {
             .dx_legacy => 16,
-            .vk_relaxed => @max(16, try alignOf(t, a.elem, row_major, rules)),
+            .vk_relaxed, .gl_std140 => @max(16, try alignOf(t, a.elem, row_major, rules)),
             else => alignOf(t, a.elem, row_major, rules),
         },
         .@"struct" => |st| return structAlign(t, st, rules),
@@ -117,8 +121,10 @@ pub fn arrayStride(t: *const TypeTable, elem: TypeId, row_major: bool, rules: Ru
     const size = try sizeOf(t, elem, row_major, rules);
     return switch (rules) {
         .dx_legacy, .vk_relaxed => roundUp(size, 16),
-        .std430 => roundUp(size, try alignOf(t, elem, row_major, rules)),
+        .gl_std140 => roundUp(size, @max(16, try alignOf(t, elem, row_major, rules))),
+        .std430, .gl_std430 => roundUp(size, try alignOf(t, elem, row_major, rules)),
         .dx_packed => size,
+        .scalar => roundUp(size, try alignOf(t, elem, row_major, rules)),
     };
 }
 
@@ -128,6 +134,12 @@ pub fn place(t: *const TypeTable, off: u32, ty: TypeId, row_major: bool, rules: 
     switch (t.get(ty)) {
         .scalar, .@"enum", .vector => {
             const size = try sizeOf(t, ty, row_major, rules);
+            switch (rules) {
+                // Strict GLSL: vectors at their full alignment.
+                .gl_std140, .gl_std430 => return roundUp(off, try alignOf(t, ty, row_major, rules)),
+                .scalar => return roundUp(off, scalarSize(t, ty)),
+                else => {},
+            }
             // Relaxed placement: vectors of 32-bit (or narrower)
             // components align like their components; 64-bit ones keep
             // their full alignment (as dxc).
@@ -147,7 +159,7 @@ fn structAlign(t: *const TypeTable, info: *const types.StructInfo, rules: Rules)
     switch (rules) {
         .dx_legacy => return 16,
         else => {
-            var al: u32 = if (rules == .vk_relaxed) 16 else 1;
+            var al: u32 = if (rules == .vk_relaxed or rules == .gl_std140) 16 else 1;
             for (info.fields.items) |f| al = @max(al, try alignOf(t, f.type, f.row_major, rules));
             return al;
         },
@@ -159,8 +171,10 @@ fn structSize(t: *const TypeTable, info: *const types.StructInfo, rules: Rules) 
     if (info.fields.items.len > buf.len) return error.Unsupported;
     const off = try layoutFields(t, info, rules, buf[0..info.fields.items.len]);
     return switch (rules) {
-        .dx_legacy, .dx_packed => off,
-        .vk_relaxed, .std430 => roundUp(off, try structAlign(t, info, rules)),
+        .dx_legacy => off,
+        // (Packed structs still round up to their widest component: a
+        // double and a float3 take 24 bytes.)
+        .dx_packed, .vk_relaxed, .std430, .gl_std140, .gl_std430, .scalar => roundUp(off, try structAlign(t, info, rules)),
     };
 }
 
@@ -169,7 +183,7 @@ fn structSize(t: *const TypeTable, info: *const types.StructInfo, rules: Rules) 
 fn layoutFields(t: *const TypeTable, info: *const types.StructInfo, rules: Rules, out: []u32) Error!u32 {
     var off: u32 = 0;
     var first: usize = 0;
-    if (info.bases.items.len > 0 and (rules == .vk_relaxed or rules == .std430)) {
+    if (info.bases.items.len > 0 and rules != .dx_legacy and rules != .dx_packed) {
         // dxc's SPIR-V keeps a base class as a nested struct (padded to
         // its alignment); DXIL lays its fields out in place.
         const base = info.bases.items[0];
@@ -177,11 +191,25 @@ fn layoutFields(t: *const TypeTable, info: *const types.StructInfo, rules: Rules
         _ = try layoutFields(t, base, rules, out[0..first]);
         off = try structSize(t, base, rules);
     }
+    // Explicit offsets (packoffset / register(cN)): the other members
+    // follow the last explicitly placed one.
+    var packed_end: ?u32 = null;
+    for (info.fields.items[first..]) |f| if (f.pack_offset) |po| {
+        packed_end = @max(packed_end orelse 0, po + try sizeOf(t, f.type, f.row_major, rules));
+    };
+    if (packed_end) |pe| off = @max(off, pe);
+    var end: u32 = off;
     for (info.fields.items[first..], out[first..]) |f, *o| {
-        o.* = try place(t, off, f.type, f.row_major, rules);
+        if (f.pack_offset) |po| {
+            o.* = po;
+            continue;
+        }
+        // [[vk::offset]] (SPIR-V only): later members continue from it.
+        o.* = if (f.vk_offset) |vo| vo else try place(t, off, f.type, f.row_major, rules);
         off = o.* + try sizeOf(t, f.type, f.row_major, rules);
+        end = @max(end, off);
     }
-    return off;
+    return @max(end, packed_end orelse 0);
 }
 
 /// Offsets of a struct's fields.

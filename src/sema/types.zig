@@ -342,6 +342,8 @@ pub const Field = struct {
     interp: Interp = .{},
     /// Hidden storage for consecutive bitfields (see StructInfo.bitfields).
     bits: bool = false,
+    /// Constant buffer members: `packoffset` / `register(cN)` byte offset.
+    pack_offset: ?u32 = null,
     /// [[vk::location(n)]], [[vk::index(n)]], [[vk::offset(n)]].
     vk_location: ?u32 = null,
     vk_index: ?u32 = null,

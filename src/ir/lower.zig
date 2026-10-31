@@ -426,7 +426,7 @@ const Lowerer = struct {
         }
         const info = try l.arena.create(@import("../sema/types.zig").StructInfo);
         info.* = .{ .name = name, .complete = true };
-        for (members.items) |mv| try info.fields.append(l.arena, .{ .name = mv.name, .type = mv.type, .row_major = mv.row_major });
+        for (members.items) |mv| try info.fields.append(l.arena, .{ .name = mv.name, .type = mv.type, .row_major = mv.row_major, .pack_offset = packOffset(mv), .vk_offset = if (mv.decl != null and l.s.opts.spirv) l.s.vkAttrInt(mv.decl.?.attrs, "vk::offset") else null });
         const ty = try l.s.types.intern(.{ .@"struct" = info });
         try l.m.globals.append(l.arena, .{ .name = name, .ty = ty, .space = .cbuffer, .binding = binding, .tbuffer = is_tbuffer, .shader_record = shader_record, .push_constant = push_constant });
         const gi: u32 = @intCast(l.m.globals.items.len - 1);
@@ -2192,6 +2192,29 @@ pub fn stringContents(a: Allocator, lit: []const u8) Allocator.Error![]const u8 
         });
     }
     return out.items;
+}
+
+/// A constant buffer member's `packoffset(cN.x)` / `register(cN)` offset
+/// in bytes.
+fn packOffset(v: *const Variable) ?u32 {
+    const d = v.decl orelse return null;
+    for (d.semantics) |sem| {
+        if (sem.kind != .packoffset and sem.kind != .register) continue;
+        if (sem.values.len == 0) continue;
+        const text = sem.values[0];
+        if (text.len < 2 or std.ascii.toLower(text[0]) != 'c') continue;
+        const dot = std.mem.indexOfScalar(u8, text, '.') orelse text.len;
+        const reg = std.fmt.parseInt(u32, text[1..dot], 10) catch continue;
+        var comp: u32 = 0;
+        if (dot + 1 < text.len) comp = switch (text[dot + 1]) {
+            'y', 'g' => 1,
+            'z', 'b' => 2,
+            'w', 'a' => 3,
+            else => 0,
+        };
+        return reg * 16 + comp * 4;
+    }
+    return null;
 }
 
 fn hasAttr(attrs: []const ast.Attribute, name: []const u8) bool {

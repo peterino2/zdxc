@@ -219,6 +219,8 @@ const Emitter = struct {
         /// shared by several elements, SampleMask), accessed element-wise.
         elem_array: bool = false,
         base: u32 = 0,
+        /// The BuiltIn decoration (none: maxInt).
+        builtin: u32 = std.math.maxInt(u32),
     };
     const EntryState = struct {
         /// Entry inputs / outputs: interface variable and its value type.
@@ -237,7 +239,9 @@ const Emitter = struct {
     };
     const LayoutKey = struct { TypeId, layout.Rules, bool };
     const MeshPlace = struct { kind: ir.MeshOutput, index: Ref = .none, offset: u32 = 0, ty: TypeId };
-    const PtrLayout = struct { rules: layout.Rules, row_major: bool };
+    /// `buffer`: storage buffer storage (structured buffers, tbuffers), not
+    /// Uniform (constant buffers).
+    const PtrLayout = struct { rules: layout.Rules, row_major: bool, buffer: bool = false };
 
     fn unsupported(e: *Emitter, comptime fmt: []const u8, args: anytype) Error {
         _ = e.diags.report(.{ .severity = .@"error", .loc = .none }, "SPIR-V code generation: " ++ fmt, args);
@@ -414,6 +418,15 @@ const Emitter = struct {
                 for (st.fields.items) |fld| try ops.append(e.arena, try e.layoutTypeId(fld.type, rules, fld.row_major));
                 try e.b.emit(.types_globals, .type_struct, ops.items);
                 const offs = layout.fieldOffsets(e.arena, e.t, st, rules) catch return e.unsupported("buffer member type '{s}'", .{st.name});
+                // An explicit [[vk::offset]] still has to respect the rules.
+                for (st.fields.items, offs) |fld, o| if (fld.vk_offset != null) {
+                    const al = layout.alignOf(e.t, fld.type, fld.row_major, rules) catch 1;
+                    const need: u32 = switch (e.t.get(fld.type)) {
+                        .scalar, .@"enum", .vector => 1,
+                        else => al,
+                    };
+                    if (o % need != 0) return e.unsupported("[[vk::offset({d})]] on '{s}' is not aligned to {d} bytes for this buffer layout", .{ o, fld.name, need });
+                };
                 for (st.fields.items, offs, 0..) |fld, o, k| {
                     const mk: u32 = @intCast(k);
                     try e.b.emit(.annotations, .member_decorate, &.{ id, mk, 35, o }); // Offset
@@ -437,7 +450,7 @@ const Emitter = struct {
         if (e.tb_blocks.get(s)) |id| return id;
         const st = e.t.get(s).@"struct";
         const id = e.b.newId();
-        try e.layoutStruct(id, st, .std430, try std.fmt.allocPrint(e.arena, "type.TextureBuffer.{s}", .{st.name}));
+        try e.layoutStruct(id, st, e.tbRules(), try std.fmt.allocPrint(e.arena, "type.TextureBuffer.{s}", .{st.name}));
         for (0..st.fields.items.len) |k| try e.b.emit(.annotations, .member_decorate, &.{ id, @intCast(k), 24 }); // NonWritable
         try e.b.emit(.annotations, .decorate, &.{ id, e.bufferBlockDecoration() });
         try e.tb_blocks.put(e.arena, s, id);
@@ -450,7 +463,7 @@ const Emitter = struct {
         if (e.cb_blocks.get(s)) |id| return id;
         const st = e.t.get(s).@"struct";
         const id = e.b.newId();
-        try e.layoutStruct(id, st, .vk_relaxed, try std.fmt.allocPrint(e.arena, "type.ConstantBuffer.{s}", .{st.name}));
+        try e.layoutStruct(id, st, e.cbRules(), try std.fmt.allocPrint(e.arena, "type.ConstantBuffer.{s}", .{st.name}));
         try e.b.emit(.annotations, .decorate, &.{ id, 2 }); // Block
         try e.cb_blocks.put(e.arena, s, id);
         return id;
@@ -852,7 +865,7 @@ const Emitter = struct {
                     const st = e.t.get(if (g.space == .resource) e.t.get(g.ty).resource.elem else g.ty);
                     if (st != .@"struct") return e.unsupported("this buffer is not supported yet", .{});
                     const block = e.b.newId();
-                    try e.layoutStruct(block, st.@"struct", .std430, try std.fmt.allocPrint(e.arena, "type.{s}.{s}", .{ if (sc == .push_constant) "PushConstant" else "ShaderRecord", g.name }));
+                    try e.layoutStruct(block, st.@"struct", e.sbRules(), try std.fmt.allocPrint(e.arena, "type.{s}.{s}", .{ if (sc == .push_constant) "PushConstant" else "ShaderRecord", g.name }));
                     try e.b.emit(.annotations, .decorate, &.{ block, 2 }); // Block
                     const var_id = e.b.newId();
                     try e.b.emit(.types_globals, .variable, &.{ try e.pointerType(sc, block), var_id, @backingInt(sc) });
@@ -895,7 +908,7 @@ const Emitter = struct {
                 },
                 .cbuffer => {
                     // tbuffers: read-only storage buffers, std430.
-                    const st = try e.layoutTypeId(g.ty, if (g.tbuffer) .std430 else .vk_relaxed, false);
+                    const st = try e.layoutTypeId(g.ty, if (g.tbuffer) e.tbRules() else e.cbRules(), false);
                     try e.b.emit(.annotations, .decorate, &.{ st, if (g.tbuffer) e.bufferBlockDecoration() else 2 }); // Block
                     if (g.tbuffer) for (0..e.t.get(g.ty).@"struct".fields.items.len) |k| {
                         try e.b.emit(.annotations, .member_decorate, &.{ st, @intCast(k), 24 }); // NonWritable
@@ -1447,7 +1460,7 @@ const Emitter = struct {
                 const sc: StorageClass = if (input) .input else .output;
                 if (bi != null and input and !el.per_vertex) {
                     // One variable per input builtin, shared by its uses.
-                    iface.* = .{ .var_id = try e.builtinInput(bi.?.id, ty), .ty = vty, .elem_array = e.t.get(ty) == .array };
+                    iface.* = .{ .var_id = try e.builtinInput(bi.?.id, ty), .ty = vty, .elem_array = e.t.get(ty) == .array, .builtin = bi.?.id };
                     if (bi.?.id == 11 or bi.?.id == 12) try e.b.emit(.annotations, .decorate, &.{ iface.var_id, 15 }); // Patch
                     continue;
                 }
@@ -1489,7 +1502,7 @@ const Emitter = struct {
                 // (Named after the semantic as written, as dxc.)
                 const name = if (el.spelling) |sp| try std.fmt.allocPrint(e.arena, "{s}.var.{s}", .{ if (input) "in" else "out", sp }) else try std.fmt.allocPrint(e.arena, "{s}.var.{s}{d}", .{ if (input) "in" else "out", el.semantic, el.semantic_index });
                 try e.b.emitWithString(.debug_names, .name, &.{var_id}, name, &.{});
-                iface.* = .{ .var_id = var_id, .ty = vty, .elem_array = bi != null and e.t.get(bi.?.ty) == .array };
+                iface.* = .{ .var_id = var_id, .ty = vty, .elem_array = bi != null and e.t.get(bi.?.ty) == .array, .builtin = if (bi) |x| x.id else std.math.maxInt(u32) };
                 try e.useVar(var_id);
             }
         }
@@ -1858,12 +1871,12 @@ const Emitter = struct {
                 if (ownStorage(e.m.globals.items[g]) != null) {
                     // (Interfaces list them from SPIR-V 1.4.)
                     if (e.spv_minor >= 4) try e.useVar(e.global_vars[g]);
-                    e.ptr_layouts[ri] = .{ .rules = .std430, .row_major = false };
+                    e.ptr_layouts[ri] = .{ .rules = e.sbRules(), .row_major = false };
                     return;
                 }
                 e.ptr_layouts[ri] = switch (e.m.globals.items[g].space) {
-                    .cbuffer => .{ .rules = if (e.m.globals.items[g].tbuffer) .std430 else .vk_relaxed, .row_major = false },
-                    .resource => .{ .rules = .std430, .row_major = false },
+                    .cbuffer => if (e.m.globals.items[g].tbuffer) .{ .rules = e.tbRules(), .row_major = false, .buffer = true } else .{ .rules = e.cbRules(), .row_major = false },
+                    .resource => .{ .rules = e.sbRules(), .row_major = false, .buffer = true },
                     else => null,
                 };
             },
@@ -1969,14 +1982,14 @@ const Emitter = struct {
                 }
                 const own = e.ownBuffer(a.base);
                 const shader_record = own != null;
-                const sc: StorageClass = if (own) |x| x else if (into_cb) .uniform else if (into_buffer or (base_pl != null and base_pl.?.rules == .std430)) e.bufferSc() else if (base_pl != null) .uniform else switch (i.ptr) {
+                const sc: StorageClass = if (own) |x| x else if (into_cb) .uniform else if (into_buffer or (base_pl != null and base_pl.?.buffer)) e.bufferSc() else if (base_pl != null) .uniform else switch (i.ptr) {
                     .function => .function,
                     .private => .private,
                     .groupshared => if (e.payload_global != null and e.rootGlobal(a.base) == e.payload_global) .task_payload_workgroup else .workgroup,
                     .cbuffer, .resource => .uniform,
                     else => return e.unsupported("access into this storage is not supported yet", .{}),
                 };
-                var pl = if (shader_record) PtrLayout{ .rules = .std430, .row_major = false } else if (into_cb) PtrLayout{ .rules = .vk_relaxed, .row_major = false } else if (into_tb) PtrLayout{ .rules = .std430, .row_major = false } else if (into_buffer) PtrLayout{ .rules = .std430, .row_major = false } else e.ptr_layouts[a.base.index()];
+                var pl = if (shader_record) PtrLayout{ .rules = e.sbRules(), .row_major = false } else if (into_cb) PtrLayout{ .rules = e.cbRules(), .row_major = false } else if (into_tb) PtrLayout{ .rules = e.tbRules(), .row_major = false, .buffer = true } else if (into_buffer) PtrLayout{ .rules = e.sbRules(), .row_major = false, .buffer = true } else e.ptr_layouts[a.base.index()];
                 var ops: std.ArrayList(u32) = .empty;
                 try ops.appendSlice(e.arena, &.{ 0, 0, e.val(a.base) });
                 var cur = f.inst(a.base).ty;
@@ -2238,8 +2251,8 @@ const Emitter = struct {
                     return;
                 }
                 const ptr = try e.bufferElement(x.res, x.index);
-                const raw = try e.opRaw(.load, try e.layoutTypeId(i.ty, .std430, false), &.{ptr});
-                e.vals[ri] = try e.fromLayout(raw, i.ty, .std430, false);
+                const raw = try e.opRaw(.load, try e.layoutTypeId(i.ty, e.sbRules(), false), &.{ptr});
+                e.vals[ri] = try e.fromLayout(raw, i.ty, e.sbRules(), false);
             },
             .res_store => |x| {
                 if (e.isImage(x.res)) {
@@ -2247,11 +2260,22 @@ const Emitter = struct {
                     return;
                 }
                 const ptr = try e.bufferElement(x.res, x.index);
-                const v = try e.toLayout(e.val(x.value), f.inst(x.value).ty, .std430, false);
+                const v = try e.toLayout(e.val(x.value), f.inst(x.value).ty, e.sbRules(), false);
                 try e.b.emit(.functions, .store, &.{ ptr, v });
             },
             .method => |x| e.vals[ri] = try e.method(x.name, x.res, x.args, i.ty),
-            .input => |k| e.vals[ri] = try e.loadInterface(e.st.inputs[k], .input, i.ty),
+            .input => |k| {
+                const iface = e.st.inputs[k];
+                e.vals[ri] = try e.loadInterface(iface, .input, i.ty);
+                // -fvk-use-dx-position-w: SV_Position.w as in DirectX (w,
+                // not 1 / w).
+                if (e.vk.dx_position_w and iface.builtin == 15 and e.entry.stage == .pixel) {
+                    const f1 = try e.t.scalar(.float);
+                    const w = try e.op1(.composite_extract, f1, &.{ e.vals[ri], 3 });
+                    const inv = try e.op1(.f_div, f1, &.{ try e.constant(f1, .{ .float = 1 }), w });
+                    e.vals[ri] = try e.op1(.composite_insert, i.ty, &.{ inv, e.vals[ri], 3 });
+                }
+            },
             .input_vertex => |x| {
                 const iface = e.st.inputs[x.element];
                 const ptr = try e.opRaw(.access_chain, try e.pointerType(.input, try e.typeId(iface.ty)), &.{ iface.var_id, try e.constUint(x.vertex) });
@@ -2305,7 +2329,14 @@ const Emitter = struct {
             .output => |o| {
                 const iface = e.st.outputs[o.element];
                 if (iface.elem_array) return e.storeInterface(iface, f.inst(o.value).ty, e.val(o.value));
-                const v = try e.reshape(e.val(o.value), f.inst(o.value).ty, iface.ty);
+                var v = try e.reshape(e.val(o.value), f.inst(o.value).ty, iface.ty);
+                // -fvk-invert-y: flip SV_Position.y in the last stage before
+                // rasterization.
+                if (e.vk.invert_y and iface.builtin == 0 and (e.entry.stage == .vertex or e.entry.stage == .domain or e.entry.stage == .geometry)) {
+                    const f1 = try e.t.scalar(.float);
+                    const y = try e.op1(.composite_extract, f1, &.{ v, 1 });
+                    v = try e.op1(.composite_insert, iface.ty, &.{ try e.op1(.f_negate, f1, &.{y}), v, 1 });
+                }
                 if (e.entry.outputs.items[o.element].per_vertex) {
                     // Hull output control points: this invocation's element.
                     const id = try e.op1(.load, try e.t.scalar(.uint), &.{try e.builtinInput(8, try e.t.scalar(.uint))});
@@ -2563,7 +2594,7 @@ const Emitter = struct {
             .structured_buffer, .rw_structured_buffer, .append_structured_buffer, .consume_structured_buffer => r.elem,
             else => return null,
         };
-        return try e.layoutTypeId(elem_ty, .std430, false);
+        return try e.layoutTypeId(elem_ty, e.sbRules(), false);
     }
 
     /// The BufferBlock struct of a buffer type (one per HLSL type, so
@@ -2573,7 +2604,7 @@ const Emitter = struct {
         const r = e.t.get(ty).resource;
         const elem_ty = if (r.kind == .byte_address_buffer or r.kind == .rw_byte_address_buffer) try e.t.scalar(.uint) else r.elem;
         const elem = (try e.bufferElemType(ty)).?;
-        const stride = layout.arrayStride(e.t, elem_ty, false, .std430) catch return e.unsupported("buffer element type '{s}'", .{try e.t.format(e.arena, elem_ty)});
+        const stride = layout.arrayStride(e.t, elem_ty, false, e.sbRules()) catch return e.unsupported("buffer element type '{s}'", .{try e.t.format(e.arena, elem_ty)});
         const rt = e.b.newId();
         try e.b.emit(.types_globals, .type_runtime_array, &.{ rt, elem });
         try e.b.emit(.annotations, .decorate, &.{ rt, 6, stride }); // ArrayStride
@@ -2583,7 +2614,7 @@ const Emitter = struct {
         if (e.isTrueMatrix(elem_ty) and storageScalar(e.t.get(elem_ty).matrix.elem).isFloat()) {
             // Buffers of (column-major) matrices: HLSL rows are SPIR-V
             // columns.
-            try e.b.emit(.annotations, .member_decorate, &.{ st, 0, 7, layout.matrixStride(e.t, elem_ty, false, .std430) }); // MatrixStride
+            try e.b.emit(.annotations, .member_decorate, &.{ st, 0, 7, layout.matrixStride(e.t, elem_ty, false, e.sbRules()) }); // MatrixStride
             try e.b.emit(.annotations, .member_decorate, &.{ st, 0, 4 }); // RowMajor
         }
         if (!r.kind.isWritable() and r.kind != .consume_structured_buffer) try e.b.emit(.annotations, .member_decorate, &.{ st, 0, 24 }); // NonWritable
@@ -2721,6 +2752,35 @@ const Emitter = struct {
 
     // ------------------------------------------------------------------
     // Images and samplers
+
+    /// Layout rules of constant buffers, tbuffers and structured buffers
+    /// (-fvk-use-gl-layout, -fvk-use-dx-layout, -fvk-use-scalar-layout).
+    fn cbRules(e: *Emitter) layout.Rules {
+        return switch (e.vk.layout) {
+            .default => .vk_relaxed,
+            .gl => .gl_std140,
+            .dx => .dx_legacy,
+            .scalar => .scalar,
+        };
+    }
+
+    fn tbRules(e: *Emitter) layout.Rules {
+        return switch (e.vk.layout) {
+            .default => .std430,
+            .gl => .gl_std430,
+            .dx => .dx_legacy,
+            .scalar => .scalar,
+        };
+    }
+
+    fn sbRules(e: *Emitter) layout.Rules {
+        return switch (e.vk.layout) {
+            .default => .std430,
+            .gl => .gl_std430,
+            .dx => .dx_packed,
+            .scalar => .scalar,
+        };
+    }
 
     fn accelType(e: *Emitter) Error!Id {
         if (e.accel_type == 0) {
@@ -3071,16 +3131,16 @@ const Emitter = struct {
             const ptr = try e.opRaw(.access_chain, try e.pointerType(e.bufferSc(), elem), &.{ e.val(res), try e.constUint(0), idx });
             const ety = r.elem;
             if (eq(u8, name, "Append")) {
-                try e.b.emit(.functions, .store, &.{ ptr, try e.toLayout(e.val(args[0]), e.f.inst(args[0]).ty, .std430, false) });
+                try e.b.emit(.functions, .store, &.{ ptr, try e.toLayout(e.val(args[0]), e.f.inst(args[0]).ty, e.sbRules(), false) });
                 _ = ety;
                 return 0;
             }
-            return e.fromLayout(try e.opRaw(.load, elem, &.{ptr}), ty, .std430, false);
+            return e.fromLayout(try e.opRaw(.load, elem, &.{ptr}), ty, e.sbRules(), false);
         }
         if (eq(u8, name, "Load") and (r.kind == .structured_buffer or r.kind == .rw_structured_buffer)) {
             const ptr = try e.bufferElement(res, args[0]);
-            const raw = try e.opRaw(.load, try e.layoutTypeId(ty, .std430, false), &.{ptr});
-            return e.fromLayout(raw, ty, .std430, false);
+            const raw = try e.opRaw(.load, try e.layoutTypeId(ty, e.sbRules(), false), &.{ptr});
+            return e.fromLayout(raw, ty, e.sbRules(), false);
         }
         const sh = texture.shape(r.kind) orelse return e.unsupported("method '{s}' is not supported yet", .{name});
         const call = texture.decode(name, sh, args.len) orelse return e.unsupported("method '{s}' is not supported yet", .{name});
@@ -3421,7 +3481,7 @@ const Emitter = struct {
                 } else {
                     try store(e, args[0], len);
                     if (args.len > 1) {
-                        const stride = layout.arrayStride(e.t, r.elem, false, .std430) catch return e.unsupported("buffer element type", .{});
+                        const stride = layout.arrayStride(e.t, r.elem, false, e.sbRules()) catch return e.unsupported("buffer element type", .{});
                         try store(e, args[1], try e.constUint(stride));
                     }
                 }

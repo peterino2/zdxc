@@ -164,6 +164,11 @@ fn parseArgs(cli: Cli, arena: std.mem.Allocator, argv: []const [:0]const u8, std
                     .auto_binding_space => opts.vk.auto_binding_space = std.fmt.parseInt(u32, v, 10) catch return cli.fail("invalid -auto-binding-space '{s}'", .{v}),
                     .fvk_auto_shift_bindings => opts.vk.auto_shift = true,
                     .fspv_flatten_resource_arrays => opts.vk.flatten_arrays = true,
+                    .fvk_invert_y => opts.vk.invert_y = true,
+                    .fvk_use_gl_layout => opts.vk.layout = .gl,
+                    .fvk_use_dx_layout => opts.vk.layout = .dx,
+                    .fvk_use_scalar_layout => opts.vk.layout = .scalar,
+                    .fvk_use_dx_position_w => opts.vk.dx_position_w = true,
                     .fvk_stage_io_order_EQ => {
                         if (std.mem.eql(u8, v, "alpha")) opts.vk.alpha_io_order = true else if (!std.mem.eql(u8, v, "decl")) return cli.fail("unknown -fvk-stage-io-order '{s}'", .{v});
                     },
