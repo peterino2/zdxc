@@ -1892,10 +1892,19 @@ pub const Sema = struct {
             o.has_operators = true;
         };
         if (f.template_params.len > 0) return s.declareTemplate(name, d);
-        // HLSL 2021 overloads operators as member functions only.
-        if (std.mem.startsWith(u8, name, "operator") and owner == null) {
-            s.err(d.loc, "non-member operator overloading is not supported yet", .{});
-            return;
+        // dxc's limits: member operators only, and not assignment,
+        // compound assignment, ++, --, -> or new/delete.
+        if (std.mem.startsWith(u8, name, "operator")) {
+            const op = name["operator".len..];
+            const disallowed = [_][]const u8{ "=", "+=", "-=", "*=", "/=", "%=", "^=", "&=", "|=", "<<=", ">>=", "++", "--", "->", "->*", "new", "delete", "new[]", "delete[]" };
+            for (disallowed) |x| if (eql(op, x)) {
+                s.err(d.loc, "overloading '{s}' is not allowed", .{name});
+                return;
+            };
+            if (owner == null) {
+                s.err(d.loc, "overloading non-member '{s}' is not allowed", .{name});
+                return;
+            }
         }
         if (f.name.parts.len > 1) return; // out-of-line method definition: not modelled yet
         // `auto` return types are deduced in HLSL 202x; unconstrained here.
@@ -2325,17 +2334,9 @@ pub const Sema = struct {
     fn unaryExpr(s: *Sema, e: *ast.Expr, op: ast.UnaryOp, operand: *ast.Expr) Allocator.Error!Typed {
         const t = try s.expr(operand);
         if (t.ty == TypeTable.error_type) return err_typed;
+        // dxc never applies unary operator overloads.
         if (s.types.get(t.ty) == .@"struct" and s.types.get(t.ty).@"struct".overloadsOperators()) {
-            const name: []const u8 = switch (op) {
-                .plus => "operator+",
-                .minus => "operator-",
-                .not => "operator!",
-                .bit_not => "operator~",
-                .pre_inc, .post_inc => "operator++",
-                .pre_dec, .post_dec => "operator--",
-            };
-            if (try s.operatorCall(e, t.ty, name, &.{})) |rt| return rvalue(rt);
-            s.err(e.loc, "invalid argument type '{s}' to unary expression", .{s.typeName(t.ty)});
+            s.err(e.loc, "scalar, vector, or matrix expected", .{});
             return err_typed;
         }
         const inc_dec = switch (op) {
@@ -2550,16 +2551,10 @@ pub const Sema = struct {
             }
         } else {
             const r = try s.expr(rhs);
-            // `a op= b` on a struct: its operator op= (or operator op).
-            if (s.types.get(l.ty) == .@"struct" and r.ty != TypeTable.error_type) {
-                const bop = std.meta.stringToEnum(ast.BinaryOp, @tagName(op)).?;
-                const base = binaryOpName(bop).?;
-                const compound = try std.fmt.allocPrint(s.arena, "{s}=", .{base});
-                if (try s.operatorCall(e, l.ty, compound, &.{s.argInfo(rhs, r)})) |rt| return rvalue(rt);
-                if (try s.operatorCall(e, l.ty, base, &.{s.argInfo(rhs, r)})) |rt| {
-                    if (s.conversionCost(rt, l.ty) == null) s.convertError(e.loc, rt, l.ty);
-                    return .{ .ty = l.ty };
-                }
+            // Compound assignment never uses operator overloads (dxc).
+            if (s.types.get(l.ty) == .@"struct" and s.types.get(l.ty).@"struct".overloadsOperators()) {
+                s.err(e.loc, "scalar, vector, or matrix expected", .{});
+                return err_typed;
             }
             if (r.ty != TypeTable.error_type) {
                 const bop = std.meta.stringToEnum(ast.BinaryOp, @tagName(op)).?;
