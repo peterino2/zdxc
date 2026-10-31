@@ -45,6 +45,9 @@ const Lowered = union(enum) {
     /// A local holding a resource (index into Emitter.res_locals): an
     /// alias of the one resource stored into it.
     res_local: u32,
+    /// A RayQuery local (index into Emitter.rq_locals) and a query handle.
+    rq_local: u32,
+    ray_query: Value,
     /// An element of a typed buffer or texture (atomics' destination).
     texel: struct { res: u32, coords: []const Value },
     /// An array of resources (or a sub-array), with the flattened index so
@@ -168,6 +171,10 @@ const Emitter = struct {
     uses_extended_command_info: bool = false,
     uses_tiled_resources: bool = false,
     uses_mesh_derivatives: bool = false,
+    uses_ray_query: bool = false,
+    /// RayQuery locals: the query handle (allocated in the prologue on
+    /// first use, or a copy of another query) and the query type.
+    rq_locals: std.ArrayList(struct { h: ?Value, ty: TypeId }) = .empty,
     /// The ResRet of the last texture operation (for status arguments).
     last_resret: Value = undefined,
     /// Status values, forwarded through locals within a block: the
@@ -396,6 +403,7 @@ const Emitter = struct {
             .texture_cube_array => 9,
             .constant_buffer => 13,
             .texture_buffer => 15,
+            .raytracing_acceleration_structure => 16,
             else => return e.unsupported("resource type '{s}' is not supported yet", .{r.name}),
         };
         const class: Resource.Class = if (kind == 13) .cbuffer else if (r.kind.isWritable() or r.kind == .consume_structured_buffer) .uav else .srv;
@@ -934,6 +942,10 @@ const Emitter = struct {
                     const base = try e.addPrologue(try e.dm.ptrType(dty), .{ .alloca = .{ .elem = dty, .size = try e.i32Const(1) } });
                     return .{ .typed = .{ .base = base, .dty = dty, .addr_space = 0, .ty = i.ty } };
                 };
+                if (isRayQuery(e.t, i.ty)) {
+                    try e.rq_locals.append(e.arena, .{ .h = null, .ty = i.ty });
+                    return .{ .rq_local = @intCast(e.rq_locals.items.len - 1) };
+                }
                 if (isResourceType(e.t, i.ty)) {
                     try e.res_locals.append(e.arena, null);
                     return .{ .res_local = @intCast(e.res_locals.items.len - 1) };
@@ -948,6 +960,7 @@ const Emitter = struct {
             },
             .load => |p| switch (frame.vals[p.index()]) {
                 .handle => |h| return .{ .handle = h },
+                .rq_local => |k| return .{ .ray_query = try e.rqHandle(k) },
                 .res_local => |k| return e.res_locals.items[k] orelse return e.unsupported("a resource local read before it is assigned", .{}),
                 .res_array => |ra| return .{ .res_array = ra },
                 .texel => |tx| {
@@ -988,6 +1001,13 @@ const Emitter = struct {
                 else => return e.unsupported("internal: load from a non-pointer", .{}),
             },
             .store => |s| {
+                if (frame.vals[s.ptr.index()] == .rq_local) {
+                    // A copy of a query is the same query.
+                    const v = frame.vals[s.value.index()];
+                    if (v != .ray_query) return e.unsupported("this RayQuery assignment is not supported yet", .{});
+                    e.rq_locals.items[frame.vals[s.ptr.index()].rq_local].h = v.ray_query;
+                    return .none;
+                }
                 if (frame.vals[s.ptr.index()] == .res_local) {
                     const slot = &e.res_locals.items[frame.vals[s.ptr.index()].res_local];
                     const h = frame.vals[s.value.index()];
@@ -2398,6 +2418,7 @@ const Emitter = struct {
     }
 
     fn method(e: *Emitter, frame: *Frame, name: []const u8, res_ref: Ref, arg_refs: []const Ref, ty: TypeId) Error!Lowered {
+        if (frame.vals[res_ref.index()] == .ray_query) return e.rayQueryMethod(frame, frame.vals[res_ref.index()].ray_query, name, arg_refs, ty);
         const res = try e.resourceOf(frame, res_ref);
         const kind = e.resourceKind(res.*);
         const eq = std.mem.eql;
@@ -2621,6 +2642,108 @@ const Emitter = struct {
             try store(e, frame, arg_refs[o.arg], try e.add(i32t, .{ .extractvalue = .{ .agg = dims, .index = o.comp } }));
         }
         return .none;
+    }
+
+    /// The handle of RayQuery local `k`, allocated in the prologue on first
+    /// use.
+    fn rqHandle(e: *Emitter, k: u32) Error!Value {
+        const slot = &e.rq_locals.items[k];
+        if (slot.h) |h| return h;
+        const i32t = try e.dm.intType(32);
+        const r = e.t.get(slot.ty).resource;
+        e.uses_ray_query = true;
+        if (r.flags2 != 0) {
+            const f = try e.dxOp("dx.op.allocateRayQuery2", i32t, &.{ i32t, i32t, i32t }, .nounwind);
+            slot.h = try e.addPrologue(i32t, .{ .call = .{ .callee = f, .args = try e.arena.dupe(Value, &.{ try e.i32Const(258), try e.i32Const(r.flags), try e.i32Const(r.flags2) }) } });
+        } else {
+            const f = try e.dxOp("dx.op.allocateRayQuery", i32t, &.{ i32t, i32t }, .nounwind);
+            slot.h = try e.addPrologue(i32t, .{ .call = .{ .callee = f, .args = try e.arena.dupe(Value, &.{ try e.i32Const(178), try e.i32Const(r.flags) }) } });
+        }
+        return slot.h.?;
+    }
+
+    /// RayQuery methods: dx.op.rayQuery_*.
+    fn rayQueryMethod(e: *Emitter, frame: *Frame, q: Value, name: []const u8, args: []const Ref, ty: TypeId) Error!Lowered {
+        const eq = std.mem.eql;
+        const i32t = try e.dm.intType(32);
+        const i8t = try e.dm.intType(8);
+        const f32t = try e.dm.getType(.float);
+        const void_ty = try e.voidTy();
+        if (eq(u8, name, "TraceRayInline")) {
+            const accel = try e.resourceOf(frame, args[0]);
+            const flags = (try e.scalars(frame, args[1]))[0];
+            const mask = (try e.scalars(frame, args[2]))[0];
+            const d = try e.scalars(frame, args[3]);
+            var ps: [13]DType = undefined;
+            ps[0] = i32t;
+            ps[1] = i32t;
+            ps[2] = e.handle_ty;
+            ps[3] = i32t;
+            ps[4] = i32t;
+            for (ps[5..]) |*x| x.* = f32t;
+            const f = try e.dxOp("dx.op.rayQuery_TraceRayInline", void_ty, &ps, .nounwind);
+            _ = try e.callOp(f, void_ty, &.{ try e.i32Const(179), q, accel.handle, flags, mask, d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7] });
+            return .none;
+        }
+        const Plain = struct { []const u8, i64 };
+        const plain = [_]Plain{ .{ "Abort", 181 }, .{ "CommitNonOpaqueTriangleHit", 182 } };
+        for (plain) |x| if (eq(u8, name, x[0])) {
+            const f = try e.dxOp(try std.fmt.allocPrint(e.arena, "dx.op.rayQuery_{s}", .{x[0]}), void_ty, &.{ i32t, i32t }, .nounwind);
+            _ = try e.callOp(f, void_ty, &.{ try e.i32Const(x[1]), q });
+            return .none;
+        };
+        if (eq(u8, name, "CommitProceduralPrimitiveHit")) {
+            const f = try e.dxOp("dx.op.rayQuery_CommitProceduralPrimitiveHit", void_ty, &.{ i32t, i32t, f32t }, .nounwind);
+            _ = try e.callOp(f, void_ty, &.{ try e.i32Const(183), q, (try e.scalars(frame, args[0]))[0] });
+            return .none;
+        }
+        if (eq(u8, name, "Proceed")) {
+            const i1t = try e.dm.intType(1);
+            const f = try e.dxOp("dx.op.rayQuery_Proceed.i1", i1t, &.{ i32t, i32t }, .nounwind);
+            return e.list(&.{try e.callOp(f, i1t, &.{ try e.i32Const(180), q })});
+        }
+        const State = struct { []const u8, i64 };
+        const table = [_]State{
+            .{ "CommittedStatus", 184 },                               .{ "CandidateType", 185 },                                 .{ "CandidateObjectToWorld3x4", 186 },
+            .{ "CandidateWorldToObject3x4", 187 },                     .{ "CommittedObjectToWorld3x4", 188 },                     .{ "CommittedWorldToObject3x4", 189 },
+            .{ "CandidateProceduralPrimitiveNonOpaque", 190 },         .{ "CandidateTriangleFrontFace", 191 },                    .{ "CommittedTriangleFrontFace", 192 },
+            .{ "CandidateTriangleBarycentrics", 193 },                 .{ "CommittedTriangleBarycentrics", 194 },                 .{ "RayFlags", 195 },
+            .{ "WorldRayOrigin", 196 },                                .{ "WorldRayDirection", 197 },                             .{ "RayTMin", 198 },
+            .{ "CandidateTriangleRayT", 199 },                         .{ "CommittedRayT", 200 },                                 .{ "CandidateInstanceIndex", 201 },
+            .{ "CandidateInstanceID", 202 },                           .{ "CandidateGeometryIndex", 203 },                        .{ "CandidatePrimitiveIndex", 204 },
+            .{ "CandidateObjectRayOrigin", 205 },                      .{ "CandidateObjectRayDirection", 206 },                   .{ "CommittedInstanceIndex", 207 },
+            .{ "CommittedInstanceID", 208 },                           .{ "CommittedGeometryIndex", 209 },                        .{ "CommittedPrimitiveIndex", 210 },
+            .{ "CommittedObjectRayOrigin", 211 },                      .{ "CommittedObjectRayDirection", 212 },                   .{ "CandidateInstanceContributionToHitGroupIndex", 214 },
+            .{ "CommittedInstanceContributionToHitGroupIndex", 215 },  .{ "CandidateObjectToWorld4x3", 186 },                     .{ "CandidateWorldToObject4x3", 187 },
+            .{ "CommittedObjectToWorld4x3", 188 },                     .{ "CommittedWorldToObject4x3", 189 },
+        };
+        const op = for (table) |x| {
+            if (eq(u8, name, x[0])) break x[1];
+        } else return e.unsupported("RayQuery method '{s}' is not supported yet", .{name});
+        const rt = try e.scalarTy(e.compOf(ty));
+        const suffix = e.overloadName(rt);
+        switch (e.t.get(ty)) {
+            .matrix => |m| {
+                // Elements of the 3x4 matrix (4x3: transposed).
+                const f = try e.dxOp(try std.fmt.allocPrint(e.arena, "dx.op.rayQuery_StateMatrix.{s}", .{suffix}), rt, &.{ i32t, i32t, i32t, i8t }, .nounwind_readonly);
+                const out = try e.arena.alloc(Value, @as(usize, m.rows) * m.cols);
+                for (0..m.rows) |r| for (0..m.cols) |c| {
+                    const row, const col = if (m.rows == 3) .{ r, c } else .{ c, r };
+                    out[r * m.cols + c] = try e.callOp(f, rt, &.{ try e.i32Const(op), q, try e.i32Const(@intCast(row)), try e.dm.constant(.{ .ty = i8t, .kind = .{ .int = @intCast(col) } }) });
+                };
+                return .{ .scalars = out };
+            },
+            .vector => |v| {
+                const f = try e.dxOp(try std.fmt.allocPrint(e.arena, "dx.op.rayQuery_StateVector.{s}", .{suffix}), rt, &.{ i32t, i32t, i8t }, .nounwind_readonly);
+                const out = try e.arena.alloc(Value, v.len);
+                for (out, 0..) |*o, k| o.* = try e.callOp(f, rt, &.{ try e.i32Const(op), q, try e.dm.constant(.{ .ty = i8t, .kind = .{ .int = @intCast(k) } }) });
+                return .{ .scalars = out };
+            },
+            else => {
+                const f = try e.dxOp(try std.fmt.allocPrint(e.arena, "dx.op.rayQuery_StateScalar.{s}", .{suffix}), rt, &.{ i32t, i32t }, .nounwind_readonly);
+                return e.list(&.{try e.callOp(f, rt, &.{ try e.i32Const(op), q })});
+            },
+        }
     }
 
     fn resourceOf(e: *Emitter, frame: *Frame, r: Ref) Error!*Resource {
@@ -3563,6 +3686,7 @@ const Emitter = struct {
         if (e.uses_sampler_heap) flags |= 1 << 31;
         if (e.uses_wave) flags |= 1 << 19;
         if (e.uses_inner_coverage) flags |= 1 << 10;
+        if (e.uses_ray_query) flags |= 1 << 25;
         return flags;
     }
 
@@ -3575,6 +3699,7 @@ const Emitter = struct {
             .{ 1 << 30, 0x2000000 }, .{ 1 << 31, 0x4000000 },
             .{ 1 << 22, 0x20000 },   .{ 1 << 38, 0x100000000 },
             .{ 1 << 12, 0x100 },     .{ 1 << 29, 0x1000000 },
+            .{ 1 << 25, 0x100000 },
         };
         var f: u64 = 0;
         for (map) |m| if (flags & m[0] != 0) {
@@ -3642,6 +3767,13 @@ const Emitter = struct {
                 const undef_s = try dm.constant(.{ .ty = try dm.ptrType(st), .kind = .undef });
                 const b = g.binding;
                 try lists[3].append(e.arena, try dm.mdNode(&.{ try mdI32(dm, r.id), try dm.mdValue(try dm.ptrType(st), undef_s), try dm.mdString(""), try mdI32(dm, b.space), try mdI32(dm, b.index), try mdI32(dm, range), try mdI32(dm, @intFromBool(r.comparison)), null }));
+                continue;
+            }
+            if (r.kind == 16) {
+                const st = try rangeTy(dm, r.count, try dm.getType(.{ .@"struct" = .{ .name = "struct.RaytracingAccelerationStructure", .elems = &.{try dm.intType(32)} } }));
+                const undef_s = try dm.constant(.{ .ty = try dm.ptrType(st), .kind = .undef });
+                const b = g.binding;
+                try lists[0].append(e.arena, try dm.mdNode(&.{ try mdI32(dm, r.id), try dm.mdValue(try dm.ptrType(st), undef_s), try dm.mdString(""), try mdI32(dm, b.space), try mdI32(dm, b.index), try mdI32(dm, range), try mdI32(dm, 16), try mdI32(dm, 0), try dm.mdNode(&.{ try mdI32(dm, 0), try mdI32(dm, 4) }) }));
                 continue;
             }
             var rty = g.ty;
@@ -3781,7 +3913,7 @@ const Emitter = struct {
             const res_type: u32 = switch (r.class) {
                 .srv => switch (r.kind) {
                     12 => 5,
-                    11 => 4,
+                    11, 16 => 4,
                     else => 3,
                 },
                 .uav => switch (r.kind) {
@@ -3916,6 +4048,8 @@ fn isResourceType(t: *TypeTable, ty: TypeId) bool {
         else => false,
     };
 }
+
+const isRayQuery = @import("../ir/lower.zig").isRayQuery;
 
 fn reachableBlocks(a: Allocator, f: *const ir.Function) Allocator.Error![]bool {
     const seen = try a.alloc(bool, f.blocks.items.len);
