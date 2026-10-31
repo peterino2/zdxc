@@ -73,6 +73,11 @@ pub fn build(b: *std.Build) void {
     oracle.setCwd(b.path("."));
     oracle.has_side_effects = true;
     oracle_step.dependOn(&oracle.step);
+    const dxil_checks = b.addSystemCommand(&.{ "sh", "test/dxil/check.sh" });
+    dxil_checks.addArtifactArg(exe);
+    dxil_checks.setCwd(b.path("."));
+    dxil_checks.has_side_effects = true;
+    oracle_step.dependOn(&dxil_checks.step);
 
     const oracle_parse_step = b.step("oracle-parse", "Parse every dxc-valid corpus file with zdxc");
     const oracle_parse = b.addSystemCommand(&.{ "sh", "test/oracle/parse.sh" });

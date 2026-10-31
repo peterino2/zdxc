@@ -14,6 +14,7 @@ const shader = @import("shader.zig");
 const container = @import("container.zig");
 const hash = @import("hash.zig");
 const layout = @import("../ir/layout.zig");
+const signature = @import("signature.zig");
 
 const TypeId = types.TypeId;
 const TypeTable = types.TypeTable;
@@ -103,8 +104,23 @@ const Emitter = struct {
 
     resources: std.ArrayList(Resource) = .empty,
     resource_of_global: std.AutoHashMapUnmanaged(u32, u32) = .empty,
+    private_globals: std.AutoHashMapUnmanaged(u32, Ptr) = .empty,
     uses_double: bool = false,
     uses_int64: bool = false,
+    /// 16-bit min-precision values cross the signature.
+    uses_min_precision: bool = false,
+    uses_view_id: bool = false,
+    uses_inner_coverage: bool = false,
+
+    sig_in: []signature.Element = &.{},
+    sig_out: []signature.Element = &.{},
+    /// IR entry input / output index -> signature element; null for system
+    /// values read with an intrinsic instead.
+    in_elem: []?u32 = &.{},
+    out_elem: []?u32 = &.{},
+    /// Rows of an SV_Target array split into one element per row (the
+    /// last row's element comes first, as in dxc); 0 if not split.
+    out_split: []u32 = &.{},
 
     handle_ty: DType = 0,
 
@@ -172,6 +188,7 @@ const Emitter = struct {
     }
 
     fn compOf(e: *Emitter, ty: TypeId) Scalar {
+        if (e.t.get(ty) == .array) return e.compOf(e.t.get(ty).array.elem);
         return storageScalar(e.t.component(ty) orelse .int);
     }
 
@@ -240,7 +257,10 @@ const Emitter = struct {
     fn run(e: *Emitter, gpa: Allocator) Error![]u8 {
         const m = e.m;
         const entry = m.entry orelse return e.unsupported("no entry point", .{});
-        if (entry.stage != .compute) return e.unsupported("only compute shaders are supported yet", .{});
+        switch (entry.stage) {
+            .compute, .vertex, .pixel => {},
+            else => return e.unsupported("{s} shaders are not supported yet", .{@tagName(entry.stage)}),
+        }
         const void_ty = try e.voidTy();
         const fn_ty = try e.dm.fnType(void_ty, &.{});
         e.main_fn = try e.dm.addFunction(.{ .name = entry.name, .ty = fn_ty, .num_blocks = 1 });
@@ -248,6 +268,7 @@ const Emitter = struct {
         e.handle_ty = try e.dm.getType(.{ .@"struct" = .{ .name = "dx.types.Handle", .elems = &.{i8p} } });
 
         try e.collectResources();
+        try e.buildSignatures(entry);
         e.cur = try e.newBlock();
         try e.createHandles();
         _ = try e.inlineCall(entry.wrapper, &.{});
@@ -547,7 +568,14 @@ const Emitter = struct {
             },
             .none, .@"unreachable" => _ = try e.add(void_ty, .@"unreachable"),
             .@"switch" => return e.unsupported("switch", .{}),
-            .discard => return e.unsupported("discard", .{}),
+            .discard => {
+                // Like SPIR-V's OpKill: the invocation stops here.
+                const i32t = try e.dm.intType(32);
+                const i1t = try e.dm.intType(1);
+                const fn_i = try e.dxOp("dx.op.discard", void_ty, &.{ i32t, i1t }, .nounwind);
+                _ = try e.callOp(fn_i, void_ty, &.{ try e.i32Const(82), try e.dm.constInt(1, 1) });
+                _ = try e.add(void_ty, .{ .ret = null });
+            },
         }
     }
 
@@ -556,6 +584,23 @@ const Emitter = struct {
             .scalars => |s| s,
             else => e.unsupported("internal: expected a value", .{}),
         };
+    }
+
+    /// Flattened storage for a value of type `ty`, allocated on entry.
+    fn alloca(e: *Emitter, ty: TypeId) Error!Ptr {
+        const n = try e.flatCount(ty);
+        if (try e.mixedStorage(ty)) {
+            const st = try e.dm.intType(32);
+            const arr = try e.dm.getType(.{ .array = .{ .len = n, .elem = st } });
+            const base = try e.addPrologue(try e.dm.ptrType(arr), .{ .alloca = .{ .elem = arr, .size = try e.i32Const(1) } });
+            return .{ .base = base, .array_ty = arr, .scalar_ty = st, .mixed = true };
+        }
+        const c = try e.uniformScalar(ty);
+        const store_c = if (c == .bool) Scalar.int else c;
+        const st = try e.scalarTy(store_c);
+        const arr = try e.dm.getType(.{ .array = .{ .len = n, .elem = st } });
+        const base = try e.addPrologue(try e.dm.ptrType(arr), .{ .alloca = .{ .elem = arr, .size = try e.i32Const(1) } });
+        return .{ .base = base, .array_ty = arr, .scalar_ty = st, .bool_storage = c == .bool };
     }
 
     fn list(e: *Emitter, vals: []const Value) Error!Lowered {
@@ -569,26 +614,18 @@ const Emitter = struct {
             .constant => |c| return e.list(&.{try e.constant(i.ty, c)}),
             .param => |p| return frame.params[p],
             .global => |g| {
+                // Static globals live in the entry function (everything is
+                // inlined into it).
+                if (e.m.globals.items[g].space == .private) {
+                    const gop = try e.private_globals.getOrPut(e.arena, g);
+                    if (!gop.found_existing) gop.value_ptr.* = try e.alloca(e.m.globals.items[g].ty);
+                    return .{ .ptr = gop.value_ptr.* };
+                }
                 const ri = e.resource_of_global.get(g) orelse return e.unsupported("global '{s}' is not supported yet", .{e.m.globals.items[g].name});
                 if (e.resources.items[ri].class == .cbuffer) return .{ .cbuf = .{ .res = ri } };
                 return .{ .handle = ri };
             },
-            .local_var => {
-                const n = try e.flatCount(i.ty);
-                if (try e.mixedStorage(i.ty)) {
-                    const st = try e.dm.intType(32);
-                    const arr = try e.dm.getType(.{ .array = .{ .len = n, .elem = st } });
-                    const base = try e.addPrologue(try e.dm.ptrType(arr), .{ .alloca = .{ .elem = arr, .size = try e.i32Const(1) } });
-                    return .{ .ptr = .{ .base = base, .array_ty = arr, .scalar_ty = st, .mixed = true } };
-                }
-                const c = try e.uniformScalar(i.ty);
-                const store_c = if (c == .bool) Scalar.int else c;
-                const st = try e.scalarTy(store_c);
-                const arr = try e.dm.getType(.{ .array = .{ .len = n, .elem = st } });
-                const ptr_ty = try e.dm.ptrType(arr);
-                const base = try e.addPrologue(ptr_ty, .{ .alloca = .{ .elem = arr, .size = try e.i32Const(1) } });
-                return .{ .ptr = .{ .base = base, .array_ty = arr, .scalar_ty = st, .bool_storage = c == .bool } };
-            },
+            .local_var => return .{ .ptr = try e.alloca(i.ty) },
             .load => |p| switch (frame.vals[p.index()]) {
                 .handle => |h| return .{ .handle = h },
                 .cbuf => |c| return e.cbufferLoad(c.res, c.offset, c.dyn_regs, c.row_major, i.ty),
@@ -766,7 +803,10 @@ const Emitter = struct {
             },
             .method => |x| return e.unsupported("method '{s}' is not supported yet", .{x.name}),
             .input => |k| return e.input(k, i.ty),
-            .output => return e.unsupported("stage outputs are not supported yet", .{}),
+            .output => |o| {
+                try e.output(frame, o.element, o.value);
+                return .none;
+            },
             .phi => return e.unsupported("phi", .{}),
         }
     }
@@ -802,7 +842,8 @@ const Emitter = struct {
         };
         return switch (s) {
             .bool => e.dm.constant(.{ .ty = dt, .kind = .{ .int = @intFromBool(iv != 0) } }),
-            .float => e.dm.constant(.{ .ty = dt, .kind = .{ .float_bits = @as(u64, @bitCast(@as(f64, @as(f32, @floatCast(fv))))) } }),
+            // Bitcode stores a float constant as its own 32-bit pattern.
+            .float => e.dm.constant(.{ .ty = dt, .kind = .{ .float_bits = @as(u32, @bitCast(@as(f32, @floatCast(fv)))) } }),
             .double => e.dm.constant(.{ .ty = dt, .kind = .{ .float_bits = @bitCast(fv) } }),
             .float16 => e.dm.constant(.{ .ty = dt, .kind = .{ .float_bits = @as(u16, @bitCast(@as(f16, @floatCast(fv)))) } }),
             .uint, .uint16 => e.dm.constant(.{ .ty = dt, .kind = .{ .int = signExtend(iv, s.size()) } }),
@@ -1124,6 +1165,42 @@ const Emitter = struct {
             const i32t = try e.dm.intType(32);
             const fn_i = try e.dxOp("dx.op.barrier", try e.voidTy(), &.{ i32t, i32t }, .nounwind);
             _ = try e.callOp(fn_i, try e.voidTy(), &.{ try e.i32Const(80), try e.i32Const(flags) });
+            return .none;
+        }
+        const Deriv = struct { name: []const u8, op: i64 };
+        const derivs = [_]Deriv{
+            .{ .name = "ddx", .op = 83 },      .{ .name = "ddx_coarse", .op = 83 }, .{ .name = "ddy", .op = 84 },
+            .{ .name = "ddy_coarse", .op = 84 }, .{ .name = "ddx_fine", .op = 85 },   .{ .name = "ddy_fine", .op = 86 },
+        };
+        const is_deriv = eq(u8, name, "fwidth") or for (derivs) |d| {
+            if (eq(u8, name, d.name)) break true;
+        } else false;
+        if (is_deriv and e.m.entry.?.stage != .pixel) return e.unsupported("derivatives outside pixel shaders are not supported yet", .{});
+        for (derivs) |d| if (eq(u8, name, d.name)) {
+            for (out, 0..) |*o, k| o.* = try e.unaryOp(d.op, "unary", a[0][k], at);
+            return .{ .scalars = out };
+        };
+        if (eq(u8, name, "fwidth")) {
+            // abs(ddx(x)) + abs(ddy(x)), coarse, as dxc.
+            for (out, 0..) |*o, k| {
+                const dx = try e.unaryOp(6, "unary", try e.unaryOp(83, "unary", a[0][k], at), at);
+                const dy = try e.unaryOp(6, "unary", try e.unaryOp(84, "unary", a[0][k], at), at);
+                o.* = try e.add(at, .{ .binop = .{ .op = .add, .lhs = dx, .rhs = dy } });
+            }
+            return .{ .scalars = out };
+        }
+        if (eq(u8, name, "clip")) {
+            // discard(any(x < 0)).
+            const i1t = try e.dm.intType(1);
+            const zero = try e.constant(try e.t.scalar(ac), .{ .float = 0 });
+            var cond: ?Value = null;
+            for (a[0]) |x| {
+                const lt = try e.add(i1t, .{ .cmp = .{ .pred = 4, .lhs = x, .rhs = zero } }); // fcmp olt
+                cond = if (cond) |c| try e.add(i1t, .{ .binop = .{ .op = .@"or", .lhs = c, .rhs = lt } }) else lt;
+            }
+            const i32t = try e.dm.intType(32);
+            const fn_i = try e.dxOp("dx.op.discard", try e.voidTy(), &.{ i32t, i1t }, .nounwind);
+            _ = try e.callOp(fn_i, try e.voidTy(), &.{ try e.i32Const(82), cond.? });
             return .none;
         }
         return e.unsupported("intrinsic '{s}' is not supported yet", .{name});
@@ -1467,7 +1544,249 @@ const Emitter = struct {
         }
     }
 
+    // ------------------------------------------------------------------
+    // Signatures
+
+    fn buildSignatures(e: *Emitter, entry: ir.Entry) Error!void {
+        const points: [2]?signature.SigPoint = switch (entry.stage) {
+            .vertex => .{ .vs_in, .vs_out },
+            .pixel => .{ .ps_in, .ps_out },
+            else => .{ null, null },
+        };
+        e.in_elem = try e.arena.alloc(?u32, entry.inputs.items.len);
+        @memset(e.in_elem, null);
+        e.out_elem = try e.arena.alloc(?u32, entry.outputs.items.len);
+        @memset(e.out_elem, null);
+        e.out_split = try e.arena.alloc(u32, entry.outputs.items.len);
+        @memset(e.out_split, 0);
+        if (points[0]) |sp| e.sig_in = try e.buildSignature(entry.inputs.items, sp, e.in_elem, null);
+        if (points[1]) |sp| e.sig_out = try e.buildSignature(entry.outputs.items, sp, e.out_elem, e.out_split);
+    }
+
+    fn buildSignature(e: *Emitter, els: []const ir.SigElement, sp: signature.SigPoint, map: []?u32, split: ?[]u32) Error![]signature.Element {
+        var out: std.ArrayList(signature.Element) = .empty;
+        for (els, 0..) |el, k| {
+            const kind = signature.kindByName(el.semantic);
+            if (kind == .invalid) return e.unsupported("semantic '{s}' is not supported yet", .{el.semantic});
+            const interp = signature.interpretation(kind, sp, e.profile.minor);
+            switch (interp) {
+                .na => return e.unsupported("semantic '{s}' is not supported as this {s} yet", .{ el.semantic, if (sp.isInput()) "input" else "output" }),
+                .not_in_sig => continue,
+                else => {},
+            }
+            const shape = try e.sigShape(el.ty, el.row_major);
+            var comp = try e.sigCompType(el.ty);
+            if (kind == .is_front_face and comp == .i1) comp = .u32;
+            if (comp == .f16 or comp == .i16 or comp == .u16) e.uses_min_precision = true;
+            const eff_kind: signature.SemanticKind = if (interp == .arb) .arbitrary else kind;
+            map[k] = @intCast(out.items.len);
+            if (kind == .target and shape.rows > 1) {
+                // One element per render target, last first (as dxc).
+                split.?[k] = shape.rows;
+                var r = shape.rows;
+                while (r > 0) {
+                    r -= 1;
+                    try out.append(e.arena, .{
+                        .id = @intCast(out.items.len),
+                        .name = signature.canonicalName(kind),
+                        .kind = kind,
+                        .interpretation = interp,
+                        .comp = comp,
+                        .interp = .undefined,
+                        .rows = 1,
+                        .cols = shape.cols,
+                        .indices = try e.arena.dupe(u32, &.{el.semantic_index + r}),
+                    });
+                }
+                continue;
+            }
+            const indices = try e.arena.alloc(u32, shape.rows);
+            for (indices, 0..) |*x, i| x.* = el.semantic_index + @as(u32, @intCast(i));
+            try out.append(e.arena, .{
+                .id = @intCast(out.items.len),
+                .name = if (eff_kind == .arbitrary) el.semantic else signature.canonicalName(eff_kind),
+                .kind = eff_kind,
+                .interpretation = interp,
+                .comp = comp,
+                .interp = interpMode(el.interp, sp, comp, eff_kind),
+                .rows = shape.rows,
+                .cols = shape.cols,
+                .indices = indices,
+            });
+        }
+        signature.pack(e.arena, out.items, sp) catch |err| switch (err) {
+            error.SignatureFull => return e.unsupported("the signature does not fit in 32 registers", .{}),
+            error.OutOfMemory => return error.OutOfMemory,
+        };
+        return out.items;
+    }
+
+    /// The interpolation mode of an element: the written modifiers, else
+    /// linear for floats and constant for the rest; SV_Position never
+    /// interpolates with perspective.
+    fn interpMode(q: types.Interp, sp: signature.SigPoint, comp: signature.CompType, kind: signature.SemanticKind) signature.InterpMode {
+        if (sp == .vs_in or sp == .ps_out) return .undefined;
+        var m: signature.InterpMode = if (q.nointerpolation)
+            .constant
+        else if (q.sample)
+            (if (q.noperspective) .linear_noperspective_sample else .linear_sample)
+        else if (q.centroid)
+            (if (q.noperspective) .linear_noperspective_centroid else .linear_centroid)
+        else if (q.noperspective)
+            .linear_noperspective
+        else if (q.linear or comp.isFloat())
+            .linear
+        else
+            .constant;
+        if (kind == .position) m = switch (m) {
+            .linear => .linear_noperspective,
+            .linear_centroid => .linear_noperspective_centroid,
+            .linear_sample => .linear_noperspective_sample,
+            else => m,
+        };
+        return m;
+    }
+
+    const Shape = struct { rows: u32, cols: u32 };
+
+    /// Rows and columns a signature element occupies.
+    fn sigShape(e: *Emitter, ty: TypeId, row_major: bool) Error!Shape {
+        return switch (e.t.get(ty)) {
+            .scalar, .@"enum" => .{ .rows = 1, .cols = 1 },
+            .vector => |v| .{ .rows = 1, .cols = v.len },
+            .matrix => |m| if (row_major) .{ .rows = m.rows, .cols = m.cols } else .{ .rows = m.cols, .cols = m.rows },
+            .array => |a| blk: {
+                const s = try e.sigShape(a.elem, row_major);
+                break :blk .{ .rows = s.rows * a.len, .cols = s.cols };
+            },
+            else => e.unsupported("signature elements of type '{s}' are not supported yet", .{try e.t.format(e.arena, ty)}),
+        };
+    }
+
+    /// Row and column (within its element) of flattened component `k`.
+    fn sigComponent(e: *Emitter, ty: TypeId, row_major: bool, k: u32) Error![2]u32 {
+        switch (e.t.get(ty)) {
+            .vector => return .{ 0, k },
+            .matrix => |m| {
+                const r = k / m.cols;
+                const c = k % m.cols;
+                return if (row_major) .{ r, c } else .{ c, r };
+            },
+            .array => |a| {
+                const n = try e.flatCount(a.elem);
+                const s = try e.sigShape(a.elem, row_major);
+                const inner = try e.sigComponent(a.elem, row_major, k % n);
+                return .{ (k / n) * s.rows + inner[0], inner[1] };
+            },
+            else => return .{ 0, 0 },
+        }
+    }
+
+    fn sigCompType(e: *Emitter, ty: TypeId) Error!signature.CompType {
+        if (e.t.get(ty) == .array) return e.sigCompType(e.t.get(ty).array.elem);
+        const s = e.t.component(ty) orelse return e.unsupported("signature elements of type '{s}' are not supported yet", .{try e.t.format(e.arena, ty)});
+        return switch (s) {
+            .bool => .i1,
+            .int, .literal_int => .i32,
+            .uint => .u32,
+            .float, .half, .literal_float => .f32,
+            .min16float, .min10float => .f16,
+            .min16int, .min12int => .i16,
+            .min16uint => .u16,
+            else => e.unsupported("signature elements of type '{s}' are not supported yet", .{try e.t.format(e.arena, ty)}),
+        };
+    }
+
+    /// The scalar a signature component travels as.
+    fn sigScalar(c: signature.CompType) Scalar {
+        return switch (c) {
+            .f32 => .float,
+            .f16 => .float16,
+            .i16 => .int16,
+            .u16 => .uint16,
+            .i32 => .int,
+            else => .uint,
+        };
+    }
+
+    /// A system value read with its own intrinsic (not a loadInput).
+    fn systemValueInput(e: *Emitter, semantic: []const u8, ty: TypeId) Error!Lowered {
+        const kind = signature.kindByName(semantic);
+        const i32t = try e.dm.intType(32);
+        const Sv = struct { kind: signature.SemanticKind, op: i64, fname: []const u8 };
+        const svs = [_]Sv{
+            .{ .kind = .sample_index, .op = 90, .fname = "dx.op.sampleIndex.i32" },
+            .{ .kind = .coverage, .op = 91, .fname = "dx.op.coverage.i32" },
+            .{ .kind = .inner_coverage, .op = 92, .fname = "dx.op.innerCoverage.i32" },
+            .{ .kind = .view_id, .op = 138, .fname = "dx.op.viewID.i32" },
+            .{ .kind = .start_vertex_location, .op = 256, .fname = "dx.op.startVertexLocation.i32" },
+            .{ .kind = .start_instance_location, .op = 257, .fname = "dx.op.startInstanceLocation.i32" },
+        };
+        const out = try e.arena.alloc(Value, try e.flatCount(ty));
+        if (kind == .cull_primitive) {
+            for (out) |*o| o.* = try e.constant(try e.t.scalar(e.compOf(ty)), .{ .int = 0 });
+            return .{ .scalars = out };
+        }
+        if (kind == .view_id) e.uses_view_id = true;
+        if (kind == .inner_coverage) e.uses_inner_coverage = true;
+        for (svs) |sv| if (sv.kind == kind) {
+            const fn_i = try e.dxOp(sv.fname, i32t, &.{i32t}, .nounwind_readnone);
+            const v = try e.callOp(fn_i, i32t, &.{try e.i32Const(sv.op)});
+            for (out) |*o| o.* = try e.convertScalar(v, .uint, e.compOf(ty));
+            return .{ .scalars = out };
+        };
+        return e.unsupported("input '{s}' is not supported yet", .{semantic});
+    }
+
     fn input(e: *Emitter, k: u32, ty: TypeId) Error!Lowered {
+        const entry = e.m.entry.?;
+        if (entry.stage == .compute) return e.computeInput(k, ty);
+        const el = entry.inputs.items[k];
+        const se = if (e.in_elem[k]) |ei| &e.sig_in[ei] else return e.systemValueInput(el.semantic, ty);
+        if (se.interpretation == .shadow) return e.systemValueInput(el.semantic, ty);
+        const i32t = try e.dm.intType(32);
+        const i8t = try e.dm.intType(8);
+        const via = sigScalar(se.comp);
+        const vt = try e.scalarTy(via);
+        const fn_i = try e.dxOp(try std.fmt.allocPrint(e.arena, "dx.op.loadInput.{s}", .{e.overloadName(vt)}), vt, &.{ i32t, i32t, i32t, i8t, i32t }, .nounwind_readnone);
+        const undef = try e.dm.constant(.{ .ty = i32t, .kind = .undef });
+        const out = try e.arena.alloc(Value, try e.flatCount(ty));
+        const to = e.compOf(ty);
+        for (out, 0..) |*o, c| {
+            const rc = try e.sigComponent(el.ty, el.row_major, @intCast(c));
+            const v = try e.callOp(fn_i, vt, &.{ try e.i32Const(4), try e.i32Const(se.id), try e.i32Const(rc[0]), try e.dm.constInt(8, rc[1]), undef });
+            o.* = try e.convertScalar(v, via, to);
+            se.usage |= @as(u8, 1) << @intCast(rc[1]);
+        }
+        return .{ .scalars = out };
+    }
+
+    fn output(e: *Emitter, frame: *Frame, k: u32, value: Ref) Error!void {
+        const el = e.m.entry.?.outputs.items[k];
+        const se = if (e.out_elem[k]) |ei| &e.sig_out[ei] else return e.unsupported("output '{s}' is not supported yet", .{el.semantic});
+        const vals = try e.scalars(frame, value);
+        const i32t = try e.dm.intType(32);
+        const i8t = try e.dm.intType(8);
+        const void_ty = try e.voidTy();
+        const via = sigScalar(se.comp);
+        const vt = try e.scalarTy(via);
+        const fn_i = try e.dxOp(try std.fmt.allocPrint(e.arena, "dx.op.storeOutput.{s}", .{e.overloadName(vt)}), void_ty, &.{ i32t, i32t, i32t, i8t, vt }, .nounwind);
+        const from = e.compOf(el.ty);
+        const split = e.out_split[k];
+        for (vals, 0..) |v, c| {
+            var rc = try e.sigComponent(el.ty, el.row_major, @intCast(c));
+            var target = se;
+            if (split > 0) {
+                target = &e.sig_out[se.id + split - 1 - rc[0]];
+                rc[0] = 0;
+            }
+            const sv = try e.convertScalar(v, from, via);
+            _ = try e.callOp(fn_i, void_ty, &.{ try e.i32Const(5), try e.i32Const(target.id), try e.i32Const(rc[0]), try e.dm.constInt(8, rc[1]), sv });
+            target.usage |= @as(u8, 1) << @intCast(rc[1]);
+        }
+    }
+
+    fn computeInput(e: *Emitter, k: u32, ty: TypeId) Error!Lowered {
         const el = e.m.entry.?.inputs.items[k];
         const eqi = std.ascii.eqlIgnoreCase;
         const i32t = try e.dm.intType(32);
@@ -1503,6 +1822,7 @@ const Emitter = struct {
         var flags: u64 = 0;
         if (e.uses_double) flags |= 1 << 2;
         if (e.uses_int64) flags |= 1 << 20;
+        if (e.uses_min_precision) flags |= 1 << 5;
         var uavs: u32 = 0;
         for (e.resources.items) |r| {
             if (r.kind == 11 or r.kind == 12) flags |= 1 << 4;
@@ -1511,7 +1831,36 @@ const Emitter = struct {
         if (uavs > 8) flags |= 1 << 15;
         // Resources may not alias (DXIL 1.7+, when UAVs are used).
         if (uavs > 0 and e.profile.minor >= 7) flags |= 1 << 33;
+        const stage = e.m.entry.?.stage;
+        if (uavs > 0 and (stage == .vertex or stage == .geometry or stage == .hull or stage == .domain)) flags |= 1 << 16;
+        for (e.sig_out) |el| switch (el.kind) {
+            .render_target_array_index, .viewport_array_index => if (stage == .vertex) {
+                flags |= 1 << 9;
+            },
+            .stencil_ref => flags |= 1 << 11,
+            .shading_rate => flags |= 1 << 24,
+            else => {},
+        };
+        for (e.sig_in) |el| if (el.kind == .shading_rate) {
+            flags |= 1 << 24;
+        };
+        if (e.uses_view_id) flags |= 1 << 21;
+        if (e.uses_inner_coverage) flags |= 1 << 10;
         return flags;
+    }
+
+    /// SFI0 feature bits implied by the shader flags.
+    fn featureInfo(flags: u64) u64 {
+        const map = [_][2]u64{
+            .{ 1 << 2, 0x1 },      .{ 1 << 16, 0x4 },     .{ 1 << 15, 0x8 },        .{ 1 << 5, 0x10 },
+            .{ 1 << 11, 0x200 },   .{ 1 << 10, 0x400 },   .{ 1 << 9, 0x2000 },      .{ 1 << 20, 0x8000 },
+            .{ 1 << 21, 0x10000 }, .{ 1 << 24, 0x80000 },
+        };
+        var f: u64 = 0;
+        for (map) |m| if (flags & m[0] != 0) {
+            f |= m[1];
+        };
+        return f;
     }
 
     fn writeModule(e: *Emitter, entry: ir.Entry) Error![]u8 {
@@ -1584,12 +1933,18 @@ const Emitter = struct {
             const i64t = try dm.intType(64);
             try props.appendSlice(e.arena, &.{ try mdI32(dm, 0), try dm.mdValue(i64t, try dm.constant(.{ .ty = i64t, .kind = .{ .int = @bitCast(flags) } })) });
         }
-        const threads = try dm.mdNode(&.{ try mdI32(dm, entry.num_threads[0]), try mdI32(dm, entry.num_threads[1]), try mdI32(dm, entry.num_threads[2]) });
-        try props.appendSlice(e.arena, &.{ try mdI32(dm, 4), threads });
-        const props_node = try dm.mdNode(props.items);
+        if (entry.stage == .compute) {
+            const threads = try dm.mdNode(&.{ try mdI32(dm, entry.num_threads[0]), try mdI32(dm, entry.num_threads[1]), try mdI32(dm, entry.num_threads[2]) });
+            try props.appendSlice(e.arena, &.{ try mdI32(dm, 4), threads });
+        }
+        const props_node = if (props.items.len > 0) try dm.mdNode(props.items) else null;
+        var sigs: ?module.MdId = null;
+        if (e.sig_in.len + e.sig_out.len > 0) {
+            sigs = try dm.mdNode(&.{ try e.signatureMetadata(e.sig_in), try e.signatureMetadata(e.sig_out), null });
+        }
         const main_ty = dm.functions.items[e.main_fn].ty;
         const fn_ref = try dm.mdValue(try dm.ptrType(main_ty), .{ .function = e.main_fn });
-        const entry_md = try dm.mdNode(&.{ fn_ref, try dm.mdString(entry.name), null, resources, props_node });
+        const entry_md = try dm.mdNode(&.{ fn_ref, try dm.mdString(entry.name), sigs, resources, props_node });
 
         try dm.addNamedMetadata("llvm.ident", &.{ident});
         try dm.addNamedMetadata("dx.version", &.{version});
@@ -1598,6 +1953,31 @@ const Emitter = struct {
         if (resources) |r| try dm.addNamedMetadata("dx.resources", &.{r});
         try dm.addNamedMetadata("dx.entryPoints", &.{entry_md});
         return dm.writeBitcode(dm.arena.child_allocator);
+    }
+
+    /// `!{id, name, comp, kind, !{indices}, interp, rows, cols, row, col,
+    /// !{usage tag, mask}}` per element.
+    fn signatureMetadata(e: *Emitter, els: []const signature.Element) Error!?module.MdId {
+        if (els.len == 0) return null;
+        const dm = &e.dm;
+        const i8t = try dm.intType(8);
+        const nodes = try e.arena.alloc(?module.MdId, els.len);
+        for (els, nodes) |el, *n| {
+            const idx = try e.arena.alloc(?module.MdId, el.indices.len);
+            for (el.indices, idx) |x, *m| m.* = try dm.mdI32(x);
+            const usage: ?module.MdId = if (el.usage != 0) try dm.mdNode(&.{ try dm.mdI32(3), try dm.mdI32(el.usage) }) else null;
+            const row: i64 = if (el.start_row) |r| r else -1;
+            const col: i64 = if (el.start_row != null) el.start_col else -1;
+            n.* = try dm.mdNode(&.{
+                try dm.mdI32(el.id),                                 try dm.mdString(el.name),
+                try dm.mdValue(i8t, try dm.constInt(8, @intFromEnum(el.comp))), try dm.mdValue(i8t, try dm.constInt(8, @intFromEnum(el.kind))),
+                try dm.mdNode(idx),                                  try dm.mdValue(i8t, try dm.constInt(8, @intFromEnum(el.interp))),
+                try dm.mdI32(el.rows),                               try dm.mdValue(i8t, try dm.constInt(8, el.cols)),
+                try dm.mdI32(row),                                   try dm.mdValue(i8t, try dm.constInt(8, col)),
+                usage,
+            });
+        }
+        return try dm.mdNode(nodes);
     }
 
     fn assemble(e: *Emitter, gpa: Allocator, entry: ir.Entry, bitcode: []const u8) Error![]u8 {
@@ -1623,18 +2003,47 @@ const Emitter = struct {
             };
             try binds.append(e.arena, .{ .res_type = res_type, .space = b.space, .lower = b.index, .upper = b.index, .kind = r.kind });
         };
-        const psv = try shader.psvCompute(gpa, entry.name, entry.num_threads, binds.items);
+        var stage_info: [16]u8 = @splat(0);
+        switch (entry.stage) {
+            .vertex => for (e.sig_out) |el| {
+                if (el.kind == .position) stage_info[0] = 1; // OutputPositionPresent
+            },
+            .pixel => {
+                for (e.sig_out) |el| switch (el.kind) {
+                    .depth, .depth_less_equal, .depth_greater_equal => stage_info[0] = 1, // DepthOutput
+                    else => {},
+                };
+                for (e.sig_in) |el| {
+                    if (el.interp.isAnySample() or el.kind == .sample_index) stage_info[1] = 1; // SampleFrequency
+                }
+            },
+            else => {},
+        }
+        const kind: shader.ShaderKind = switch (entry.stage) {
+            .vertex => .vertex,
+            .pixel => .pixel,
+            else => .compute,
+        };
+        const psv = try shader.psv(gpa, .{
+            .kind = kind,
+            .entry = entry.name,
+            .stage_info = stage_info,
+            .num_threads = if (entry.stage == .compute) entry.num_threads else .{ 0, 0, 0 },
+            .resources = binds.items,
+            .inputs = e.sig_in,
+            .outputs = e.sig_out,
+        });
         defer gpa.free(psv);
-        const empty_sig = [_]u8{ 0, 0, 0, 0, 8, 0, 0, 0 };
+        const isg1 = try signature.programSignature(gpa, e.sig_in, true);
+        defer gpa.free(isg1);
+        const osg1 = try signature.programSignature(gpa, e.sig_out, false);
+        defer gpa.free(osg1);
         var sfi0: [8]u8 = @splat(0);
-        var feature: u64 = 0;
-        if (e.uses_double) feature |= 0x1;
-        if (e.uses_int64) feature |= 0x8000;
-        std.mem.writeInt(u64, &sfi0, feature, .little);
+        std.mem.writeInt(u64, &sfi0, featureInfo(e.shaderFlags()), .little);
         const parts = [_]container.Part{
             .{ .fourcc = container.fourcc("SFI0"), .data = &sfi0 },
-            .{ .fourcc = container.fourcc("ISG1"), .data = &empty_sig },
-            .{ .fourcc = container.fourcc("OSG1"), .data = &empty_sig },
+            .{ .fourcc = container.fourcc("ISG1"), .data = isg1 },
+            .{ .fourcc = container.fourcc("OSG1"), .data = osg1 },
             .{ .fourcc = container.fourcc("PSV0"), .data = psv },
             .{ .fourcc = container.fourcc("DXIL"), .data = dxil_part },
         };

@@ -319,6 +319,18 @@ pub const Field = struct {
     row_major: bool = false,
     /// The field's semantic (`float4 pos : SV_Position;`).
     semantic: ?[]const u8 = null,
+    /// Interpolation modifiers (for entry-point inputs and outputs).
+    interp: Interp = .{},
+};
+
+/// Interpolation modifiers written on a parameter, field or function.
+pub const Interp = packed struct(u8) {
+    nointerpolation: bool = false,
+    linear: bool = false,
+    centroid: bool = false,
+    sample: bool = false,
+    noperspective: bool = false,
+    _pad: u3 = 0,
 };
 
 /// A struct's layout-relevant information. Methods live in Sema.

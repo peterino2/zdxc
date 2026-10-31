@@ -191,6 +191,9 @@ pub const SigElement = struct {
     semantic_index: u32,
     ty: TypeId,
     system_value: bool,
+    interp: types.Interp = .{},
+    /// Matrices in the element are row_major (signature layout only).
+    row_major: bool = false,
 };
 
 pub const Entry = struct {

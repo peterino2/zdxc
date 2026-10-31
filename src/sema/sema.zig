@@ -164,6 +164,9 @@ pub const Sema = struct {
     decl_vars: std.AutoHashMapUnmanaged(*const ast.VarDecl, *Variable) = .empty,
     /// Global uniforms outside cbuffers (dxc's `$Globals`), in order.
     uniform_globals: std.ArrayList(*Variable) = .empty,
+    /// `static` (and `static const`) globals and static members, in
+    /// declaration order.
+    static_globals: std.ArrayList(*Variable) = .empty,
     current_block: ?*const ast.Decl = null,
     loop_depth: u32 = 0,
     switch_depth: u32 = 0,
@@ -967,7 +970,7 @@ pub const Sema = struct {
                 for (v.semantics) |sem| if (sem.kind == .semantic) {
                     fsem = sem.values[0];
                 };
-                try info.fields.append(s.arena, .{ .name = v.name, .type = ft, .row_major = isRowMajor(fattrs), .semantic = fsem });
+                try info.fields.append(s.arena, .{ .name = v.name, .type = ft, .row_major = isRowMajor(fattrs), .semantic = fsem, .interp = interpOf(v.quals) });
             },
             .func => {},
             else => try s.decl(m, .member),
@@ -1367,6 +1370,7 @@ pub const Sema = struct {
         try s.decl_vars.put(s.arena, v, variable);
         if (ctx == .cbuffer) variable.block = s.current_block;
         if (storage == .global_uniform) try s.uniform_globals.append(s.arena, variable);
+        if (storage == .global_static or storage == .constant) try s.static_globals.append(s.arena, variable);
         // Unsized arrays take their size from the initializer.
         if (v.init) |init_e| if (!is_auto) {
             if (s.types.get(ty) == .array and s.types.get(ty).array.len == 0 and init_e.kind == .init_list) {
@@ -2874,6 +2878,10 @@ fn templateArgLoc(arg: ast.TemplateArg) Loc {
         .expr => |e| e.loc,
         .type => |t| t.loc,
     };
+}
+
+pub fn interpOf(q: ast.Qualifiers) types.Interp {
+    return .{ .nointerpolation = q.nointerpolation, .linear = q.linear, .centroid = q.centroid, .sample = q.sample, .noperspective = q.noperspective };
 }
 
 fn isRowMajor(a: TypeAttrs) bool {

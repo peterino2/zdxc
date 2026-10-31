@@ -9,6 +9,8 @@ const ast = @import("../front/ast.zig");
 const ir = @import("ir.zig");
 const semamod = @import("../sema/sema.zig");
 const types = @import("../sema/types.zig");
+const Interp = types.Interp;
+const Field = types.Field;
 const table = @import("intrinsics_table");
 
 const Sema = semamod.Sema;
@@ -939,22 +941,41 @@ const Lowerer = struct {
     // ------------------------------------------------------------------
     // Entry point
 
+    /// Per-element modifiers that reach the signature.
+    const SigAttrs = struct {
+        interp: Interp = .{},
+        row_major: bool = false,
+
+        /// A field's modifiers, inheriting the enclosing interpolation.
+        fn field(outer: SigAttrs, fld: Field) SigAttrs {
+            const own: u8 = @bitCast(fld.interp);
+            return .{ .interp = if (own != 0) fld.interp else outer.interp, .row_major = fld.row_major };
+        }
+    };
+
+    fn withAttrs(el: ir.SigElement, attrs: SigAttrs) ir.SigElement {
+        var r = el;
+        r.interp = attrs.interp;
+        r.row_major = attrs.row_major;
+        return r;
+    }
+
     /// An entry input of type `ty`: one signature element, or for structs
     /// without a semantic one per field (recursively).
-    fn entryInput(l: *Lowerer, entry: *ir.Entry, ty: TypeId, semantic: ?[]const u8, loc: ast.Loc, what: []const u8) Error!Ref {
+    fn entryInput(l: *Lowerer, entry: *ir.Entry, ty: TypeId, semantic: ?[]const u8, attrs: SigAttrs, loc: ast.Loc, what: []const u8) Error!Ref {
         if (semantic) |sem| if (l.s.types.get(ty) == .@"struct") {
             // A semantic on a struct numbers its fields: X, X1, X2, ...
             var el = sigElement(sem, ty);
-            return l.structInput(entry, ty, el.semantic, &el.semantic_index);
+            return l.structInput(entry, ty, el.semantic, &el.semantic_index, attrs);
         };
         if (semantic) |sem| {
-            try entry.inputs.append(l.arena, sigElement(sem, ty));
+            try entry.inputs.append(l.arena, withAttrs(sigElement(sem, ty), attrs));
             return l.b.add(.{ .op = .{ .input = @intCast(entry.inputs.items.len - 1) }, .ty = ty });
         }
         switch (l.s.types.get(ty)) {
             .@"struct" => |st| {
                 const parts = try l.arena.alloc(Ref, st.fields.items.len);
-                for (parts, st.fields.items) |*p, fld| p.* = try l.entryInput(entry, fld.type, fld.semantic, loc, fld.name);
+                for (parts, st.fields.items) |*p, fld| p.* = try l.entryInput(entry, fld.type, fld.semantic, attrs.field(fld), loc, fld.name);
                 return l.b.add(.{ .op = .{ .construct = parts }, .ty = ty });
             },
             else => {
@@ -964,49 +985,49 @@ const Lowerer = struct {
         }
     }
 
-    fn structInput(l: *Lowerer, entry: *ir.Entry, ty: TypeId, name: []const u8, index: *u32) Error!Ref {
+    fn structInput(l: *Lowerer, entry: *ir.Entry, ty: TypeId, name: []const u8, index: *u32, attrs: SigAttrs) Error!Ref {
         const st = l.s.types.get(ty).@"struct";
         const parts = try l.arena.alloc(Ref, st.fields.items.len);
         for (parts, st.fields.items) |*p, fld| {
             if (l.s.types.get(fld.type) == .@"struct") {
-                p.* = try l.structInput(entry, fld.type, name, index);
+                p.* = try l.structInput(entry, fld.type, name, index, attrs.field(fld));
                 continue;
             }
-            try entry.inputs.append(l.arena, .{ .semantic = name, .semantic_index = index.*, .ty = fld.type, .system_value = std.ascii.startsWithIgnoreCase(name, "SV_") });
+            try entry.inputs.append(l.arena, withAttrs(.{ .semantic = name, .semantic_index = index.*, .ty = fld.type, .system_value = std.ascii.startsWithIgnoreCase(name, "SV_") }, attrs.field(fld)));
             index.* += 1;
             p.* = try l.b.add(.{ .op = .{ .input = @intCast(entry.inputs.items.len - 1) }, .ty = fld.type });
         }
         return l.b.add(.{ .op = .{ .construct = parts }, .ty = ty });
     }
 
-    fn structOutput(l: *Lowerer, entry: *ir.Entry, ty: TypeId, name: []const u8, index: *u32, value: Ref) Error!void {
+    fn structOutput(l: *Lowerer, entry: *ir.Entry, ty: TypeId, name: []const u8, index: *u32, value: Ref, attrs: SigAttrs) Error!void {
         const st = l.s.types.get(ty).@"struct";
         for (st.fields.items, 0..) |fld, k| {
             const v = try l.b.add(.{ .op = .{ .extract = .{ .agg = value, .index = @intCast(k) } }, .ty = fld.type });
             if (l.s.types.get(fld.type) == .@"struct") {
-                try l.structOutput(entry, fld.type, name, index, v);
+                try l.structOutput(entry, fld.type, name, index, v, attrs.field(fld));
                 continue;
             }
-            try entry.outputs.append(l.arena, .{ .semantic = name, .semantic_index = index.*, .ty = fld.type, .system_value = std.ascii.startsWithIgnoreCase(name, "SV_") });
+            try entry.outputs.append(l.arena, withAttrs(.{ .semantic = name, .semantic_index = index.*, .ty = fld.type, .system_value = std.ascii.startsWithIgnoreCase(name, "SV_") }, attrs.field(fld)));
             index.* += 1;
             _ = try l.b.add(.{ .op = .{ .output = .{ .element = @intCast(entry.outputs.items.len - 1), .value = v } }, .ty = TypeTable.void_type });
         }
     }
 
-    fn entryOutput(l: *Lowerer, entry: *ir.Entry, ty: TypeId, semantic: ?[]const u8, value: Ref, loc: ast.Loc, what: []const u8) Error!void {
+    fn entryOutput(l: *Lowerer, entry: *ir.Entry, ty: TypeId, semantic: ?[]const u8, attrs: SigAttrs, value: Ref, loc: ast.Loc, what: []const u8) Error!void {
         if (semantic) |sem| if (l.s.types.get(ty) == .@"struct") {
             var el = sigElement(sem, ty);
-            return l.structOutput(entry, ty, el.semantic, &el.semantic_index, value);
+            return l.structOutput(entry, ty, el.semantic, &el.semantic_index, value, attrs);
         };
         if (semantic) |sem| {
-            try entry.outputs.append(l.arena, sigElement(sem, ty));
+            try entry.outputs.append(l.arena, withAttrs(sigElement(sem, ty), attrs));
             _ = try l.b.add(.{ .op = .{ .output = .{ .element = @intCast(entry.outputs.items.len - 1), .value = value } }, .ty = TypeTable.void_type });
             return;
         }
         switch (l.s.types.get(ty)) {
             .@"struct" => |st| for (st.fields.items, 0..) |fld, k| {
                 const v = try l.b.add(.{ .op = .{ .extract = .{ .agg = value, .index = @intCast(k) } }, .ty = fld.type });
-                try l.entryOutput(entry, fld.type, fld.semantic, v, loc, fld.name);
+                try l.entryOutput(entry, fld.type, fld.semantic, attrs.field(fld), v, loc, fld.name);
             },
             else => {
                 l.unsupported(loc, "entry {s} needs a semantic", .{what});
@@ -1015,7 +1036,36 @@ const Lowerer = struct {
         }
     }
 
+    /// Lowers the initializers of the static globals the program uses,
+    /// each into its own function (an initializer may use earlier statics,
+    /// which then need initializing too). Returns them by global.
+    fn staticInits(l: *Lowerer) Error!std.AutoHashMapUnmanaged(*const Variable, u32) {
+        var inits: std.AutoHashMapUnmanaged(*const Variable, u32) = .empty;
+        var changed = true;
+        while (changed) {
+            changed = false;
+            for (l.s.static_globals.items) |v| {
+                const init_e = v.init orelse continue;
+                if (!l.globals.contains(v) or inits.contains(v)) continue;
+                if (l.s.types.get(v.type) == .resource or l.s.types.get(v.type) == .sampler) continue;
+                const fi = try l.m.addFunction(.{ .name = try std.fmt.allocPrint(l.arena, "init.{s}", .{v.name}), .params = &.{}, .ret = v.type });
+                try inits.put(l.arena, v, fi);
+                l.b = .{ .m = &l.m, .f = l.m.functions.items[fi] };
+                l.vars = .empty;
+                l.loops = .empty;
+                l.ret_ty = v.type;
+                l.b.setBlock(try l.b.newBlock());
+                const val = if (init_e.kind == .init_list) try l.initList(init_e, v.type) else try l.converted(init_e, v.type);
+                l.b.terminate(.{ .ret = val });
+                try l.drain();
+                changed = true;
+            }
+        }
+        return inits;
+    }
+
     fn buildEntry(l: *Lowerer, f: *const semamod.Function, main: u32, opts: Options) Error!void {
+        const inits = try l.staticInits();
         var entry: ir.Entry = .{ .func = main, .name = opts.entry, .stage = opts.stage };
         for (f.decl.attrs) |a| {
             if (std.ascii.eqlIgnoreCase(a.name, "numthreads") and a.args.len == 3) {
@@ -1025,22 +1075,28 @@ const Lowerer = struct {
         const wrapper = try l.m.addFunction(.{ .name = opts.entry, .params = &.{}, .ret = TypeTable.void_type });
         l.b = .{ .m = &l.m, .f = l.m.functions.items[wrapper] };
         l.b.setBlock(try l.b.newBlock());
+        for (l.s.static_globals.items) |v| if (inits.get(v)) |fi| {
+            const g = l.globals.get(v).?;
+            const glob = l.m.globals.items[g];
+            const ptr = try l.b.add(.{ .op = .{ .global = g }, .ty = glob.ty, .ptr = glob.space });
+            try l.b.store(ptr, try l.b.add(.{ .op = .{ .call = .{ .func = fi, .args = &.{} } }, .ty = v.type }));
+        };
         const args = try l.arena.alloc(Ref, f.params.len);
         const locals = try l.arena.alloc(Ref, f.params.len);
         for (f.decl.params, f.params, 0..) |pd, p, i| {
             locals[i] = try l.b.add(.{ .op = .local_var, .ty = p.type, .ptr = .function });
             if (p.dir != .out) {
-                const v = try l.entryInput(&entry, p.type, semanticOf(pd.semantics), pd.name_loc, pd.name);
+                const v = try l.entryInput(&entry, p.type, semanticOf(pd.semantics), paramAttrs(pd.quals), pd.name_loc, pd.name);
                 try l.b.store(locals[i], v);
             }
             args[i] = if (p.dir == .in) try l.b.load(locals[i]) else locals[i];
         }
         const ret = try l.b.add(.{ .op = .{ .call = .{ .func = main, .args = args } }, .ty = f.ret });
-        if (f.ret != TypeTable.void_type) try l.entryOutput(&entry, f.ret, semanticOf(f.decl.ret_semantics), ret, f.loc, "return value");
+        if (f.ret != TypeTable.void_type) try l.entryOutput(&entry, f.ret, semanticOf(f.decl.ret_semantics), paramAttrs(f.decl.quals), ret, f.loc, "return value");
         for (f.decl.params, f.params, 0..) |pd, p, i| {
             if (p.dir == .in) continue;
             const v = try l.b.load(locals[i]);
-            try l.entryOutput(&entry, p.type, semanticOf(pd.semantics), v, pd.name_loc, pd.name);
+            try l.entryOutput(&entry, p.type, semanticOf(pd.semantics), paramAttrs(pd.quals), v, pd.name_loc, pd.name);
         }
         l.b.terminate(.{ .ret = .none });
         entry.wrapper = wrapper;
@@ -1057,6 +1113,10 @@ pub fn saturatingInt(f: f64) i64 {
     if (f >= 9.2233720368547758e18) return std.math.maxInt(i64);
     if (f <= -9.2233720368547758e18) return std.math.minInt(i64);
     return @intFromFloat(@trunc(f));
+}
+
+fn paramAttrs(q: ast.Qualifiers) Lowerer.SigAttrs {
+    return .{ .interp = semamod.interpOf(q), .row_major = q.row_major };
 }
 
 fn semanticOf(sems: []const ast.Semantic) ?[]const u8 {

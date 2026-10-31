@@ -5,6 +5,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Module = @import("module.zig").Module;
 const container = @import("container.zig");
+const signature = @import("signature.zig");
 
 pub const ShaderKind = enum(u8) {
     pixel = 0,
@@ -102,15 +103,15 @@ pub fn buildEmptyCompute(gpa: Allocator, info: ComputeInfo) ![]u8 {
 
     const dxil_part = try programPart(gpa, info.profile, bitcode);
     defer gpa.free(dxil_part);
-    const psv = try psvCompute(gpa, info.entry, info.num_threads, &.{});
-    defer gpa.free(psv);
+    const psv_part = try psvCompute(gpa, info.entry, info.num_threads, &.{});
+    defer gpa.free(psv_part);
     const empty_sig = [_]u8{ 0, 0, 0, 0, 8, 0, 0, 0 }; // ParamCount 0, ParamOffset 8
 
     const parts = [_]container.Part{
         .{ .fourcc = container.fourcc("SFI0"), .data = &@as([8]u8, @splat(0)) },
         .{ .fourcc = container.fourcc("ISG1"), .data = &empty_sig },
         .{ .fourcc = container.fourcc("OSG1"), .data = &empty_sig },
-        .{ .fourcc = container.fourcc("PSV0"), .data = psv },
+        .{ .fourcc = container.fourcc("PSV0"), .data = psv_part },
         .{ .fourcc = container.fourcc("DXIL"), .data = dxil_part },
     };
     return container.assemble(gpa, &parts);
@@ -135,51 +136,106 @@ pub fn programPart(gpa: Allocator, profile: Profile, bitcode: []const u8) ![]u8 
 /// One PSVResourceBindInfo1 record.
 pub const ResourceBind = struct { res_type: u32, space: u32, lower: u32, upper: u32, kind: u32, flags: u32 = 0 };
 
-/// PSV0 with PSVRuntimeInfo4 (60 bytes), as produced for validator 1.11.
+pub const PsvInfo = struct {
+    kind: ShaderKind,
+    entry: []const u8,
+    /// The stage-specific PSVRuntimeInfo0 union.
+    stage_info: [16]u8 = @splat(0),
+    num_threads: [3]u32 = .{ 0, 0, 0 },
+    resources: []const ResourceBind = &.{},
+    inputs: []const signature.Element = &.{},
+    outputs: []const signature.Element = &.{},
+};
+
 pub fn psvCompute(gpa: Allocator, entry: []const u8, num_threads: [3]u32, resources: []const ResourceBind) ![]u8 {
+    return psv(gpa, .{ .kind = .compute, .entry = entry, .num_threads = num_threads, .resources = resources });
+}
+
+/// PSV0 with PSVRuntimeInfo4 (60 bytes), as produced for validator 1.11.
+pub fn psv(gpa: Allocator, info: PsvInfo) ![]u8 {
     var buf: std.ArrayList(u8) = .empty;
     errdefer buf.deinit(gpa);
-    const w = struct {
-        fn u32_(b: *std.ArrayList(u8), a: Allocator, v: u32) !void {
-            var tmp: [4]u8 = undefined;
-            std.mem.writeInt(u32, &tmp, v, .little);
-            try b.appendSlice(a, &tmp);
-        }
-    }.u32_;
+    const w = signature.put32;
+    const in_vectors = signature.vectorsUsed(info.inputs, 0);
+    var out_vectors: [4]u32 = undefined;
+    for (&out_vectors, 0..) |*v, s| v.* = signature.vectorsUsed(info.outputs, @intCast(s));
 
     try w(&buf, gpa, 60); // sizeof(PSVRuntimeInfo4)
     // PSVRuntimeInfo0
-    try buf.appendNTimes(gpa, 0, 16); // stage-specific union
+    try buf.appendSlice(gpa, &info.stage_info);
     try w(&buf, gpa, 0); // MinimumExpectedWaveLaneCount
     try w(&buf, gpa, 0xFFFFFFFF); // MaximumExpectedWaveLaneCount
-    // PSVRuntimeInfo1
-    try buf.appendSlice(gpa, &.{ @backingInt(ShaderKind.compute), 0, 0, 0 }); // stage, UsesViewID, union
-    try buf.appendNTimes(gpa, 0, 4); // sig element counts, SigInputVectors
-    try buf.appendNTimes(gpa, 0, 4); // SigOutputVectors[4]
+    // PSVRuntimeInfo1: stage, UsesViewID, MaxVertexCount, element counts,
+    // vector counts.
+    try buf.appendSlice(gpa, &.{ @backingInt(info.kind), 0, 0, 0 });
+    try buf.appendSlice(gpa, &.{ @intCast(info.inputs.len), @intCast(info.outputs.len), 0, @intCast(in_vectors) });
+    for (out_vectors) |v| try buf.append(gpa, @intCast(v));
     // PSVRuntimeInfo2
-    for (num_threads) |t| try w(&buf, gpa, t);
-    // PSVRuntimeInfo3: EntryFunctionName offset into string table (after leading NUL)
-    try w(&buf, gpa, 1);
+    for (info.num_threads) |t| try w(&buf, gpa, t);
+
+    // String table: "\0", arbitrary semantic names, the entry name.
+    var strings: std.ArrayList(u8) = .empty;
+    defer strings.deinit(gpa);
+    try strings.append(gpa, 0);
+    // Semantic index table, with runs shared between elements.
+    var indices: std.ArrayList(u32) = .empty;
+    defer indices.deinit(gpa);
+    var records: std.ArrayList(u8) = .empty;
+    defer records.deinit(gpa);
+    for ([_][]const signature.Element{ info.inputs, info.outputs }) |els| for (els) |e| {
+        var name_off: u32 = 0;
+        if (e.kind == .arbitrary and e.name.len > 0) {
+            name_off = @intCast(strings.items.len);
+            try strings.appendSlice(gpa, e.name);
+            try strings.append(gpa, 0);
+        }
+        const idx_off: u32 = blk: {
+            var off: usize = 0;
+            while (off + e.indices.len <= indices.items.len) : (off += 1) {
+                if (std.mem.eql(u32, indices.items[off..][0..e.indices.len], e.indices)) break :blk @intCast(off);
+            }
+            try indices.appendSlice(gpa, e.indices);
+            break :blk @intCast(indices.items.len - e.indices.len);
+        };
+        try w(&records, gpa, name_off);
+        try w(&records, gpa, idx_off);
+        var cols_and_start: u8 = @intCast(e.cols);
+        if (e.start_row != null) cols_and_start |= 0x40 | @as(u8, @intCast(e.start_col << 4));
+        try records.appendSlice(gpa, &.{ @intCast(e.rows), @intCast(e.start_row orelse 0), cols_and_start, @intFromEnum(e.kind), @intCast(e.comp.sigCompType()), @intFromEnum(e.interp), @intCast((e.stream & 3) << 4), 0 });
+    };
+    const entry_off: u32 = @intCast(strings.items.len);
+    try strings.appendSlice(gpa, info.entry);
+    try strings.append(gpa, 0);
+    while (strings.items.len % 4 != 0) try strings.append(gpa, 0);
+
+    // PSVRuntimeInfo3: EntryFunctionName
+    try w(&buf, gpa, entry_off);
     // PSVRuntimeInfo4
     try w(&buf, gpa, 0); // NumBytesGroupSharedMemory
     try w(&buf, gpa, 0); // Flags
 
-    try w(&buf, gpa, @intCast(resources.len)); // resource count
-    if (resources.len > 0) {
+    try w(&buf, gpa, @intCast(info.resources.len));
+    if (info.resources.len > 0) {
         try w(&buf, gpa, 24); // sizeof(PSVResourceBindInfo1)
-        for (resources) |r| {
+        for (info.resources) |r| {
             for ([_]u32{ r.res_type, r.space, r.lower, r.upper, r.kind, r.flags }) |v| try w(&buf, gpa, v);
         }
     }
 
-    // String table: "\0" ++ entry ++ "\0", padded to 4 bytes.
-    const strtab_len = std.mem.alignForward(usize, entry.len + 2, 4);
-    try w(&buf, gpa, @intCast(strtab_len));
-    try buf.append(gpa, 0);
-    try buf.appendSlice(gpa, entry);
-    try buf.appendNTimes(gpa, 0, strtab_len - entry.len - 1);
-
-    try w(&buf, gpa, 0); // semantic index table count
+    try w(&buf, gpa, @intCast(strings.items.len));
+    try buf.appendSlice(gpa, strings.items);
+    try w(&buf, gpa, @intCast(indices.items.len));
+    for (indices.items) |v| try w(&buf, gpa, v);
+    if (info.inputs.len + info.outputs.len > 0) {
+        try w(&buf, gpa, 16); // sizeof(PSVSignatureElement0)
+        try buf.appendSlice(gpa, records.items);
+    }
+    // Input-to-output dependency table (no ViewID). Left empty: the
+    // validator only checks it against dx.viewIdState, which zdxc omits.
+    if (in_vectors > 0 and out_vectors[0] > 0) {
+        const dwords = ((out_vectors[0] + 7) >> 3) * in_vectors * 4;
+        try buf.appendNTimes(gpa, 0, dwords * 4);
+    }
     return buf.toOwnedSlice(gpa);
 }
 
