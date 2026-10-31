@@ -854,14 +854,31 @@ const Lowerer = struct {
                     };
                     return result;
                 }
+                // `out` parameters go through temporaries copied back
+                // afterwards; `ref` ones (atomic destinations) pass the
+                // storage itself.
                 const vals = try l.arena.alloc(Ref, args.len);
+                var any_out = false;
                 for (args, 0..) |a, i| {
-                    if (i < spec.params.len and spec.params[i].qual != .in) {
-                        return l.fail(a, "out arguments of intrinsics");
+                    const q = if (i < spec.params.len) spec.params[i].qual else .in;
+                    const pt = try l.concrete(it.params[i]);
+                    switch (q) {
+                        .in => vals[i] = try l.converted(a, pt),
+                        .ref => vals[i] = try l.lvalue(a),
+                        .out, .inout => {
+                            vals[i] = try l.b.add(.{ .op = .local_var, .ty = pt, .ptr = .function });
+                            if (q == .inout) try l.b.store(vals[i], try l.converted(a, pt));
+                            any_out = true;
+                        },
                     }
-                    vals[i] = try l.converted(a, try l.concrete(it.params[i]));
                 }
-                return l.b.add(.{ .op = .{ .intrinsic = .{ .name = name, .args = vals } }, .ty = ret_ty });
+                const result = try l.b.add(.{ .op = .{ .intrinsic = .{ .name = name, .args = vals } }, .ty = ret_ty });
+                if (any_out) for (args, 0..) |a, i| {
+                    const q = if (i < spec.params.len) spec.params[i].qual else .in;
+                    if (q != .out and q != .inout) continue;
+                    try l.storeTo(a, try l.convert(try l.b.load(vals[i]), a.ty));
+                };
+                return result;
             },
             else => return l.fail(e, "this call"),
         }

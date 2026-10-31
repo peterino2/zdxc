@@ -1087,6 +1087,7 @@ const Emitter = struct {
 
     fn intrinsic(e: *Emitter, frame: *Frame, name: []const u8, ty: TypeId, args: []const Ref) Error!Lowered {
         const eq = std.mem.eql;
+        if (try e.outIntrinsic(frame, name, ty, args)) |r| return r;
         var a: [4][]const Value = undefined;
         for (args, 0..) |x, k| a[k] = try e.scalars(frame, x);
         const ac = if (args.len > 0) e.compOf(frame.f.inst(args[0]).ty) else e.compOf(ty);
@@ -1297,6 +1298,83 @@ const Emitter = struct {
             return .none;
         }
         return e.unsupported("intrinsic '{s}' is not supported yet", .{name});
+    }
+
+    /// The pointer an out argument was lowered to.
+    fn outPtr(e: *Emitter, frame: *Frame, r: Ref) Error!Ptr {
+        return switch (frame.vals[r.index()]) {
+            .ptr => |p| p,
+            else => e.unsupported("internal: out argument is not a pointer", .{}),
+        };
+    }
+
+    /// Intrinsics with out parameters (null for the others).
+    fn outIntrinsic(e: *Emitter, frame: *Frame, name: []const u8, ty: TypeId, args: []const Ref) Error!?Lowered {
+        const eq = std.mem.eql;
+        if (eq(u8, name, "sincos") or eq(u8, name, "modf") or eq(u8, name, "frexp")) {
+            const xty = frame.f.inst(args[0]).ty;
+            const xs = try e.scalars(frame, args[0]);
+            const ft = try e.scalarTy(e.compOf(xty));
+            const n = xs.len;
+            const a1 = try e.arena.alloc(Value, n);
+            const a2 = try e.arena.alloc(Value, n);
+            if (eq(u8, name, "sincos")) {
+                for (xs, a1, a2) |x, *sv, *cv| {
+                    sv.* = try e.unaryOp(13, "unary", x, ft);
+                    cv.* = try e.unaryOp(12, "unary", x, ft);
+                }
+                try e.storePtr(try e.outPtr(frame, args[1]), a1, frame.f.inst(args[1]).ty);
+                try e.storePtr(try e.outPtr(frame, args[2]), a2, frame.f.inst(args[2]).ty);
+                return .none;
+            }
+            if (eq(u8, name, "modf")) {
+                // ip = trunc(x), result x - ip.
+                for (xs, a1, a2) |x, *ip, *fr| {
+                    ip.* = try e.unaryOp(29, "unary", x, ft);
+                    fr.* = try e.fbin(.sub, x, ip.*, ft);
+                }
+                try e.storePtr(try e.outPtr(frame, args[1]), a1, frame.f.inst(args[1]).ty);
+                return .{ .scalars = a2 };
+            }
+            // frexp, as dxc: exponent and mantissa from the bits.
+            const i32t = try e.dm.intType(32);
+            for (xs, a1, a2) |x, *ex, *mn| {
+                const nz = try e.add(i32t, .{ .cast = .{ .op = .sext, .val = try e.fcmp(14, x, try e.constant(try e.t.scalar(.float), .{ .float = 0 })) } });
+                const bitsv = try e.add(i32t, .{ .cast = .{ .op = .bitcast, .val = x } });
+                var t = try e.fbin(.@"and", bitsv, try e.i32Const(0x7f800000), i32t);
+                t = try e.fbin(.add, t, try e.i32Const(-0x3f000000), i32t);
+                t = try e.fbin(.@"and", t, nz, i32t);
+                t = try e.fbin(.ashr, t, try e.i32Const(23), i32t);
+                ex.* = try e.add(ft, .{ .cast = .{ .op = .sitofp, .val = t } });
+                var m = try e.fbin(.@"and", bitsv, try e.i32Const(0x007fffff), i32t);
+                m = try e.fbin(.@"or", m, try e.i32Const(0x3f000000), i32t);
+                m = try e.fbin(.@"and", m, nz, i32t);
+                mn.* = try e.add(ft, .{ .cast = .{ .op = .bitcast, .val = m } });
+            }
+            try e.storePtr(try e.outPtr(frame, args[1]), a1, frame.f.inst(args[1]).ty);
+            _ = ty;
+            return .{ .scalars = a2 };
+        }
+        if (eq(u8, name, "asuint") and args.len == 3) {
+            // SplitDouble.
+            const i32t = try e.dm.intType(32);
+            const f64t = try e.dm.getType(.double);
+            e.uses_double = true;
+            const st = try e.dm.getType(.{ .@"struct" = .{ .name = "dx.types.splitdouble", .elems = &.{ i32t, i32t } } });
+            const fn_i = try e.dxOp("dx.op.splitDouble.f64", st, &.{ i32t, f64t }, .nounwind_readnone);
+            const ds = try e.scalars(frame, args[0]);
+            const lo = try e.arena.alloc(Value, ds.len);
+            const hi = try e.arena.alloc(Value, ds.len);
+            for (ds, lo, hi) |d, *l, *h| {
+                const r = try e.callOp(fn_i, st, &.{ try e.i32Const(102), d });
+                l.* = try e.add(i32t, .{ .extractvalue = .{ .agg = r, .index = 0 } });
+                h.* = try e.add(i32t, .{ .extractvalue = .{ .agg = r, .index = 1 } });
+            }
+            try e.storePtr(try e.outPtr(frame, args[1]), lo, frame.f.inst(args[1]).ty);
+            try e.storePtr(try e.outPtr(frame, args[2]), hi, frame.f.inst(args[2]).ty);
+            return .none;
+        }
+        return null;
     }
 
     fn fbin(e: *Emitter, op: module.BinOp, x: Value, y: Value, ty: DType) Error!Value {
@@ -1523,27 +1601,32 @@ const Emitter = struct {
         const i32t = try e.dm.intType(32);
         var cache_reg: ?u32 = null;
         var cache_val: Value = undefined;
-        var cache_c: Scalar = .int;
+        var cache_st: DType = 0;
         for (out, 0..) |*o, k| {
             const comp_ty = try e.componentType(ty, @intCast(k));
             const c = e.compOf(comp_ty);
             const mem_c: Scalar = if (c == .bool) .uint else c;
-            if (mem_c.size() != 4) return e.unsupported("{d}-bit constant buffer members are not supported yet", .{mem_c.size() * 8});
+            // A register holds 16 bytes: 4 32-bit, 2 64-bit or 8 16-bit values.
+            const sz = mem_c.size();
             const off = offset + (layout.componentOffset(e.arena, e.t, ty, row_major, @intCast(k), .dx_legacy) catch return e.unsupported("constant buffer member types", .{}));
             const reg = off / 16;
             const st = try e.scalarTy(mem_c);
-            const same_kind = (mem_c.isFloat() == cache_c.isFloat());
-            if (cache_reg == null or cache_reg.? != reg or !same_kind) {
-                const ret_name = try std.fmt.allocPrint(e.arena, "dx.types.CBufRet.{s}", .{e.overloadName(st)});
-                const ret_ty = try e.dm.getType(.{ .@"struct" = .{ .name = ret_name, .elems = &.{ st, st, st, st } } });
+            if (cache_reg == null or cache_reg.? != reg or cache_st != st) {
+                const ret_name = try std.fmt.allocPrint(e.arena, "dx.types.CBufRet.{s}{s}", .{ e.overloadName(st), if (sz == 2) ".8" else "" });
+                const elems: []const DType = switch (sz) {
+                    8 => &.{ st, st },
+                    2 => &.{ st, st, st, st, st, st, st, st },
+                    else => &.{ st, st, st, st },
+                };
+                const ret_ty = try e.dm.getType(.{ .@"struct" = .{ .name = ret_name, .elems = try e.arena.dupe(DType, elems) } });
                 const fn_i = try e.dxOp(try std.fmt.allocPrint(e.arena, "dx.op.cbufferLoadLegacy.{s}", .{e.overloadName(st)}), ret_ty, &.{ i32t, e.handle_ty, i32t }, .nounwind_readonly);
                 var reg_v = try e.i32Const(reg);
                 if (dyn_regs) |d| reg_v = try e.add(i32t, .{ .binop = .{ .op = .add, .lhs = d, .rhs = reg_v } });
                 cache_val = try e.callOp(fn_i, ret_ty, &.{ try e.i32Const(59), res.handle, reg_v });
                 cache_reg = reg;
-                cache_c = mem_c;
+                cache_st = st;
             }
-            const v = try e.add(st, .{ .extractvalue = .{ .agg = cache_val, .index = (off % 16) / 4 } });
+            const v = try e.add(st, .{ .extractvalue = .{ .agg = cache_val, .index = (off % 16) / sz } });
             o.* = if (c == .bool) try e.convertScalar(v, .uint, .bool) else v;
         }
         return .{ .scalars = out };

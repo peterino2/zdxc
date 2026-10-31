@@ -612,7 +612,7 @@ const Emitter = struct {
                     if ((input and entry.stage == .pixel) or (!input and entry.stage == .vertex)) {
                         var et = ty;
                         while (e.t.get(et) == .array) et = e.t.get(et).array.elem;
-                        if (!e.t.component(et).?.isFloat()) {
+                        if (!e.t.component(et).?.isFloat() or e.t.component(et).? == .double) {
                             try e.b.emit(.annotations, .decorate, &.{ var_id, 14 }); // Flat
                         } else {
                             if (el.interp.centroid) try e.b.emit(.annotations, .decorate, &.{ var_id, 16 }); // Centroid
@@ -1751,7 +1751,63 @@ const Emitter = struct {
         return e.glsl;
     }
 
+    /// Intrinsics with out parameters (null for the others).
+    fn outIntrinsic(e: *Emitter, name: []const u8, ty: TypeId, args: []const Ref) Error!?Id {
+        const eq = std.mem.eql;
+        const xty = if (args.len > 0) e.f.inst(args[0]).ty else ty;
+        if (eq(u8, name, "sincos") or eq(u8, name, "modf") or eq(u8, name, "frexp")) {
+            // Matrices go row by row; each piece gives two results.
+            const m = e.isTrueMatrix(xty);
+            const nrows: u32 = if (m) e.t.get(xty).matrix.rows else 1;
+            const pty = if (m) try e.t.vector(e.t.get(xty).matrix.elem, e.t.get(xty).matrix.cols) else xty;
+            const first = try e.arena.alloc(Id, nrows);
+            const second = try e.arena.alloc(Id, nrows);
+            const n = e.t.componentCount(pty).?;
+            const ity = if (n == 1) try e.t.scalar(.int) else try e.t.vector(.int, @intCast(n));
+            for (first, second, 0..) |*a, *b, k| {
+                const x = if (m) try e.row(e.val(args[0]), pty, @intCast(k)) else e.val(args[0]);
+                if (eq(u8, name, "sincos")) {
+                    a.* = try e.op1(.ext_inst, pty, &.{ e.glslSet(), 13, x });
+                    b.* = try e.op1(.ext_inst, pty, &.{ e.glslSet(), 14, x });
+                    continue;
+                }
+                // ModfStruct {fraction, whole}; FrexpStruct {mantissa, exponent}.
+                const is_modf = eq(u8, name, "modf");
+                const st = e.b.newId();
+                try e.b.emit(.types_globals, .type_struct, &.{ st, try e.typeId(pty), try e.typeId(if (is_modf) pty else ity) });
+                const r = try e.opRaw(.ext_inst, st, &.{ e.glslSet(), if (is_modf) 36 else 52, x });
+                a.* = try e.op1(.composite_extract, pty, &.{ r, 0 });
+                b.* = if (is_modf) try e.op1(.composite_extract, pty, &.{ r, 1 }) else try e.convert(try e.op1(.composite_extract, ity, &.{ r, 1 }), ity, pty);
+            }
+            const join = struct {
+                fn f(em: *Emitter, parts: []const Id, is_m: bool, t: TypeId) Error!Id {
+                    return if (is_m) em.op1(.composite_construct, t, parts) else parts[0];
+                }
+            }.f;
+            const av = try join(e, first, m, xty);
+            const bv = try join(e, second, m, xty);
+            if (eq(u8, name, "sincos")) {
+                try e.b.emit(.functions, .store, &.{ e.val(args[1]), av });
+                try e.b.emit(.functions, .store, &.{ e.val(args[2]), bv });
+                return 0;
+            }
+            try e.b.emit(.functions, .store, &.{ e.val(args[1]), try e.convert(bv, xty, e.f.inst(args[1]).ty) });
+            return av;
+        }
+        if (eq(u8, name, "asuint") and args.len == 3) {
+            const n = e.t.componentCount(xty).?;
+            if (n != 1) return e.unsupported("asuint of double vectors is not supported yet", .{});
+            const pair = try e.op1(.bitcast, try e.t.vector(.uint, 2), &.{e.val(args[0])});
+            const u = try e.t.scalar(.uint);
+            try e.b.emit(.functions, .store, &.{ e.val(args[1]), try e.op1(.composite_extract, u, &.{ pair, 0 }) });
+            try e.b.emit(.functions, .store, &.{ e.val(args[2]), try e.op1(.composite_extract, u, &.{ pair, 1 }) });
+            return 0;
+        }
+        return null;
+    }
+
     fn intrinsic(e: *Emitter, name: []const u8, ty: TypeId, args: []const Ref) Error!Id {
+        if (try e.outIntrinsic(name, ty, args)) |id| return id;
         if (std.mem.eql(u8, name, "NonUniformResourceIndex")) {
             // A decorated copy marks the index (as dxc).
             const id = try e.op1(.copy_object, ty, &.{e.val(args[0])});
