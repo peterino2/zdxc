@@ -9,12 +9,26 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    // dxc's option table, generated from the vendored tablegen file by a
+    // host tool (no tablegen or Python needed).
+    const gen_options = b.addExecutable(.{
+        .name = "gen_options",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/gen_options.zig"),
+            .target = b.graph.host,
+        }),
+    });
+    const gen_options_run = b.addRunArtifact(gen_options);
+    gen_options_run.addFileArg(b.path("vendor/dxc/HLSLOptions.td"));
+    const options_table = gen_options_run.addOutputFileArg("options_table.zig");
+
     const mod = b.addModule("zdxc", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &.{.{ .name = "hlsl_headers", .module = hlsl_headers }},
     });
+    mod.addAnonymousImport("options_table", .{ .root_source_file = options_table });
 
     const exe = b.addExecutable(.{
         .name = "zdxc",
@@ -53,6 +67,13 @@ pub fn build(b: *std.Build) void {
     oracle_parse.setCwd(b.path("."));
     oracle_parse.has_side_effects = true;
     oracle_parse_step.dependOn(&oracle_parse.step);
+
+    const oracle_cli_step = b.step("oracle-cli", "Parse every dxc command line in the DXC test corpus");
+    const oracle_cli = b.addSystemCommand(&.{ "sh", "test/oracle/cli.sh" });
+    oracle_cli.addArtifactArg(exe);
+    oracle_cli.setCwd(b.path("."));
+    oracle_cli.has_side_effects = true;
+    oracle_cli_step.dependOn(&oracle_cli.step);
 
     // Benchmarks always build optimized so numbers are comparable.
     const bench = b.addExecutable(.{

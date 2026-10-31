@@ -5,41 +5,7 @@ const shader = zdxc.dxil.shader;
 const container = zdxc.dxil.container;
 const front = zdxc.front;
 
-const usage =
-    \\OVERVIEW: zdxc - HLSL 2021 to DXIL / SPIR-V compiler
-    \\
-    \\USAGE: zdxc [options] <input>
-    \\
-    \\OPTIONS:
-    \\  -T <profile>          Target profile (cs_6_0 .. cs_6_9, vs_, ps_, gs_)
-    \\  -E <name>             Entry point name (default: main)
-    \\  -Fo <file>            Output object file
-    \\  -spirv                Generate SPIR-V
-    \\  -D <name>[=<value>]   Define a macro
-    \\  -I <dir>              Add an include directory
-    \\  -P                    Preprocess only (to -Fi <file>, or stdout)
-    \\  -Fi <file>            Output file for -P
-    \\  -HV 2021              HLSL version (only 2021 is supported)
-    \\  -enable-16bit-types   Enable 16-bit types
-    \\  -WX                   Treat warnings as errors
-    \\  -no-warnings          Suppress warnings
-    \\  -Wno-<group>          Disable a warning group (e.g. -Wno-macro-redefined)
-    \\  -fdiagnostics-format=<clang|msvc|vi>
-    \\                        Diagnostic location style (msvc: file(line,col))
-    \\  -fcolor-diagnostics, -fno-color-diagnostics
-    \\                        Force colors on or off (default: on for terminals)
-    \\  -ferror-limit=<n>     Stop after n errors (default 20, 0 = no limit)
-    \\  --version             Print version
-    \\
-    \\DEVELOPMENT (temporary, until the frontend lands):
-    \\  -zdxc-empty           Emit an empty shader for -T instead of compiling <input>
-    \\  -zdxc-check-hash      Verify the container hash of <input>
-    \\  -zdxc-lex             Print the tokens of <input>, one per line (no preprocessing;
-    \\                        `#line` lines are skipped)
-    \\  -zdxc-parse           Preprocess and parse <input>, reporting syntax errors only
-    \\  -zdxc-ast             Preprocess and parse <input> and dump the syntax tree
-    \\
-;
+const options = zdxc.options;
 
 const Options = struct {
     profile: ?[]const u8 = null,
@@ -63,6 +29,10 @@ const Options = struct {
     error_limit: u32 = 20,
     parse: bool = false,
     dump_ast: bool = false,
+    /// -O0..-O3 / -Od (default -O3, as in dxc).
+    opt_level: enum { od, o0, o1, o2, o3 } = .o3,
+    /// Accepted options with no effect yet, reported once each.
+    ignored: std.ArrayList([]const u8) = .empty,
 };
 
 const Cli = struct {
@@ -84,91 +54,121 @@ pub fn main(init: std.process.Init) !u8 {
     var stdout_buf: [4096]u8 = undefined;
     var stdout_writer: Io.File.Writer = .init(.stdout(), io, &stdout_buf);
     const cli: Cli = .{ .io = io, .stderr = &stderr_writer.interface };
+    defer stderr_writer.interface.flush() catch {};
 
+    // Exit codes follow dxc: 1 for command-line and I/O errors, 5 when the
+    // compilation reports errors.
     run(cli, arena, try init.minimal.args.toSlice(arena), &stdout_writer.interface) catch |err| switch (err) {
         error.Fatal => return 1,
+        error.CompileFailed => return 5,
         else => return err,
     };
     try stdout_writer.interface.flush();
     return 0;
 }
 
-/// Splits `-Dfoo` / `-D foo` style options.
-fn optionValue(cli: Cli, args: []const [:0]const u8, i: *usize, flag: []const u8) ![]const u8 {
-    const a = args[i.*];
-    if (a.len > flag.len) return a[flag.len..];
-    i.* += 1;
-    if (i.* >= args.len) return cli.fail("missing argument to '{s}'", .{flag});
-    return args[i.*];
-}
+/// Parse a dxc-style command line. Returns null when the command is
+/// complete (`-help`, `--version`).
+fn parseArgs(cli: Cli, arena: std.mem.Allocator, argv: []const [:0]const u8, stdout: *Io.Writer) !?Options {
+    var failure: options.Failure = .{};
+    const plain = try arena.alloc([]const u8, argv.len -| 1);
+    for (plain, 0..) |*a, i| a.* = argv[i + 1];
+    const parsed = options.parse(arena, plain, &failure) catch |e| switch (e) {
+        error.UnknownArgument => return cli.fail("unknown argument: '{s}'", .{failure.arg}),
+        error.MissingArgument => return cli.fail("argument to '{s}' is missing", .{failure.arg}),
+        error.OutOfMemory => return error.OutOfMemory,
+    };
 
-fn parseArgs(cli: Cli, arena: std.mem.Allocator, args: []const [:0]const u8, stdout: *Io.Writer) !?Options {
     var opts: Options = .{};
-    var i: usize = 1;
-    while (i < args.len) : (i += 1) {
-        const a = args[i];
-        if (std.mem.eql(u8, a, "-T")) {
-            opts.profile = try optionValue(cli, args, &i, "-T");
-        } else if (std.mem.eql(u8, a, "-E")) {
-            opts.entry = try optionValue(cli, args, &i, "-E");
-        } else if (std.mem.eql(u8, a, "-Fo")) {
-            opts.output = try optionValue(cli, args, &i, "-Fo");
-        } else if (std.mem.eql(u8, a, "-Fi")) {
-            opts.pp_output = try optionValue(cli, args, &i, "-Fi");
-        } else if (std.mem.startsWith(u8, a, "-D")) {
-            const v = try optionValue(cli, args, &i, "-D");
-            if (std.mem.indexOfScalar(u8, v, '=')) |eq| {
-                try opts.defines.append(arena, .{ .name = v[0..eq], .value = v[eq + 1 ..] });
-            } else try opts.defines.append(arena, .{ .name = v });
-        } else if (std.mem.startsWith(u8, a, "-I")) {
-            try opts.include_dirs.append(arena, try optionValue(cli, args, &i, "-I"));
-        } else if (std.mem.eql(u8, a, "-HV")) {
-            const v = try optionValue(cli, args, &i, "-HV");
-            if (!std.mem.eql(u8, v, "2021")) return cli.fail("HLSL version {s} is not supported; zdxc implements HLSL 2021 only", .{v});
-        } else if (std.mem.eql(u8, a, "-P")) {
-            opts.preprocess = true;
-        } else if (std.mem.eql(u8, a, "-spirv")) {
-            opts.spirv = true;
-        } else if (std.mem.eql(u8, a, "-enable-16bit-types")) {
-            opts.enable_16bit = true;
-        } else if (std.mem.eql(u8, a, "-WX")) {
-            opts.warnings_as_errors = true;
-        } else if (std.mem.eql(u8, a, "-no-warnings")) {
-            opts.no_warnings = true;
-        } else if (std.mem.startsWith(u8, a, "-Wno-")) {
-            try opts.disabled_warnings.append(arena, a["-Wno-".len..]);
-        } else if (std.mem.startsWith(u8, a, "-fdiagnostics-format=")) {
-            const v = a["-fdiagnostics-format=".len..];
-            opts.diag_format = std.meta.stringToEnum(zdxc.diag.Format, v) orelse return cli.fail("unknown diagnostics format '{s}'", .{v});
-        } else if (std.mem.eql(u8, a, "-fcolor-diagnostics")) {
-            opts.color = true;
-        } else if (std.mem.eql(u8, a, "-fno-color-diagnostics")) {
-            opts.color = false;
-        } else if (std.mem.startsWith(u8, a, "-ferror-limit=")) {
-            opts.error_limit = std.fmt.parseInt(u32, a["-ferror-limit=".len..], 10) catch return cli.fail("invalid -ferror-limit value", .{});
-        } else if (std.mem.eql(u8, a, "-zdxc-empty")) {
-            opts.empty = true;
-        } else if (std.mem.eql(u8, a, "-zdxc-check-hash")) {
-            opts.check_hash = true;
-        } else if (std.mem.eql(u8, a, "-zdxc-lex")) {
-            opts.lex = true;
-        } else if (std.mem.eql(u8, a, "-zdxc-parse")) {
-            opts.parse = true;
-        } else if (std.mem.eql(u8, a, "-zdxc-ast")) {
-            opts.parse = true;
-            opts.dump_ast = true;
-        } else if (std.mem.eql(u8, a, "--version")) {
-            try stdout.print("zdxc {s}\n", .{zdxc.version});
-            return null;
-        } else if (std.mem.eql(u8, a, "-help") or std.mem.eql(u8, a, "--help")) {
-            try stdout.writeAll(usage);
-            return null;
-        } else if (a.len > 0 and a[0] == '-') {
-            return cli.fail("unknown argument: '{s}'", .{a});
-        } else {
-            if (opts.input != null) return cli.fail("more than one input file", .{});
-            opts.input = a;
+    for (parsed.args) |a| {
+        switch (a.which) {
+            .extra => |x| switch (x) {
+                .zdxc_empty => opts.empty = true,
+                .zdxc_check_hash => opts.check_hash = true,
+                .zdxc_lex => opts.lex = true,
+                .zdxc_parse => opts.parse = true,
+                .zdxc_ast => {
+                    opts.parse = true;
+                    opts.dump_ast = true;
+                },
+                .fcolor_diagnostics => opts.color = true,
+                .fno_color_diagnostics => opts.color = false,
+            },
+            .dxc => |id| {
+                switch (options.support(id)) {
+                    .implemented => {},
+                    .ignored => {
+                        try opts.ignored.append(arena, a.spelling);
+                        continue;
+                    },
+                    .unsupported => |why| return cli.fail("'{s}' is not supported: {s}", .{ a.spelling, why }),
+                }
+                const v = a.value();
+                switch (id) {
+                    .target_profile => opts.profile = v,
+                    .entrypoint => opts.entry = v,
+                    .Fo => opts.output = v,
+                    .Fi => opts.pp_output = v,
+                    .D => if (std.mem.indexOfScalar(u8, v, '=')) |eq| {
+                        try opts.defines.append(arena, .{ .name = v[0..eq], .value = v[eq + 1 ..] });
+                    } else try opts.defines.append(arena, .{ .name = v }),
+                    .I => try opts.include_dirs.append(arena, v),
+                    .hlsl_version => if (!std.mem.eql(u8, v, "2021")) {
+                        return cli.fail("HLSL version {s} is not supported; zdxc implements HLSL 2021 only", .{v});
+                    },
+                    .P => opts.preprocess = true,
+                    .spirv => opts.spirv = true,
+                    .enable_16bit_types => opts.enable_16bit = true,
+                    ._SLASH_WX => opts.warnings_as_errors = true,
+                    .no_warnings => opts.no_warnings = true,
+                    .W_Joined => {
+                        // -Wno-<group>, -Werror; enabling groups is a no-op.
+                        if (std.mem.startsWith(u8, v, "no-")) {
+                            try opts.disabled_warnings.append(arena, v[3..]);
+                        } else if (std.mem.eql(u8, v, "error")) opts.warnings_as_errors = true;
+                    },
+                    .Wno_vk_ignored_features => try opts.disabled_warnings.append(arena, "vk-ignored-features"),
+                    .Wno_vk_emulated_features => try opts.disabled_warnings.append(arena, "vk-emulated-features"),
+                    .fdiagnostics_format_EQ => {
+                        // dxc also accepts msvc-fallback.
+                        const name = if (std.mem.eql(u8, v, "msvc-fallback")) "msvc" else v;
+                        opts.diag_format = std.meta.stringToEnum(zdxc.diag.Format, name) orelse
+                            return cli.fail("unknown diagnostics format '{s}' (expected clang, msvc or vi)", .{v});
+                    },
+                    .ferror_limit_EQ => opts.error_limit = std.fmt.parseInt(u32, v, 10) catch
+                        return cli.fail("invalid -ferror-limit value '{s}'", .{v}),
+                    .fdiagnostics_color => opts.color = true,
+                    .fdiagnostics_color_EQ => opts.color = if (std.mem.eql(u8, v, "always"))
+                        true
+                    else if (std.mem.eql(u8, v, "never"))
+                        false
+                    else
+                        null,
+                    .help, ._help_question, ._help_hidden => {
+                        try options.printHelp(stdout, id == ._help_hidden);
+                        return null;
+                    },
+                    ._version => {
+                        try stdout.print("zdxc {s} (dxc-compatible command line, HLSL 2021)\n", .{zdxc.version});
+                        return null;
+                    },
+                    .O0 => opts.opt_level = .o0,
+                    .O1 => opts.opt_level = .o1,
+                    .O2 => opts.opt_level = .o2,
+                    .O3 => opts.opt_level = .o3,
+                    .Od => opts.opt_level = .od,
+                    else => {}, // implemented as a no-op (e.g. -Vd, -nologo)
+                }
+            },
         }
+    }
+    // Like dxc, the last input wins (dxc reads getLastArgValue(OPT_INPUT)).
+    if (parsed.inputs.len > 0) opts.input = parsed.inputs[parsed.inputs.len - 1];
+
+    if (opts.ignored.items.len > 0 and !opts.no_warnings) {
+        try cli.stderr.writeAll("zdxc: note: accepted for compatibility, no effect yet:");
+        for (opts.ignored.items) |sp| try cli.stderr.print(" {s}", .{sp});
+        try cli.stderr.writeByte('\n');
     }
     return opts;
 }
@@ -240,7 +240,7 @@ fn run(cli: Cli, arena: std.mem.Allocator, args: []const [:0]const u8, stdout: *
         const color = opts.color orelse (Io.File.stderr().supportsAnsiEscapeCodes(cli.io) catch false);
         try diags.render(&sm, cli.stderr, .{ .format = opts.diag_format, .color = color });
         try cli.stderr.flush();
-        if (diags.hasErrors()) return error.Fatal;
+        if (diags.hasErrors()) return error.CompileFailed;
         if (opts.pp_output) |path| {
             try Io.Dir.cwd().writeFile(cli.io, .{ .sub_path = path, .data = out.written() });
         } else try stdout.writeAll(out.written());
