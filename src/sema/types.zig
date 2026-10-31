@@ -51,6 +51,11 @@ pub const Scalar = enum(u8) {
         };
     }
 
+    /// dxc's BPROP_INTEGER: integers, bool and integer literals.
+    pub fn isIntegral(s: Scalar) bool {
+        return s == .bool or s.isInt();
+    }
+
     pub fn isLiteral(s: Scalar) bool {
         return s == .literal_int or s == .literal_float;
     }
@@ -321,6 +326,15 @@ pub const StructInfo = struct {
     /// Opaque pointer to Sema's per-struct data (methods, base).
     sema: ?*anyopaque = null,
     complete: bool = false,
+    /// Declares operator overloads (milestone 0.2): uses of operators on
+    /// it are not diagnosed.
+    has_operators: bool = false,
+
+    pub fn overloadsOperators(info: *const StructInfo) bool {
+        if (info.has_operators) return true;
+        for (info.bases.items) |b| if (b.overloadsOperators()) return true;
+        return false;
+    }
 };
 
 pub const EnumInfo = struct {
@@ -352,6 +366,8 @@ pub const Type = union(enum) {
     descriptor_heap: struct { sampler: bool },
     /// `ResourceDescriptorHeap[i]`: converts to any resource / sampler.
     dynamic_resource,
+    /// `tex.mips` / `tex.sample` and their slices (`tex.mips[level]`).
+    texture_view: struct { texture: TypeId, kind: enum { mips, mips_slice, sample, sample_slice } },
 };
 
 /// Interns types. Ids 0 and 1 are `error` and `void`.
@@ -398,6 +414,7 @@ pub const TypeTable = struct {
             .patch => |p| .{ .tag = 11, .a = (@as(u64, @intFromBool(p.output)) << 32) | p.elem, .b = p.count },
             .descriptor_heap => |h| .{ .tag = 12, .a = @intFromBool(h.sampler), .b = 0 },
             .dynamic_resource => .{ .tag = 13, .a = 0, .b = 0 },
+            .texture_view => |v| .{ .tag = 14, .a = v.texture, .b = @backingInt(v.kind) },
         };
     }
 
@@ -438,7 +455,75 @@ pub const TypeTable = struct {
         };
     }
 
-    pub const Shape = struct { rows: u8, cols: u8, kind: enum { scalar, vector, matrix } };
+    pub const Shape = struct {
+        rows: u8,
+        cols: u8,
+        kind: enum { scalar, vector, matrix },
+
+        pub fn count(sh: Shape) u32 {
+            return @as(u32, sh.rows) * sh.cols;
+        }
+    };
+
+    pub const DimConv = enum { identity, scalar, splat, truncation, conversion };
+
+    /// Whether a value of shape `src` converts to shape `target`, and how:
+    /// a port of dxc's ConvertDimensions (identical for implicit and
+    /// explicit conversions).
+    pub fn convertDimensions(target: Shape, src: Shape) ?DimConv {
+        const tn = target.count();
+        const sn = src.count();
+        return switch (target.kind) {
+            .scalar => switch (src.kind) {
+                .scalar => .identity,
+                .vector, .matrix => if (sn > 1) .truncation else .scalar,
+            },
+            .vector => switch (src.kind) {
+                .scalar => .splat,
+                .vector => if (target.cols > src.cols)
+                    (if (src.cols == 1) .splat else null)
+                else if (target.cols < src.cols) .truncation else .identity,
+                .matrix => if (sn == 1 and target.cols != 1)
+                    .splat
+                else if (src.rows == 1 or src.cols == 1)
+                    (if (target.cols > sn) null else if (target.cols < sn) .truncation else .conversion)
+                else if (target.cols == 1)
+                    .truncation
+                else if (target.cols != sn) null else .conversion,
+            },
+            .matrix => switch (src.kind) {
+                .scalar => .splat,
+                .vector => if (src.cols == 1 and tn != 1)
+                    .splat
+                else if (tn == src.cols)
+                    .conversion
+                else if (tn == 1)
+                    .truncation
+                else if ((target.rows == 1 or target.cols == 1) and tn < src.cols) .truncation else null,
+                .matrix => if (sn == 1 and tn != 1)
+                    .splat
+                else if (tn == 1)
+                    .truncation
+                else if (target.rows > src.rows or target.cols > src.cols)
+                    null
+                else if (target.rows < src.rows or target.cols < src.cols) .truncation else .identity,
+            },
+        };
+    }
+
+    /// The shape of a binary operation's result (dxc's CombineDimensions:
+    /// prefer the larger operand, or the left on a tie), or null if the
+    /// shapes do not combine.
+    pub fn combineDimensions(l: Shape, r: Shape) ?Shape {
+        if (l.count() >= r.count()) {
+            if (convertDimensions(l, r) != null) return l;
+            if (convertDimensions(r, l) != null) return r;
+        } else {
+            if (convertDimensions(r, l) != null) return r;
+            if (convertDimensions(l, r) != null) return l;
+        }
+        return null;
+    }
 
     /// Shape of a numeric type: scalars are 1x1, vectors 1xN.
     pub fn shape(t: *const TypeTable, id: TypeId) ?Shape {
@@ -500,20 +585,34 @@ pub const TypeTable = struct {
                 std.fmt.allocPrint(gpa, "{s}[{d}]", .{ try t.format(gpa, a.elem), a.len }),
             .@"struct" => |s| s.name,
             .@"enum" => |e| e.name,
-            .resource => |r| if (r.elem == void_type) r.name else std.fmt.allocPrint(gpa, "{s}<{s}>", .{ r.name, try t.format(gpa, r.elem) }),
+            .resource => |r| if (r.elem == void_type) r.name else templateName(gpa, r.name, try t.format(gpa, r.elem), ""),
             .sampler => |s| if (s.comparison) "SamplerComparisonState" else "SamplerState",
             .string => "string",
-            .stream => |s| std.fmt.allocPrint(gpa, "{s}Stream<{s}>", .{ switch (s.kind) {
-                .point => "Point",
-                .line => "Line",
-                .triangle => "Triangle",
-            }, try t.format(gpa, s.elem) }),
-            .patch => |p| std.fmt.allocPrint(gpa, "{s}Patch<{s}, {d}>", .{ if (p.output) "Output" else "Input", try t.format(gpa, p.elem), p.count }),
+            .stream => |s| templateName(gpa, switch (s.kind) {
+                .point => "PointStream",
+                .line => "LineStream",
+                .triangle => "TriangleStream",
+            }, try t.format(gpa, s.elem), ""),
+            .patch => |p| templateName(gpa, if (p.output) "OutputPatch" else "InputPatch", try t.format(gpa, p.elem), try std.fmt.allocPrint(gpa, ", {d}", .{p.count})),
             .descriptor_heap => |h| if (h.sampler) "SamplerDescriptorHeap" else "ResourceDescriptorHeap",
             .dynamic_resource => "<dynamic resource>",
+            .texture_view => |v| std.fmt.allocPrint(gpa, "{s}::{s}", .{ try t.format(gpa, v.texture), switch (v.kind) {
+                .mips => "mips_type",
+                .mips_slice => "mips_slice_type",
+                .sample => "sample_type",
+                .sample_slice => "sample_slice_type",
+            } }),
         };
     }
 };
+
+/// `name<arg rest>`, spelled as clang does: `> >` when `arg rest` ends
+/// in `>`.
+fn templateName(gpa: Allocator, name: []const u8, arg: []const u8, rest: []const u8) Allocator.Error![]const u8 {
+    const inner = try std.mem.concat(gpa, u8, &.{ arg, rest });
+    const space = if (std.mem.endsWith(u8, inner, ">")) " " else "";
+    return std.fmt.allocPrint(gpa, "{s}<{s}{s}>", .{ name, inner, space });
+}
 
 test "interning and shapes" {
     var t = try TypeTable.init(std.testing.allocator);

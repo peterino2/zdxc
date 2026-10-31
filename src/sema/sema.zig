@@ -143,7 +143,7 @@ pub const Sema = struct {
         _ = s.diags.report(.{ .severity = .@"error", .loc = loc }, fmt, args);
     }
 
-    fn warn(s: *Sema, loc: Loc, group: []const u8, comptime fmt: []const u8, args: anytype) void {
+    fn warn(s: *Sema, loc: Loc, group: ?[]const u8, comptime fmt: []const u8, args: anytype) void {
         _ = s.diags.report(.{ .severity = .warning, .loc = loc, .group = group }, fmt, args);
     }
 
@@ -544,6 +544,17 @@ pub const Sema = struct {
             .func => |*f| try s.funcDecl(d, f, null),
             .@"struct" => |*st| try s.structDecl(d, st),
             .cbuffer => |cb| {
+                for (cb.semantics) |sem| {
+                    if (sem.kind != .register) continue;
+                    const reg = s.parseRegister(sem) orelse continue;
+                    if (reg.type == 0) continue;
+                    const want: u8 = if (cb.tbuffer) 't' else 'b';
+                    if (std.ascii.toLower(reg.type) != want) {
+                        s.err(sem.loc, "invalid register specification, expected '{c}' binding", .{want});
+                    } else if (reg.profile) {
+                        s.err(sem.loc, "user defined constant buffer slots cannot be target specific", .{});
+                    }
+                }
                 for (cb.members) |m| try s.decl(m, .cbuffer);
                 if (cb.name.len > 0 and s.scope.syms.get(cb.name) == null) {
                     // The buffer name is not usable as a value; reserve it.
@@ -699,6 +710,7 @@ pub const Sema = struct {
                 }
                 s.checkModifiers(.field, v.qual_words, start, fbase);
                 const ft = try s.applyArrayDims(fbase, v.array_dims);
+                s.checkSemantics(.field, v.semantics, ft);
                 for (info.fields.items[base_fields..]) |f| if (std.mem.eql(u8, f.name, v.name)) s.err(v.name_loc, "duplicate member '{s}'", .{v.name});
                 try info.fields.append(s.arena, .{ .name = v.name, .type = ft });
             },
@@ -873,6 +885,93 @@ pub const Sema = struct {
         if (param and !(usage_in and usage_out) and s.types.get(ty) == .stream) s.err(start, "stream-output object must be an inout parameter", .{});
     }
 
+    const Register = struct { type: u8, profile: bool };
+
+    /// Checks the syntax of `register([profile,] Tn[sub] [, spaceN])` as
+    /// dxc's parser does; null after an error. A space-only binding has
+    /// type 0.
+    fn parseRegister(s: *Sema, sem: ast.Semantic) ?Register {
+        var vals = sem.values;
+        var profile = false;
+        if (vals.len > 0 and isProfileLike(vals[0])) {
+            profile = true;
+            vals = vals[1..];
+        }
+        if (vals.len == 0) return null;
+        if (std.mem.startsWith(u8, vals[0], "space")) {
+            if (!s.checkSpace(sem.loc, vals[0])) return null;
+            return .{ .type = 0, .profile = profile };
+        }
+        const reg = vals[0];
+        if (reg.len == 0 or std.mem.indexOfScalar(u8, "bcistu", std.ascii.toLower(reg[0])) == null) {
+            s.err(sem.loc, "register type is unsupported - available types are 'b', 'c', 'i', 's', 't', 'u'", .{});
+            return null;
+        }
+        const num = reg[1 .. std.mem.indexOfScalar(u8, reg, '[') orelse reg.len];
+        if (num.len > 0) _ = std.fmt.parseInt(u32, num, 10) catch {
+            s.err(sem.loc, "register number should be an integral numeric string", .{});
+            return null;
+        };
+        if (vals.len > 1 and !s.checkSpace(sem.loc, vals[1])) return null;
+        return .{ .type = reg[0], .profile = profile };
+    }
+
+    fn checkSpace(s: *Sema, loc: Loc, text: []const u8) bool {
+        if (!std.mem.startsWith(u8, text, "space")) {
+            s.err(loc, "expected space definition with syntax 'spaceX', where X is an integral value", .{});
+            return false;
+        }
+        _ = std.fmt.parseInt(u32, text["space".len..], 10) catch {
+            s.err(loc, "space number should be an integral numeric string", .{});
+            return false;
+        };
+        return true;
+    }
+
+    /// Semantics and register bindings on a declaration (dxc's
+    /// DiagnoseHLSLDecl annotations part and DiagnoseRegisterType).
+    fn checkSemantics(s: *Sema, kind: DeclKind, sems: []const ast.Semantic, ty: TypeId) void {
+        for (sems) |sem| switch (sem.kind) {
+            .semantic => if (kind == .local_variable or kind == .typedef) {
+                s.err(sem.loc, "semantic is not a valid modifier for a {s}", .{kind.text()});
+            },
+            .register => {
+                const reg = s.parseRegister(sem) orelse continue;
+                if (reg.type == 0) continue;
+                s.checkRegisterType(sem.loc, ty, std.ascii.toLower(reg.type));
+            },
+            else => {},
+        };
+    }
+
+    fn checkRegisterType(s: *Sema, loc: Loc, ty: TypeId, reg: u8) void {
+        var elem = ty;
+        while (s.types.get(elem) == .array) elem = s.types.get(elem).array.elem;
+        const Want = struct { expected: []const u8, ok: []const u8, warning: bool = false };
+        const want: Want = switch (s.types.get(elem)) {
+            .scalar, .vector, .matrix => .{ .expected = "'b', 'c', or 'i'", .ok = "bci" },
+            .sampler => .{ .expected = "'s' or 't'", .ok = "st" },
+            .stream, .patch => .{ .expected = "none", .ok = "", .warning = true },
+            .resource => |r| blk: {
+                const n = r.name;
+                const u_names = [_][]const u8{ "RWTexture1D", "RWTexture1DArray", "RWTexture2D", "RWTexture2DArray", "RWTexture3D", "RWBuffer", "RWByteAddressBuffer", "RWStructuredBuffer", "AppendStructuredBuffer", "ConsumeStructuredBuffer", "FeedbackTexture2D", "FeedbackTexture2DArray" };
+                const t_names = [_][]const u8{ "Buffer", "ByteAddressBuffer", "StructuredBuffer", "TextureBuffer" };
+                const ts_names = [_][]const u8{ "Texture1D", "Texture1DArray", "Texture2D", "Texture2DArray", "Texture3D", "TextureCube", "TextureCubeArray", "Texture2DMS", "Texture2DMSArray" };
+                for (u_names) |u| if (eql(n, u)) break :blk .{ .expected = "'u'", .ok = "u" };
+                if (std.mem.startsWith(u8, n, "RasterizerOrdered")) break :blk .{ .expected = "'u'", .ok = "u" };
+                for (t_names) |t| if (eql(n, t)) break :blk .{ .expected = "'t'", .ok = "t" };
+                for (ts_names) |t| if (eql(n, t)) break :blk .{ .expected = "'t' or 's'", .ok = "ts" };
+                if (eql(n, "ConstantBuffer")) break :blk .{ .expected = "'b'", .ok = "b" };
+                return;
+            },
+            else => return,
+        };
+        if (std.mem.indexOfScalar(u8, want.ok, reg) != null) return;
+        if (want.warning) {
+            s.warn(loc, null, "invalid register specification, expected {s} binding", .{want.expected});
+        } else s.err(loc, "invalid register specification, expected {s} binding", .{want.expected});
+    }
+
     fn varDecl(s: *Sema, d: *const ast.Decl, v: *const ast.VarDecl, ctx: DeclCtx) Allocator.Error!void {
         if (v.template_params.len > 0) return s.declare(v.name, .{ .template = d }, d.loc);
         if (std.mem.indexOf(u8, v.name, "::") != null) return; // out-of-line static member definition
@@ -899,6 +998,7 @@ pub const Sema = struct {
             s.err(v.name_loc, "variable has incomplete type 'void'", .{});
             ty = TypeTable.error_type;
         }
+        s.checkSemantics(if (ctx == .local) .local_variable else if (ctx == .member) .field else .global_variable, v.semantics, ty);
         const q = v.quals;
         const storage: Storage = switch (ctx) {
             .cbuffer => .cbuffer,
@@ -928,7 +1028,9 @@ pub const Sema = struct {
                 ty = try s.types.array(elem, @intCast(@max(1, (flat + elem_count - 1) / @max(1, elem_count))));
             }
             variable.type = ty;
-            try s.checkInitializer(ty, init_e);
+            // Uses of a declaration with a bad initializer are not
+            // diagnosed again (clang marks it invalid).
+            if (!try s.checkInitializer(ty, init_e)) variable.type = TypeTable.error_type;
         };
         if (v.init == null and q.@"const" and ctx == .local) {
             s.err(v.name_loc, "default initialization of an object of const type '{s}'", .{s.typeName(ty)});
@@ -968,6 +1070,9 @@ pub const Sema = struct {
             for (sym.functions.funcs.items) |func| if (func.decl == f) return s.funcBody(func, f);
             return;
         }
+        if (std.mem.startsWith(u8, name, "operator")) if (owner) |o| {
+            o.has_operators = true;
+        };
         if (f.template_params.len > 0) return s.declare(name, .{ .template = d }, d.loc);
         if (std.mem.startsWith(u8, name, "operator")) {
             s.err(d.loc, "operator overloading is not supported yet (planned for milestone 0.2)", .{});
@@ -982,6 +1087,7 @@ pub const Sema = struct {
             const pbase = try s.resolveType(p.type);
             s.checkModifiers(.parameter, p.qual_words, if (p.qual_words.len > 0) p.qual_words[0].loc else p.type.loc, pbase);
             const pt = try s.applyArrayDims(pbase, p.array_dims);
+            s.checkSemantics(.parameter, p.semantics, pt);
             out.* = .{
                 .name = p.name,
                 .type = pt,
@@ -989,7 +1095,7 @@ pub const Sema = struct {
                 .has_default = p.init != null,
                 .groupshared = p.quals.groupshared,
             };
-            if (p.init) |init_e| try s.checkInitializer(pt, init_e);
+            if (p.init) |init_e| _ = try s.checkInitializer(pt, init_e);
         }
         const func = try s.arena.create(Function);
         func.* = .{ .name = name, .decl = f, .loc = d.loc, .ret = ret, .params = params, .defined = f.body != null, .owner = owner };
@@ -1143,7 +1249,7 @@ pub const Sema = struct {
                 if (t.ty != TypeTable.void_type and t.ty != TypeTable.error_type) s.err(e.loc, "void function '{s}' should not return a value", .{f.name});
                 return;
             }
-            try s.checkInitializer(ret, e);
+            _ = try s.checkInitializer(ret, e);
         } else if (ret != TypeTable.void_type and ret != TypeTable.error_type) {
             s.err(st.loc, "non-void function '{s}' should return a value", .{f.name});
         }
@@ -1316,33 +1422,49 @@ pub const Sema = struct {
         return err_typed;
     }
 
+    /// A port of dxc's CheckUnaryOpForHLSL.
     fn unaryExpr(s: *Sema, e: *ast.Expr, op: ast.UnaryOp, operand: *ast.Expr) Allocator.Error!Typed {
         const t = try s.expr(operand);
         if (t.ty == TypeTable.error_type) return err_typed;
+        if (s.types.get(t.ty) == .@"struct" and s.types.get(t.ty).@"struct".overloadsOperators()) return err_typed;
+        const inc_dec = switch (op) {
+            .pre_inc, .pre_dec, .post_inc, .post_dec => true,
+            else => false,
+        };
+        if (inc_dec) {
+            if (s.types.get(t.ty) == .@"enum") {
+                s.err(e.loc, "cannot {s} expression of enum type '{s}'", .{ if (op == .pre_inc or op == .post_inc) "increment" else "decrement", s.typeName(t.ty) });
+                return err_typed;
+            }
+            if (!t.lvalue) {
+                s.err(e.loc, "expression is not assignable", .{});
+                return err_typed;
+            }
+            if (t.read_only) {
+                s.err(e.loc, "cannot assign to {s} with const-qualified type '{s}'", .{ describeTarget(operand), s.constTypeName(t.ty) });
+                return err_typed;
+            }
+            if (s.types.component(t.ty) == .bool) {
+                s.err(e.loc, "operator cannot be used with a bool lvalue", .{});
+                return err_typed;
+            }
+        }
         const comp = s.types.component(t.ty) orelse {
-            s.err(e.loc, "invalid argument type '{s}' to unary expression", .{s.typeName(t.ty)});
+            s.err(e.loc, "scalar, vector, or matrix expected", .{});
             return err_typed;
         };
         switch (op) {
             .not => return rvalue(try s.types.withComponent(t.ty, .bool)),
             .bit_not => {
-                if (comp.isFloat()) {
+                if (!comp.isIntegral()) {
                     s.err(e.loc, "int or unsigned int type required", .{});
                     return err_typed;
                 }
                 return rvalue(try s.types.withComponent(t.ty, if (comp == .bool) .int else comp));
             },
             .plus, .minus => return rvalue(try s.types.withComponent(t.ty, if (comp == .bool) .int else comp)),
-            .pre_inc, .pre_dec, .post_inc, .post_dec => {
-                if (!t.lvalue) {
-                    s.err(e.loc, "expression is not assignable", .{});
-                } else if (t.read_only) {
-                    s.err(e.loc, "cannot assign to {s} with const-qualified type", .{describeTarget(operand)});
-                }
-                if (comp == .bool) s.err(e.loc, "operator on type 'bool' is not allowed", .{});
-                // Prefix forms are lvalues, as in C++.
-                return .{ .ty = t.ty, .lvalue = op == .pre_inc or op == .pre_dec };
-            },
+            // Prefix forms are lvalues, as in C++.
+            .pre_inc, .pre_dec, .post_inc, .post_dec => return .{ .ty = t.ty, .lvalue = op == .pre_inc or op == .pre_dec },
         }
     }
 
@@ -1351,49 +1473,114 @@ pub const Sema = struct {
         const r = try s.expr(rhs);
         if (op == .comma) return rvalue(r.ty);
         if (l.ty == TypeTable.error_type or r.ty == TypeTable.error_type) return err_typed;
-        if (op == .log_and or op == .log_or) {
-            const ls = s.types.shape(l.ty);
-            const rs = s.types.shape(r.ty);
-            if ((ls != null and ls.?.kind != .scalar) or (rs != null and rs.?.kind != .scalar)) {
-                s.err(e.loc, "operands for short-circuiting logical binary operator must be scalar, for non-scalar types use '{s}'", .{if (op == .log_and) "and" else "or"});
-                return err_typed;
-            }
-            if (ls == null or rs == null) {
-                s.err(e.loc, "invalid operands to binary expression ('{s}' and '{s}')", .{ s.typeName(l.ty), s.typeName(r.ty) });
-                return err_typed;
-            }
-            return rvalue(try s.types.scalar(.bool));
+        return rvalue(try s.binaryOp(e.loc, op, l.ty, r.ty, false, lhs.loc, rhs.loc) orelse return err_typed);
+    }
+
+    /// The type of `l op r` (for a compound assignment, `l op= r`), or null
+    /// after an error: a port of dxc's CheckBinOpForHLSL after its
+    /// assignability checks.
+    fn binaryOp(s: *Sema, loc: Loc, op: ast.BinaryOp, lt: TypeId, rt: TypeId, compound: bool, lhs_loc: Loc, rhs_loc: Loc) Allocator.Error!?TypeId {
+        const arith = switch (op) {
+            .mul, .div, .rem, .add, .sub => true,
+            else => false,
+        };
+        const order = switch (op) {
+            .lt, .gt, .le, .ge => true,
+            else => false,
+        };
+        const equality = op == .eq or op == .ne;
+        const logical = op == .log_and or op == .log_or;
+        const shift = op == .shl or op == .shr;
+        const bitwise = shift or op == .bit_and or op == .bit_or or op == .bit_xor;
+        const numeric = arith or order or logical;
+        const bool_lvalue = compound and !(op == .bit_and or op == .bit_or or op == .bit_xor) and s.types.component(lt) == .bool;
+        // Overloaded operators (milestone 0.2) were reported at their
+        // declaration; clang resolves them before the builtin checks.
+        for ([2]TypeId{ lt, rt }) |t| {
+            if (s.types.get(t) == .@"struct" and s.types.get(t).@"struct".overloadsOperators()) return null;
         }
-        const res = s.arithmetic(e, l.ty, r.ty) orelse return err_typed;
-        var comp = s.types.component(res).?;
-        if (op == .shl or op == .shr) {
-            // Shifts keep the left operand's component type; a literal
-            // shifted by a typed amount becomes int (uint for a uint amount).
-            const lc = s.types.component(l.ty).?;
-            const rc = s.types.component(r.ty).?;
-            comp = lc;
-            if (lc.isLiteral() and !rc.isLiteral()) {
-                s.warn(e.loc, "ambig-lit-shift", "ambiguous type for bit shift; use a type suffix on literal values, like 'L' or 'U', or a cast", .{});
-                comp = if (rc == .uint) .uint else .int;
+
+        for ([2]TypeId{ lt, rt }) |t| {
+            if ((numeric or bitwise) and s.types.shape(t) == null) {
+                s.err(loc, "scalar, vector, or matrix expected", .{});
+                return null;
             }
-            if (comp.isFloat()) {
-                s.err(e.loc, "int or unsigned int type required", .{});
-                return err_typed;
+            if (bitwise and !s.types.component(t).?.isIntegral()) {
+                s.err(loc, "int or unsigned int type required", .{});
+                return null;
             }
-            return rvalue(try s.types.withComponent(res, if (comp == .bool) .int else comp));
         }
-        switch (op) {
-            .lt, .gt, .le, .ge, .eq, .ne => return rvalue(try s.types.withComponent(res, .bool)),
-            .bit_and, .bit_or, .bit_xor, .shl, .shr => {
-                if (comp.isFloat()) {
-                    s.err(e.loc, "int or unsigned int type required", .{});
-                    return err_typed;
-                }
-                return rvalue(try s.types.withComponent(res, if (comp == .bool) .int else comp));
-            },
-            .rem, .mul, .div, .add, .sub => return rvalue(try s.types.withComponent(res, if (comp == .bool) .int else comp)),
-            .log_and, .log_or, .comma => unreachable,
+        if (bool_lvalue) {
+            s.err(loc, "operator cannot be used with a bool lvalue", .{});
+            return null;
         }
+        // What is left for non-numeric operands: `==` and `!=`.
+        for ([2]TypeId{ lt, rt }) |t| {
+            if (s.isObject(t)) {
+                s.err(loc, "operator cannot be used with built-in type '{s}'", .{s.typeName(t)});
+                return null;
+            }
+        }
+        for ([2]TypeId{ lt, rt }) |t| {
+            if (s.types.get(t) == .@"struct") {
+                s.err(loc, "operator cannot be used with user-defined type '{s}'", .{s.typeName(t)});
+                return null;
+            }
+        }
+        if (equality and (s.types.get(lt) == .array or s.types.get(rt) == .array)) {
+            s.err(loc, "equality operators cannot be used with array types", .{});
+            return null;
+        }
+        const ls = s.types.shape(lt) orelse return s.invalidOperands(loc, lt, rt);
+        const rs = s.types.shape(rt) orelse return s.invalidOperands(loc, lt, rt);
+        if (logical) {
+            if (ls.kind != .scalar or rs.kind != .scalar) {
+                s.err(loc, "operands for short-circuiting logical binary operator must be scalar, for non-scalar types use '{s}'", .{if (op == .log_and) "and" else "or"});
+                return null;
+            }
+            return try s.types.scalar(.bool);
+        }
+
+        // Component type.
+        const lc = s.types.component(lt).?;
+        const rc = s.types.component(rt).?;
+        var comp = lc;
+        if (!shift and lc != rc) {
+            comp = Scalar.combine(lc, rc);
+        } else if (shift and lc.isLiteral() and !rc.isLiteral()) {
+            s.warn(loc, "ambig-lit-shift", "ambiguous type for bit shift; use a type suffix on literal values, like 'L' or 'U', or a cast", .{});
+            comp = if (rc == .uint) .uint else .int;
+        } else if (comp == .bool and (arith or bitwise)) {
+            comp = .int;
+        }
+
+        // Shape: compound assignments keep the left operand's.
+        const sh = if (compound) ls else TypeTable.combineDimensions(ls, rs) orelse {
+            s.convertError(rhs_loc, rt, try s.types.withShape(comp, ls));
+            return null;
+        };
+        if (compound and TypeTable.convertDimensions(ls, rs) == null) {
+            s.convertError(rhs_loc, rt, lt);
+            return null;
+        }
+        if (!shift and rs.count() > sh.count()) s.warn(rhs_loc, "conversion", "implicit truncation of vector type", .{});
+        if (!compound and ls.count() > sh.count()) s.warn(lhs_loc, "conversion", "implicit truncation of vector type", .{});
+
+        if ((op == .div or op == .rem) and (comp == .min12int or comp == .min16int)) {
+            s.err(loc, "signed integer division is not supported on minimum-precision types, cast to int to use 32-bit division", .{});
+            return null;
+        }
+        if (op == .rem and comp == .double) {
+            s.err(loc, "modulo cannot be used with doubles, cast to float first", .{});
+            return null;
+        }
+        if (compound) return lt;
+        return try s.types.withShape(if (order or equality) .bool else comp, sh);
+    }
+
+    fn invalidOperands(s: *Sema, loc: Loc, lt: TypeId, rt: TypeId) ?TypeId {
+        s.err(loc, "invalid operands to binary expression ('{s}' and '{s}')", .{ s.typeName(lt), s.typeName(rt) });
+        return null;
     }
 
     /// Usual arithmetic conversions of two numeric operands: the result
@@ -1412,26 +1599,11 @@ pub const Sema = struct {
         const comp = Scalar.combine(ac.?, bc.?);
         const as = s.types.shape(a).?;
         const bs = s.types.shape(b).?;
-        var sh = as;
-        if (as.kind == .scalar) {
-            sh = bs;
-        } else if (bs.kind == .scalar) {
-            sh = as;
-        } else if (as.kind == bs.kind) {
-            sh = .{ .rows = @min(as.rows, bs.rows), .cols = @min(as.cols, bs.cols), .kind = as.kind };
-            if (sh.rows != as.rows or sh.cols != as.cols or sh.rows != bs.rows or sh.cols != bs.cols) {
-                s.warn(e.loc, "conversion", "implicit truncation of vector type", .{});
-            }
-        } else {
-            // vector op matrix: allowed when the element counts agree.
-            const ac_n = @as(u32, as.rows) * as.cols;
-            const bc_n = @as(u32, bs.rows) * bs.cols;
-            if (ac_n != bc_n and !(as.rows == 1 or as.cols == 1 or bs.rows == 1 or bs.cols == 1)) {
-                s.err(e.loc, "invalid operands to binary expression ('{s}' and '{s}')", .{ s.typeName(a), s.typeName(b) });
-                return null;
-            }
-            sh = if (as.kind == .matrix) as else bs;
-        }
+        const sh = TypeTable.combineDimensions(as, bs) orelse {
+            s.err(e.loc, "invalid operands to binary expression ('{s}' and '{s}')", .{ s.typeName(a), s.typeName(b) });
+            return null;
+        };
+        if (as.count() > sh.count() or bs.count() > sh.count()) s.warn(e.loc, "conversion", "implicit truncation of vector type", .{});
         return s.types.withShape(comp, sh) catch null;
     }
 
@@ -1450,16 +1622,23 @@ pub const Sema = struct {
             s.err(lhs.loc, "cannot assign to {s} with const-qualified type '{s}'", .{ describeTarget(lhs), s.constTypeName(l.ty) });
         }
         if (op == .assign) {
-            try s.checkInitializer(l.ty, rhs);
+            if (rhs.kind == .init_list) {
+                _ = try s.checkInitializer(l.ty, rhs);
+            } else {
+                const r = try s.expr(rhs);
+                if (r.callee != null and r.ty == TypeTable.error_type) {
+                    if (r.callee.? != .type) s.err(rhs.loc, "reference to overloaded function could not be resolved", .{});
+                } else if (r.ty != TypeTable.error_type) {
+                    if (s.conversionCost(r.ty, l.ty) == null) {
+                        s.convertError(e.loc, r.ty, l.ty);
+                    } else s.conversionWarnings(rhs, r.ty, l.ty);
+                }
+            }
         } else {
             const r = try s.expr(rhs);
             if (r.ty != TypeTable.error_type) {
-                const res = s.arithmetic(e, l.ty, r.ty) orelse return rvalue(l.ty);
-                _ = res;
-                const comp = s.types.component(l.ty);
-                if (comp != null and comp.?.isFloat() and (op == .shl or op == .shr or op == .bit_and or op == .bit_or or op == .bit_xor)) {
-                    s.err(e.loc, "int or unsigned int type required", .{});
-                }
+                const bop = std.meta.stringToEnum(ast.BinaryOp, @tagName(op)).?;
+                _ = try s.binaryOp(e.loc, bop, l.ty, r.ty, true, lhs.loc, rhs.loc);
             }
         }
         // The result of an assignment is an lvalue, as in C++.
@@ -1564,6 +1743,16 @@ pub const Sema = struct {
                     }
                     return err_typed;
                 }
+                const view: ?@FieldType(@FieldType(types.Type, "texture_view"), "kind") = switch (r.kind) {
+                    .texture1d, .texture1d_array, .texture2d, .texture2d_array, .texture3d => if (eql(name, "mips")) .mips else null,
+                    .texture2dms, .texture2dms_array, .rw_texture2dms, .rw_texture2dms_array => if (eql(name, "sample")) .sample else null,
+                    else => null,
+                };
+                if (view) |k| return rvalue(try s.types.intern(.{ .texture_view = .{ .texture = b.ty, .kind = k } }));
+                if (methodNamespace(s.types.get(b.ty))) |ns| if (!s.intrinsic_db.hasMethod(ns, name)) {
+                    s.err(name_loc, "no member named '{s}' in '{s}'", .{ name, s.typeName(b.ty) });
+                    return err_typed;
+                };
                 return .{ .ty = TypeTable.error_type, .callee = .{ .method = .{ .object = b.ty, .name = name, .object_lvalue = b.lvalue } } };
             },
             .stream, .patch => return .{ .ty = TypeTable.error_type, .callee = .{ .method = .{ .object = b.ty, .name = name, .object_lvalue = b.lvalue } } },
@@ -1572,6 +1761,19 @@ pub const Sema = struct {
                 return err_typed;
             },
         }
+    }
+
+    /// A resource index converts to `uint<dims>`: exactly `dims`
+    /// components (no splat or truncation in overload resolution).
+    fn indexMatches(s: *Sema, index: TypeId, dims: u8) bool {
+        if (index == TypeTable.error_type) return true;
+        const sh = s.types.shape(index) orelse return true; // reported elsewhere
+        return sh.kind != .matrix and sh.count() == dims;
+    }
+
+    fn noViableSubscript(s: *Sema, loc: Loc, ty: TypeId) Typed {
+        s.err(loc, "no viable overloaded operator[] for type '{s}'", .{s.typeName(ty)});
+        return err_typed;
     }
 
     fn indexExpr(s: *Sema, e: *ast.Expr, base: *ast.Expr, index: *ast.Expr) Allocator.Error!Typed {
@@ -1591,12 +1793,28 @@ pub const Sema = struct {
                     s.err(e.loc, "type '{s}' does not provide a subscript operator", .{s.typeName(b.ty)});
                     return err_typed;
                 }
+                if (!s.indexMatches(i.ty, r.kind.indexDims())) return s.noViableSubscript(e.loc, b.ty);
                 return .{ .ty = r.elem, .lvalue = true, .read_only = !r.kind.isWritable() };
+            },
+            .texture_view => |v| {
+                const tex = s.types.get(v.texture).resource;
+                switch (v.kind) {
+                    .mips, .sample => {
+                        if (!s.indexMatches(i.ty, 1)) return s.noViableSubscript(e.loc, b.ty);
+                        return rvalue(try s.types.intern(.{ .texture_view = .{ .texture = v.texture, .kind = if (v.kind == .mips) .mips_slice else .sample_slice } }));
+                    },
+                    .mips_slice, .sample_slice => {
+                        if (!s.indexMatches(i.ty, tex.kind.indexDims())) return s.noViableSubscript(e.loc, b.ty);
+                        return .{ .ty = tex.elem, .lvalue = true, .read_only = !tex.kind.isWritable() };
+                    },
+                }
             },
             .patch => |p| return .{ .ty = p.elem, .lvalue = true, .read_only = !p.output },
             .descriptor_heap => return rvalue(try s.types.intern(.dynamic_resource)),
-            .@"struct" => {
-                s.err(e.loc, "operator overloading is not supported yet (planned for milestone 0.2)", .{});
+            // Structs declaring operator[] were already reported as
+            // milestone 0.2 at the declaration.
+            .@"struct" => |info| {
+                if (!info.overloadsOperators()) s.err(e.loc, "type '{s}' does not provide a subscript operator", .{s.typeName(b.ty)});
                 return err_typed;
             },
             else => {
@@ -1655,7 +1873,7 @@ pub const Sema = struct {
         }
         const target = c.callee orelse {
             if (s.types.get(c.ty) == .@"struct") {
-                s.err(callee.loc, "operator overloading is not supported yet (planned for milestone 0.2)", .{});
+                if (!s.types.get(c.ty).@"struct".overloadsOperators()) s.err(callee.loc, "type '{s}' does not provide a call operator", .{s.typeName(c.ty)});
             } else if (c.ty != TypeTable.error_type) s.err(callee.loc, "called object type '{s}' is not a function", .{s.typeName(c.ty)});
             return err_typed;
         };
@@ -1761,17 +1979,13 @@ pub const Sema = struct {
             const fs = s.types.shape(from).?;
             const ts = s.types.shape(to).?;
             var cost: u32 = if (fc.? == tc.?) 0 else if (fc.?.isLiteral()) 1 else if (fc.?.isFloat() == tc.?.isFloat() and tc.?.rank() > fc.?.rank()) 2 else 3;
-            if ((fs.kind == .scalar or (fs.rows == 1 and fs.cols == 1)) and !(ts.rows == 1 and ts.cols == 1)) {
-                cost += 4; // splat (float and float1 alike)
-            } else if (fs.rows == ts.rows and fs.cols == ts.cols) {
-                if (fs.kind != ts.kind) cost += 1; // float1 <-> float
-            } else if (fs.rows >= ts.rows and fs.cols >= ts.cols and fs.kind == ts.kind) {
-                cost += 8; // truncation
-            } else if (ts.kind == .scalar) {
-                cost += 10; // vector / matrix -> scalar truncation (worse than shrinking)
-            } else if (@as(u32, fs.rows) * fs.cols == @as(u32, ts.rows) * ts.cols and (fs.kind == .vector or ts.kind == .vector)) {
-                cost += 6; // vector <-> matrix of the same size
-            } else return null;
+            cost += switch (TypeTable.convertDimensions(ts, fs) orelse return null) {
+                .identity => 0,
+                .scalar => 1, // float1 -> float
+                .splat => if (ts.count() == 1) 1 else 4,
+                .conversion => 6, // vector <-> matrix of the same size
+                .truncation => if (ts.count() == 1) 10 else 8,
+            };
             return cost;
         }
         // A descriptor heap element converts to any resource or sampler.
@@ -1798,6 +2012,10 @@ pub const Sema = struct {
     fn explicitConvertible(s: *Sema, from: TypeId, to: TypeId) bool {
         if (to == TypeTable.void_type) return true;
         if (s.conversionCost(from, to) != null) return true;
+        // Numeric casts follow the same shape rules as implicit ones.
+        if (s.types.shape(from)) |fs| if (s.types.shape(to)) |ts| {
+            return TypeTable.convertDimensions(ts, fs) != null;
+        };
         // vk::BufferPointer and other opaque objects to / from integers.
         if (s.types.get(from) == .resource and s.types.get(from).resource.kind == .other and s.types.isNumeric(to)) return true;
         const fc = s.types.componentCount(from);
@@ -1811,14 +2029,16 @@ pub const Sema = struct {
     }
 
     /// Check `e` as an initializer / assigned value for `target`.
-    pub fn checkInitializer(s: *Sema, target: TypeId, e: *ast.Expr) Allocator.Error!void {
+    /// Checks `e` as an initializer of a `target` value; false after an
+    /// error (the declaration is then invalid).
+    pub fn checkInitializer(s: *Sema, target: TypeId, e: *ast.Expr) Allocator.Error!bool {
         if (e.kind == .init_list) {
             for (e.kind.init_list) |item| {
-                if (item.kind != .init_list) _ = try s.expr(item) else try s.checkInitializer(TypeTable.error_type, item);
+                if (item.kind != .init_list) _ = try s.expr(item) else _ = try s.checkInitializer(TypeTable.error_type, item);
             }
             e.ty = target;
-            if (target == TypeTable.error_type) return;
-            const want = s.types.componentCount(target) orelse return;
+            if (target == TypeTable.error_type) return true;
+            const want = s.types.componentCount(target) orelse return true;
             const have = s.flatCount(e);
             if (have != want and have != 0) {
                 if (have < want) {
@@ -1826,20 +2046,30 @@ pub const Sema = struct {
                 } else {
                     s.err(e.loc, "too many elements in vector initialization (expected {d} elements, have {d})", .{ want, have });
                 }
+                return false;
             }
-            return;
+            return true;
         }
         const t = try s.expr(e);
         if (t.callee != null and t.ty == TypeTable.error_type) {
             if (t.callee.? != .type) s.err(e.loc, "reference to overloaded function could not be resolved", .{});
-            return;
+            return false;
         }
-        if (t.ty == TypeTable.error_type or target == TypeTable.error_type) return;
+        if (t.ty == TypeTable.error_type or target == TypeTable.error_type) return true;
         if (s.conversionCost(t.ty, target)) |_| {
             s.conversionWarnings(e, t.ty, target);
-            return;
+            return true;
         }
-        s.err(e.loc, "cannot initialize a variable of type '{s}' with an rvalue of type '{s}'", .{ s.typeName(target), s.typeName(t.ty) });
+        s.err(e.loc, "cannot initialize a variable of type '{s}' with an {s} of type '{s}'", .{ s.typeName(target), if (t.lvalue) "lvalue" else "rvalue", s.typeName(t.ty) });
+        return false;
+    }
+
+    /// dxc's err_hlsl_cannot_convert: "implicitly" only when an explicit
+    /// cast would work.
+    fn convertError(s: *Sema, loc: Loc, from: TypeId, to: TypeId) void {
+        if (s.explicitConvertible(from, to)) {
+            s.err(loc, "cannot implicitly convert from '{s}' to '{s}'", .{ s.typeName(from), s.typeName(to) });
+        } else s.err(loc, "cannot convert from '{s}' to '{s}'", .{ s.typeName(from), s.typeName(to) });
     }
 
     fn conversionWarnings(s: *Sema, e: *ast.Expr, from: TypeId, to: TypeId) void {
@@ -2187,6 +2417,21 @@ fn methodNamespace(t: types.Type) ?[]const u8 {
         },
         else => null,
     };
+}
+
+/// dxc's IsShaderProfileLike / IsShaderProfileShort: `ps_5_0`, `vs`.
+fn isProfileLike(text: []const u8) bool {
+    if (text.len == 2 and text[1] == 's' and std.mem.indexOfScalar(u8, "vpgc", text[0]) != null) return true;
+    var underscore = false;
+    var digit = false;
+    var letter = false;
+    for (text) |c| switch (c) {
+        '0'...'9' => digit = true,
+        'a'...'z' => letter = true,
+        '_' => underscore = true,
+        else => return false,
+    };
+    return underscore and digit and letter;
 }
 
 fn eql(a: []const u8, b: []const u8) bool {

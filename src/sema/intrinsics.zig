@@ -48,6 +48,13 @@ pub const Db = struct {
         return db;
     }
 
+    /// `ns` (e.g. `Texture2DMethods`) declares a method `name`.
+    pub fn hasMethod(db: *const Db, ns: []const u8, name: []const u8) bool {
+        var buf: [256]u8 = undefined;
+        const key = std.fmt.bufPrint(&buf, "{s}::{s}", .{ ns, name }) catch return true;
+        return db.by_name.contains(key);
+    }
+
     pub fn has(db: *const Db, name: []const u8, spirv: bool) bool {
         return db.globals.contains(name) or (spirv and db.vk_globals.contains(name));
     }
