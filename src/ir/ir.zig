@@ -135,8 +135,11 @@ pub const Terminator = union(enum) {
 pub const Merge = union(enum) {
     none,
     selection: BlockId,
-    loop: struct { merge: BlockId, @"continue": BlockId },
+    loop: struct { merge: BlockId, @"continue": BlockId, unroll: Unroll = .auto },
 };
+
+/// `[unroll]` / `[loop]` on a loop.
+pub const Unroll = enum { auto, unroll, dont };
 
 pub const Block = struct {
     insts: std.ArrayList(Ref) = .empty,

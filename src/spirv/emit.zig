@@ -398,7 +398,9 @@ const Emitter = struct {
             .double => return e.constBits(ty_id, @bitCast(floatOf(c)), 2),
             .float16 => return e.constBits(ty_id, @as(u16, @bitCast(@as(f16, @floatCast(floatOf(c))))), 1),
             .int64, .uint64 => return e.constBits(ty_id, @bitCast(intOf(c)), 2),
-            .int16, .uint16 => return e.constBits(ty_id, @as(u16, @truncate(@as(u64, @bitCast(intOf(c))))), 1),
+            // Narrow signed literals are sign-extended to the word.
+            .int16 => return e.constBits(ty_id, @as(u32, @bitCast(@as(i32, @as(i16, @truncate(intOf(c)))))), 1),
+            .uint16 => return e.constBits(ty_id, @as(u16, @truncate(@as(u64, @bitCast(intOf(c))))), 1),
             else => return e.constBits(ty_id, @as(u32, @truncate(@as(u64, @bitCast(intOf(c))))), 1),
         }
     }

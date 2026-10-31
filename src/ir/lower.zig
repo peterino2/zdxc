@@ -225,16 +225,16 @@ const Lowerer = struct {
             },
             .@"for" => |x| {
                 if (x.init) |i| try l.stmt(i);
-                try l.loop(x.cond, x.inc, x.body, false);
+                try l.loop(x.cond, x.inc, x.body, false, st.attrs);
             },
             .@"while" => |x| {
                 if (x.cond_decl != null) {
                     l.unsupported(st.loc, "declarations in while conditions are not supported yet", .{});
                     return error.Unsupported;
                 }
-                try l.loop(x.cond, null, x.body, false);
+                try l.loop(x.cond, null, x.body, false, st.attrs);
             },
-            .do_while => |x| try l.loop(x.cond, null, x.body, true),
+            .do_while => |x| try l.loop(x.cond, null, x.body, true, st.attrs),
             .@"break" => {
                 const target = l.loops.getLast();
                 l.b.terminate(.{ .br = target.brk });
@@ -253,14 +253,19 @@ const Lowerer = struct {
 
     /// header (loop merge) -> cond -> body -> continue (inc) -> header.
     /// `do` loops test at the end of the continue block.
-    fn loop(l: *Lowerer, cond: ?*ast.Expr, inc: ?*ast.Expr, body: *const ast.Stmt, do_while: bool) Error!void {
+    fn loop(l: *Lowerer, cond: ?*ast.Expr, inc: ?*ast.Expr, body: *const ast.Stmt, do_while: bool, attrs: []const ast.Attribute) Error!void {
+        var hint: ir.Unroll = .auto;
+        for (attrs) |a| {
+            if (std.ascii.eqlIgnoreCase(a.name, "unroll")) hint = .unroll;
+            if (std.ascii.eqlIgnoreCase(a.name, "loop")) hint = .dont;
+        }
         const header = try l.b.newBlock();
         const body_b = try l.b.newBlock();
         const cont = try l.b.newBlock();
         const merge = try l.b.newBlock();
         l.b.terminate(.{ .br = header });
         l.b.setBlock(header);
-        l.b.f.block(header).merge = .{ .loop = .{ .merge = merge, .@"continue" = cont } };
+        l.b.f.block(header).merge = .{ .loop = .{ .merge = merge, .@"continue" = cont, .unroll = hint } };
         if (!do_while and cond != null) {
             const check = try l.b.newBlock();
             l.b.terminate(.{ .br = check });
@@ -509,7 +514,13 @@ const Lowerer = struct {
             .name => {
                 const r = l.s.resolution(e) orelse return l.fail(e, "this name");
                 switch (r) {
-                    .variable => return l.b.load(try l.lvalue(e)),
+                    .variable => |v| {
+                        // Integer `static const` scalars are constants.
+                        if (v.storage == .constant and v.init != null and l.s.types.get(v.type) == .scalar and !l.s.types.get(v.type).scalar.isFloat()) {
+                            if (l.s.evalInt(v.init.?)) |val| return l.b.constInt(try l.concrete(e.ty), val);
+                        }
+                        return l.b.load(try l.lvalue(e));
+                    },
                     .enumerator => |v| return l.b.constInt(try l.concrete(e.ty), v),
                     else => return l.fail(e, "this name"),
                 }

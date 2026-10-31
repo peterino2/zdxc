@@ -30,6 +30,7 @@ pub const ir = struct {
     pub const lower = @import("ir/lower.zig");
     pub const layout = @import("ir/layout.zig");
     pub const texture = @import("ir/texture.zig");
+    pub const opt = @import("ir/opt.zig");
 };
 
 pub const sema = struct {

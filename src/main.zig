@@ -286,6 +286,7 @@ fn run(cli: Cli, arena: std.mem.Allocator, args: []const [:0]const u8, stdout: *
         if (opts.parse or opts.sema) return;
         if (profile == null) return cli.fail("missing -T <profile>", .{});
         if (module) |*m| {
+            try zdxc.ir.opt.run(arena, m);
             if (opts.dump_ir) {
                 try zdxc.ir.ir.dump(m, stdout);
                 return;
