@@ -13,6 +13,8 @@ const Options = struct {
     output: ?[]const u8 = null,
     input: ?[]const u8 = null,
     spirv: bool = false,
+    /// -fspv-target-env (vulkan1.0 by default).
+    target_env: []const u8 = "vulkan1.0",
     preprocess: bool = false,
     pp_output: ?[]const u8 = null,
     enable_16bit: bool = false,
@@ -122,6 +124,7 @@ fn parseArgs(cli: Cli, arena: std.mem.Allocator, argv: []const [:0]const u8, std
                     },
                     .P => opts.preprocess = true,
                     .spirv => opts.spirv = true,
+                    .fspv_target_env_EQ => opts.target_env = v,
                     .enable_16bit_types => opts.enable_16bit = true,
                     ._SLASH_WX => opts.warnings_as_errors = true,
                     .no_warnings => opts.no_warnings = true,
@@ -292,7 +295,7 @@ fn run(cli: Cli, arena: std.mem.Allocator, args: []const [:0]const u8, stdout: *
                 return;
             }
             if (opts.spirv) {
-                const bytes = zdxc.spirv.emit.emit(arena, m, &diags) catch |err| switch (err) {
+                const bytes = zdxc.spirv.emit.emit(arena, m, &diags, zdxc.spirv.emit.TargetEnv.parse(opts.target_env) orelse return cli.fail("unknown SPIR-V target environment '{s}'", .{opts.target_env})) catch |err| switch (err) {
                     error.Unsupported => {
                         try diags.render(&sm, cli.stderr, .{ .format = opts.diag_format, .color = false });
                         try cli.stderr.flush();

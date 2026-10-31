@@ -46,6 +46,12 @@ const Capability = enum(u32) {
     image_query = 50,
     storage_image_read_without_format = 55,
     storage_image_write_without_format = 56,
+    group_non_uniform = 61,
+    group_non_uniform_vote = 62,
+    group_non_uniform_arithmetic = 63,
+    group_non_uniform_ballot = 64,
+    group_non_uniform_shuffle = 65,
+    group_non_uniform_quad = 68,
     shader_non_uniform = 5301,
     runtime_descriptor_array = 5302,
     uniform_texel_buffer_array_non_uniform_indexing = 5311,
@@ -55,13 +61,28 @@ const Capability = enum(u32) {
     storage_image_array_non_uniform_indexing = 5309,
 };
 
-pub fn emit(gpa: Allocator, m: *const ir.Module, diags: *diag.Diagnostics) Error![]u8 {
+/// A Vulkan (or universal) target and the SPIR-V version it implies.
+pub const TargetEnv = struct {
+    /// SPIR-V minor version (1.x).
+    minor: u8,
+
+    pub fn parse(s: []const u8) ?TargetEnv {
+        const table = [_]struct { []const u8, u8 }{
+            .{ "vulkan1.0", 0 },           .{ "vulkan1.1", 3 }, .{ "vulkan1.1spirv1.3", 3 }, .{ "vulkan1.1spirv1.4", 4 },
+            .{ "vulkan1.2", 5 },           .{ "vulkan1.3", 6 }, .{ "vulkan1.4", 6 },         .{ "universal1.5", 5 },
+        };
+        for (table) |t| if (std.mem.eql(u8, s, t[0])) return .{ .minor = t[1] };
+        return null;
+    }
+};
+
+pub fn emit(gpa: Allocator, m: *const ir.Module, diags: *diag.Diagnostics, env: TargetEnv) Error![]u8 {
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
-    var e: Emitter = .{ .arena = arena_state.allocator(), .b = .init(gpa), .m = m, .t = m.types, .diags = diags };
+    var e: Emitter = .{ .arena = arena_state.allocator(), .b = .init(gpa), .m = m, .t = m.types, .diags = diags, .spv_minor = env.minor };
     defer e.b.deinit();
     try e.module();
-    return e.b.finish(builder.spv_1_0);
+    return e.b.finish(0x00010000 | (@as(u32, env.minor) << 8));
 }
 
 const Emitter = struct {
@@ -70,6 +91,8 @@ const Emitter = struct {
     m: *const ir.Module,
     t: *TypeTable,
     diags: *diag.Diagnostics,
+    /// SPIR-V 1.x.
+    spv_minor: u8 = 0,
 
     value_types: std.AutoHashMapUnmanaged(TypeId, Id) = .empty,
     /// Explicitly laid out variants of arrays and structs (buffers).
@@ -95,6 +118,7 @@ const Emitter = struct {
     sampled_image_types: std.AutoHashMapUnmanaged(Id, Id) = .empty,
     sampler_type: Id = 0,
     counter_vars: []Id = &.{},
+    builtin_inputs: std.AutoHashMapUnmanaged(u32, Id) = .empty,
     /// Per instruction (current function): texel places (`tex[i]`).
     texel_places: std.AutoHashMapUnmanaged(u32, struct { res: Ref, coord: Ref, comp: Ref = .none }) = .empty,
     counter_type: Id = 0,
@@ -120,6 +144,16 @@ const Emitter = struct {
     fn unsupported(e: *Emitter, comptime fmt: []const u8, args: anytype) Error {
         _ = e.diags.report(.{ .severity = .@"error", .loc = .none }, "SPIR-V code generation: " ++ fmt, args);
         return error.Unsupported;
+    }
+
+    /// Storage buffers: Uniform + BufferBlock up to SPIR-V 1.3,
+    /// StorageBuffer + Block after (BufferBlock was removed).
+    fn bufferSc(e: *const Emitter) StorageClass {
+        return if (e.spv_minor >= 4) .storage_buffer else .uniform;
+    }
+
+    fn bufferBlockDecoration(e: *const Emitter) u32 {
+        return if (e.spv_minor >= 4) 2 else 3; // Block / BufferBlock
     }
 
     fn cap(e: *Emitter, c: Capability) !void {
@@ -474,6 +508,11 @@ const Emitter = struct {
             .library => return e.unsupported("library targets are not supported", .{}),
         };
         const wrapper = e.func_ids[entry.wrapper];
+        // From SPIR-V 1.4 the interface lists every global the entry uses.
+        if (e.spv_minor >= 4) {
+            for (e.global_vars) |v| if (v != 0) try e.interface_ids.append(e.arena, v);
+            for (e.counter_vars) |v| if (v != 0) try e.interface_ids.append(e.arena, v);
+        }
         try e.b.emitWithString(.entry_points, .entry_point, &.{ model, wrapper }, entry.name, e.interface_ids.items);
         switch (entry.stage) {
             .compute => try e.b.emit(.execution_modes, .execution_mode, &.{ wrapper, 17, entry.num_threads[0], entry.num_threads[1], entry.num_threads[2] }),
@@ -556,11 +595,11 @@ const Emitter = struct {
                 e.counter_type = e.b.newId();
                 try e.b.emit(.types_globals, .type_struct, &.{ e.counter_type, try e.scalarType(.int) });
                 try e.b.emit(.annotations, .member_decorate, &.{ e.counter_type, 0, 35, 0 }); // Offset 0
-                try e.b.emit(.annotations, .decorate, &.{ e.counter_type, 3 }); // BufferBlock
+                try e.b.emit(.annotations, .decorate, &.{ e.counter_type, e.bufferBlockDecoration() });
                 try e.b.emitWithString(.debug_names, .name, &.{e.counter_type}, "type.ACSBuffer.counter", &.{});
             }
             const var_id = e.b.newId();
-            try e.b.emit(.types_globals, .variable, &.{ try e.pointerType(.uniform, e.counter_type), var_id, @backingInt(StorageClass.uniform) });
+            try e.b.emit(.types_globals, .variable, &.{ try e.pointerType(e.bufferSc(), e.counter_type), var_id, @backingInt(e.bufferSc()) });
             while (used.contains(.{ g.binding.space, next_free })) next_free += 1;
             try used.put(e.arena, .{ g.binding.space, next_free }, {});
             try e.b.emit(.annotations, .decorate, &.{ var_id, 34, g.binding.space }); // DescriptorSet
@@ -604,7 +643,7 @@ const Emitter = struct {
         const cv = e.counter_vars[g];
         if (cv == 0) return e.unsupported("this buffer has no counter", .{});
         const int_ty = try e.t.scalar(.int);
-        const ptr = try e.opRaw(.access_chain, try e.pointerType(.uniform, try e.scalarType(.int)), &.{ cv, try e.constUint(0) });
+        const ptr = try e.opRaw(.access_chain, try e.pointerType(e.bufferSc(), try e.scalarType(.int)), &.{ cv, try e.constUint(0) });
         const old = try e.op1(if (increment) .atomic_i_add else .atomic_i_sub, int_ty, &.{ ptr, try e.constUint(1), try e.constUint(0), try e.constInt(1) });
         // Decrements report the new value.
         const v = if (post) try e.op1(.i_sub, int_ty, &.{ old, try e.constInt(1) }) else old;
@@ -989,7 +1028,8 @@ const Emitter = struct {
                 // Buffers reached through locals or parameters are still
                 // Uniform std430 storage.
                 const into_buffer = e.t.get(f.inst(a.base).ty) == .resource;
-                const sc: StorageClass = if (into_buffer or e.ptr_layouts[a.base.index()] != null) .uniform else switch (i.ptr) {
+                const base_pl = e.ptr_layouts[a.base.index()];
+                const sc: StorageClass = if (into_buffer or (base_pl != null and base_pl.?.rules == .std430)) e.bufferSc() else if (base_pl != null) .uniform else switch (i.ptr) {
                     .function => .function,
                     .private => .private,
                     .groupshared => .workgroup,
@@ -1274,7 +1314,7 @@ const Emitter = struct {
     fn bufferElement(e: *Emitter, res: Ref, index: Ref) Error!Id {
         const elem = (try e.bufferElemType(e.f.inst(res).ty)) orelse return e.unsupported("indexing this resource is not supported yet", .{});
         const id = e.b.newId();
-        try e.b.emit(.functions, .access_chain, &.{ try e.pointerType(.uniform, elem), id, e.val(res), try e.constInt(0), e.val(index) });
+        try e.b.emit(.functions, .access_chain, &.{ try e.pointerType(e.bufferSc(), elem), id, e.val(res), try e.constInt(0), e.val(index) });
         return id;
     }
 
@@ -1308,7 +1348,7 @@ const Emitter = struct {
         try e.b.emit(.types_globals, .type_struct, &.{ st, rt });
         try e.b.emit(.annotations, .member_decorate, &.{ st, 0, 35, 0 }); // Offset 0
         if (!r.kind.isWritable() and r.kind != .consume_structured_buffer) try e.b.emit(.annotations, .member_decorate, &.{ st, 0, 24 }); // NonWritable
-        try e.b.emit(.annotations, .decorate, &.{ st, 3 }); // BufferBlock
+        try e.b.emit(.annotations, .decorate, &.{ st, e.bufferBlockDecoration() });
         try e.b.emitWithString(.debug_names, .name, &.{st}, try std.fmt.allocPrint(e.arena, "type.{s}.{s}", .{ r.name, try e.typeLabel(elem_ty) }), &.{});
         try e.buffer_blocks.put(e.arena, ty, st);
         return st;
@@ -1329,7 +1369,7 @@ const Emitter = struct {
         switch (e.t.get(ty)) {
             .sampler => return .{ .sc = .uniform_constant, .ty = try e.samplerType() },
             .resource => |r| switch (r.kind) {
-                .structured_buffer, .rw_structured_buffer, .append_structured_buffer, .consume_structured_buffer, .byte_address_buffer, .rw_byte_address_buffer => return .{ .sc = .uniform, .ty = try e.bufferBlockType(ty) },
+                .structured_buffer, .rw_structured_buffer, .append_structured_buffer, .consume_structured_buffer, .byte_address_buffer, .rw_byte_address_buffer => return .{ .sc = e.bufferSc(), .ty = try e.bufferBlockType(ty) },
                 else => if (texture.shape(r.kind)) |sh| return .{ .sc = .uniform_constant, .ty = try e.imageType(sh, r.elem) },
             },
             .array => |arr| {
@@ -1576,7 +1616,7 @@ const Emitter = struct {
         if (eq(u8, name, "Append") or eq(u8, name, "Consume")) {
             const idx = try e.counterOp(res, eq(u8, name, "Append"), eq(u8, name, "Consume"));
             const elem = (try e.bufferElemType(e.f.inst(res).ty)).?;
-            const ptr = try e.opRaw(.access_chain, try e.pointerType(.uniform, elem), &.{ e.val(res), try e.constUint(0), idx });
+            const ptr = try e.opRaw(.access_chain, try e.pointerType(e.bufferSc(), elem), &.{ e.val(res), try e.constUint(0), idx });
             const ety = r.elem;
             if (eq(u8, name, "Append")) {
                 try e.b.emit(.functions, .store, &.{ ptr, try e.toLayout(e.val(args[0]), e.f.inst(args[0]).ty, .std430, false) });
@@ -1705,13 +1745,13 @@ const Emitter = struct {
                 const ut = try em.t.scalar(.uint);
                 var idx = try em.op1(.shift_right_logical, ut, &.{ off, try em.constUint(2) });
                 if (k > 0) idx = try em.op1(.i_add, ut, &.{ idx, try em.constUint(k) });
-                return em.opRaw(.access_chain, try em.pointerType(.uniform, try em.scalarType(.uint)), &.{ base, try em.constInt(0), idx });
+                return em.opRaw(.access_chain, try em.pointerType(em.bufferSc(), try em.scalarType(.uint)), &.{ base, try em.constInt(0), idx });
             }
         }.f;
         const off = try e.convert(e.val(args[0]), e.f.inst(args[0]).ty, uint_ty);
         if (std.mem.startsWith(u8, name, "Load") and args.len == 1) {
             const n = e.t.componentCount(ty) orelse return e.unsupported("templated Load is not supported yet", .{});
-            if (e.t.component(ty).? != .uint) return e.unsupported("templated Load is not supported yet", .{});
+            if (e.t.component(ty) != .uint) return e.unsupported("templated Load is not supported yet", .{});
             const parts = try e.arena.alloc(Id, n);
             for (parts, 0..) |*p, k| p.* = try e.op1(.load, uint_ty, &.{try word(e, e.val(res), off, @intCast(k))});
             return if (n == 1) parts[0] else e.op1(.composite_construct, ty, parts);
@@ -1719,7 +1759,7 @@ const Emitter = struct {
         if (std.mem.startsWith(u8, name, "Store") and args.len == 2) {
             const vty = e.f.inst(args[1]).ty;
             const n = e.t.componentCount(vty) orelse return e.unsupported("templated Store is not supported yet", .{});
-            if (e.t.component(vty).? != .uint) return e.unsupported("templated Store is not supported yet", .{});
+            if (e.t.component(vty) != .uint) return e.unsupported("templated Store is not supported yet", .{});
             for (0..n) |k| {
                 const v = if (n == 1) e.val(args[1]) else try e.op1(.composite_extract, uint_ty, &.{ e.val(args[1]), @intCast(k) });
                 try e.b.emit(.functions, .store, &.{ try word(e, e.val(res), off, @intCast(k)), v });
@@ -1727,7 +1767,8 @@ const Emitter = struct {
             return 0;
         }
         if (std.mem.startsWith(u8, name, "Interlocked")) {
-            if (e.t.component(e.f.inst(args[1]).ty).?.size() != 4) return e.unsupported("64-bit '{s}' is not supported yet", .{name});
+            const vc = e.t.component(e.f.inst(args[1]).ty) orelse return e.unsupported("'{s}' on this value is not supported yet", .{name});
+            if (vc.size() != 4) return e.unsupported("64-bit '{s}' is not supported yet", .{name});
             return e.atomicOp(name["Interlocked".len..], try word(e, e.val(res), off, 0), uint_ty, 1, args[1..]);
         }
         return e.unsupported("method '{s}' is not supported yet", .{name});
@@ -1898,6 +1939,103 @@ const Emitter = struct {
         return e.glsl;
     }
 
+    /// An Input variable for a builtin the code reads (created once).
+    fn builtinInput(e: *Emitter, builtin: u32, ty: TypeId) Error!Id {
+        if (e.builtin_inputs.get(builtin)) |v| return v;
+        const v = e.b.newId();
+        try e.b.emit(.types_globals, .variable, &.{ try e.pointerType(.input, try e.typeId(ty)), v, @backingInt(StorageClass.input) });
+        try e.b.emit(.annotations, .decorate, &.{ v, 11, builtin }); // BuiltIn
+        if (e.m.entry.?.stage == .pixel and !e.t.component(ty).?.isFloat()) try e.b.emit(.annotations, .decorate, &.{ v, 14 }); // Flat
+        try e.interface_ids.append(e.arena, v);
+        try e.builtin_inputs.put(e.arena, builtin, v);
+        return v;
+    }
+
+    /// Wave and quad intrinsics as GroupNonUniform operations (SPIR-V 1.3).
+    fn waveIntrinsic(e: *Emitter, name: []const u8, ty: TypeId, args: []const Ref) Error!?Id {
+        const eq = std.mem.eql;
+        if (e.spv_minor < 3) return e.unsupported("'{s}' needs a Vulkan 1.1 target (-fspv-target-env=vulkan1.1)", .{name});
+        try e.cap(.group_non_uniform);
+        const scope = try e.constUint(3); // Subgroup
+        const uint_ty = try e.t.scalar(.uint);
+        const bool_ty = try e.t.scalar(.bool);
+        if (eq(u8, name, "WaveGetLaneIndex") or eq(u8, name, "WaveGetLaneCount")) {
+            const v = try e.builtinInput(if (eq(u8, name, "WaveGetLaneIndex")) 41 else 36, uint_ty); // SubgroupLocalInvocationId / SubgroupSize
+            return try e.op1(.load, uint_ty, &.{v});
+        }
+        if (eq(u8, name, "WaveIsFirstLane")) return try e.op1(.group_non_uniform_elect, bool_ty, &.{scope});
+        if (eq(u8, name, "WaveActiveAnyTrue") or eq(u8, name, "WaveActiveAllTrue")) {
+            try e.cap(.group_non_uniform_vote);
+            return try e.op1(if (eq(u8, name, "WaveActiveAnyTrue")) .group_non_uniform_any else .group_non_uniform_all, bool_ty, &.{ scope, e.val(args[0]) });
+        }
+        const uvec4 = try e.t.vector(.uint, 4);
+        if (eq(u8, name, "WaveActiveBallot")) {
+            try e.cap(.group_non_uniform_ballot);
+            return try e.op1(.group_non_uniform_ballot, uvec4, &.{ scope, e.val(args[0]) });
+        }
+        if (eq(u8, name, "WaveActiveCountBits") or eq(u8, name, "WavePrefixCountBits")) {
+            try e.cap(.group_non_uniform_ballot);
+            const ballot = try e.op1(.group_non_uniform_ballot, uvec4, &.{ scope, e.val(args[0]) });
+            return try e.op1(.group_non_uniform_ballot_bit_count, uint_ty, &.{ scope, if (eq(u8, name, "WaveActiveCountBits")) 0 else 2, ballot });
+        }
+        if (eq(u8, name, "WaveActiveAllEqual")) {
+            // Per component (the HLSL result is a bool per component).
+            try e.cap(.group_non_uniform_vote);
+            const xty = e.f.inst(args[0]).ty;
+            const n = e.t.componentCount(xty).?;
+            if (n == 1) return try e.op1(.group_non_uniform_all_equal, bool_ty, &.{ scope, e.val(args[0]) });
+            const ct = try e.t.scalar(e.t.component(xty).?);
+            const parts = try e.arena.alloc(Id, n);
+            for (parts, 0..) |*p, k| p.* = try e.op1(.group_non_uniform_all_equal, bool_ty, &.{ scope, try e.op1(.composite_extract, ct, &.{ e.val(args[0]), @intCast(k) }) });
+            return try e.op1(.composite_construct, ty, parts);
+        }
+        if (eq(u8, name, "WaveReadLaneFirst")) {
+            try e.cap(.group_non_uniform_ballot);
+            return try e.op1(.group_non_uniform_broadcast_first, ty, &.{ scope, e.val(args[0]) });
+        }
+        if (eq(u8, name, "WaveReadLaneAt")) {
+            // Broadcast needs a constant lane before SPIR-V 1.5; Shuffle
+            // takes any.
+            const lane = try e.convert(e.val(args[1]), e.f.inst(args[1]).ty, uint_ty);
+            if ((try e.constValue(args[1])) != null or e.spv_minor >= 5) {
+                try e.cap(.group_non_uniform_ballot);
+                return try e.op1(.group_non_uniform_broadcast, ty, &.{ scope, e.val(args[0]), lane });
+            }
+            try e.cap(.group_non_uniform_shuffle);
+            return try e.op1(.group_non_uniform_shuffle, ty, &.{ scope, e.val(args[0]), lane });
+        }
+        if (eq(u8, name, "QuadReadAcrossX") or eq(u8, name, "QuadReadAcrossY") or eq(u8, name, "QuadReadAcrossDiagonal")) {
+            try e.cap(.group_non_uniform_quad);
+            const dir: u32 = if (eq(u8, name, "QuadReadAcrossX")) 0 else if (eq(u8, name, "QuadReadAcrossY")) 1 else 2;
+            return try e.op1(.group_non_uniform_quad_swap, ty, &.{ scope, e.val(args[0]), try e.constUint(dir) });
+        }
+        if (eq(u8, name, "QuadReadLaneAt")) {
+            try e.cap(.group_non_uniform_quad);
+            return try e.op1(.group_non_uniform_quad_broadcast, ty, &.{ scope, e.val(args[0]), try e.convert(e.val(args[1]), e.f.inst(args[1]).ty, uint_ty) });
+        }
+        // Reductions (Reduce) and prefix scans (ExclusiveScan).
+        const c = e.t.component(ty) orelse return null;
+        const fl = c.isFloat();
+        const un = c.isUnsigned();
+        const Red = struct { name: []const u8, op: Op, scan: u32 };
+        const reds = [_]Red{
+            .{ .name = "WaveActiveSum", .op = if (fl) .group_non_uniform_f_add else .group_non_uniform_i_add, .scan = 0 },
+            .{ .name = "WaveActiveProduct", .op = if (fl) .group_non_uniform_f_mul else .group_non_uniform_i_mul, .scan = 0 },
+            .{ .name = "WaveActiveMin", .op = if (fl) .group_non_uniform_f_min else if (un) .group_non_uniform_u_min else .group_non_uniform_s_min, .scan = 0 },
+            .{ .name = "WaveActiveMax", .op = if (fl) .group_non_uniform_f_max else if (un) .group_non_uniform_u_max else .group_non_uniform_s_max, .scan = 0 },
+            .{ .name = "WaveActiveBitAnd", .op = .group_non_uniform_bitwise_and, .scan = 0 },
+            .{ .name = "WaveActiveBitOr", .op = .group_non_uniform_bitwise_or, .scan = 0 },
+            .{ .name = "WaveActiveBitXor", .op = .group_non_uniform_bitwise_xor, .scan = 0 },
+            .{ .name = "WavePrefixSum", .op = if (fl) .group_non_uniform_f_add else .group_non_uniform_i_add, .scan = 2 },
+            .{ .name = "WavePrefixProduct", .op = if (fl) .group_non_uniform_f_mul else .group_non_uniform_i_mul, .scan = 2 },
+        };
+        for (reds) |r| if (eq(u8, name, r.name)) {
+            try e.cap(.group_non_uniform_arithmetic);
+            return try e.op1(r.op, ty, &.{ scope, r.scan, e.val(args[0]) });
+        };
+        return null;
+    }
+
     /// Intrinsics with out parameters (null for the others).
     fn outIntrinsic(e: *Emitter, name: []const u8, ty: TypeId, args: []const Ref) Error!?Id {
         const eq = std.mem.eql;
@@ -1997,6 +2135,9 @@ const Emitter = struct {
 
     fn intrinsic(e: *Emitter, name: []const u8, ty: TypeId, args: []const Ref) Error!Id {
         if (try e.outIntrinsic(name, ty, args)) |id| return id;
+        if (std.mem.startsWith(u8, name, "Wave") or std.mem.startsWith(u8, name, "Quad")) {
+            if (try e.waveIntrinsic(name, ty, args)) |id| return id;
+        }
         if (std.mem.eql(u8, name, "NonUniformResourceIndex")) {
             // A decorated copy marks the index (as dxc).
             const id = try e.op1(.copy_object, ty, &.{e.val(args[0])});
