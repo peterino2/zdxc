@@ -42,6 +42,9 @@ const Lowered = union(enum) {
     ptr: Ptr,
     /// A resource handle (index into Emitter.resources).
     handle: u32,
+    /// A local holding a resource (index into Emitter.res_locals): an
+    /// alias of the one resource stored into it.
+    res_local: u32,
     /// A place in a constant buffer: byte offset plus a dynamic register
     /// offset.
     cbuf: struct { res: u32, offset: u32 = 0, dyn_regs: ?Value = null, row_major: bool = false },
@@ -108,6 +111,7 @@ const Emitter = struct {
     resources: std.ArrayList(Resource) = .empty,
     resource_of_global: std.AutoHashMapUnmanaged(u32, u32) = .empty,
     private_globals: std.AutoHashMapUnmanaged(u32, Ptr) = .empty,
+    res_locals: std.ArrayList(?u32) = .empty,
     uses_double: bool = false,
     uses_int64: bool = false,
     /// 16-bit min-precision values cross the signature.
@@ -648,15 +652,34 @@ const Emitter = struct {
                 if (e.resources.items[ri].class == .cbuffer) return .{ .cbuf = .{ .res = ri } };
                 return .{ .handle = ri };
             },
-            .local_var => return .{ .ptr = try e.alloca(i.ty) },
+            .local_var => {
+                if (isResourceType(e.t, i.ty)) {
+                    try e.res_locals.append(e.arena, null);
+                    return .{ .res_local = @intCast(e.res_locals.items.len - 1) };
+                }
+                return .{ .ptr = try e.alloca(i.ty) };
+            },
             .load => |p| switch (frame.vals[p.index()]) {
                 .handle => |h| return .{ .handle = h },
+                .res_local => |k| return .{ .handle = e.res_locals.items[k] orelse return e.unsupported("a resource local read before it is assigned", .{}) },
                 .cbuf => |c| return e.cbufferLoad(c.res, c.offset, c.dyn_regs, c.row_major, i.ty),
                 .buf => |b| return .{ .scalars = try e.structuredLoad(e.resources.items[b.res], b.index, b.offset, b.dyn, b.row_major, i.ty) },
                 .ptr => |ptr| return e.loadPtr(ptr, i.ty),
                 else => return e.unsupported("internal: load from a non-pointer", .{}),
             },
             .store => |s| {
+                if (frame.vals[s.ptr.index()] == .res_local) {
+                    const slot = &e.res_locals.items[frame.vals[s.ptr.index()].res_local];
+                    const h = switch (frame.vals[s.value.index()]) {
+                        .handle => |h| h,
+                        else => return e.unsupported("resources not tied to a global are not supported yet", .{}),
+                    };
+                    // Selecting between resources at run time has no
+                    // handle-based lowering here; one assignment is fine.
+                    if (slot.*) |old| if (old != h) return e.unsupported("assigning different resources to one variable is not supported yet", .{});
+                    slot.* = h;
+                    return .none;
+                }
                 if (frame.vals[s.ptr.index()] == .buf) {
                     const b = frame.vals[s.ptr.index()].buf;
                     try e.structuredStore(e.resources.items[b.res], b.index, b.offset, b.dyn, b.row_major, f.inst(s.value).ty, try e.scalars(frame, s.value));
@@ -2458,6 +2481,13 @@ const Emitter = struct {
         return container.assemble(gpa, &parts);
     }
 };
+
+fn isResourceType(t: *TypeTable, ty: TypeId) bool {
+    return switch (t.get(ty)) {
+        .resource, .sampler => true,
+        else => false,
+    };
+}
 
 fn reachableBlocks(a: Allocator, f: *const ir.Function) Allocator.Error![]bool {
     const seen = try a.alloc(bool, f.blocks.items.len);

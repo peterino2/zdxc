@@ -80,13 +80,13 @@ const Emitter = struct {
     /// Per global: the OpVariable and, for buffers, the element pointer
     /// type.
     global_vars: []Id = &.{},
-    buffer_elem_ptr: []Id = &.{},
-    /// Per global: its image type (textures, typed buffers) or 0.
-    global_images: []Id = &.{},
+    /// Buffer block structs by resource type.
+    buffer_blocks: std.AutoHashMapUnmanaged(TypeId, Id) = .empty,
     /// Image types by (sampled type, dim, arrayed, ms, sampled, format).
     image_types: std.AutoHashMapUnmanaged([6]u32, Id) = .empty,
     sampled_image_types: std.AutoHashMapUnmanaged(Id, Id) = .empty,
     sampler_type: Id = 0,
+    variants: std.ArrayList(struct { fi: u32, bindings: []const Id, id: Id }) = .empty,
     /// Entry inputs / outputs: interface variable and its value type.
     inputs: []Interface = &.{},
     outputs: []Interface = &.{},
@@ -433,7 +433,14 @@ const Emitter = struct {
         try e.emitGlobals();
         try e.emitInterface(entry);
 
-        for (m.functions.items, 0..) |f, fi| try e.emitFunction(f, @intCast(fi));
+        for (m.functions.items, e.func_ids) |f, id| {
+            if (!e.hasResourceParams(f)) try e.emitFunction(f, id, &.{});
+        }
+        var vi: usize = 0;
+        while (vi < e.variants.items.len) : (vi += 1) {
+            const v = e.variants.items[vi];
+            try e.emitFunction(m.functions.items[v.fi], v.id, v.bindings);
+        }
 
         for (e.capabilities.keys()) |c| try e.b.emit(.capabilities, .capability, &.{@backingInt(c)});
         if (e.glsl != 0) try e.b.emitWithString(.ext_inst_imports, .ext_inst_import, &.{e.glsl}, "GLSL.std.450", &.{});
@@ -459,16 +466,15 @@ const Emitter = struct {
             },
             else => {},
         }
-        for (m.functions.items, e.func_ids) |f, id| try e.b.emitWithString(.debug_names, .name, &.{id}, f.name, &.{});
+        for (m.functions.items, e.func_ids) |f, id| {
+            if (!e.hasResourceParams(f)) try e.b.emitWithString(.debug_names, .name, &.{id}, f.name, &.{});
+        }
     }
 
     fn emitGlobals(e: *Emitter) Error!void {
         const m = e.m;
         e.global_vars = try e.arena.alloc(Id, m.globals.items.len);
-        e.buffer_elem_ptr = try e.arena.alloc(Id, m.globals.items.len);
-        e.global_images = try e.arena.alloc(Id, m.globals.items.len);
-        @memset(e.global_images, 0);
-        @memset(e.buffer_elem_ptr, 0);
+
         // Registers without an explicit binding take the next free one.
         var used: std.AutoHashMapUnmanaged(struct { u32, u32 }, void) = .empty;
         for (m.globals.items) |g| if (g.binding.explicit) try used.put(e.arena, .{ g.binding.space, g.binding.index }, {});
@@ -481,35 +487,11 @@ const Emitter = struct {
                         else => return e.unsupported("global '{s}' of type '{s}' is not supported yet", .{ g.name, try e.t.format(e.arena, g.ty) }),
                     };
                     const var_id = e.b.newId();
-                    switch (r.kind) {
-                        .structured_buffer, .rw_structured_buffer, .byte_address_buffer, .rw_byte_address_buffer => {
-                            const elem_ty = if (r.kind == .byte_address_buffer or r.kind == .rw_byte_address_buffer) try e.t.scalar(.uint) else r.elem;
-                            if (e.isTrueMatrix(elem_ty)) return e.unsupported("buffers of matrices are not supported yet", .{});
-                            const elem = try e.layoutTypeId(elem_ty, .std430, false);
-                            const stride = layout.arrayStride(e.t, elem_ty, false, .std430) catch return e.unsupported("buffer element type '{s}'", .{try e.t.format(e.arena, elem_ty)});
-                            const rt = e.b.newId();
-                            try e.b.emit(.types_globals, .type_runtime_array, &.{ rt, elem });
-                            try e.b.emit(.annotations, .decorate, &.{ rt, 6, stride }); // ArrayStride
-                            const st = e.b.newId();
-                            try e.b.emit(.types_globals, .type_struct, &.{ st, rt });
-                            try e.b.emit(.annotations, .member_decorate, &.{ st, 0, 35, 0 }); // Offset 0
-                            if (!r.kind.isWritable()) try e.b.emit(.annotations, .member_decorate, &.{ st, 0, 24 }); // NonWritable
-                            try e.b.emit(.annotations, .decorate, &.{ st, 3 }); // BufferBlock
-                            try e.b.emitWithString(.debug_names, .name, &.{st}, try std.fmt.allocPrint(e.arena, "type.{s}.{s}", .{ r.name, try e.typeLabel(elem_ty) }), &.{});
-                            const ptr = try e.pointerType(.uniform, st);
-                            try e.b.emit(.types_globals, .variable, &.{ ptr, var_id, @backingInt(StorageClass.uniform) });
-                            e.buffer_elem_ptr[gi] = try e.pointerType(.uniform, elem);
-                        },
-                        else => if (e.t.get(g.ty) == .sampler) {
-                            const ptr = try e.pointerType(.uniform_constant, try e.samplerType());
-                            try e.b.emit(.types_globals, .variable, &.{ ptr, var_id, @backingInt(StorageClass.uniform_constant) });
-                        } else if (texture.shape(r.kind)) |sh| {
-                            const img = try e.imageType(sh, r.elem);
-                            e.global_images[gi] = img;
-                            const ptr = try e.pointerType(.uniform_constant, img);
-                            try e.b.emit(.types_globals, .variable, &.{ ptr, var_id, @backingInt(StorageClass.uniform_constant) });
-                        } else return e.unsupported("resource type '{s}' is not supported yet", .{r.name}),
-                    }
+                    const sc: StorageClass = switch (r.kind) {
+                        .structured_buffer, .rw_structured_buffer, .byte_address_buffer, .rw_byte_address_buffer => .uniform,
+                        else => .uniform_constant,
+                    };
+                    try e.b.emit(.types_globals, .variable, &.{ try e.resourcePtrType(g.ty), var_id, @backingInt(sc) });
                     var binding = g.binding.index;
                     if (!g.binding.explicit) {
                         while (used.contains(.{ g.binding.space, next_free })) next_free += 1;
@@ -658,26 +640,50 @@ const Emitter = struct {
     // ------------------------------------------------------------------
     // Functions
 
-    fn emitFunction(e: *Emitter, f: *const ir.Function, fi: u32) Error!void {
+    fn hasResourceParams(e: *Emitter, f: *const ir.Function) bool {
+        for (f.params) |p| if (isResourceType(e.t, p.ty)) return true;
+        return false;
+    }
+
+    /// The copy of function `fi` with its resource parameters bound to
+    /// `bindings` (resource variables; 0 for other parameters). Vulkan
+    /// cannot pass buffer pointers to functions, so each distinct set of
+    /// resource arguments gets its own copy (dxc gets there by inlining).
+    fn variantFor(e: *Emitter, fi: u32, bindings: []const Id) Error!Id {
+        for (e.variants.items) |v| if (v.fi == fi and std.mem.eql(Id, v.bindings, bindings)) return v.id;
+        const id = e.b.newId();
+        try e.variants.append(e.arena, .{ .fi = fi, .bindings = try e.arena.dupe(Id, bindings), .id = id });
+        try e.b.emitWithString(.debug_names, .name, &.{id}, e.m.functions.items[fi].name, &.{});
+        return id;
+    }
+
+    fn emitFunction(e: *Emitter, f: *const ir.Function, fn_id: Id, bindings: []const Id) Error!void {
         e.f = f;
         e.vals = try e.arena.alloc(Id, f.insts.items.len);
         @memset(e.vals, 0);
         e.ptr_layouts = try e.arena.alloc(?PtrLayout, f.insts.items.len);
         @memset(e.ptr_layouts, null);
         const ret = try e.typeId(f.ret);
-        const params = try e.arena.alloc(Id, f.params.len);
-        for (f.params, params) |p, *out| {
+        var params: std.ArrayList(Id) = .empty;
+        for (f.params, 0..) |p, k| {
+            if (bindings.len > 0 and bindings[k] != 0) continue;
             const t = try e.typeId(p.ty);
-            out.* = if (p.by_ref) try e.pointerType(.function, t) else t;
+            try params.append(e.arena, if (p.by_ref) try e.pointerType(.function, t) else t);
         }
-        const fn_ty = try e.functionType(ret, params);
-        try e.b.emit(.functions, .function, &.{ ret, e.func_ids[fi], 0, fn_ty });
+        const fn_ty = try e.functionType(ret, params.items);
+        try e.b.emit(.functions, .function, &.{ ret, fn_id, 0, fn_ty });
         const param_ids = try e.arena.alloc(Id, f.params.len);
-        for (params, param_ids) |p, *id| {
+        var next: usize = 0;
+        for (f.params, param_ids, 0..) |p, *id, k| {
+            if (bindings.len > 0 and bindings[k] != 0) {
+                id.* = bindings[k];
+                continue;
+            }
             id.* = e.b.newId();
-            try e.b.emit(.functions, .function_parameter, &.{ p, id.* });
+            try e.b.emit(.functions, .function_parameter, &.{ params.items[next], id.* });
+            next += 1;
+            try e.b.emitWithString(.debug_names, .name, &.{id.*}, p.name, &.{});
         }
-        for (f.params, param_ids) |p, id| try e.b.emitWithString(.debug_names, .name, &.{id}, p.name, &.{});
 
         const order = try blockOrder(e.arena, f);
         const labels = try e.arena.alloc(Id, f.blocks.items.len);
@@ -695,6 +701,8 @@ const Emitter = struct {
             if (oi == 0) {
                 // OpVariables must open the first block.
                 for (f.insts.items, 0..) |inst, i| if (inst.op == .local_var) {
+                    // Resource locals alias the one resource stored in them.
+                    if (isResourceType(e.t, inst.ty)) continue;
                     const ptr = try e.pointerType(.function, try e.typeId(inst.ty));
                     e.vals[i] = e.b.newId();
                     try e.b.emit(.functions, .variable, &.{ ptr, e.vals[i], @backingInt(StorageClass.function) });
@@ -859,6 +867,13 @@ const Emitter = struct {
                 e.vals[ri] = try e.op1(.load, i.ty, &.{e.val(p)});
             },
             .store => |s| {
+                const target = f.inst(s.ptr);
+                if (target.op == .local_var and isResourceType(e.t, target.ty)) {
+                    const old = e.vals[s.ptr.index()];
+                    if (old != 0 and old != e.val(s.value)) return e.unsupported("assigning different resources to one variable is not supported yet", .{});
+                    e.vals[s.ptr.index()] = e.val(s.value);
+                    return;
+                }
                 if (e.ptr_layouts[s.ptr.index()]) |pl| {
                     const v = try e.toLayout(e.val(s.value), f.inst(s.value).ty, pl.rules, pl.row_major);
                     try e.b.emit(.functions, .store, &.{ e.val(s.ptr), v });
@@ -867,14 +882,17 @@ const Emitter = struct {
                 try e.b.emit(.functions, .store, &.{ e.val(s.ptr), e.val(s.value) });
             },
             .access => |a| {
-                const sc: StorageClass = switch (i.ptr) {
+                // Buffers reached through locals or parameters are still
+                // Uniform std430 storage.
+                const into_buffer = e.t.get(f.inst(a.base).ty) == .resource;
+                const sc: StorageClass = if (into_buffer or e.ptr_layouts[a.base.index()] != null) .uniform else switch (i.ptr) {
                     .function => .function,
                     .private => .private,
                     .groupshared => .workgroup,
                     .cbuffer, .resource => .uniform,
                     else => return e.unsupported("access into this storage is not supported yet", .{}),
                 };
-                var pl = e.ptr_layouts[a.base.index()];
+                var pl = if (into_buffer) PtrLayout{ .rules = .std430, .row_major = false } else e.ptr_layouts[a.base.index()];
                 var ops: std.ArrayList(u32) = .empty;
                 try ops.appendSlice(e.arena, &.{ 0, 0, e.val(a.base) });
                 var cur = f.inst(a.base).ty;
@@ -882,7 +900,7 @@ const Emitter = struct {
                 if (e.t.get(cur) == .resource) {
                     // buffer[i]...: member 0 (the runtime array), element i.
                     const rk = e.t.get(cur).resource;
-                    if (e.buffer_elem_ptr[e.globalOf(a.base) orelse return e.unsupported("resources not tied to a global", .{})] == 0) return e.unsupported("indexing this resource is not supported yet", .{});
+                    if (try e.bufferElemType(cur) == null) return e.unsupported("indexing this resource is not supported yet", .{});
                     try ops.appendSlice(e.arena, &.{ try e.constInt(0), e.val(indices[0]) });
                     cur = if (rk.kind == .byte_address_buffer or rk.kind == .rw_byte_address_buffer) try e.t.scalar(.uint) else rk.elem;
                     indices = indices[1..];
@@ -1089,14 +1107,23 @@ const Emitter = struct {
             },
             .call => |c| {
                 var ops: std.ArrayList(u32) = .empty;
+                const callee = e.m.functions.items[c.func];
+                if (e.hasResourceParams(callee)) {
+                    const bindings = try e.arena.alloc(Id, c.args.len);
+                    for (callee.params, c.args, bindings) |p, a, *bd| bd.* = if (isResourceType(e.t, p.ty)) e.val(a) else 0;
+                    try ops.append(e.arena, try e.variantFor(c.func, bindings));
+                    for (callee.params, c.args) |p, a| if (!isResourceType(e.t, p.ty)) try ops.append(e.arena, e.val(a));
+                    e.vals[ri] = try e.op1(.function_call, i.ty, ops.items);
+                    return;
+                }
                 try ops.append(e.arena, e.func_ids[c.func]);
                 for (c.args) |a| try ops.append(e.arena, e.val(a));
                 e.vals[ri] = try e.op1(.function_call, i.ty, ops.items);
             },
             .intrinsic => |c| e.vals[ri] = try e.intrinsic(c.name, i.ty, c.args),
             .res_load => |x| {
-                if (e.imageGlobal(x.res)) |g| {
-                    e.vals[ri] = try e.imageIndexLoad(g, e.val(x.index), i.ty);
+                if (e.isImage(x.res)) {
+                    e.vals[ri] = try e.imageIndexLoad(x.res, e.val(x.index), i.ty);
                     return;
                 }
                 const ptr = try e.bufferElement(x.res, x.index);
@@ -1104,8 +1131,8 @@ const Emitter = struct {
                 e.vals[ri] = try e.fromLayout(raw, i.ty, .std430, false);
             },
             .res_store => |x| {
-                if (e.imageGlobal(x.res)) |g| {
-                    try e.imageWrite(g, e.val(x.index), e.val(x.value));
+                if (e.isImage(x.res)) {
+                    try e.imageWrite(x.res, e.val(x.index), e.val(x.value));
                     return;
                 }
                 const ptr = try e.bufferElement(x.res, x.index);
@@ -1139,12 +1166,60 @@ const Emitter = struct {
 
     /// Pointer to `buffer[index]` (structured / byte-address buffers).
     fn bufferElement(e: *Emitter, res: Ref, index: Ref) Error!Id {
-        const g = e.globalOf(res) orelse return e.unsupported("resources not tied to a global are not supported yet", .{});
-        const elem_ptr = e.buffer_elem_ptr[g];
-        if (elem_ptr == 0) return e.unsupported("indexing this resource is not supported yet", .{});
+        const elem = (try e.bufferElemType(e.f.inst(res).ty)) orelse return e.unsupported("indexing this resource is not supported yet", .{});
         const id = e.b.newId();
-        try e.b.emit(.functions, .access_chain, &.{ elem_ptr, id, e.global_vars[g], try e.constInt(0), e.val(index) });
+        try e.b.emit(.functions, .access_chain, &.{ try e.pointerType(.uniform, elem), id, e.val(res), try e.constInt(0), e.val(index) });
         return id;
+    }
+
+    /// The laid-out element type of a structured / byte-address buffer.
+    fn bufferElemType(e: *Emitter, ty: TypeId) Error!?Id {
+        const r = switch (e.t.get(ty)) {
+            .resource => |r| r,
+            else => return null,
+        };
+        const elem_ty = switch (r.kind) {
+            .byte_address_buffer, .rw_byte_address_buffer => try e.t.scalar(.uint),
+            .structured_buffer, .rw_structured_buffer => r.elem,
+            else => return null,
+        };
+        if (e.isTrueMatrix(elem_ty)) return e.unsupported("buffers of matrices are not supported yet", .{});
+        return try e.layoutTypeId(elem_ty, .std430, false);
+    }
+
+    /// The BufferBlock struct of a buffer type (one per HLSL type, so
+    /// functions taking buffers accept every buffer of that type).
+    fn bufferBlockType(e: *Emitter, ty: TypeId) Error!Id {
+        if (e.buffer_blocks.get(ty)) |id| return id;
+        const r = e.t.get(ty).resource;
+        const elem_ty = if (r.kind == .byte_address_buffer or r.kind == .rw_byte_address_buffer) try e.t.scalar(.uint) else r.elem;
+        const elem = (try e.bufferElemType(ty)).?;
+        const stride = layout.arrayStride(e.t, elem_ty, false, .std430) catch return e.unsupported("buffer element type '{s}'", .{try e.t.format(e.arena, elem_ty)});
+        const rt = e.b.newId();
+        try e.b.emit(.types_globals, .type_runtime_array, &.{ rt, elem });
+        try e.b.emit(.annotations, .decorate, &.{ rt, 6, stride }); // ArrayStride
+        const st = e.b.newId();
+        try e.b.emit(.types_globals, .type_struct, &.{ st, rt });
+        try e.b.emit(.annotations, .member_decorate, &.{ st, 0, 35, 0 }); // Offset 0
+        if (!r.kind.isWritable()) try e.b.emit(.annotations, .member_decorate, &.{ st, 0, 24 }); // NonWritable
+        try e.b.emit(.annotations, .decorate, &.{ st, 3 }); // BufferBlock
+        try e.b.emitWithString(.debug_names, .name, &.{st}, try std.fmt.allocPrint(e.arena, "type.{s}.{s}", .{ r.name, try e.typeLabel(elem_ty) }), &.{});
+        try e.buffer_blocks.put(e.arena, ty, st);
+        return st;
+    }
+
+    /// The pointer type of a resource variable of HLSL type `ty` (also how
+    /// resources are passed to functions).
+    fn resourcePtrType(e: *Emitter, ty: TypeId) Error!Id {
+        switch (e.t.get(ty)) {
+            .sampler => return e.pointerType(.uniform_constant, try e.samplerType()),
+            .resource => |r| switch (r.kind) {
+                .structured_buffer, .rw_structured_buffer, .byte_address_buffer, .rw_byte_address_buffer => return e.pointerType(.uniform, try e.bufferBlockType(ty)),
+                else => if (texture.shape(r.kind)) |sh| return e.pointerType(.uniform_constant, try e.imageType(sh, r.elem)),
+            },
+            else => {},
+        }
+        return e.unsupported("resource type '{s}' is not supported yet", .{try e.t.format(e.arena, ty)});
     }
 
     // ------------------------------------------------------------------
@@ -1227,18 +1302,25 @@ const Emitter = struct {
         return id;
     }
 
-    /// The global behind an image value, if it is one.
-    fn imageGlobal(e: *Emitter, r: Ref) ?u32 {
-        const g = e.globalOf(r) orelse return null;
-        return if (e.global_images[g] != 0) g else null;
+    /// Whether `r` is a texture or typed buffer.
+    fn isImage(e: *Emitter, r: Ref) bool {
+        return switch (e.t.get(e.f.inst(r).ty)) {
+            .resource => |rk| texture.shape(rk.kind) != null,
+            else => false,
+        };
     }
 
-    fn loadImage(e: *Emitter, g: u32) Error!Id {
-        return e.opRaw(.load, e.global_images[g], &.{e.global_vars[g]});
+    fn imageTypeOf(e: *Emitter, r: Ref) Error!Id {
+        const rk = e.resourceInfo(r);
+        return e.imageType(texture.shape(rk.kind).?, rk.elem);
     }
 
-    fn resourceInfo(e: *Emitter, g: u32) @FieldType(types.Type, "resource") {
-        return e.t.get(e.m.globals.items[g].ty).resource;
+    fn loadImage(e: *Emitter, r: Ref) Error!Id {
+        return e.opRaw(.load, try e.imageTypeOf(r), &.{e.val(r)});
+    }
+
+    fn resourceInfo(e: *Emitter, r: Ref) @FieldType(types.Type, "resource") {
+        return e.t.get(e.f.inst(r).ty).resource;
     }
 
     /// The first components of a four-component texel, as `ty`.
@@ -1258,11 +1340,11 @@ const Emitter = struct {
     }
 
     /// `res[index]` on a texture or typed buffer.
-    fn imageIndexLoad(e: *Emitter, g: u32, coord: Id, ty: TypeId) Error!Id {
-        const r = e.resourceInfo(g);
+    fn imageIndexLoad(e: *Emitter, res: Ref, coord: Id, ty: TypeId) Error!Id {
+        const r = e.resourceInfo(res);
         const sh = texture.shape(r.kind).?;
         const s = try e.texelScalar(r.elem);
-        const img = try e.loadImage(g);
+        const img = try e.loadImage(res);
         var v: Id = undefined;
         if (sh.rw) {
             if (e.imageFormat(r.elem) == 0) try e.cap(.storage_image_read_without_format);
@@ -1279,11 +1361,11 @@ const Emitter = struct {
         return e.texelResult(v, s, ty);
     }
 
-    fn imageWrite(e: *Emitter, g: u32, coord: Id, value: Id) Error!void {
-        const r = e.resourceInfo(g);
+    fn imageWrite(e: *Emitter, res: Ref, coord: Id, value: Id) Error!void {
+        const r = e.resourceInfo(res);
         _ = try e.texelScalar(r.elem);
         if (e.imageFormat(r.elem) == 0) try e.cap(.storage_image_write_without_format);
-        const img = try e.loadImage(g);
+        const img = try e.loadImage(res);
         try e.b.emit(.functions, .image_write, &.{ img, coord, value });
     }
 
@@ -1307,12 +1389,10 @@ const Emitter = struct {
 
     fn method(e: *Emitter, name: []const u8, res: Ref, args: []const Ref, ty: TypeId) Error!Id {
         const eq = std.mem.eql;
-        const g = e.globalOf(res) orelse return e.unsupported("resources not tied to a global are not supported yet", .{});
-        const gty = e.m.globals.items[g].ty;
-        if (e.t.get(gty) != .resource) return e.unsupported("method '{s}' is not supported yet", .{name});
-        const r = e.resourceInfo(g);
+        if (e.t.get(e.f.inst(res).ty) != .resource) return e.unsupported("method '{s}' is not supported yet", .{name});
+        const r = e.resourceInfo(res);
         if (eq(u8, name, "GetDimensions")) {
-            try e.getDimensions(g, r, args);
+            try e.getDimensions(res, r, args);
             return 0;
         }
         if (eq(u8, name, "Load") and (r.kind == .structured_buffer or r.kind == .rw_structured_buffer)) {
@@ -1326,7 +1406,7 @@ const Emitter = struct {
         if (call.offsets4) return e.unsupported("Gather with four offsets is not supported yet", .{});
         if (call.op.implicitLod() and e.m.entry.?.stage != .pixel) return e.unsupported("'{s}' outside pixel shaders is not supported yet", .{name});
         const s = try e.texelScalar(r.elem);
-        const img = try e.loadImage(g);
+        const img = try e.loadImage(res);
         const coord = e.val(args[call.coord]);
         // Image operands, in operand-mask bit order.
         var mask: u32 = 0;
@@ -1399,7 +1479,7 @@ const Emitter = struct {
         }
         if (call.op == .sample_position) return e.unsupported("GetSamplePosition is not supported yet", .{});
         const smp = try e.opRaw(.load, try e.samplerType(), &.{e.val(args[call.sampler.?])});
-        const si = try e.opRaw(.sampled_image, try e.sampledImageType(e.global_images[g]), &.{ img, smp });
+        const si = try e.opRaw(.sampled_image, try e.sampledImageType(try e.imageTypeOf(res)), &.{ img, smp });
         if (call.op == .calc_lod or call.op == .calc_lod_unclamped) {
             try e.cap(.image_query);
             const q = try e.opRaw(.image_query_lod, try e.typeId(try e.t.vector(.float, 2)), &.{ si, coord });
@@ -1425,7 +1505,7 @@ const Emitter = struct {
         return e.texelResult(v, s, ty);
     }
 
-    fn getDimensions(e: *Emitter, g: u32, r: @FieldType(types.Type, "resource"), args: []const Ref) Error!void {
+    fn getDimensions(e: *Emitter, res: Ref, r: @FieldType(types.Type, "resource"), args: []const Ref) Error!void {
         const uint_ty = try e.t.scalar(.uint);
         const store = struct {
             fn f(em: *Emitter, arg: Ref, v: Id) Error!void {
@@ -1436,7 +1516,7 @@ const Emitter = struct {
         }.f;
         switch (r.kind) {
             .structured_buffer, .rw_structured_buffer, .byte_address_buffer, .rw_byte_address_buffer => {
-                const len = try e.op1(.array_length, uint_ty, &.{ e.global_vars[g], 0 });
+                const len = try e.op1(.array_length, uint_ty, &.{ e.val(res), 0 });
                 if (r.kind == .byte_address_buffer or r.kind == .rw_byte_address_buffer) {
                     try store(e, args[0], try e.op1(.i_mul, uint_ty, &.{ len, try e.constUint(4) }));
                 } else {
@@ -1452,7 +1532,7 @@ const Emitter = struct {
         }
         const sh = texture.shape(r.kind) orelse return e.unsupported("GetDimensions on this resource is not supported yet", .{});
         try e.cap(.image_query);
-        const img = try e.loadImage(g);
+        const img = try e.loadImage(res);
         const d = texture.getDimensions(sh, args.len);
         const n: u8 = if (sh.dim == .buffer) 1 else (if (sh.dim == .cube) 2 else sh.coords()) + @intFromBool(sh.array);
         const size_ty = if (n == 1) uint_ty else try e.t.vector(.uint, n);
@@ -1781,4 +1861,11 @@ fn dfs(a: Allocator, f: *const ir.Function, b: u32, seen: []bool, post: *std.Arr
     }
     for (succ.items) |s| if (!seen[s]) try dfs(a, f, s, seen, post);
     try post.append(a, b);
+}
+
+fn isResourceType(t: *TypeTable, ty: TypeId) bool {
+    return switch (t.get(ty)) {
+        .resource, .sampler => true,
+        else => false,
+    };
 }
