@@ -131,6 +131,7 @@ const Emitter = struct {
     m: *const ir.Module,
     t: *TypeTable,
     profile: shader.Profile,
+    entry: ir.Entry = undefined,
     diags: *diag.Diagnostics,
 
     main_fn: u32 = 0,
@@ -334,7 +335,9 @@ const Emitter = struct {
 
     fn run(e: *Emitter, gpa: Allocator) Error![]u8 {
         const m = e.m;
-        const entry = m.entry orelse return e.unsupported("no entry point", .{});
+        if (m.entries.items.len != 1 or e.profile.kind == .library) return e.unsupported("library targets are not supported yet", .{});
+        const entry = m.entries.items[0];
+        e.entry = entry;
         switch (entry.stage) {
             .compute, .vertex, .pixel, .geometry, .hull, .domain, .mesh, .amplification => {},
             else => return e.unsupported("{s} shaders are not supported yet", .{@tagName(entry.stage)}),
@@ -552,12 +555,12 @@ const Emitter = struct {
     /// Derivatives (and implicit-LOD sampling): pixel shaders, and from SM
     /// 6.6 compute, mesh and amplification shaders.
     fn checkDerivatives(e: *Emitter) Error!void {
-        switch (e.m.entry.?.stage) {
+        switch (e.entry.stage) {
             .pixel => {},
             .compute, .mesh, .amplification => if (e.profile.minor < 6) return e.unsupported("derivatives outside pixel shaders need shader model 6.6", .{}),
-            else => return e.unsupported("derivatives are not available in {s} shaders", .{@tagName(e.m.entry.?.stage)}),
+            else => return e.unsupported("derivatives are not available in {s} shaders", .{@tagName(e.entry.stage)}),
         }
-        if (e.m.entry.?.stage == .mesh or e.m.entry.?.stage == .amplification) e.uses_mesh_derivatives = true;
+        if (e.entry.stage == .mesh or e.entry.stage == .amplification) e.uses_mesh_derivatives = true;
     }
 
     /// The ResourceProperties constant annotating `res`'s handles.
@@ -722,7 +725,7 @@ const Emitter = struct {
         };
         @memset(frame.vals, .none);
         @memset(frame.blocks, null);
-        const is_entry = e.cur == 0 and e.blocks.items[0].items.len == 0 and (fi == e.m.entry.?.wrapper or fi == e.m.entry.?.patch_wrapper);
+        const is_entry = e.cur == 0 and e.blocks.items[0].items.len == 0 and (fi == e.entry.wrapper or fi == e.entry.patch_wrapper);
         if (!is_entry) frame.cont = try e.newBlock();
         // The callee's entry continues the current block.
         frame.blocks[0] = e.cur;
@@ -854,6 +857,7 @@ const Emitter = struct {
         switch (i.op) {
             .constant => |c| return e.list(&.{try e.constant(i.ty, c)}),
             .param => |p| return frame.params[p],
+            .ray_incoming => return e.unsupported("ray tracing shaders are not supported yet", .{}),
             .heap_resource => |h| {
                 if (e.t.get(i.ty) != .resource and e.t.get(i.ty) != .sampler) return .none;
                 if (e.profile.minor < 6) return e.unsupported("descriptor heaps need shader model 6.6", .{});
@@ -3181,7 +3185,7 @@ const Emitter = struct {
     }
 
     fn inputAt(e: *Emitter, k: u32, ty: TypeId, vertex: ?u32) Error!Lowered {
-        const entry = e.m.entry.?;
+        const entry = e.entry;
         if (entry.stage == .compute or entry.stage == .mesh or entry.stage == .amplification) return e.computeInput(k, ty);
         const el = entry.inputs.items[k];
         const se = if (e.in_elem[k]) |ei| &e.sig_in[ei] else return e.systemValueInput(el.semantic, ty);
@@ -3204,7 +3208,7 @@ const Emitter = struct {
     }
 
     fn output(e: *Emitter, frame: *Frame, k: u32, value: Ref) Error!void {
-        const el = e.m.entry.?.outputs.items[k];
+        const el = e.entry.outputs.items[k];
         const se = if (e.out_elem[k]) |ei| &e.sig_out[ei] else return e.unsupported("output '{s}' is not supported yet", .{el.semantic});
         const vals = try e.scalars(frame, value);
         const i32t = try e.dm.intType(32);
@@ -3231,7 +3235,7 @@ const Emitter = struct {
     /// A domain shader's patch constant (or a system value read with its
     /// own intrinsic).
     fn patchInput(e: *Emitter, k: u32, ty: TypeId) Error!Lowered {
-        const el = e.m.entry.?.patch_constants.items[k];
+        const el = e.entry.patch_constants.items[k];
         const se = if (e.pc_elem[k]) |ei| &e.sig_pc[ei] else return e.systemValueInput(el.semantic, ty);
         const i32t = try e.dm.intType(32);
         const i8t = try e.dm.intType(8);
@@ -3251,7 +3255,7 @@ const Emitter = struct {
     /// A patch constant written by the hull shader's patch constant
     /// function.
     fn patchOutput(e: *Emitter, frame: *Frame, k: u32, value: Ref) Error!void {
-        const el = e.m.entry.?.patch_constants.items[k];
+        const el = e.entry.patch_constants.items[k];
         const se = if (e.pc_elem[k]) |ei| &e.sig_pc[ei] else return e.unsupported("patch constant '{s}' is not supported yet", .{el.semantic});
         const vals = try e.scalars(frame, value);
         const i32t = try e.dm.intType(32);
@@ -3270,7 +3274,7 @@ const Emitter = struct {
     /// An output control point of the hull shader, read by its patch
     /// constant function.
     fn outputControlPoint(e: *Emitter, k: u32, ty: TypeId, point: u32) Error!Lowered {
-        const el = e.m.entry.?.outputs.items[k];
+        const el = e.entry.outputs.items[k];
         const se = if (e.out_elem[k]) |ei| &e.sig_out[ei] else return e.unsupported("output '{s}' is not supported yet", .{el.semantic});
         const i32t = try e.dm.intType(32);
         const i8t = try e.dm.intType(8);
@@ -3462,7 +3466,7 @@ const Emitter = struct {
             _ = try e.callOp(fn_i, void_ty, &.{ try e.i32Const(169), index, vals[0], vals[1], v2 });
             return;
         }
-        const entry = e.m.entry.?;
+        const entry = e.entry;
         const els = if (m.kind == .vertices) entry.outputs.items else entry.patch_constants.items;
         const map = if (m.kind == .vertices) e.out_elem else e.pc_elem;
         const sig = if (m.kind == .vertices) e.sig_out else e.sig_pc;
@@ -3491,7 +3495,7 @@ const Emitter = struct {
     }
 
     fn computeInput(e: *Emitter, k: u32, ty: TypeId) Error!Lowered {
-        const el = e.m.entry.?.inputs.items[k];
+        const el = e.entry.inputs.items[k];
         const eqi = std.ascii.eqlIgnoreCase;
         const i32t = try e.dm.intType(32);
         const n = try e.flatCount(ty);
@@ -3537,7 +3541,7 @@ const Emitter = struct {
         if (e.uses_typed_uav_load) flags |= 1 << 13;
         // Resources may not alias (DXIL 1.7+, when UAVs are used).
         if (uavs > 0 and e.profile.minor >= 7) flags |= 1 << 33;
-        const stage = e.m.entry.?.stage;
+        const stage = e.entry.stage;
         if (uavs > 0 and (stage == .vertex or stage == .geometry or stage == .hull or stage == .domain)) flags |= 1 << 16;
         for (e.sig_out) |el| switch (el.kind) {
             .render_target_array_index, .viewport_array_index => if (stage == .vertex) {

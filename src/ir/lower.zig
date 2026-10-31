@@ -33,17 +33,54 @@ pub const Error = Allocator.Error || error{Unsupported};
 /// not handle yet fail with `error.Unsupported` after reporting why.
 pub fn lowerUnit(arena: Allocator, s: *Sema, opts: Options) Error!ir.Module {
     var l: Lowerer = .{ .arena = arena, .s = s, .m = .{ .arena = arena, .types = &s.types } };
+    if (opts.stage == .library) {
+        // Every function with a shader attribute, in declaration order.
+        for (s.all_functions.items) |f| {
+            if (f.owner != null or !f.defined) continue;
+            const stage = for (f.decl.attrs) |a| {
+                if (!std.ascii.eqlIgnoreCase(a.name, "shader") or a.args.len != 1 or a.args[0].kind != .string_lit) continue;
+                const lit = a.args[0].kind.string_lit;
+                break stageNamed(lit[1 .. lit.len - 1]) orelse {
+                    l.unsupported(a.loc, "{s} shaders are not supported yet", .{lit});
+                    return error.Unsupported;
+                };
+            } else continue;
+            try l.lowerEntry(f, f.name, stage);
+        }
+        for (s.all_functions.items) |f| {
+            if (f.owner != null or !f.defined or !f.decl.quals.@"export" or f.decl.quals.static) continue;
+            l.cur_entry = 0;
+            const fi = try l.functionIndex(f);
+            try l.drain();
+            try l.m.exports.append(l.arena, fi);
+        }
+        if (l.m.entries.items.len == 0 and l.m.exports.items.len == 0) {
+            l.unsupported(.none, "libraries without shader entry points or exported functions", .{});
+            return error.Unsupported;
+        }
+        return l.m;
+    }
     const entry_fn = for (s.all_functions.items) |f| {
         if (f.owner == null and f.defined and std.mem.eql(u8, f.name, opts.entry)) break f;
     } else {
         l.unsupported(.none, "missing entry point definition", .{});
         return error.Unsupported;
     };
-    if (opts.stage == .geometry) try l.registerStreams(entry_fn);
-    const main = try l.functionIndex(entry_fn);
-    try l.drain();
-    try l.buildEntry(entry_fn, main, opts);
+    try l.lowerEntry(entry_fn, opts.entry, opts.stage);
     return l.m;
+}
+
+/// The stage a `[shader("...")]` attribute names.
+fn stageNamed(name: []const u8) ?ir.Stage {
+    const names = [_]struct { []const u8, ir.Stage }{
+        .{ "vertex", .vertex },               .{ "pixel", .pixel },           .{ "geometry", .geometry },
+        .{ "hull", .hull },                   .{ "domain", .domain },         .{ "compute", .compute },
+        .{ "mesh", .mesh },                   .{ "amplification", .amplification }, .{ "raygeneration", .raygeneration },
+        .{ "intersection", .intersection },   .{ "anyhit", .anyhit },         .{ "closesthit", .closesthit },
+        .{ "miss", .miss },                   .{ "callable", .callable },
+    };
+    for (names) |t| if (std.ascii.eqlIgnoreCase(name, t[0])) return t[1];
+    return null;
 }
 
 const Stream = struct { param: u32, ty: TypeId, first: u32, kind: @FieldType(types.Type, "stream") };
@@ -79,6 +116,24 @@ const Lowerer = struct {
     /// The current method's object pointer.
     this_ptr: Ref = .none,
     ret_ty: TypeId = TypeTable.void_type,
+    /// The entry being lowered (index into the module's entries).
+    cur_entry: u32 = 0,
+    /// Initializer functions of static globals (made once).
+    inits: std.AutoHashMapUnmanaged(*const Variable, u32) = .empty,
+
+    /// Lowers one entry point and what it reaches (functions shared with
+    /// earlier entries are already lowered).
+    fn lowerEntry(l: *Lowerer, f: *const semamod.Function, name: []const u8, stage: ir.Stage) Error!void {
+        l.cur_entry = @intCast(l.m.entries.items.len);
+        l.early_outputs = .empty;
+        l.streams = .empty;
+        l.entry_fn = null;
+        l.mesh_payload = null;
+        if (stage == .geometry) try l.registerStreams(f);
+        const main = try l.functionIndex(f);
+        try l.drain();
+        try l.buildEntry(f, main, .{ .entry = name, .stage = stage });
+    }
 
     fn unsupported(l: *Lowerer, loc: ast.Loc, comptime fmt: []const u8, args: anytype) void {
         _ = l.s.diags.report(.{ .severity = .@"error", .loc = loc }, "code generation: " ++ fmt, args);
@@ -102,7 +157,7 @@ const Lowerer = struct {
             if (l.s.types.get(p.type) == .stream) continue;
             try params.append(l.arena, .{ .name = p.name, .ty = l.irType(p.type), .by_ref = p.dir != .in });
         }
-        const i = try l.m.addFunction(.{ .name = f.name, .params = params.items, .ret = f.ret });
+        const i = try l.m.addFunction(.{ .name = f.name, .params = params.items, .ret = f.ret, .entry = l.cur_entry });
         try l.funcs.put(l.arena, f, i);
         try l.pending.append(l.arena, f);
         return i;
@@ -400,7 +455,7 @@ const Lowerer = struct {
                     try l.vars.put(l.arena, variable, try l.b.add(.{ .op = .{ .global = gi }, .ty = glob.ty, .ptr = glob.space }));
                     return;
                 }
-                if (v.init == null and isObject(&l.s.types, variable.type)) {
+                if (v.init == null and isObject(&l.s.types, variable.type) and !isRayQuery(&l.s.types, variable.type)) {
                     l.unsupported(d.loc, "uninitialized local resource '{s}' is not supported yet", .{variable.name});
                     return error.Unsupported;
                 }
@@ -878,6 +933,10 @@ const Lowerer = struct {
 
     fn construct(l: *Lowerer, e: *ast.Expr, ty: TypeId, args: []const *ast.Expr) Error!Ref {
         const t = l.types();
+        if (args.len == 0 and isRayQuery(t, ty)) {
+            // A new query object.
+            return l.b.load(try l.b.add(.{ .op = .local_var, .ty = ty, .ptr = .function }));
+        }
         var comps: std.ArrayList(Ref) = .empty;
         for (args) |a| try l.flatten(try l.rvalue(a), &comps);
         if (comps.items.len == 0) return l.fail(e, "this constructor");
@@ -1473,7 +1532,7 @@ const Lowerer = struct {
     /// each into its own function (an initializer may use earlier statics,
     /// which then need initializing too). Returns them by global.
     fn staticInits(l: *Lowerer) Error!std.AutoHashMapUnmanaged(*const Variable, u32) {
-        var inits: std.AutoHashMapUnmanaged(*const Variable, u32) = .empty;
+        const inits = &l.inits;
         var changed = true;
         while (changed) {
             changed = false;
@@ -1481,7 +1540,7 @@ const Lowerer = struct {
                 const init_e = v.init orelse continue;
                 if (!l.globals.contains(v) or inits.contains(v)) continue;
                 if (isObject(&l.s.types, v.type)) continue;
-                const fi = try l.m.addFunction(.{ .name = try std.fmt.allocPrint(l.arena, "init.{s}", .{v.name}), .params = &.{}, .ret = v.type });
+                const fi = try l.m.addFunction(.{ .name = try std.fmt.allocPrint(l.arena, "init.{s}", .{v.name}), .params = &.{}, .ret = v.type, .entry = l.cur_entry });
                 try inits.put(l.arena, v, fi);
                 l.b = .{ .m = &l.m, .f = l.m.functions.items[fi] };
                 l.vars = .empty;
@@ -1494,7 +1553,7 @@ const Lowerer = struct {
                 changed = true;
             }
         }
-        return inits;
+        return inits.*;
     }
 
     /// One leaf at a time of a signature value of type `ty`: registers
@@ -1722,7 +1781,7 @@ const Lowerer = struct {
         };
         const pci = try l.functionIndex(pcf);
         try l.drain();
-        const wrapper = try l.m.addFunction(.{ .name = try std.fmt.allocPrint(l.arena, "{s}.wrapper", .{name}), .params = &.{}, .ret = TypeTable.void_type });
+        const wrapper = try l.m.addFunction(.{ .name = try std.fmt.allocPrint(l.arena, "{s}.wrapper", .{name}), .params = &.{}, .ret = TypeTable.void_type, .entry = l.cur_entry });
         l.b = .{ .m = &l.m, .f = l.m.functions.items[wrapper] };
         l.b.setBlock(try l.b.newBlock());
         const args = try l.arena.alloc(Ref, pcf.params.len);
@@ -1773,7 +1832,7 @@ const Lowerer = struct {
             .line => .line,
             .triangle => .triangle,
         };
-        const wrapper = try l.m.addFunction(.{ .name = opts.entry, .params = &.{}, .ret = TypeTable.void_type });
+        const wrapper = try l.m.addFunction(.{ .name = opts.entry, .params = &.{}, .ret = TypeTable.void_type, .entry = l.cur_entry });
         l.b = .{ .m = &l.m, .f = l.m.functions.items[wrapper] };
         l.b.setBlock(try l.b.newBlock());
         for (l.s.static_globals.items) |v| if (inits.get(v)) |fi| {
@@ -1784,6 +1843,8 @@ const Lowerer = struct {
         };
         const args = try l.arena.alloc(Ref, f.params.len);
         const locals = try l.arena.alloc(Ref, f.params.len);
+        const ray_srcs = try l.arena.alloc(Ref, f.params.len);
+        @memset(ray_srcs, .none);
         var n_args: usize = 0;
         if (opts.stage == .mesh) for (f.decl.attrs) |a| {
             if (std.ascii.eqlIgnoreCase(a.name, "outputtopology") and a.args.len == 1 and a.args[0].kind == .string_lit) {
@@ -1861,6 +1922,15 @@ const Lowerer = struct {
                 args[i] = try l.b.load(locals[i]);
                 continue;
             }
+            if (opts.stage.isRayTracing()) {
+                // Payload, hit attributes or callable data: copied in from
+                // (and inout ones back to) the shader's incoming storage.
+                const kind: ir.RayIncoming = if (opts.stage == .callable) .callable else if (i == 0) .payload else .attributes;
+                ray_srcs[i] = try l.b.add(.{ .op = .{ .ray_incoming = kind }, .ty = p.type, .ptr = .ray });
+                try l.b.store(locals[i], try l.b.load(ray_srcs[i]));
+                args[i] = if (p.dir == .in) try l.b.load(locals[i]) else locals[i];
+                continue;
+            }
             if (p.dir != .out) {
                 const v = try l.entryInput(&entry, p.type, semanticOf(pd.semantics), paramAttrs(pd.quals), pd.name_loc, pd.name);
                 try l.b.store(locals[i], v);
@@ -1876,6 +1946,10 @@ const Lowerer = struct {
             if (p.dir == .in or l.s.types.get(p.type) == .stream) continue;
             if (l.b.f.inst(locals[i]).ptr == .mesh) continue;
             const v = try l.b.load(locals[i]);
+            if (ray_srcs[i] != .none) {
+                try l.b.store(ray_srcs[i], v);
+                continue;
+            }
             try l.entryOutput(&entry, p.type, semanticOf(pd.semantics), paramAttrs(pd.quals), v, pd.name_loc, pd.name);
         }
         l.b.terminate(.{ .ret = .none });
@@ -1892,7 +1966,7 @@ const Lowerer = struct {
         }
         // The HLSL entry keeps its name with a prefix (as dxc's SPIR-V).
         l.m.functions.items[main].name = try std.fmt.allocPrint(l.arena, "src.{s}", .{opts.entry});
-        l.m.entry = entry;
+        try l.m.entries.append(l.arena, entry);
     }
 };
 
@@ -1909,6 +1983,14 @@ pub fn saturatingInt(f: f64) i64 {
 /// parameter.
 fn isMethod(f: *const semamod.Function) bool {
     return f.owner != null and !f.decl.quals.static;
+}
+
+/// RayQuery objects: stateful, they live in function storage.
+pub fn isRayQuery(t: *TypeTable, ty: TypeId) bool {
+    return switch (t.get(ty)) {
+        .resource => |r| r.kind == .other and std.mem.eql(u8, r.name, "RayQuery"),
+        else => false,
+    };
 }
 
 /// Resources, samplers and arrays of them.

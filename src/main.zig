@@ -236,6 +236,7 @@ fn run(cli: Cli, arena: std.mem.Allocator, args: []const [:0]const u8, stdout: *
             .major = if (profile) |p| p.major else 6,
             .minor = if (profile) |p| p.minor else 0,
             .spirv = opts.spirv,
+            .spirv_minor = if (zdxc.spirv.emit.TargetEnv.parse(opts.target_env)) |t| t.minor else 0,
             .enable_16bit = opts.enable_16bit,
         });
         var out: Io.Writer.Allocating = .init(arena);
@@ -258,7 +259,7 @@ fn run(cli: Cli, arena: std.mem.Allocator, args: []const [:0]const u8, stdout: *
                         .root = opts.entry,
                     });
                     try sema.checkUnit(tu);
-                    if (!opts.sema and !diags.hasErrors() and profile != null and !is_lib) {
+                    if (!opts.sema and !diags.hasErrors() and profile != null) {
                         const stage: zdxc.ir.ir.Stage = switch (profile.?.kind) {
                             .vertex => .vertex,
                             .pixel => .pixel,

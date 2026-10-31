@@ -38,7 +38,11 @@ pub const BlockId = enum(u32) {
 };
 
 /// Where a pointer points.
-pub const Space = enum { none, function, private, groupshared, resource, input, output, cbuffer, mesh };
+pub const Space = enum { none, function, private, groupshared, resource, input, output, cbuffer, mesh, ray };
+
+/// Ray tracing shader storage an entry receives: the incoming payload,
+/// the hit attributes and the incoming callable data.
+pub const RayIncoming = enum { payload, attributes, callable };
 
 pub const BinaryOp = enum {
     add,
@@ -122,6 +126,9 @@ pub const Op = union(enum) {
     /// `ResourceDescriptorHeap[index]` / `SamplerDescriptorHeap[index]`
     /// as a resource of the instruction's type.
     heap_resource: struct { index: Ref, sampler: bool },
+    /// Ray tracing entries: pointer (`ray` space) to the storage of an
+    /// incoming value of the instruction's type.
+    ray_incoming: RayIncoming,
     patch_output: struct { element: u32, value: Ref },
     output_vertex: struct { element: u32, vertex: u32 },
     /// Geometry shaders: emit the vertex written to the outputs of a stream,
@@ -178,6 +185,9 @@ pub const Function = struct {
     name: []const u8,
     params: []const Param,
     ret: TypeId,
+    /// The entry (index into `Module.entries`) the function was lowered
+    /// for first.
+    entry: u32 = 0,
     insts: std.ArrayList(Inst) = .empty,
     blocks: std.ArrayList(Block) = .empty,
 
@@ -208,7 +218,27 @@ pub const Global = struct {
     tbuffer: bool = false,
 };
 
-pub const Stage = enum { vertex, pixel, geometry, hull, domain, compute, mesh, amplification, library };
+pub const Stage = enum {
+    vertex,
+    pixel,
+    geometry,
+    hull,
+    domain,
+    compute,
+    mesh,
+    amplification,
+    library,
+    raygeneration,
+    intersection,
+    anyhit,
+    closesthit,
+    miss,
+    callable,
+
+    pub fn isRayTracing(s: Stage) bool {
+        return @backingInt(s) >= @backingInt(Stage.raygeneration);
+    }
+};
 
 /// One entry-point input or output (a semantic on a parameter, field or
 /// the return value).
@@ -294,7 +324,10 @@ pub const Module = struct {
     globals: std.ArrayList(Global) = .empty,
     /// By pointer: lowering appends callees while building a caller.
     functions: std.ArrayList(*Function) = .empty,
-    entry: ?Entry = null,
+    /// Entry points (one, or a library's shaders in declaration order).
+    entries: std.ArrayList(Entry) = .empty,
+    /// Libraries: functions exported by name (`export`).
+    exports: std.ArrayList(u32) = .empty,
 
     pub fn addFunction(m: *Module, f: Function) !u32 {
         const p = try m.arena.create(Function);
@@ -448,6 +481,7 @@ fn dumpInst(m: *const Module, f: *const Function, r: Ref, w: *std.Io.Writer) !vo
         .patch_input => |k| try w.print("patch input {d}", .{k}),
         .mesh_output => |k| try w.print("mesh output {s}", .{@tagName(k)}),
         .mesh_payload => try w.print("mesh payload", .{}),
+        .ray_incoming => |k| try w.print("ray incoming {s}", .{@tagName(k)}),
         .heap_resource => |h| try w.print("{s}[%{d}]", .{ if (h.sampler) "SamplerDescriptorHeap" else "ResourceDescriptorHeap", h.index.index() }),
         .patch_output => |x| try w.print("patch output {d} = %{d}", .{ x.element, x.value.index() }),
         .output_vertex => |x| try w.print("output {d} vertex {d}", .{ x.element, x.vertex }),

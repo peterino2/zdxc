@@ -26,10 +26,11 @@ pub const Error = Allocator.Error || error{Unsupported};
 /// Marks a binding that is a recipe (see Emitter.resourceBinding).
 const recipe_tag: u32 = 0x8000_0000;
 
-const StorageClass = enum(u32) { uniform_constant = 0, input = 1, uniform = 2, output = 3, workgroup = 4, private = 6, function = 7, image = 11, storage_buffer = 12, task_payload_workgroup = 5402 };
+const StorageClass = enum(u32) { uniform_constant = 0, input = 1, uniform = 2, output = 3, workgroup = 4, private = 6, function = 7, image = 11, storage_buffer = 12, task_payload_workgroup = 5402, callable_data_khr = 5328, incoming_callable_data_khr = 5329, ray_payload_khr = 5338, hit_attribute_khr = 5339, incoming_ray_payload_khr = 5342, shader_record_buffer_khr = 5343 };
 
 const Capability = enum(u32) {
     shader = 1,
+    linkage = 5,
     geometry = 2,
     tessellation = 3,
     float16 = 9,
@@ -68,6 +69,12 @@ const Capability = enum(u32) {
     storage_image_write_without_format = 56,
     group_non_uniform = 61,
     mesh_shading_ext = 5283,
+    ray_tracing_khr = 4479,
+    ray_query_khr = 4472,
+    ray_traversal_primitive_culling_khr = 4478,
+    ray_tracing_position_fetch_khr = 5336,
+    ray_query_position_fetch_khr = 5391,
+    ray_tracing_opacity_micromap_ext = 5381,
     group_non_uniform_vote = 62,
     group_non_uniform_arithmetic = 63,
     group_non_uniform_ballot = 64,
@@ -87,13 +94,15 @@ const Capability = enum(u32) {
 pub const TargetEnv = struct {
     /// SPIR-V minor version (1.x).
     minor: u8,
+    /// A universal (not Vulkan) environment: linkage is allowed.
+    universal: bool = false,
 
     pub fn parse(s: []const u8) ?TargetEnv {
         const table = [_]struct { []const u8, u8 }{
             .{ "vulkan1.0", 0 },           .{ "vulkan1.1", 3 }, .{ "vulkan1.1spirv1.3", 3 }, .{ "vulkan1.1spirv1.4", 4 },
             .{ "vulkan1.2", 5 },           .{ "vulkan1.3", 6 }, .{ "vulkan1.4", 6 },         .{ "universal1.5", 5 },
         };
-        for (table) |t| if (std.mem.eql(u8, s, t[0])) return .{ .minor = t[1] };
+        for (table) |t| if (std.mem.eql(u8, s, t[0])) return .{ .minor = t[1], .universal = std.mem.startsWith(u8, s, "universal") };
         return null;
     }
 };
@@ -101,7 +110,7 @@ pub const TargetEnv = struct {
 pub fn emit(gpa: Allocator, m: *const ir.Module, diags: *diag.Diagnostics, env: TargetEnv) Error![]u8 {
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
-    var e: Emitter = .{ .arena = arena_state.allocator(), .b = .init(gpa), .m = m, .t = m.types, .diags = diags, .spv_minor = env.minor };
+    var e: Emitter = .{ .arena = arena_state.allocator(), .b = .init(gpa), .m = m, .t = m.types, .diags = diags, .spv_minor = env.minor, .universal = env.universal };
     defer e.b.deinit();
     try e.module();
     return e.b.finish(0x00010000 | (@as(u32, env.minor) << 8));
@@ -115,6 +124,7 @@ const Emitter = struct {
     diags: *diag.Diagnostics,
     /// SPIR-V 1.x.
     spv_minor: u8 = 0,
+    universal: bool = false,
 
     value_types: std.AutoHashMapUnmanaged(TypeId, Id) = .empty,
     /// Explicitly laid out variants of arrays and structs (buffers).
@@ -144,12 +154,12 @@ const Emitter = struct {
     /// on the heap's binding.
     heap_vars: std.AutoHashMapUnmanaged(struct { bool, Id }, Id) = .empty,
     heap_bindings: [2]u32 = .{ 0, 0 },
-    /// Compute derivatives' execution mode (0: none).
-    derivative_mode: u32 = 0,
     /// Image types by (sampled type, dim, arrayed, ms, sampled, format).
     image_types: std.AutoHashMapUnmanaged([6]u32, Id) = .empty,
     sampled_image_types: std.AutoHashMapUnmanaged(Id, Id) = .empty,
     sampler_type: Id = 0,
+    accel_type: Id = 0,
+    ray_query_type: Id = 0,
     counter_vars: []Id = &.{},
     builtin_inputs: std.AutoHashMapUnmanaged(u32, Id) = .empty,
     /// Per instruction (current function): texel places (`tex[i]`).
@@ -165,22 +175,27 @@ const Emitter = struct {
     cur_bindings: []const Id = &.{},
     /// Resource array elements bound to specialized parameters.
     recipes: std.ArrayList(struct { var_id: Id, ptr_ty: Id, indices: []const Id }) = .empty,
-    /// Entry inputs / outputs: interface variable and its value type.
-    inputs: []Interface = &.{},
-    outputs: []Interface = &.{},
-    patches: []Interface = &.{},
-    /// Mesh shaders: the primitive indices builtin and the payload
-    /// variable (both made on first use); amplification shaders: the
-    /// groupshared variable sent by DispatchMesh.
-    indices_var: Id = 0,
-    payload_var: Id = 0,
     payload_global: ?u32 = null,
     /// Per instruction (current function): places in mesh output arrays.
     mesh_places: std.AutoHashMapUnmanaged(u32, MeshPlace) = .empty,
     /// Parameters receiving mesh output arrays: not real parameters (the
     /// outputs are module variables); by function and parameter index.
     mesh_params: std.AutoHashMapUnmanaged(struct { *const ir.Function, u32 }, ir.MeshOutput) = .empty,
-    interface_ids: std.ArrayList(Id) = .empty,
+    /// Per entry: its interface state; `st` and `entry` are the current
+    /// entry's (the one the function being emitted was lowered for).
+    states: []EntryState = &.{},
+    st: *EntryState = undefined,
+    entry: *const ir.Entry = undefined,
+    /// Interface variables each function uses directly, and the functions
+    /// it calls (by function id), for the entries' interface lists.
+    fn_uses: std.AutoHashMapUnmanaged(Id, std.ArrayList(Id)) = .empty,
+    fn_calls: std.AutoHashMapUnmanaged(Id, std.ArrayList(Id)) = .empty,
+    cur_fn: Id = 0,
+    /// Ray tracing storage by (storage class, value type).
+    ray_vars: std.AutoHashMapUnmanaged(struct { StorageClass, TypeId }, Id) = .empty,
+    /// Next Location per ray tracing storage class (RayPayloadKHR,
+    /// CallableDataKHR).
+    ray_locations: std.AutoHashMapUnmanaged(StorageClass, u32) = .empty,
 
     // Per function.
     vals: []Id = &.{},
@@ -194,6 +209,21 @@ const Emitter = struct {
         /// shared by several elements, SampleMask), accessed element-wise.
         elem_array: bool = false,
         base: u32 = 0,
+    };
+    const EntryState = struct {
+        /// Entry inputs / outputs: interface variable and its value type.
+        inputs: []Interface = &.{},
+        outputs: []Interface = &.{},
+        patches: []Interface = &.{},
+        /// Interface variables made for the entry itself.
+        iface: std.ArrayList(Id) = .empty,
+        /// Compute derivatives' execution mode (0: none).
+        derivative_mode: u32 = 0,
+        /// Mesh shaders: the primitive indices builtin and the payload
+        /// variable (both made on first use); amplification shaders: the
+        /// groupshared variable sent by DispatchMesh.
+        indices_var: Id = 0,
+        payload_var: Id = 0,
     };
     const LayoutKey = struct { TypeId, layout.Rules, bool };
     const MeshPlace = struct { kind: ir.MeshOutput, index: Ref = .none, offset: u32 = 0, ty: TypeId };
@@ -564,37 +594,122 @@ const Emitter = struct {
 
     fn module(e: *Emitter) Error!void {
         const m = e.m;
-        const entry = m.entry orelse return e.unsupported("no entry point", .{});
+        if (m.entries.items.len == 0 and m.exports.items.len == 0) return e.unsupported("no entry point", .{});
         try e.b.emit(.debug_names, .source, &.{ 5, 600 }); // HLSL
         e.void_id = try e.typeId(TypeTable.void_type);
         try e.cap(.shader);
-        if (entry.stage == .geometry) try e.cap(.geometry);
-        if (entry.stage == .mesh or entry.stage == .amplification) {
-            if (e.spv_minor < 4) return e.unsupported("mesh and amplification shaders need SPIR-V 1.4 or later (-fspv-target-env=vulkan1.2 or later)", .{});
-            try e.cap(.mesh_shading_ext);
-            try e.extension("SPV_EXT_mesh_shader");
-            e.payload_global = e.dispatchPayloadGlobal();
-            try e.findMeshParams();
+        e.states = try e.arena.alloc(EntryState, @max(1, m.entries.items.len));
+        for (e.states) |*st| st.* = .{};
+        e.st = &e.states[0];
+        if (m.entries.items.len > 0) {
+            e.entry = &m.entries.items[0];
+        } else {
+            // Exports only: functions see no entry interface.
+            const none = try e.arena.create(ir.Entry);
+            none.* = .{ .func = 0, .name = "", .stage = .library };
+            e.entry = none;
+        }
+        // Vulkan has no linkage: exports are plain functions there.
+        const link = m.exports.items.len > 0 and e.universal;
+        if (m.entries.items.len == 0 and !link) return e.unsupported("libraries without entry points need a universal target environment (-fspv-target-env=universal1.5)", .{});
+        if (link) try e.cap(.linkage);
+        for (m.entries.items) |*entry| {
+            if (entry.stage == .geometry) try e.cap(.geometry);
+            if (entry.stage == .mesh or entry.stage == .amplification) {
+                if (e.spv_minor < 4) return e.unsupported("mesh and amplification shaders need SPIR-V 1.4 or later (-fspv-target-env=vulkan1.2 or later)", .{});
+                if (m.entries.items.len > 1) return e.unsupported("mesh and amplification shaders in libraries are not supported yet", .{});
+                try e.cap(.mesh_shading_ext);
+                try e.extension("SPV_EXT_mesh_shader");
+                e.payload_global = e.dispatchPayloadGlobal();
+                try e.findMeshParams();
+            }
+            if (entry.stage.isRayTracing()) {
+                if (e.spv_minor < 4) return e.unsupported("ray tracing shaders need SPIR-V 1.4 or later (-fspv-target-env=vulkan1.2 or later)", .{});
+                try e.cap(.ray_tracing_khr);
+                try e.extension("SPV_KHR_ray_tracing");
+            }
         }
 
         e.func_ids = try e.arena.alloc(Id, m.functions.items.len);
         for (e.func_ids) |*id| id.* = e.b.newId();
+        if (link) for (m.exports.items) |fi| {
+            if (e.hasResourceParams(m.functions.items[fi])) return e.unsupported("exported functions with resource parameters are not supported yet", .{});
+            try e.b.emitWithString(.annotations, .decorate, &.{ e.func_ids[fi], 41 }, m.functions.items[fi].name, &.{0}); // LinkageAttributes Export
+        };
 
         try e.emitGlobals();
-        try e.emitInterface(entry);
+        for (m.entries.items, 0..) |entry, k| {
+            e.setEntry(@intCast(k));
+            try e.emitInterface(entry);
+        }
 
         for (m.functions.items, e.func_ids) |f, id| {
+            e.setEntry(f.entry);
             if (!e.hasResourceParams(f)) try e.emitFunction(f, id, &.{});
         }
         var vi: usize = 0;
         while (vi < e.variants.items.len) : (vi += 1) {
             const v = e.variants.items[vi];
+            e.setEntry(m.functions.items[v.fi].entry);
             try e.emitFunction(m.functions.items[v.fi], v.id, v.bindings);
         }
 
         for (e.capabilities.keys()) |c| try e.b.emit(.capabilities, .capability, &.{@backingInt(c)});
         if (e.glsl != 0) try e.b.emitWithString(.ext_inst_imports, .ext_inst_import, &.{e.glsl}, "GLSL.std.450", &.{});
         try e.b.emit(.memory_model, .memory_model, &.{ 0, 1 }); // Logical GLSL450
+        for (m.entries.items, 0..) |*entry, k| {
+            e.setEntry(@intCast(k));
+            try e.entryPoint(entry);
+        }
+        for (m.functions.items, e.func_ids) |f, id| {
+            if (!e.hasResourceParams(f)) try e.b.emitWithString(.debug_names, .name, &.{id}, f.name, &.{});
+        }
+    }
+
+    fn recordCall(e: *Emitter, callee: Id) Error!void {
+        const gop = try e.fn_calls.getOrPut(e.arena, e.cur_fn);
+        if (!gop.found_existing) gop.value_ptr.* = .empty;
+        try gop.value_ptr.append(e.arena, callee);
+    }
+
+    fn setEntry(e: *Emitter, k: u32) void {
+        e.st = &e.states[k];
+        if (k < e.m.entries.items.len) e.entry = &e.m.entries.items[k];
+    }
+
+    /// Records that the current function (or, outside functions, the
+    /// current entry) uses interface variable `v`.
+    fn useVar(e: *Emitter, v: Id) Error!void {
+        const list = if (e.cur_fn == 0) &e.st.iface else blk: {
+            const gop = try e.fn_uses.getOrPut(e.arena, e.cur_fn);
+            if (!gop.found_existing) gop.value_ptr.* = .empty;
+            break :blk gop.value_ptr;
+        };
+        for (list.items) |x| if (x == v) return;
+        try list.append(e.arena, v);
+    }
+
+    /// The entry's interface: its own variables and those of every
+    /// function it reaches (from SPIR-V 1.4 every global it may use).
+    fn entryInterface(e: *Emitter, wrapper: Id) Error![]const Id {
+        var out: std.AutoArrayHashMapUnmanaged(Id, void) = .empty;
+        for (e.st.iface.items) |v| try out.put(e.arena, v, {});
+        var seen: std.AutoHashMapUnmanaged(Id, void) = .empty;
+        var stack: std.ArrayList(Id) = .empty;
+        try stack.append(e.arena, wrapper);
+        while (stack.pop()) |fid| {
+            if ((try seen.getOrPut(e.arena, fid)).found_existing) continue;
+            if (e.fn_uses.get(fid)) |us| for (us.items) |v| try out.put(e.arena, v, {});
+            if (e.fn_calls.get(fid)) |cs| try stack.appendSlice(e.arena, cs.items);
+        }
+        if (e.spv_minor >= 4) {
+            for (e.global_vars) |v| if (v != 0) try out.put(e.arena, v, {});
+            for (e.counter_vars) |v| if (v != 0) try out.put(e.arena, v, {});
+        }
+        return out.keys();
+    }
+
+    fn entryPoint(e: *Emitter, entry: *const ir.Entry) Error!void {
         const model: u32 = switch (entry.stage) {
             .vertex => 0,
             .hull => 1,
@@ -604,15 +719,16 @@ const Emitter = struct {
             .compute => 5,
             .amplification => 5364, // TaskEXT
             .mesh => 5365, // MeshEXT
+            .raygeneration => 5313, // RayGenerationKHR
+            .intersection => 5314,
+            .anyhit => 5315,
+            .closesthit => 5316,
+            .miss => 5317,
+            .callable => 5318,
             .library => return e.unsupported("library targets are not supported", .{}),
         };
         const wrapper = e.func_ids[entry.wrapper];
-        // From SPIR-V 1.4 the interface lists every global the entry uses.
-        if (e.spv_minor >= 4) {
-            for (e.global_vars) |v| if (v != 0) try e.interface_ids.append(e.arena, v);
-            for (e.counter_vars) |v| if (v != 0) try e.interface_ids.append(e.arena, v);
-        }
-        try e.b.emitWithString(.entry_points, .entry_point, &.{ model, wrapper }, entry.name, e.interface_ids.items);
+        try e.b.emitWithString(.entry_points, .entry_point, &.{ model, wrapper }, entry.name, try e.entryInterface(wrapper));
         switch (entry.stage) {
             .compute => try e.b.emit(.execution_modes, .execution_mode, &.{ wrapper, 17, entry.num_threads[0], entry.num_threads[1], entry.num_threads[2] }),
             .geometry => {
@@ -672,10 +788,7 @@ const Emitter = struct {
             },
             else => {},
         }
-        if (e.derivative_mode != 0) try e.b.emit(.execution_modes, .execution_mode, &.{ wrapper, e.derivative_mode });
-        for (m.functions.items, e.func_ids) |f, id| {
-            if (!e.hasResourceParams(f)) try e.b.emitWithString(.debug_names, .name, &.{id}, f.name, &.{});
-        }
+        if (e.st.derivative_mode != 0) try e.b.emit(.execution_modes, .execution_mode, &.{ wrapper, e.st.derivative_mode });
     }
 
     fn domainMode(d: ir.Domain) u32 {
@@ -1034,15 +1147,15 @@ const Emitter = struct {
     }
 
     fn emitInterface(e: *Emitter, entry: ir.Entry) Error!void {
-        e.inputs = try e.arena.alloc(Interface, entry.inputs.items.len);
-        e.outputs = try e.arena.alloc(Interface, entry.outputs.items.len);
-        e.patches = try e.arena.alloc(Interface, entry.patch_constants.items.len);
+        e.st.inputs = try e.arena.alloc(Interface, entry.inputs.items.len);
+        e.st.outputs = try e.arena.alloc(Interface, entry.outputs.items.len);
+        e.st.patches = try e.arena.alloc(Interface, entry.patch_constants.items.len);
         if (entry.stage == .hull or entry.stage == .domain) try e.cap(.tessellation);
         // Variables needing a Location, assigned once all exist.
         const Located = struct { var_id: Id, key: []const u8, count: u32, input: bool, target: ?u32 };
         var located: std.ArrayList(Located) = .empty;
         const lists = [_][]const ir.SigElement{ entry.inputs.items, entry.outputs.items, entry.patch_constants.items };
-        const ifaces = [_][]Interface{ e.inputs, e.outputs, e.patches };
+        const ifaces = [_][]Interface{ e.st.inputs, e.st.outputs, e.st.patches };
         for (lists, ifaces, 0..) |els, out, li| {
             const patch = li == 2;
             const input = if (patch) entry.stage == .domain else li == 0;
@@ -1079,7 +1192,7 @@ const Emitter = struct {
                 try e.b.emit(.types_globals, .variable, &.{ try e.pointerType(sc, try e.typeId(arr)), v, @backingInt(sc) });
                 try e.b.emit(.annotations, .decorate, &.{ v, 11, if (kind == 0) 3 else 4 }); // BuiltIn ClipDistance / CullDistance
                 try e.b.emitWithString(.debug_names, .name, &.{v}, if (kind == 0) "gl_ClipDistance" else "gl_CullDistance", &.{});
-                try e.interface_ids.append(e.arena, v);
+                try e.useVar(v);
                 clip_vars[kind] = v;
             }
             for (els, out, 0..) |el, *iface, ek| {
@@ -1143,7 +1256,7 @@ const Emitter = struct {
                 const name = try std.fmt.allocPrint(e.arena, "{s}.var.{s}{d}", .{ if (input) "in" else "out", el.semantic, el.semantic_index });
                 try e.b.emitWithString(.debug_names, .name, &.{var_id}, name, &.{});
                 iface.* = .{ .var_id = var_id, .ty = vty, .elem_array = bi != null and e.t.get(bi.?.ty) == .array };
-                try e.interface_ids.append(e.arena, var_id);
+                try e.useVar(var_id);
             }
         }
         // Locations in declaration order, except hull outputs and domain
@@ -1250,6 +1363,8 @@ const Emitter = struct {
 
     fn emitFunction(e: *Emitter, f: *const ir.Function, fn_id: Id, bindings: []const Id) Error!void {
         e.f = f;
+        e.cur_fn = fn_id;
+        defer e.cur_fn = 0;
         e.cur_bindings = bindings;
         e.texel_places = .empty;
         e.mesh_places = .empty;
@@ -1262,6 +1377,10 @@ const Emitter = struct {
         for (f.params, 0..) |p, k| {
             if (bindings.len > 0 and bindings[k] != 0) continue;
             if (e.mesh_params.contains(.{ f, @intCast(k) })) continue;
+            if (isRayQuery(e.t, p.ty)) {
+                try params.append(e.arena, try e.pointerType(.function, try e.rayQueryType()));
+                continue;
+            }
             const t = try e.typeId(p.ty);
             try params.append(e.arena, if (p.by_ref) try e.pointerType(.function, t) else t);
         }
@@ -1304,6 +1423,13 @@ const Emitter = struct {
             if (oi == 0) {
                 // OpVariables must open the first block.
                 for (f.insts.items, 0..) |inst, i| if (inst.op == .local_var) {
+                    if (isRayQuery(e.t, inst.ty)) {
+                        try e.cap(.ray_query_khr);
+                        try e.extension("SPV_KHR_ray_query");
+                        e.vals[i] = e.b.newId();
+                        try e.b.emit(.functions, .variable, &.{ try e.pointerType(.function, try e.rayQueryType()), e.vals[i], @backingInt(StorageClass.function) });
+                        continue;
+                    }
                     // Resource locals alias the one resource stored in them.
                     if (isResourceType(e.t, inst.ty)) continue;
                     const ptr = try e.pointerType(.function, try e.typeId(inst.ty));
@@ -1363,7 +1489,7 @@ const Emitter = struct {
     /// For the hull shader's entry wrapper: the patch constant wrapper it
     /// calls before returning.
     fn hullEpilogue(e: *Emitter, fn_id: Id) ?Id {
-        const entry = e.m.entry.?;
+        const entry = e.entry;
         if (entry.stage != .hull or fn_id != e.func_ids[entry.wrapper]) return null;
         return e.func_ids[entry.patch_wrapper orelse return null];
     }
@@ -1481,6 +1607,11 @@ const Emitter = struct {
         const ri = r.index();
         switch (i.op) {
             .constant, .param, .local_var => {},
+            .ray_incoming => |k| e.vals[ri] = try e.rayVar(switch (k) {
+                .payload => .incoming_ray_payload_khr,
+                .attributes => .hit_attribute_khr,
+                .callable => .incoming_callable_data_khr,
+            }, i.ty),
             .global => |g| {
                 e.vals[ri] = e.global_vars[g];
                 e.ptr_layouts[ri] = switch (e.m.globals.items[g].space) {
@@ -1519,6 +1650,11 @@ const Emitter = struct {
                     return e.imageWrite(tp.res, e.val(tp.coord), e.val(s.value));
                 }
                 const target = f.inst(s.ptr);
+                if (target.op == .local_var and isRayQuery(e.t, target.ty)) {
+                    // A copy of a RayQuery is the same query object.
+                    e.vals[s.ptr.index()] = e.val(s.value);
+                    return;
+                }
                 if (target.op == .local_var and isResourceType(e.t, target.ty)) {
                     const old = e.vals[s.ptr.index()];
                     if (old != 0 and old != e.val(s.value)) return e.unsupported("assigning different resources to one variable is not supported yet", .{});
@@ -1814,11 +1950,14 @@ const Emitter = struct {
                 if (e.hasResourceParams(callee)) {
                     const bindings = try e.arena.alloc(Id, c.args.len);
                     for (callee.params, c.args, bindings) |p, a, *bd| bd.* = if (isResourceType(e.t, p.ty)) try e.resourceBinding(a) else 0;
-                    try ops.append(e.arena, try e.variantFor(c.func, bindings));
+                    const vid = try e.variantFor(c.func, bindings);
+                    try e.recordCall(vid);
+                    try ops.append(e.arena, vid);
                     for (callee.params, c.args) |p, a| if (!isResourceType(e.t, p.ty)) try ops.append(e.arena, e.val(a));
                     e.vals[ri] = try e.op1(.function_call, i.ty, ops.items);
                     return;
                 }
+                try e.recordCall(e.func_ids[c.func]);
                 try ops.append(e.arena, e.func_ids[c.func]);
                 for (c.args, 0..) |a, k| {
                     if (e.mesh_params.contains(.{ callee, @intCast(k) })) continue;
@@ -1836,6 +1975,10 @@ const Emitter = struct {
                     try e.b.emit(.functions, .emit_mesh_tasks_ext, &.{ e.val(c.args[0]), e.val(c.args[1]), e.val(c.args[2]), e.val(c.args[3]) });
                     // A terminator: what follows is unreachable.
                     try e.b.emit(.functions, .label, &.{e.b.newId()});
+                    return;
+                }
+                if (try e.rayIntrinsic(c.name, i.ty, c.args)) |id| {
+                    e.vals[ri] = id;
                     return;
                 }
                 e.vals[ri] = try e.intrinsic(c.name, i.ty, c.args);
@@ -1859,13 +2002,13 @@ const Emitter = struct {
                 try e.b.emit(.functions, .store, &.{ ptr, v });
             },
             .method => |x| e.vals[ri] = try e.method(x.name, x.res, x.args, i.ty),
-            .input => |k| e.vals[ri] = try e.loadInterface(e.inputs[k], .input, i.ty),
+            .input => |k| e.vals[ri] = try e.loadInterface(e.st.inputs[k], .input, i.ty),
             .input_vertex => |x| {
-                const iface = e.inputs[x.element];
+                const iface = e.st.inputs[x.element];
                 const ptr = try e.opRaw(.access_chain, try e.pointerType(.input, try e.typeId(iface.ty)), &.{ iface.var_id, try e.constUint(x.vertex) });
                 e.vals[ri] = try e.reshape(try e.op1(.load, iface.ty, &.{ptr}), iface.ty, i.ty);
             },
-            .patch_input => |k| e.vals[ri] = try e.loadInterface(e.patches[k], .input, i.ty),
+            .patch_input => |k| e.vals[ri] = try e.loadInterface(e.st.patches[k], .input, i.ty),
             .mesh_output => try e.mesh_places.put(e.arena, ri, .{ .kind = i.op.mesh_output, .ty = i.ty }),
             .heap_resource => |h| {
                 if (e.t.get(i.ty) != .resource and e.t.get(i.ty) != .sampler) return;
@@ -1881,7 +2024,7 @@ const Emitter = struct {
                     try e.b.emit(.annotations, .decorate, &.{ v, 34, 0 }); // DescriptorSet
                     try e.b.emit(.annotations, .decorate, &.{ v, 33, e.heap_bindings[@intFromBool(h.sampler)] }); // Binding
                     try e.b.emitWithString(.debug_names, .name, &.{v}, if (h.sampler) "SamplerDescriptorHeap" else "ResourceDescriptorHeap", &.{});
-                    if (e.spv_minor >= 4) try e.interface_ids.append(e.arena, v);
+                    if (e.spv_minor >= 4) try e.useVar(v);
                     try e.heap_vars.put(e.arena, key, v);
                     break :blk v;
                 };
@@ -1890,31 +2033,31 @@ const Emitter = struct {
                 if (e.nonuniform_ids.contains(e.val(h.index))) try e.markNonUniform(id, i.ty);
             },
             .mesh_payload => {
-                if (e.payload_var == 0) {
-                    e.payload_var = e.b.newId();
-                    try e.b.emit(.types_globals, .variable, &.{ try e.pointerType(.task_payload_workgroup, try e.typeId(i.ty)), e.payload_var, @backingInt(StorageClass.task_payload_workgroup) });
-                    try e.b.emitWithString(.debug_names, .name, &.{e.payload_var}, "in.var.payload", &.{});
-                    try e.interface_ids.append(e.arena, e.payload_var);
+                if (e.st.payload_var == 0) {
+                    e.st.payload_var = e.b.newId();
+                    try e.b.emit(.types_globals, .variable, &.{ try e.pointerType(.task_payload_workgroup, try e.typeId(i.ty)), e.st.payload_var, @backingInt(StorageClass.task_payload_workgroup) });
+                    try e.b.emitWithString(.debug_names, .name, &.{e.st.payload_var}, "in.var.payload", &.{});
+                    try e.useVar(e.st.payload_var);
                 }
-                e.vals[ri] = try e.op1(.load, i.ty, &.{e.payload_var});
+                e.vals[ri] = try e.op1(.load, i.ty, &.{e.st.payload_var});
             },
-            .patch_output => |o| try e.storeInterface(e.patches[o.element], f.inst(o.value).ty, e.val(o.value)),
+            .patch_output => |o| try e.storeInterface(e.st.patches[o.element], f.inst(o.value).ty, e.val(o.value)),
             .output_vertex => |x| {
-                const iface = e.outputs[x.element];
+                const iface = e.st.outputs[x.element];
                 const ptr = try e.opRaw(.access_chain, try e.pointerType(.output, try e.typeId(iface.ty)), &.{ iface.var_id, try e.constUint(x.vertex) });
                 e.vals[ri] = try e.reshape(try e.op1(.load, iface.ty, &.{ptr}), iface.ty, i.ty);
             },
             .emit, .cut => |stream| {
-                const multi = e.m.entry.?.geometry.streams[1] != null;
+                const multi = e.entry.geometry.streams[1] != null;
                 if (multi) {
                     try e.b.emit(.functions, if (i.op == .emit) .emit_stream_vertex else .end_stream_primitive, &.{try e.constUint(stream)});
                 } else try e.b.emit(.functions, if (i.op == .emit) .emit_vertex else .end_primitive, &.{});
             },
             .output => |o| {
-                const iface = e.outputs[o.element];
+                const iface = e.st.outputs[o.element];
                 if (iface.elem_array) return e.storeInterface(iface, f.inst(o.value).ty, e.val(o.value));
                 const v = try e.reshape(e.val(o.value), f.inst(o.value).ty, iface.ty);
-                if (e.m.entry.?.outputs.items[o.element].per_vertex) {
+                if (e.entry.outputs.items[o.element].per_vertex) {
                     // Hull output control points: this invocation's element.
                     const id = try e.op1(.load, try e.t.scalar(.uint), &.{try e.builtinInput(8, try e.t.scalar(.uint))});
                     const ptr = try e.opRaw(.access_chain, try e.pointerType(.output, try e.typeId(iface.ty)), &.{ iface.var_id, id });
@@ -2006,33 +2149,33 @@ const Emitter = struct {
     /// each attribute's array) or a primitive's indices.
     fn meshStore(e: *Emitter, mp: MeshPlace, v: Id, ty: TypeId) Error!void {
         if (mp.index == .none) return e.unsupported("storing a whole mesh output array is not supported yet", .{});
-        const entry = e.m.entry.?;
+        const entry = e.entry;
         const index = e.val(mp.index);
         if (mp.kind == .indices) {
             const lines = entry.mesh.topology == .line;
             const vty = try e.t.vector(.uint, if (lines) 2 else 3);
-            if (e.indices_var == 0) {
-                e.indices_var = e.b.newId();
-                try e.b.emit(.types_globals, .variable, &.{ try e.pointerType(.output, try e.typeId(try e.t.array(vty, entry.mesh.max_primitives))), e.indices_var, @backingInt(StorageClass.output) });
-                try e.b.emit(.annotations, .decorate, &.{ e.indices_var, 11, if (lines) 5295 else 5296 }); // BuiltIn Primitive{Line,Triangle}IndicesEXT
-                try e.interface_ids.append(e.arena, e.indices_var);
+            if (e.st.indices_var == 0) {
+                e.st.indices_var = e.b.newId();
+                try e.b.emit(.types_globals, .variable, &.{ try e.pointerType(.output, try e.typeId(try e.t.array(vty, entry.mesh.max_primitives))), e.st.indices_var, @backingInt(StorageClass.output) });
+                try e.b.emit(.annotations, .decorate, &.{ e.st.indices_var, 11, if (lines) 5295 else 5296 }); // BuiltIn Primitive{Line,Triangle}IndicesEXT
+                try e.useVar(e.st.indices_var);
             }
             if (mp.offset == 0 and e.t.componentCount(ty) == e.t.componentCount(vty)) {
-                const ptr = try e.opRaw(.access_chain, try e.pointerType(.output, try e.typeId(vty)), &.{ e.indices_var, index });
+                const ptr = try e.opRaw(.access_chain, try e.pointerType(.output, try e.typeId(vty)), &.{ e.st.indices_var, index });
                 try e.b.emit(.functions, .store, &.{ ptr, try e.reshape(v, ty, vty) });
                 return;
             }
             const ut = try e.t.scalar(.uint);
             for (0..e.t.componentCount(ty).?) |c| {
                 const comp = try e.flatComponent(v, ty, @intCast(c));
-                const ptr = try e.opRaw(.access_chain, try e.pointerType(.output, try e.typeId(ut)), &.{ e.indices_var, index, try e.constUint(mp.offset + @as(u32, @intCast(c))) });
+                const ptr = try e.opRaw(.access_chain, try e.pointerType(.output, try e.typeId(ut)), &.{ e.st.indices_var, index, try e.constUint(mp.offset + @as(u32, @intCast(c))) });
                 try e.b.emit(.functions, .store, &.{ ptr, try e.reshape(comp[0], comp[1], ut) });
             }
             return;
         }
         const n = e.t.componentCount(ty) orelse return e.unsupported("mesh outputs of type '{s}' are not supported yet", .{try e.t.format(e.arena, ty)});
         const els = if (mp.kind == .vertices) entry.outputs.items else entry.patch_constants.items;
-        const ifaces = if (mp.kind == .vertices) e.outputs else e.patches;
+        const ifaces = if (mp.kind == .vertices) e.st.outputs else e.st.patches;
         for (0..n) |c| {
             const comp = try e.flatComponent(v, ty, @intCast(c));
             var flat = mp.offset + @as(u32, @intCast(c));
@@ -2073,21 +2216,21 @@ const Emitter = struct {
     /// Derivatives outside pixel shaders: compute-like stages, over quads
     /// of the thread group (or linearly, as dxc).
     fn checkDerivatives(e: *Emitter) Error!void {
-        const entry = e.m.entry.?;
+        const entry = e.entry;
         switch (entry.stage) {
             .pixel => return,
             .compute, .mesh, .amplification => {},
             else => return e.unsupported("derivatives are not available in {s} shaders", .{@tagName(entry.stage)}),
         }
-        if (e.derivative_mode != 0) return;
+        if (e.st.derivative_mode != 0) return;
         try e.extension("SPV_KHR_compute_shader_derivatives");
         const t = entry.num_threads;
         if (t[0] % 2 == 0 and t[1] % 2 == 0) {
             try e.cap(.compute_derivative_group_quads);
-            e.derivative_mode = 5289; // DerivativeGroupQuadsKHR
+            e.st.derivative_mode = 5289; // DerivativeGroupQuadsKHR
         } else {
             try e.cap(.compute_derivative_group_linear);
-            e.derivative_mode = 5290; // DerivativeGroupLinearKHR
+            e.st.derivative_mode = 5290; // DerivativeGroupLinearKHR
         }
     }
 
@@ -2216,6 +2359,7 @@ const Emitter = struct {
         switch (e.t.get(ty)) {
             .sampler => return .{ .sc = .uniform_constant, .ty = try e.samplerType() },
             .resource => |r| switch (r.kind) {
+                .raytracing_acceleration_structure => return .{ .sc = .uniform_constant, .ty = try e.accelType() },
                 .structured_buffer, .rw_structured_buffer, .append_structured_buffer, .consume_structured_buffer, .byte_address_buffer, .rw_byte_address_buffer => return .{ .sc = e.bufferSc(), .ty = try e.bufferBlockType(ty) },
                 .constant_buffer => if (e.t.get(r.elem) == .@"struct") return .{ .sc = .uniform, .ty = try e.constantBufferBlock(r.elem) },
                 .texture_buffer => if (e.t.get(r.elem) == .@"struct") return .{ .sc = e.bufferSc(), .ty = try e.textureBufferBlock(r.elem) },
@@ -2292,6 +2436,165 @@ const Emitter = struct {
 
     // ------------------------------------------------------------------
     // Images and samplers
+
+    fn accelType(e: *Emitter) Error!Id {
+        if (e.accel_type == 0) {
+            e.accel_type = e.b.newId();
+            try e.b.emit(.types_globals, .type_acceleration_structure_khr, &.{e.accel_type});
+        }
+        return e.accel_type;
+    }
+
+    /// The acceleration structure a resource value designates.
+    fn loadAccel(e: *Emitter, r: Ref) Error!Id {
+        return e.opRaw(.load, try e.accelType(), &.{e.val(r)});
+    }
+
+    /// RayDesc's members: Origin, TMin, Direction, TMax.
+    fn rayDesc(e: *Emitter, r: Ref) Error![4]Id {
+        const f3 = try e.t.vector(.float, 3);
+        const f1 = try e.t.scalar(.float);
+        const v = e.val(r);
+        return .{
+            try e.op1(.composite_extract, f3, &.{ v, 0 }), try e.op1(.composite_extract, f1, &.{ v, 1 }),
+            try e.op1(.composite_extract, f3, &.{ v, 2 }), try e.op1(.composite_extract, f1, &.{ v, 3 }),
+        };
+    }
+
+    /// Ray tracing intrinsics (SPV_KHR_ray_tracing): TraceRay and friends,
+    /// and the system values as builtins. Null for other names.
+    fn rayIntrinsic(e: *Emitter, name: []const u8, ty: TypeId, args: []const Ref) Error!?Id {
+        const eq = std.mem.eql;
+        if (eq(u8, name, "TraceRay") or eq(u8, name, "CallShader")) {
+            // Through the payload / callable data variable, copied in and
+            // back out.
+            const trace = eq(u8, name, "TraceRay");
+            const data = args[args.len - 1];
+            const dty = e.f.inst(data).ty;
+            const v = try e.rayVar(if (trace) .ray_payload_khr else .callable_data_khr, dty);
+            try e.b.emit(.functions, .store, &.{ v, try e.op1(.load, dty, &.{e.val(data)}) });
+            if (trace) {
+                const d = try e.rayDesc(args[6]);
+                try e.b.emit(.functions, .trace_ray_khr, &.{ try e.loadAccel(args[0]), e.val(args[1]), e.val(args[2]), e.val(args[3]), e.val(args[4]), e.val(args[5]), d[0], d[1], d[2], d[3], v });
+            } else try e.b.emit(.functions, .execute_callable_khr, &.{ e.val(args[0]), v });
+            try e.b.emit(.functions, .store, &.{ e.val(data), try e.op1(.load, dty, &.{v}) });
+            return 0;
+        }
+        if (eq(u8, name, "ReportHit")) {
+            const aty = e.f.inst(args[2]).ty;
+            const v = try e.rayVar(.hit_attribute_khr, aty);
+            try e.b.emit(.functions, .store, &.{ v, e.val(args[2]) });
+            return try e.op1(.report_intersection_khr, ty, &.{ e.val(args[0]), e.val(args[1]) });
+        }
+        if (eq(u8, name, "IgnoreHit") or eq(u8, name, "AcceptHitAndEndSearch")) {
+            try e.b.emit(.functions, if (eq(u8, name, "IgnoreHit")) .ignore_intersection_khr else .terminate_ray_khr, &.{});
+            // A terminator: what follows is unreachable.
+            try e.b.emit(.functions, .label, &.{e.b.newId()});
+            return 0;
+        }
+        const Sys = struct { []const u8, u32, enum { plain, transpose } };
+        const table = [_]Sys{
+            .{ "DispatchRaysIndex", 5319, .plain },     .{ "DispatchRaysDimensions", 5320, .plain }, .{ "WorldRayOrigin", 5321, .plain },
+            .{ "WorldRayDirection", 5322, .plain },     .{ "ObjectRayOrigin", 5323, .plain },        .{ "ObjectRayDirection", 5324, .plain },
+            .{ "RayTMin", 5325, .plain },               .{ "RayTCurrent", 5326, .plain },            .{ "InstanceID", 5327, .plain },
+            .{ "InstanceIndex", 6, .plain },            .{ "PrimitiveIndex", 7, .plain },            .{ "HitKind", 5333, .plain },
+            .{ "RayFlags", 5351, .plain },              .{ "GeometryIndex", 5352, .plain },          .{ "ObjectToWorld4x3", 5330, .plain },
+            .{ "WorldToObject4x3", 5331, .plain },      .{ "ObjectToWorld3x4", 5330, .transpose },   .{ "WorldToObject3x4", 5331, .transpose },
+            .{ "ObjectToWorld", 5330, .transpose },     .{ "WorldToObject", 5331, .transpose },
+        };
+        for (table) |x| {
+            if (!eq(u8, name, x[0])) continue;
+            if (x[2] == .plain) {
+                const vty = try e.builtinValueType(x[1], ty);
+                return try e.reshape(try e.op1(.load, vty, &.{try e.builtinInput(x[1], vty)}), vty, ty);
+            }
+            const m = e.t.get(ty).matrix;
+            const mty = try e.t.matrix(m.elem, m.cols, m.rows);
+            return try e.op1(.transpose, ty, &.{try e.op1(.load, mty, &.{try e.builtinInput(x[1], mty)})});
+        }
+        return null;
+    }
+
+    /// The SPIR-V type of a builtin read as an HLSL value of type `ty`.
+    fn builtinValueType(e: *Emitter, builtin: u32, ty: TypeId) Error!TypeId {
+        return switch (builtin) {
+            5319, 5320 => e.t.vector(.uint, 3),
+            5321...5324 => e.t.vector(.float, 3),
+            5325, 5326 => e.t.scalar(.float),
+            6, 7, 5327, 5333, 5351, 5352 => e.t.scalar(.uint),
+            else => ty,
+        };
+    }
+
+    fn rayQueryType(e: *Emitter) Error!Id {
+        if (e.ray_query_type == 0) {
+            e.ray_query_type = e.b.newId();
+            try e.b.emit(.types_globals, .type_ray_query_khr, &.{e.ray_query_type});
+        }
+        return e.ray_query_type;
+    }
+
+    /// RayQuery methods (SPV_KHR_ray_query).
+    fn rayQueryMethod(e: *Emitter, name: []const u8, res: Ref, args: []const Ref, ty: TypeId) Error!Id {
+        const eq = std.mem.eql;
+        const q = e.val(res);
+        if (eq(u8, name, "TraceRayInline")) {
+            // The type's constant flags join the call's.
+            var flags = e.val(args[1]);
+            const tf = e.t.get(e.f.inst(res).ty).resource.flags;
+            if (tf != 0) flags = try e.op1(.bitwise_or, try e.t.scalar(.uint), &.{ flags, try e.constUint(tf) });
+            const d = try e.rayDesc(args[3]);
+            try e.b.emit(.functions, .ray_query_initialize_khr, &.{ q, try e.loadAccel(args[0]), flags, e.val(args[2]), d[0], d[1], d[2], d[3] });
+            return 0;
+        }
+        if (eq(u8, name, "Proceed")) return e.op1(.ray_query_proceed_khr, ty, &.{q});
+        if (eq(u8, name, "Abort")) {
+            try e.b.emit(.functions, .ray_query_terminate_khr, &.{q});
+            return 0;
+        }
+        if (eq(u8, name, "CommitNonOpaqueTriangleHit")) {
+            try e.b.emit(.functions, .ray_query_confirm_intersection_khr, &.{q});
+            return 0;
+        }
+        if (eq(u8, name, "CommitProceduralPrimitiveHit")) {
+            try e.b.emit(.functions, .ray_query_generate_intersection_khr, &.{ q, e.val(args[0]) });
+            return 0;
+        }
+        if (eq(u8, name, "RayFlags")) return e.op1(.ray_query_get_ray_flags_khr, ty, &.{q});
+        if (eq(u8, name, "WorldRayOrigin")) return e.op1(.ray_query_get_world_ray_origin_khr, ty, &.{q});
+        if (eq(u8, name, "WorldRayDirection")) return e.op1(.ray_query_get_world_ray_direction_khr, ty, &.{q});
+        if (eq(u8, name, "RayTMin")) return e.op1(.ray_query_get_ray_t_min_khr, ty, &.{q});
+        if (eq(u8, name, "CommittedStatus")) return e.op1(.ray_query_get_intersection_type_khr, ty, &.{ q, try e.constUint(1) });
+        if (eq(u8, name, "CandidateType")) return e.op1(.ray_query_get_intersection_type_khr, ty, &.{ q, try e.constUint(0) });
+        if (eq(u8, name, "CandidateProceduralPrimitiveNonOpaque")) {
+            const opaque_ = try e.op1(.ray_query_get_intersection_candidate_aabb_opaque_khr, ty, &.{q});
+            return e.op1(.logical_not, ty, &.{opaque_});
+        }
+        // Candidate* / Committed* getters.
+        const committed = std.mem.startsWith(u8, name, "Committed");
+        if (!committed and !std.mem.startsWith(u8, name, "Candidate")) return e.unsupported("RayQuery method '{s}' is not supported yet", .{name});
+        const rest = name[if (committed) 9 else 9..];
+        const which = try e.constUint(@intFromBool(committed));
+        const Get = struct { []const u8, Op, bool };
+        const table = [_]Get{
+            .{ "ObjectToWorld4x3", .ray_query_get_intersection_object_to_world_khr, false }, .{ "ObjectToWorld3x4", .ray_query_get_intersection_object_to_world_khr, true },
+            .{ "WorldToObject4x3", .ray_query_get_intersection_world_to_object_khr, false }, .{ "WorldToObject3x4", .ray_query_get_intersection_world_to_object_khr, true },
+            .{ "TriangleFrontFace", .ray_query_get_intersection_front_face_khr, false },     .{ "TriangleBarycentrics", .ray_query_get_intersection_barycentrics_khr, false },
+            .{ "TriangleRayT", .ray_query_get_intersection_t_khr, false },                   .{ "RayT", .ray_query_get_intersection_t_khr, false },
+            .{ "InstanceIndex", .ray_query_get_intersection_instance_id_khr, false },        .{ "InstanceID", .ray_query_get_intersection_instance_custom_index_khr, false },
+            .{ "GeometryIndex", .ray_query_get_intersection_geometry_index_khr, false },     .{ "PrimitiveIndex", .ray_query_get_intersection_primitive_index_khr, false },
+            .{ "ObjectRayOrigin", .ray_query_get_intersection_object_ray_origin_khr, false }, .{ "ObjectRayDirection", .ray_query_get_intersection_object_ray_direction_khr, false },
+            .{ "InstanceContributionToHitGroupIndex", .ray_query_get_intersection_instance_shader_binding_table_record_offset_khr, false },
+        };
+        for (table) |g| {
+            if (!eq(u8, rest, g[0])) continue;
+            if (!g[2]) return e.op1(g[1], ty, &.{ q, which });
+            const m = e.t.get(ty).matrix;
+            const raw = try e.op1(g[1], try e.t.matrix(m.elem, m.cols, m.rows), &.{ q, which });
+            return e.op1(.transpose, ty, &.{raw});
+        }
+        return e.unsupported("RayQuery method '{s}' is not supported yet", .{name});
+    }
 
     fn samplerType(e: *Emitter) Error!Id {
         if (e.sampler_type == 0) {
@@ -2468,6 +2771,7 @@ const Emitter = struct {
     fn method(e: *Emitter, name: []const u8, res: Ref, args: []const Ref, ty: TypeId) Error!Id {
         const eq = std.mem.eql;
         if (e.t.get(e.f.inst(res).ty) != .resource) return e.unsupported("method '{s}' is not supported yet", .{name});
+        if (isRayQuery(e.t, e.f.inst(res).ty)) return e.rayQueryMethod(name, res, args, ty);
         const r = e.resourceInfo(res);
         if (eq(u8, name, "GetDimensions")) {
             try e.getDimensions(res, r, args);
@@ -2989,17 +3293,49 @@ const Emitter = struct {
         return e.glsl;
     }
 
+    /// The module variable of ray tracing storage class `sc` holding values
+    /// of type `ty` (one per pair; outgoing payloads and callable data get
+    /// distinct Locations).
+    fn rayVar(e: *Emitter, sc: StorageClass, ty: TypeId) Error!Id {
+        const v = e.ray_vars.get(.{ sc, ty }) orelse blk: {
+            const v = e.b.newId();
+            try e.b.emit(.types_globals, .variable, &.{ try e.pointerType(sc, try e.typeId(ty)), v, @backingInt(sc) });
+            if (sc == .ray_payload_khr or sc == .callable_data_khr) {
+                const gop = try e.ray_locations.getOrPut(e.arena, sc);
+                if (!gop.found_existing) gop.value_ptr.* = 0;
+                try e.b.emit(.annotations, .decorate, &.{ v, 30, gop.value_ptr.* }); // Location
+                gop.value_ptr.* += 1;
+            }
+            const name = switch (sc) {
+                .incoming_ray_payload_khr => "payload",
+                .hit_attribute_khr => "attributes",
+                .incoming_callable_data_khr => "callable.data",
+                .ray_payload_khr => "ray.payload",
+                .callable_data_khr => "callable.param",
+                else => "ray.var",
+            };
+            try e.b.emitWithString(.debug_names, .name, &.{v}, name, &.{});
+            try e.ray_vars.put(e.arena, .{ sc, ty }, v);
+            break :blk v;
+        };
+        try e.useVar(v);
+        return v;
+    }
+
     /// An Input variable for a builtin the code reads (created once).
     fn builtinInput(e: *Emitter, builtin: u32, ty: TypeId) Error!Id {
-        if (e.builtin_inputs.get(builtin)) |v| return v;
+        if (e.builtin_inputs.get(builtin)) |v| {
+            try e.useVar(v);
+            return v;
+        }
         const v = e.b.newId();
         try e.b.emit(.types_globals, .variable, &.{ try e.pointerType(.input, try e.typeId(ty)), v, @backingInt(StorageClass.input) });
         try e.b.emit(.annotations, .decorate, &.{ v, 11, builtin }); // BuiltIn
         var et = ty;
         while (e.t.get(et) == .array) et = e.t.get(et).array.elem;
         const c = e.t.component(et).?;
-        if (e.m.entry.?.stage == .pixel and !c.isFloat() and c != .bool) try e.b.emit(.annotations, .decorate, &.{ v, 14 }); // Flat
-        try e.interface_ids.append(e.arena, v);
+        if (e.entry.stage == .pixel and !c.isFloat() and c != .bool) try e.b.emit(.annotations, .decorate, &.{ v, 14 }); // Flat
+        try e.useVar(v);
         try e.builtin_inputs.put(e.arena, builtin, v);
         return v;
     }
@@ -3037,10 +3373,9 @@ const Emitter = struct {
             const xty = e.f.inst(args[0]).ty;
             const n = e.t.componentCount(xty).?;
             if (n == 1) return try e.op1(.group_non_uniform_all_equal, bool_ty, &.{ scope, e.val(args[0]) });
-            const ct = try e.t.scalar(e.t.component(xty).?);
             const parts = try e.arena.alloc(Id, n);
-            for (parts, 0..) |*p, k| p.* = try e.op1(.group_non_uniform_all_equal, bool_ty, &.{ scope, try e.op1(.composite_extract, ct, &.{ e.val(args[0]), @intCast(k) }) });
-            return try e.op1(.composite_construct, ty, parts);
+            for (parts, 0..) |*p, k| p.* = try e.op1(.group_non_uniform_all_equal, bool_ty, &.{ scope, (try e.flatComponent(e.val(args[0]), xty, @intCast(k)))[0] });
+            return try e.composeFlat(ty, parts);
         }
         if (eq(u8, name, "WaveReadLaneFirst")) {
             try e.cap(.group_non_uniform_ballot);
@@ -3531,9 +3866,19 @@ fn dfs(a: Allocator, f: *const ir.Function, b: u32, seen: []bool, post: *std.Arr
     try post.append(a, b);
 }
 
+fn isRayQuery(t: *TypeTable, ty: TypeId) bool {
+    return switch (t.get(ty)) {
+        .resource => |r| r.kind == .other and std.mem.eql(u8, r.name, "RayQuery"),
+        else => false,
+    };
+}
+
+/// Resources and samplers (not RayQuery objects, which are function
+/// storage passed by pointer).
 fn isResourceType(t: *TypeTable, ty: TypeId) bool {
     return switch (t.get(ty)) {
-        .resource, .sampler => true,
+        .resource => !isRayQuery(t, ty),
+        .sampler => true,
         .array => |a| isResourceType(t, a.elem),
         else => false,
     };

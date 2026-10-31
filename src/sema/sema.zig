@@ -1063,6 +1063,11 @@ pub const Sema = struct {
         // Any other builtin object (RayQuery, node records, vk:: types...).
         if (isOtherBuiltinObject(n)) {
             var elem: TypeId = TypeTable.void_type;
+            if (eql(n, "RayQuery")) {
+                const flags: u32 = if (args.len > 0) @truncate(@as(u64, @bitCast(s.constArg(args[0]) orelse 0))) else 0;
+                const flags2: u32 = if (args.len > 1) @truncate(@as(u64, @bitCast(s.constArg(args[1]) orelse 0))) else 0;
+                return s.types.intern(.{ .resource = .{ .kind = .other, .elem = elem, .name = n, .flags = flags, .flags2 = flags2 } });
+            }
             if (args.len > 0) elem = try s.typeArg(args[0]) orelse TypeTable.void_type;
             return s.types.intern(.{ .resource = .{ .kind = .other, .elem = elem, .name = n } });
         }
@@ -2270,7 +2275,10 @@ pub const Sema = struct {
                 return .{ .ty = v.type, .lvalue = true, .read_only = v.read_only };
             },
             .functions => |set| return .{ .ty = TypeTable.error_type, .callee = .{ .functions = set } },
-            .enumerator => |en| return rvalue(en.type),
+            .enumerator => |en| {
+                s.record(e, .{ .enumerator = en.value });
+                return rvalue(en.type);
+            },
             .type => |t| return .{ .ty = TypeTable.error_type, .callee = .{ .type = t } },
             .namespace => {
                 s.err(e.loc, "unexpected namespace name '{s}'", .{n.last()});
@@ -3555,7 +3563,7 @@ fn methodNamespace(t: types.Type) ?[]const u8 {
             .sampled_texture_cube => "VkSampledTextureCUBEMethods",
             .sampled_texture_cube_array => "VkSampledTextureCUBEArrayMethods",
             .constant_buffer, .texture_buffer, .raytracing_acceleration_structure => null,
-            .other => null,
+            .other => if (std.mem.eql(u8, r.name, "RayQuery")) "RayQueryMethods" else null,
         },
         else => null,
     };

@@ -27,6 +27,8 @@ pub const Options = struct {
     major: u32 = 6,
     minor: u32 = 0,
     spirv: bool = false,
+    /// SPIR-V 1.x of the target environment.
+    spirv_minor: u32 = 0,
     enable_16bit: bool = false,
 };
 
@@ -241,7 +243,7 @@ pub const Preprocessor = struct {
         );
         try w.print("#define __SHADER_TARGET_STAGE {d}\n#define __SHADER_TARGET_MAJOR {d}\n#define __SHADER_TARGET_MINOR {d}\n", .{ o.stage, o.major, o.minor });
         if (o.enable_16bit) try w.writeAll("#define __HLSL_ENABLE_16_BIT 1\n");
-        if (o.spirv) try w.writeAll("#define __spirv__ 1\n#define __SPIRV_MAJOR_VERSION__ 1\n#define __SPIRV_MINOR_VERSION__ 0\n");
+        if (o.spirv) try w.print("#define __spirv__ 1\n#define __SPIRV_MAJOR_VERSION__ 1\n#define __SPIRV_MINOR_VERSION__ {d}\n", .{o.spirv_minor});
         for (o.defines) |d| try w.print("#define {s} {s}\n", .{ d.name, d.value orelse "1" });
 
         const id = try pp.sm.addFile("<built-in>", text.written());
