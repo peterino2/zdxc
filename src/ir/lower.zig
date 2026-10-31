@@ -447,6 +447,23 @@ const Lowerer = struct {
         const t = l.types();
         const inst = l.b.f.inst(v);
         if (inst.ty == target) return v;
+        // A descriptor heap element takes the type it is used as.
+        if (t.get(inst.ty) == .dynamic_resource and inst.op == .heap_resource) {
+            return l.b.add(.{ .op = .{ .heap_resource = inst.op.heap_resource }, .ty = target });
+        }
+        // ConstantBuffer<S> read as an S: member by member.
+        if (t.get(inst.ty) == .resource and t.get(target) == .@"struct") {
+            const rs = t.get(inst.ty).resource;
+            if ((rs.kind == .constant_buffer or rs.kind == .texture_buffer) and rs.elem == target) {
+                const fields = t.get(target).@"struct".fields.items;
+                const parts = try l.arena.alloc(Ref, fields.len);
+                for (parts, fields, 0..) |*p, fld, k| {
+                    const idx = try l.b.constInt(try t.scalar(.uint), @intCast(k));
+                    p.* = try l.b.load(try l.b.add(.{ .op = .{ .access = .{ .base = v, .indices = try l.arena.dupe(Ref, &.{idx}) } }, .ty = fld.type, .ptr = .cbuffer }));
+                }
+                return l.b.add(.{ .op = .{ .construct = parts }, .ty = target });
+            }
+        }
         // Derived structs convert to a base: its fields are a prefix.
         if (t.get(inst.ty) == .@"struct" and t.get(target) == .@"struct") {
             const tf = t.get(target).@"struct".fields.items;
@@ -700,6 +717,10 @@ const Lowerer = struct {
             .member => |m| return l.member(e, m.base, m.name),
             .index => |x| {
                 const bt = t.get(x.base.ty);
+                if (bt == .descriptor_heap) {
+                    const idx = try l.converted(x.index, try t.scalar(.uint));
+                    return l.b.add(.{ .op = .{ .heap_resource = .{ .index = idx, .sampler = bt.descriptor_heap.sampler } }, .ty = e.ty });
+                }
                 if (bt == .resource) {
                     const res = try l.rvalue(x.base);
                     const idx = try l.indexValue(x.index, bt.resource.kind.indexDims());
@@ -835,6 +856,7 @@ const Lowerer = struct {
         const t = l.types();
         const from = l.b.f.inst(v).ty;
         if (from == target) return v;
+        if (t.get(from) == .dynamic_resource) return l.convert(v, target);
         const aggregate = switch (t.get(target)) {
             .@"struct", .array => true,
             else => switch (t.get(from)) {
@@ -919,6 +941,19 @@ const Lowerer = struct {
                 const v = try l.rvalue(base);
                 return l.b.add(.{ .op = .{ .extract = .{ .agg = v, .index = r.field } }, .ty = e.ty });
             },
+            // ConstantBuffer<S> / TextureBuffer<S>: members of S.
+            .resource => |rs| {
+                if (rs.kind != .constant_buffer and rs.kind != .texture_buffer) return l.fail(e, "this member access");
+                const r = l.s.resolution(e) orelse return l.fail(e, "this member");
+                if (r == .bitfield) {
+                    const bf = r.bitfield;
+                    const idx = try l.b.constInt(try t.scalar(.uint), bf.storage);
+                    const sty = t.get(rs.elem).@"struct".fields.items[bf.storage].type;
+                    const ptr = try l.b.add(.{ .op = .{ .access = .{ .base = try l.rvalue(base), .indices = try l.arena.dupe(Ref, &.{idx}) } }, .ty = sty, .ptr = .cbuffer });
+                    return l.bitRead(try l.b.load(ptr), bf);
+                }
+                return l.b.load(try l.lvalue(e));
+            },
             else => return l.fail(e, "this member access"),
         }
     }
@@ -965,8 +1000,14 @@ const Lowerer = struct {
                     // struct (a base prefix of derived objects), written
                     // back afterwards to writable storage.
                     const tmp = try l.b.add(.{ .op = .local_var, .ty = owner_ty, .ptr = .function });
-                    const whole = if (direct) |p| try l.b.load(p) else try l.rvalue(base);
-                    try l.b.store(tmp, try l.basePrefix(whole, base.ty, owner_ty));
+                    var whole = if (direct) |p| try l.b.load(p) else try l.rvalue(base);
+                    var whole_ty = base.ty;
+                    if (l.s.types.get(base.ty) == .resource) {
+                        // A method of ConstantBuffer<S>'s S: on a copy of S.
+                        whole_ty = l.s.types.get(base.ty).resource.elem;
+                        whole = try l.convert(whole, whole_ty);
+                    }
+                    try l.b.store(tmp, try l.basePrefix(whole, whole_ty, owner_ty));
                     object = tmp;
                     if (direct) |p| switch (l.b.f.inst(p).ptr) {
                         .function, .private, .groupshared => write_back = p,
@@ -1156,8 +1197,13 @@ const Lowerer = struct {
             .member => |m| {
                 const r = l.s.resolution(e) orelse return l.fail(e, "this member");
                 if (r != .field) return l.fail(e, "this member");
-                const base = try l.lvalue(m.base);
                 const idx = try l.b.constInt(try t.scalar(.uint), r.field);
+                if (t.get(m.base.ty) == .resource) {
+                    // A member of a ConstantBuffer<S>: inside the buffer.
+                    const res = try l.rvalue(m.base);
+                    return l.b.add(.{ .op = .{ .access = .{ .base = res, .indices = try l.arena.dupe(Ref, &.{idx}) } }, .ty = e.ty, .ptr = .cbuffer });
+                }
+                const base = try l.lvalue(m.base);
                 return l.b.add(.{ .op = .{ .access = .{ .base = base, .indices = try l.arena.dupe(Ref, &.{idx}) } }, .ty = e.ty, .ptr = l.b.f.inst(base).ptr });
             },
             .index => |x| {

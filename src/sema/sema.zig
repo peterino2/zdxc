@@ -2789,8 +2789,18 @@ pub const Sema = struct {
                 if (r.kind == .constant_buffer or r.kind == .texture_buffer) {
                     if (s.types.get(r.elem) == .@"struct") {
                         const info = s.types.get(r.elem).@"struct";
-                        for (info.fields.items) |f| {
-                            if (std.mem.eql(u8, f.name, name)) return .{ .ty = f.type, .lvalue = true, .read_only = true };
+                        var fi = info.fields.items.len;
+                        while (fi > 0) {
+                            fi -= 1;
+                            const f = info.fields.items[fi];
+                            if (std.mem.eql(u8, f.name, name)) {
+                                s.record(e, .{ .field = @intCast(fi) });
+                                return .{ .ty = f.type, .lvalue = true, .read_only = true };
+                            }
+                        }
+                        if (findBitfield(info, name)) |bf| {
+                            s.record(e, .{ .bitfield = bf });
+                            return .{ .ty = bf.type, .lvalue = true, .read_only = true };
                         }
                         if (info.sema) |p| {
                             const ss: *StructSema = @ptrCast(@alignCast(p));

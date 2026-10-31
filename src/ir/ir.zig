@@ -119,6 +119,9 @@ pub const Op = union(enum) {
     /// from the amplification shader.
     mesh_output: MeshOutput,
     mesh_payload,
+    /// `ResourceDescriptorHeap[index]` / `SamplerDescriptorHeap[index]`
+    /// as a resource of the instruction's type.
+    heap_resource: struct { index: Ref, sampler: bool },
     patch_output: struct { element: u32, value: Ref },
     output_vertex: struct { element: u32, vertex: u32 },
     /// Geometry shaders: emit the vertex written to the outputs of a stream,
@@ -442,6 +445,7 @@ fn dumpInst(m: *const Module, f: *const Function, r: Ref, w: *std.Io.Writer) !vo
         .patch_input => |k| try w.print("patch input {d}", .{k}),
         .mesh_output => |k| try w.print("mesh output {s}", .{@tagName(k)}),
         .mesh_payload => try w.print("mesh payload", .{}),
+        .heap_resource => |h| try w.print("{s}[%{d}]", .{ if (h.sampler) "SamplerDescriptorHeap" else "ResourceDescriptorHeap", h.index.index() }),
         .patch_output => |x| try w.print("patch output {d} = %{d}", .{ x.element, x.value.index() }),
         .output_vertex => |x| try w.print("output {d} vertex {d}", .{ x.element, x.vertex }),
         .cut => |k| try w.print("cut stream {d}", .{k}),

@@ -23,6 +23,9 @@ const Ref = ir.Ref;
 pub const Error = Allocator.Error || error{Unsupported};
 
 /// SPIR-V storage classes.
+/// Marks a binding that is a recipe (see Emitter.resourceBinding).
+const recipe_tag: u32 = 0x8000_0000;
+
 const StorageClass = enum(u32) { uniform_constant = 0, input = 1, uniform = 2, output = 3, workgroup = 4, private = 6, function = 7, image = 11, storage_buffer = 12, task_payload_workgroup = 5402 };
 
 const Capability = enum(u32) {
@@ -58,6 +61,7 @@ const Capability = enum(u32) {
     group_non_uniform_shuffle = 65,
     group_non_uniform_quad = 68,
     shader_non_uniform = 5301,
+    uniform_buffer_array_non_uniform_indexing = 5306,
     runtime_descriptor_array = 5302,
     uniform_texel_buffer_array_non_uniform_indexing = 5311,
     storage_texel_buffer_array_non_uniform_indexing = 5312,
@@ -118,6 +122,12 @@ const Emitter = struct {
     global_vars: []Id = &.{},
     /// Buffer block structs by resource type.
     buffer_blocks: std.AutoHashMapUnmanaged(TypeId, Id) = .empty,
+    /// ConstantBuffer<S> blocks by S.
+    cb_blocks: std.AutoHashMapUnmanaged(TypeId, Id) = .empty,
+    /// Descriptor heaps: a runtime array variable per (heap, element type),
+    /// on the heap's binding.
+    heap_vars: std.AutoHashMapUnmanaged(struct { bool, Id }, Id) = .empty,
+    heap_bindings: [2]u32 = .{ 0, 0 },
     /// Image types by (sampled type, dim, arrayed, ms, sampled, format).
     image_types: std.AutoHashMapUnmanaged([6]u32, Id) = .empty,
     sampled_image_types: std.AutoHashMapUnmanaged(Id, Id) = .empty,
@@ -133,6 +143,10 @@ const Emitter = struct {
     /// through them).
     nonuniform_ids: std.AutoHashMapUnmanaged(Id, void) = .empty,
     variants: std.ArrayList(struct { fi: u32, bindings: []const Id, id: Id }) = .empty,
+    /// The bindings of the function being emitted (a specialization).
+    cur_bindings: []const Id = &.{},
+    /// Resource array elements bound to specialized parameters.
+    recipes: std.ArrayList(struct { var_id: Id, ptr_ty: Id, indices: []const Id }) = .empty,
     /// Entry inputs / outputs: interface variable and its value type.
     inputs: []Interface = &.{},
     outputs: []Interface = &.{},
@@ -324,7 +338,17 @@ const Emitter = struct {
                 const stride = layout.arrayStride(e.t, a.elem, row_major, rules) catch return e.unsupported("buffer member type", .{});
                 try e.b.emit(.annotations, .decorate, &.{ id, 6, stride }); // ArrayStride
             },
-            .@"struct" => |st| {
+            .@"struct" => |st| try e.layoutStruct(id, st, rules, st.name),
+            else => return e.unsupported("buffer members of type '{s}' are not supported yet", .{try e.t.format(e.arena, ty)}),
+        }
+        try e.layout_types.put(e.arena, key, id);
+        return id;
+    }
+
+    /// Emits struct `id` with `st`'s fields laid out by `rules`.
+    fn layoutStruct(e: *Emitter, id: Id, st: *const types.StructInfo, rules: layout.Rules, name: []const u8) Error!void {
+        {
+            {
                 var ops: std.ArrayList(u32) = .empty;
                 try ops.append(e.arena, id);
                 for (st.fields.items) |fld| try ops.append(e.arena, try e.layoutTypeId(fld.type, rules, fld.row_major));
@@ -343,11 +367,20 @@ const Emitter = struct {
                     }
                     try e.b.emitWithString(.debug_names, .member_name, &.{ id, mk }, fld.name, &.{});
                 }
-                try e.b.emitWithString(.debug_names, .name, &.{id}, st.name, &.{});
-            },
-            else => return e.unsupported("buffer members of type '{s}' are not supported yet", .{try e.t.format(e.arena, ty)}),
+                try e.b.emitWithString(.debug_names, .name, &.{id}, name, &.{});
+            }
         }
-        try e.layout_types.put(e.arena, key, id);
+    }
+
+    /// The Block struct of ConstantBuffer<S>: S's members laid out as a
+    /// constant buffer (a type of its own, so S itself can be nested).
+    fn constantBufferBlock(e: *Emitter, s: TypeId) Error!Id {
+        if (e.cb_blocks.get(s)) |id| return id;
+        const st = e.t.get(s).@"struct";
+        const id = e.b.newId();
+        try e.layoutStruct(id, st, .vk_relaxed, try std.fmt.allocPrint(e.arena, "type.ConstantBuffer.{s}", .{st.name}));
+        try e.b.emit(.annotations, .decorate, &.{ id, 2 }); // Block
+        try e.cb_blocks.put(e.arena, s, id);
         return id;
     }
 
@@ -671,6 +704,22 @@ const Emitter = struct {
             }
         }
 
+        // Descriptor heaps: the next free bindings of set 0 (resources,
+        // then samplers), as dxc.
+        for ([_]bool{ false, true }) |sampler| {
+            const used_heap = for (m.functions.items) |f| {
+                const hit = for (f.insts.items) |inst| switch (inst.op) {
+                    .heap_resource => |h| if (h.sampler == sampler) break true,
+                    else => {},
+                } else false;
+                if (hit) break true;
+            } else false;
+            if (!used_heap) continue;
+            while (used.contains(.{ 0, next_free })) next_free += 1;
+            try used.put(e.arena, .{ 0, next_free }, {});
+            e.heap_bindings[@intFromBool(sampler)] = next_free;
+        }
+
         // Hidden counters (as dxc): a `{ int }` buffer per structured buffer
         // that uses one, on the next free binding of its set.
         e.counter_vars = try e.arena.alloc(Id, m.globals.items.len);
@@ -929,6 +978,55 @@ const Emitter = struct {
     /// `bindings` (resource variables; 0 for other parameters). Vulkan
     /// cannot pass buffer pointers to functions, so each distinct set of
     /// resource arguments gets its own copy (dxc gets there by inlining).
+    /// What a resource argument binds a specialized callee's parameter
+    /// to: a module variable, or (an element of a resource array) a
+    /// recipe the callee re-creates: `recipe_tag | index` into `recipes`.
+    fn resourceBinding(e: *Emitter, a: Ref) Error!Id {
+        const f = e.f;
+        var x = a;
+        while (true) switch (f.inst(x).op) {
+            .load => |p| x = p,
+            // A resource local: what was stored into it.
+            .local_var => x = for (f.insts.items) |inst| {
+                if (inst.op == .store and inst.op.store.ptr == x) break inst.op.store.value;
+            } else return e.val(x),
+            else => break,
+        };
+        switch (f.inst(x).op) {
+            .global => return e.val(x),
+            .heap_resource => |h| {
+                // A heap element at a constant index.
+                if (f.inst(h.index).op != .constant) return e.unsupported("passing a resource from a descriptor heap at a dynamic index to a function is not supported yet", .{});
+                const p = try e.resourcePointee(f.inst(x).ty);
+                const hv = e.heap_vars.get(.{ h.sampler, p.ty }) orelse return e.unsupported("internal: heap variable missing", .{});
+                return e.addRecipe(hv, try e.pointerType(p.sc, p.ty), try e.arena.dupe(Id, &.{e.val(h.index)}));
+            },
+            // A specialized parameter passes on what it is bound to.
+            .param => |pi| return if (pi < e.cur_bindings.len and e.cur_bindings[pi] != 0) e.cur_bindings[pi] else e.val(x),
+            .access => |acc| {
+                var base = acc.base;
+                while (f.inst(base).op == .load) base = f.inst(base).op.load;
+                if (f.inst(base).op != .global) return e.unsupported("passing this resource to a function is not supported yet", .{});
+                const idx = try e.arena.alloc(Id, acc.indices.len);
+                for (idx, acc.indices) |*d, r| {
+                    if (f.inst(r).op != .constant) return e.unsupported("passing a dynamically selected resource to a function is not supported yet", .{});
+                    d.* = e.val(r);
+                }
+                const p = try e.resourcePointee(f.inst(x).ty);
+                return e.addRecipe(e.val(base), try e.pointerType(p.sc, p.ty), idx);
+            },
+            else => return e.val(x),
+        }
+    }
+
+    fn addRecipe(e: *Emitter, var_id: Id, ptr_ty: Id, idx: []const Id) Error!Id {
+        for (e.recipes.items, 0..) |rc, k| {
+            if (rc.var_id == var_id and rc.ptr_ty == ptr_ty and std.mem.eql(Id, rc.indices, idx)) return recipe_tag | @as(Id, @intCast(k));
+        }
+        try e.recipes.append(e.arena, .{ .var_id = var_id, .ptr_ty = ptr_ty, .indices = idx });
+        return recipe_tag | @as(Id, @intCast(e.recipes.items.len - 1));
+    }
+
     fn variantFor(e: *Emitter, fi: u32, bindings: []const Id) Error!Id {
         for (e.variants.items) |v| if (v.fi == fi and std.mem.eql(Id, v.bindings, bindings)) return v.id;
         const id = e.b.newId();
@@ -939,6 +1037,7 @@ const Emitter = struct {
 
     fn emitFunction(e: *Emitter, f: *const ir.Function, fn_id: Id, bindings: []const Id) Error!void {
         e.f = f;
+        e.cur_bindings = bindings;
         e.texel_places = .empty;
         e.mesh_places = .empty;
         e.vals = try e.arena.alloc(Id, f.insts.items.len);
@@ -959,7 +1058,8 @@ const Emitter = struct {
         var next: usize = 0;
         for (f.params, param_ids, 0..) |p, *id, k| {
             if (bindings.len > 0 and bindings[k] != 0) {
-                id.* = bindings[k];
+                // Recipes are re-created at the start of the body.
+                id.* = if (bindings[k] & recipe_tag != 0) e.b.newId() else bindings[k];
                 continue;
             }
             if (e.mesh_params.contains(.{ f, @intCast(k) })) {
@@ -996,6 +1096,13 @@ const Emitter = struct {
                     const ptr = try e.pointerType(.function, try e.typeId(inst.ty));
                     e.vals[i] = e.b.newId();
                     try e.b.emit(.functions, .variable, &.{ ptr, e.vals[i], @backingInt(StorageClass.function) });
+                };
+                for (bindings, 0..) |bd, k| if (bd & recipe_tag != 0) {
+                    const rc = e.recipes.items[bd & ~recipe_tag];
+                    var ops: std.ArrayList(u32) = .empty;
+                    try ops.appendSlice(e.arena, &.{ rc.ptr_ty, param_ids[k], rc.var_id });
+                    try ops.appendSlice(e.arena, rc.indices);
+                    try e.b.emit(.functions, .access_chain, ops.items);
                 };
             }
             const blk = f.blocks.items[bi];
@@ -1229,6 +1336,7 @@ const Emitter = struct {
                 // Buffers reached through locals or parameters are still
                 // Uniform std430 storage.
                 const into_buffer = e.t.get(f.inst(a.base).ty) == .resource;
+                const into_cb = into_buffer and e.t.get(f.inst(a.base).ty).resource.kind == .constant_buffer;
                 const base_pl = e.ptr_layouts[a.base.index()];
                 if (i.ptr == .mesh) {
                     // Mesh outputs: a place, written component by component.
@@ -1262,19 +1370,21 @@ const Emitter = struct {
                     try e.mesh_places.put(e.arena, ri, mp);
                     return;
                 }
-                const sc: StorageClass = if (into_buffer or (base_pl != null and base_pl.?.rules == .std430)) e.bufferSc() else if (base_pl != null) .uniform else switch (i.ptr) {
+                const sc: StorageClass = if (into_cb) .uniform else if (into_buffer or (base_pl != null and base_pl.?.rules == .std430)) e.bufferSc() else if (base_pl != null) .uniform else switch (i.ptr) {
                     .function => .function,
                     .private => .private,
                     .groupshared => if (e.payload_global != null and e.rootGlobal(a.base) == e.payload_global) .task_payload_workgroup else .workgroup,
                     .cbuffer, .resource => .uniform,
                     else => return e.unsupported("access into this storage is not supported yet", .{}),
                 };
-                var pl = if (into_buffer) PtrLayout{ .rules = .std430, .row_major = false } else e.ptr_layouts[a.base.index()];
+                var pl = if (into_cb) PtrLayout{ .rules = .vk_relaxed, .row_major = false } else if (into_buffer) PtrLayout{ .rules = .std430, .row_major = false } else e.ptr_layouts[a.base.index()];
                 var ops: std.ArrayList(u32) = .empty;
                 try ops.appendSlice(e.arena, &.{ 0, 0, e.val(a.base) });
                 var cur = f.inst(a.base).ty;
                 var indices = a.indices;
-                if (e.t.get(cur) == .resource) {
+                if (into_cb) {
+                    cur = e.t.get(cur).resource.elem;
+                } else if (e.t.get(cur) == .resource) {
                     // buffer[i]...: member 0 (the runtime array), element i.
                     const rk = e.t.get(cur).resource;
                     if (try e.bufferElemType(cur) == null) return e.unsupported("indexing this resource is not supported yet", .{});
@@ -1489,7 +1599,7 @@ const Emitter = struct {
                 const callee = e.m.functions.items[c.func];
                 if (e.hasResourceParams(callee)) {
                     const bindings = try e.arena.alloc(Id, c.args.len);
-                    for (callee.params, c.args, bindings) |p, a, *bd| bd.* = if (isResourceType(e.t, p.ty)) e.val(a) else 0;
+                    for (callee.params, c.args, bindings) |p, a, *bd| bd.* = if (isResourceType(e.t, p.ty)) try e.resourceBinding(a) else 0;
                     try ops.append(e.arena, try e.variantFor(c.func, bindings));
                     for (callee.params, c.args) |p, a| if (!isResourceType(e.t, p.ty)) try ops.append(e.arena, e.val(a));
                     e.vals[ri] = try e.op1(.function_call, i.ty, ops.items);
@@ -1547,6 +1657,28 @@ const Emitter = struct {
             },
             .patch_input => |k| e.vals[ri] = try e.loadInterface(e.patches[k], .input, i.ty),
             .mesh_output => try e.mesh_places.put(e.arena, ri, .{ .kind = i.op.mesh_output, .ty = i.ty }),
+            .heap_resource => |h| {
+                if (e.t.get(i.ty) != .resource and e.t.get(i.ty) != .sampler) return;
+                const p = try e.resourcePointee(i.ty);
+                const key = .{ h.sampler, p.ty };
+                const hv = e.heap_vars.get(key) orelse blk: {
+                    try e.cap(.runtime_descriptor_array);
+                    try e.extension("SPV_EXT_descriptor_indexing");
+                    const arr = e.b.newId();
+                    try e.b.emit(.types_globals, .type_runtime_array, &.{ arr, p.ty });
+                    const v = e.b.newId();
+                    try e.b.emit(.types_globals, .variable, &.{ try e.pointerType(p.sc, arr), v, @backingInt(p.sc) });
+                    try e.b.emit(.annotations, .decorate, &.{ v, 34, 0 }); // DescriptorSet
+                    try e.b.emit(.annotations, .decorate, &.{ v, 33, e.heap_bindings[@intFromBool(h.sampler)] }); // Binding
+                    try e.b.emitWithString(.debug_names, .name, &.{v}, if (h.sampler) "SamplerDescriptorHeap" else "ResourceDescriptorHeap", &.{});
+                    if (e.spv_minor >= 4) try e.interface_ids.append(e.arena, v);
+                    try e.heap_vars.put(e.arena, key, v);
+                    break :blk v;
+                };
+                const id = try e.opRaw(.access_chain, try e.pointerType(p.sc, p.ty), &.{ hv, e.val(h.index) });
+                e.vals[ri] = id;
+                if (e.nonuniform_ids.contains(e.val(h.index))) try e.markNonUniform(id, i.ty);
+            },
             .mesh_payload => {
                 if (e.payload_var == 0) {
                     e.payload_var = e.b.newId();
@@ -1825,6 +1957,7 @@ const Emitter = struct {
             .sampler => return .{ .sc = .uniform_constant, .ty = try e.samplerType() },
             .resource => |r| switch (r.kind) {
                 .structured_buffer, .rw_structured_buffer, .append_structured_buffer, .consume_structured_buffer, .byte_address_buffer, .rw_byte_address_buffer => return .{ .sc = e.bufferSc(), .ty = try e.bufferBlockType(ty) },
+                .constant_buffer => if (e.t.get(r.elem) == .@"struct") return .{ .sc = .uniform, .ty = try e.constantBufferBlock(r.elem) },
                 else => if (texture.shape(r.kind)) |sh| return .{ .sc = .uniform_constant, .ty = try e.imageType(sh, r.elem) },
             },
             .array => |arr| {
@@ -1880,6 +2013,7 @@ const Emitter = struct {
             .resource => |r| switch (r.kind) {
                 .structured_buffer, .rw_structured_buffer, .append_structured_buffer, .consume_structured_buffer, .byte_address_buffer, .rw_byte_address_buffer => .storage_buffer_array_non_uniform_indexing,
                 .buffer => .uniform_texel_buffer_array_non_uniform_indexing,
+                .constant_buffer => .uniform_buffer_array_non_uniform_indexing,
                 .rw_buffer => .storage_texel_buffer_array_non_uniform_indexing,
                 else => if (r.kind.isWritable()) .storage_image_array_non_uniform_indexing else .sampled_image_array_non_uniform_indexing,
             },

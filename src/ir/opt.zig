@@ -202,6 +202,7 @@ fn mapOp(a: Allocator, op: Op, ctx: anytype) Allocator.Error!Op {
         .res_store => |x| .{ .res_store = .{ .res = ctx.map(x.res), .index = ctx.map(x.index), .value = ctx.map(x.value) } },
         .method => |x| .{ .method = .{ .name = x.name, .res = ctx.map(x.res), .args = try mapRefs(a, x.args, ctx) } },
         .output => |x| .{ .output = .{ .element = x.element, .value = ctx.map(x.value) } },
+        .heap_resource => |h| .{ .heap_resource = .{ .index = ctx.map(h.index), .sampler = h.sampler } },
         .patch_output => |x| .{ .patch_output = .{ .element = x.element, .value = ctx.map(x.value) } },
         .phi => |ps| blk: {
             const out = try a.alloc(@typeInfo(@TypeOf(ps)).pointer.child, ps.len);

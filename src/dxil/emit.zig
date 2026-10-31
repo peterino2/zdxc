@@ -95,8 +95,11 @@ const Resource = struct {
     /// Registers in the range (arrays of resources); maxInt for unsized.
     count: u32 = 1,
     /// An array element's handle made at its use: a copy of the array's
-    /// entry, skipped by metadata.
+    /// entry, skipped by metadata. (Descriptor heap resources are views
+    /// with no global.)
     view: bool = false,
+    /// The resource type (without array dimensions); 0 for cbuffer blocks.
+    rty: TypeId = 0,
 
     const Class = enum(u8) { srv = 0, uav = 1, cbuffer = 2, sampler = 3 };
 };
@@ -150,6 +153,8 @@ const Emitter = struct {
     /// A typed UAV load of more than one component.
     uses_typed_uav_load: bool = false,
     uses_inner_coverage: bool = false,
+    uses_resource_heap: bool = false,
+    uses_sampler_heap: bool = false,
 
     sig_in: []signature.Element = &.{},
     sig_out: []signature.Element = &.{},
@@ -336,6 +341,31 @@ const Emitter = struct {
         return e.assemble(gpa, entry, bitcode);
     }
 
+    /// The resource entry for a value of resource type `ty` (global,
+    /// id and count left for the caller).
+    fn resourceFor(e: *Emitter, ty: TypeId) Error!Resource {
+        if (e.t.get(ty) == .sampler) return .{ .global = 0, .class = .sampler, .kind = 14, .elem = ty, .comparison = e.t.get(ty).sampler.comparison, .rty = ty };
+        const r = e.t.get(ty).resource;
+        const kind: u32 = switch (r.kind) {
+            .structured_buffer, .rw_structured_buffer, .append_structured_buffer, .consume_structured_buffer => 12,
+            .byte_address_buffer, .rw_byte_address_buffer => 11,
+            .buffer, .rw_buffer => 10,
+            .texture1d, .rw_texture1d => 1,
+            .texture2d, .rw_texture2d => 2,
+            .texture2dms, .rw_texture2dms => 3,
+            .texture3d, .rw_texture3d => 4,
+            .texture_cube => 5,
+            .texture1d_array, .rw_texture1d_array => 6,
+            .texture2d_array, .rw_texture2d_array => 7,
+            .texture2dms_array, .rw_texture2dms_array => 8,
+            .texture_cube_array => 9,
+            .constant_buffer => 13,
+            else => return e.unsupported("resource type '{s}' is not supported yet", .{r.name}),
+        };
+        const class: Resource.Class = if (kind == 13) .cbuffer else if (r.kind.isWritable() or r.kind == .consume_structured_buffer) .uav else .srv;
+        return .{ .global = 0, .class = class, .kind = kind, .elem = r.elem, .rty = ty, .has_counter = r.kind == .append_structured_buffer or r.kind == .consume_structured_buffer };
+    }
+
     fn collectResources(e: *Emitter) Error!void {
         var counts = [_]u32{ 0, 0, 0, 0 };
         // Constant buffers: `$Globals` first, then the others in order.
@@ -362,30 +392,22 @@ const Emitter = struct {
                 try e.resource_of_global.put(e.arena, @intCast(gi), @intCast(e.resources.items.len - 1));
                 continue;
             }
-            const r = switch (e.t.get(gty)) {
-                .resource => |r| r,
-                else => return e.unsupported("global '{s}' is not supported yet", .{g.name}),
+            if (e.t.get(gty) != .resource) return e.unsupported("global '{s}' is not supported yet", .{g.name});
+            var res = try e.resourceFor(gty);
+            const class = res.class;
+            const want: u8 = switch (class) {
+                .uav => 'u',
+                .srv => 't',
+                .cbuffer => 'b',
+                .sampler => 's',
             };
-            const kind: u32 = switch (r.kind) {
-                .structured_buffer, .rw_structured_buffer, .append_structured_buffer, .consume_structured_buffer => 12,
-                .byte_address_buffer, .rw_byte_address_buffer => 11,
-                .buffer, .rw_buffer => 10,
-                .texture1d, .rw_texture1d => 1,
-                .texture2d, .rw_texture2d => 2,
-                .texture2dms, .rw_texture2dms => 3,
-                .texture3d, .rw_texture3d => 4,
-                .texture_cube => 5,
-                .texture1d_array, .rw_texture1d_array => 6,
-                .texture2d_array, .rw_texture2d_array => 7,
-                .texture2dms_array, .rw_texture2dms_array => 8,
-                .texture_cube_array => 9,
-                else => return e.unsupported("resource type '{s}' is not supported yet", .{r.name}),
-            };
-            const class: Resource.Class = if (r.kind.isWritable() or r.kind == .consume_structured_buffer) .uav else .srv;
-            if (g.binding.explicit and g.binding.class != @as(u8, if (class == .uav) 'u' else 't')) {
+            if (g.binding.explicit and g.binding.class != want) {
                 return e.unsupported("binding '{s}' to the wrong register class", .{g.name});
             }
-            try e.resources.append(e.arena, .{ .global = @intCast(gi), .class = class, .id = counts[@backingInt(class)], .kind = kind, .elem = r.elem, .count = count, .has_counter = r.kind == .append_structured_buffer or r.kind == .consume_structured_buffer });
+            res.global = @intCast(gi);
+            res.id = counts[@backingInt(class)];
+            res.count = count;
+            try e.resources.append(e.arena, res);
             counts[@backingInt(class)] += 1;
             try e.resource_of_global.put(e.arena, @intCast(gi), @intCast(e.resources.items.len - 1));
         }
@@ -475,11 +497,7 @@ const Emitter = struct {
             const cls = try e.dm.constant(.{ .ty = i8t, .kind = .{ .int = @backingInt(res.class) } });
             const bind = try e.dm.constant(.{ .ty = bind_ty, .kind = .{ .aggregate = try e.arena.dupe(module.ConstId, &.{ lb_c.constant, ub_c.constant, space.constant, cls.constant }) } });
             const raw = try emitCall(e, prologue, create, &.{ try e.i32Const(217), bind, index, nu });
-            const p = try e.resourceProperties(res);
-            const p0 = try e.dm.constant(.{ .ty = i32t, .kind = .{ .int = p[0] } });
-            const p1 = try e.dm.constant(.{ .ty = i32t, .kind = .{ .int = p[1] } });
-            const props = try e.dm.constant(.{ .ty = props_ty, .kind = .{ .aggregate = try e.arena.dupe(module.ConstId, &.{ p0.constant, p1.constant }) } });
-            return emitCall(e, prologue, annotate, &.{ try e.i32Const(216), raw, props });
+            return emitCall(e, prologue, annotate, &.{ try e.i32Const(216), raw, try e.propertiesConst(res) });
         }
         const create = try e.dxOp("dx.op.createHandle", e.handle_ty, &.{ i32t, i8t, i32t, i32t, i1t }, .nounwind_readonly);
         return emitCall(e, prologue, create, &.{
@@ -489,6 +507,24 @@ const Emitter = struct {
             index,
             nu,
         });
+    }
+
+    /// The ResourceProperties constant annotating `res`'s handles.
+    fn propertiesConst(e: *Emitter, res: Resource) Error!Value {
+        const i32t = try e.dm.intType(32);
+        const props_ty = try e.dm.getType(.{ .@"struct" = .{ .name = "dx.types.ResourceProperties", .elems = &.{ i32t, i32t } } });
+        const p = try e.resourceProperties(res);
+        const p0 = try e.dm.constant(.{ .ty = i32t, .kind = .{ .int = p[0] } });
+        const p1 = try e.dm.constant(.{ .ty = i32t, .kind = .{ .int = p[1] } });
+        return e.dm.constant(.{ .ty = props_ty, .kind = .{ .aggregate = try e.arena.dupe(module.ConstId, &.{ p0.constant, p1.constant }) } });
+    }
+
+    /// annotateHandle at the current point.
+    fn annotateHandle(e: *Emitter, res: Resource, raw: Value) Error!Value {
+        const i32t = try e.dm.intType(32);
+        const props_ty = try e.dm.getType(.{ .@"struct" = .{ .name = "dx.types.ResourceProperties", .elems = &.{ i32t, i32t } } });
+        const fn_i = try e.dxOp("dx.op.annotateHandle", e.handle_ty, &.{ i32t, e.handle_ty, props_ty }, .nounwind_readnone);
+        return e.callOp(fn_i, e.handle_ty, &.{ try e.i32Const(216), raw, try e.propertiesConst(res) });
     }
 
     fn self_sm66(e: *Emitter) bool {
@@ -767,6 +803,22 @@ const Emitter = struct {
         switch (i.op) {
             .constant => |c| return e.list(&.{try e.constant(i.ty, c)}),
             .param => |p| return frame.params[p],
+            .heap_resource => |h| {
+                if (e.t.get(i.ty) != .resource and e.t.get(i.ty) != .sampler) return .none;
+                if (e.profile.minor < 6) return e.unsupported("descriptor heaps need shader model 6.6", .{});
+                var res = try e.resourceFor(i.ty);
+                res.global = std.math.maxInt(u32);
+                res.view = true;
+                const idx = (try e.scalars(frame, h.index))[0];
+                const i32t = try e.dm.intType(32);
+                const i1t = try e.dm.intType(1);
+                const create = try e.dxOp("dx.op.createHandleFromHeap", e.handle_ty, &.{ i32t, i32t, i1t, i1t }, .nounwind_readnone);
+                const raw = try e.callOp(create, e.handle_ty, &.{ try e.i32Const(218), idx, try e.dm.constant(.{ .ty = i1t, .kind = .{ .int = @intFromBool(h.sampler) } }), try e.dm.constant(.{ .ty = i1t, .kind = .{ .int = @intFromBool(e.nonuniform.contains(idx)) } }) });
+                res.handle = try e.annotateHandle(res, raw);
+                if (h.sampler) e.uses_sampler_heap = true else e.uses_resource_heap = true;
+                try e.resources.append(e.arena, res);
+                return .{ .handle = @intCast(e.resources.items.len - 1) };
+            },
             .mesh_output => |k| return .{ .mesh = .{ .kind = k, .ty = i.ty } },
             .mesh_payload => {
                 const dty = try e.memoryType(i.ty);
@@ -807,7 +859,7 @@ const Emitter = struct {
                     return .{ .ptr = gop.value_ptr.* };
                 }
                 const ri = e.resource_of_global.get(g) orelse return e.unsupported("global '{s}' is not supported yet", .{e.m.globals.items[g].name});
-                if (e.resources.items[ri].class == .cbuffer) return .{ .cbuf = .{ .res = ri } };
+                if (e.resources.items[ri].class == .cbuffer and e.m.globals.items[g].space == .cbuffer) return .{ .cbuf = .{ .res = ri } };
                 if (e.resources.items[ri].count != 1) return .{ .res_array = .{ .res = ri, .ty = e.m.globals.items[g].ty } };
                 return .{ .handle = ri };
             },
@@ -895,6 +947,7 @@ const Emitter = struct {
                 if (frame.vals[a.base.index()] == .handle) {
                     const ri = frame.vals[a.base.index()].handle;
                     const rk = e.resources.items[ri].kind;
+                    if (rk == 13) return e.cbufferAccess(frame, .{ .res = ri }, e.resources.items[ri].elem, a.indices);
                     if (rk >= 1 and rk <= 10) return .{ .texel = .{ .res = ri, .coords = try e.scalars(frame, a.indices[0]) } };
                     if (rk != 12) return e.unsupported("member access into this resource is not supported yet", .{});
                     const start: @FieldType(Lowered, "buf") = .{ .res = ri, .index = (try e.scalars(frame, a.indices[0]))[0] };
@@ -1891,8 +1944,7 @@ const Emitter = struct {
     // Constant buffers
 
     fn cbufferSize(e: *Emitter, res: Resource) Error!i64 {
-        const g = e.m.globals.items[res.global];
-        return layout.sizeOf(e.t, g.ty, false, .dx_legacy) catch e.unsupported("constant buffer '{s}' contains types that are not supported yet", .{g.name});
+        return layout.sizeOf(e.t, res.elem, false, .dx_legacy) catch e.unsupported("constant buffer '{s}' contains types that are not supported yet", .{try e.t.format(e.arena, res.elem)});
     }
 
     /// Byte offset of a member / element inside a constant buffer.
@@ -2049,6 +2101,7 @@ const Emitter = struct {
     }
 
     fn resourceKind(e: *Emitter, res: Resource) types.ResourceKind {
+        if (res.rty != 0) return e.t.get(res.rty).resource.kind;
         var ty = e.m.globals.items[res.global].ty;
         while (e.t.get(ty) == .array) ty = e.t.get(ty).array.elem;
         return e.t.get(ty).resource.kind;
@@ -2158,7 +2211,7 @@ const Emitter = struct {
             }
         }
         if (res.kind == 12 and (eq(u8, name, "IncrementCounter") or eq(u8, name, "DecrementCounter") or eq(u8, name, "Append") or eq(u8, name, "Consume"))) {
-            for (e.resources.items) |*r2| if (r2.global == res.global) {
+            if (res.global != std.math.maxInt(u32)) for (e.resources.items) |*r2| if (r2.global == res.global) {
                 r2.has_counter = true;
             };
             const i8t = try e.dm.intType(8);
@@ -3129,6 +3182,8 @@ const Emitter = struct {
             flags |= 1 << 24;
         };
         if (e.uses_view_id) flags |= 1 << 21;
+        if (e.uses_resource_heap) flags |= 1 << 30;
+        if (e.uses_sampler_heap) flags |= 1 << 31;
         if (e.uses_wave) flags |= 1 << 19;
         if (e.uses_inner_coverage) flags |= 1 << 10;
         return flags;
@@ -3140,6 +3195,7 @@ const Emitter = struct {
             .{ 1 << 2, 0x1 },      .{ 1 << 16, 0x4 },     .{ 1 << 15, 0x8 },        .{ 1 << 5, 0x10 },
             .{ 1 << 11, 0x200 },   .{ 1 << 10, 0x400 },   .{ 1 << 9, 0x2000 },      .{ 1 << 20, 0x8000 },
             .{ 1 << 21, 0x10000 }, .{ 1 << 24, 0x80000 },   .{ 1 << 19, 0x4000 },   .{ 1 << 13, 0x800 },
+            .{ 1 << 30, 0x2000000 }, .{ 1 << 31, 0x4000000 },
         };
         var f: u64 = 0;
         for (map) |m| if (flags & m[0] != 0) {
@@ -3184,10 +3240,11 @@ const Emitter = struct {
             }.f;
             if (r.class == .cbuffer) {
                 const f32t = try dm.getType(.float);
-                const cb_ty = try dm.getType(.{ .@"struct" = .{ .name = g.name, .elems = &.{f32t} } });
+                const cb_name = if (r.rty != 0) try std.fmt.allocPrint(e.arena, "struct.{s}", .{try e.t.format(e.arena, r.elem)}) else g.name;
+                const cb_ty = try rangeTy(dm, r.count, try dm.getType(.{ .@"struct" = .{ .name = cb_name, .elems = &.{f32t} } }));
                 const undef_cb = try dm.constant(.{ .ty = try dm.ptrType(cb_ty), .kind = .undef });
                 const b = g.binding;
-                try lists[2].append(e.arena, try dm.mdNode(&.{ try mdI32(dm, r.id), try dm.mdValue(try dm.ptrType(cb_ty), undef_cb), try dm.mdString(""), try mdI32(dm, b.space), try mdI32(dm, b.index), try mdI32(dm, 1), try mdI32(dm, try e.cbufferSize(r)), null }));
+                try lists[2].append(e.arena, try dm.mdNode(&.{ try mdI32(dm, r.id), try dm.mdValue(try dm.ptrType(cb_ty), undef_cb), try dm.mdString(""), try mdI32(dm, b.space), try mdI32(dm, b.index), try mdI32(dm, range), try mdI32(dm, try e.cbufferSize(r)), null }));
                 continue;
             }
             if (r.class == .sampler) {
