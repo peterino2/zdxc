@@ -14,6 +14,9 @@ pub const Shape = struct {
     array: bool = false,
     ms: bool = false,
     rw: bool = false,
+    /// A combined image sampler (vk::SampledTexture*): sampling methods
+    /// take no sampler argument.
+    combined: bool = false,
 
     /// Coordinate components, without the array index.
     pub fn coords(s: Shape) u8 {
@@ -61,6 +64,15 @@ pub fn shape(kind: Kind) ?Shape {
         .rw_texture2dms => .{ .dim = .d2, .ms = true, .rw = true },
         .rw_texture2dms_array => .{ .dim = .d2, .array = true, .ms = true, .rw = true },
         .rw_texture3d => .{ .dim = .d3, .rw = true },
+        .sampled_texture1d => .{ .dim = .d1, .combined = true },
+        .sampled_texture1d_array => .{ .dim = .d1, .array = true, .combined = true },
+        .sampled_texture2d => .{ .dim = .d2, .combined = true },
+        .sampled_texture2d_array => .{ .dim = .d2, .array = true, .combined = true },
+        .sampled_texture2dms => .{ .dim = .d2, .ms = true, .combined = true },
+        .sampled_texture2dms_array => .{ .dim = .d2, .array = true, .ms = true, .combined = true },
+        .sampled_texture3d => .{ .dim = .d3, .combined = true },
+        .sampled_texture_cube => .{ .dim = .cube, .combined = true },
+        .sampled_texture_cube_array => .{ .dim = .cube, .array = true, .combined = true },
         else => null,
     };
 }
@@ -136,6 +148,23 @@ const sampled = [_]Sampled{
 /// Decodes `name(args...)` on a resource of shape `s`; null for methods
 /// that are not texture operations (GetDimensions is handled apart).
 pub fn decode(name: []const u8, s: Shape, nargs: usize) ?Call {
+    if (s.combined) {
+        // As with a sampler argument, every index one lower.
+        var plain = s;
+        plain.combined = false;
+        var c = decodePlain(name, plain, nargs + 1) orelse return null;
+        if (c.sampler == null) return decodePlain(name, plain, nargs);
+        c.sampler = null;
+        c.coord -= 1;
+        inline for (.{ "compare", "bias", "lod", "ddx", "ddy", "offset", "clamp", "status", "sample_index" }) |f| {
+            if (@field(c, f)) |*k| k.* -= 1;
+        }
+        return c;
+    }
+    return decodePlain(name, s, nargs);
+}
+
+fn decodePlain(name: []const u8, s: Shape, nargs: usize) ?Call {
     const eq = std.mem.eql;
     const n: u8 = @intCast(nargs);
     for (sampled) |sm| if (eq(u8, name, sm.name)) {

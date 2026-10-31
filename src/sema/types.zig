@@ -261,6 +261,16 @@ pub const ResourceKind = enum(u8) {
     raytracing_acceleration_structure,
     feedback_texture2d,
     feedback_texture2d_array,
+    /// vk::SampledTexture*: combined image samplers (SPIR-V only).
+    sampled_texture1d,
+    sampled_texture1d_array,
+    sampled_texture2d,
+    sampled_texture2d_array,
+    sampled_texture2dms,
+    sampled_texture2dms_array,
+    sampled_texture3d,
+    sampled_texture_cube,
+    sampled_texture_cube_array,
     /// Any other builtin object (RayQuery, node records, vk:: types...):
     /// accepted, with methods resolved through the intrinsic table.
     other,
@@ -275,9 +285,9 @@ pub const ResourceKind = enum(u8) {
     /// Dimensions of the integer index used by operator[] (0: no indexing).
     pub fn indexDims(k: ResourceKind) u8 {
         return switch (k) {
-            .buffer, .rw_buffer, .structured_buffer, .rw_structured_buffer, .texture1d, .rw_texture1d => 1,
-            .texture1d_array, .rw_texture1d_array, .texture2d, .rw_texture2d, .texture2dms, .rw_texture2dms => 2,
-            .texture2d_array, .rw_texture2d_array, .texture2dms_array, .rw_texture2dms_array, .texture3d, .rw_texture3d => 3,
+            .buffer, .rw_buffer, .structured_buffer, .rw_structured_buffer, .texture1d, .rw_texture1d, .sampled_texture1d => 1,
+            .texture1d_array, .rw_texture1d_array, .texture2d, .rw_texture2d, .texture2dms, .rw_texture2dms, .sampled_texture1d_array, .sampled_texture2d, .sampled_texture2dms => 2,
+            .texture2d_array, .rw_texture2d_array, .texture2dms_array, .rw_texture2dms_array, .texture3d, .rw_texture3d, .sampled_texture2d_array, .sampled_texture2dms_array, .sampled_texture3d => 3,
             else => 0,
         };
     }
@@ -304,6 +314,15 @@ pub const ResourceKind = enum(u8) {
         .{ "RasterizerOrderedTexture1D", .rw_texture1d },                           .{ "RasterizerOrderedTexture1DArray", .rw_texture1d_array },
         .{ "RasterizerOrderedTexture2D", .rw_texture2d },                           .{ "RasterizerOrderedTexture2DArray", .rw_texture2d_array },
         .{ "RasterizerOrderedTexture3D", .rw_texture3d },
+    };
+
+    /// vk::SampledTexture* by name.
+    pub const vk_names = [_]struct { []const u8, ResourceKind }{
+        .{ "SampledTexture1D", .sampled_texture1d },               .{ "SampledTexture1DArray", .sampled_texture1d_array },
+        .{ "SampledTexture2D", .sampled_texture2d },               .{ "SampledTexture2DArray", .sampled_texture2d_array },
+        .{ "SampledTexture2DMS", .sampled_texture2dms },           .{ "SampledTexture2DMSArray", .sampled_texture2dms_array },
+        .{ "SampledTexture3D", .sampled_texture3d },               .{ "SampledTextureCUBE", .sampled_texture_cube },
+        .{ "SampledTextureCUBEArray", .sampled_texture_cube_array },
     };
 
     pub fn fromName(n: []const u8) ?ResourceKind {

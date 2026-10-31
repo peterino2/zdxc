@@ -1047,6 +1047,19 @@ pub const Sema = struct {
                 return TypeTable.error_type;
             },
         };
+        // vk::SampledTexture<T> (T defaults to float4).
+        for (types.ResourceKind.vk_names) |vn| if (std.mem.eql(u8, vn[0], n)) {
+            var elem = try s.types.vector(.float, 4);
+            if (args.len > 0) elem = try s.typeArg(args[0]) orelse elem;
+            if (args.len > 0 and elem != TypeTable.error_type) switch (s.types.get(elem)) {
+                .scalar, .vector => {},
+                else => {
+                    s.err(templateArgLoc(args[0]), "elements of typed buffers and textures must be scalars or vectors", .{});
+                    return TypeTable.error_type;
+                },
+            };
+            return s.types.intern(.{ .resource = .{ .kind = vn[1], .elem = elem, .name = n } });
+        };
         // Any other builtin object (RayQuery, node records, vk:: types...).
         if (isOtherBuiltinObject(n)) {
             var elem: TypeId = TypeTable.void_type;
@@ -2813,8 +2826,8 @@ pub const Sema = struct {
                     return err_typed;
                 }
                 const view: ?@FieldType(@FieldType(types.Type, "texture_view"), "kind") = switch (r.kind) {
-                    .texture1d, .texture1d_array, .texture2d, .texture2d_array, .texture3d => if (eql(name, "mips")) .mips else null,
-                    .texture2dms, .texture2dms_array, .rw_texture2dms, .rw_texture2dms_array => if (eql(name, "sample")) .sample else null,
+                    .texture1d, .texture1d_array, .texture2d, .texture2d_array, .texture3d, .sampled_texture1d, .sampled_texture1d_array, .sampled_texture2d, .sampled_texture2d_array, .sampled_texture3d => if (eql(name, "mips")) .mips else null,
+                    .texture2dms, .texture2dms_array, .rw_texture2dms, .rw_texture2dms_array, .sampled_texture2dms, .sampled_texture2dms_array => if (eql(name, "sample")) .sample else null,
                     else => null,
                 };
                 if (view) |k| return rvalue(try s.types.intern(.{ .texture_view = .{ .texture = b.ty, .kind = k } }));
@@ -3532,6 +3545,15 @@ fn methodNamespace(t: types.Type) ?[]const u8 {
             .rw_texture3d => "RWTexture3DMethods",
             .feedback_texture2d => "FeedbackTexture2DMethods",
             .feedback_texture2d_array => "FeedbackTexture2DArrayMethods",
+            .sampled_texture1d => "VkSampledTexture1DMethods",
+            .sampled_texture1d_array => "VkSampledTexture1DArrayMethods",
+            .sampled_texture2d => "VkSampledTexture2DMethods",
+            .sampled_texture2d_array => "VkSampledTexture2DArrayMethods",
+            .sampled_texture2dms => "VkSampledTexture2DMSMethods",
+            .sampled_texture2dms_array => "VkSampledTexture2DMSArrayMethods",
+            .sampled_texture3d => "VkSampledTexture3DMethods",
+            .sampled_texture_cube => "VkSampledTextureCUBEMethods",
+            .sampled_texture_cube_array => "VkSampledTextureCUBEArrayMethods",
             .constant_buffer, .texture_buffer, .raytracing_acceleration_structure => null,
             .other => null,
         },

@@ -67,6 +67,7 @@ pub const Op = enum(u16) {
     image_gather = 96,
     image_dref_gather = 97,
     image_read = 98,
+    image = 100,
     image_sparse_sample_implicit_lod = 305,
     image_sparse_sample_explicit_lod = 306,
     image_sparse_sample_dref_implicit_lod = 307,

@@ -2131,7 +2131,12 @@ const Emitter = struct {
                 .structured_buffer, .rw_structured_buffer, .append_structured_buffer, .consume_structured_buffer, .byte_address_buffer, .rw_byte_address_buffer => return .{ .sc = e.bufferSc(), .ty = try e.bufferBlockType(ty) },
                 .constant_buffer => if (e.t.get(r.elem) == .@"struct") return .{ .sc = .uniform, .ty = try e.constantBufferBlock(r.elem) },
                 .texture_buffer => if (e.t.get(r.elem) == .@"struct") return .{ .sc = e.bufferSc(), .ty = try e.textureBufferBlock(r.elem) },
-                else => if (texture.shape(r.kind)) |sh| return .{ .sc = .uniform_constant, .ty = try e.imageType(sh, r.elem) },
+                else => if (texture.shape(r.kind)) |sh| {
+                    var plain = sh;
+                    plain.combined = false;
+                    const img = try e.imageType(plain, r.elem);
+                    return .{ .sc = .uniform_constant, .ty = if (sh.combined) try e.sampledImageType(img) else img };
+                },
             },
             .array => |arr| {
                 const inner = try e.resourcePointee(arr.elem);
@@ -2291,6 +2296,12 @@ const Emitter = struct {
     }
 
     fn loadImage(e: *Emitter, r: Ref) Error!Id {
+        if (texture.shape(e.resourceInfo(r).kind)) |sh| if (sh.combined) {
+            // A combined image sampler: its image.
+            const si = try e.opRaw(.load, try e.sampledImageType(try e.imageTypeOf(r)), &.{e.val(r)});
+            if (e.nonuniform_ids.contains(e.val(r))) try e.markNonUniform(si, e.f.inst(r).ty);
+            return e.opRaw(.image, try e.imageTypeOf(r), &.{si});
+        };
         const id = try e.opRaw(.load, try e.imageTypeOf(r), &.{e.val(r)});
         if (e.nonuniform_ids.contains(e.val(r))) try e.markNonUniform(id, e.f.inst(r).ty);
         return id;
@@ -2488,10 +2499,17 @@ const Emitter = struct {
             return e.texelResult(v, s, ty);
         }
         if (call.op == .sample_position) return e.unsupported("GetSamplePosition is not supported yet", .{});
-        const smp = try e.opRaw(.load, try e.samplerType(), &.{e.val(args[call.sampler.?])});
-        if (e.nonuniform_ids.contains(e.val(args[call.sampler.?]))) try e.markNonUniform(smp, e.f.inst(args[call.sampler.?]).ty);
-        const si = try e.opRaw(.sampled_image, try e.sampledImageType(try e.imageTypeOf(res)), &.{ img, smp });
-        if (e.nonuniform_ids.contains(img) or e.nonuniform_ids.contains(smp)) try e.markNonUniform(si, e.f.inst(res).ty);
+        const si = if (sh.combined) blk: {
+            const v = try e.opRaw(.load, try e.sampledImageType(try e.imageTypeOf(res)), &.{e.val(res)});
+            if (e.nonuniform_ids.contains(e.val(res))) try e.markNonUniform(v, e.f.inst(res).ty);
+            break :blk v;
+        } else blk: {
+            const smp = try e.opRaw(.load, try e.samplerType(), &.{e.val(args[call.sampler.?])});
+            if (e.nonuniform_ids.contains(e.val(args[call.sampler.?]))) try e.markNonUniform(smp, e.f.inst(args[call.sampler.?]).ty);
+            const v = try e.opRaw(.sampled_image, try e.sampledImageType(try e.imageTypeOf(res)), &.{ img, smp });
+            if (e.nonuniform_ids.contains(img) or e.nonuniform_ids.contains(smp)) try e.markNonUniform(v, e.f.inst(res).ty);
+            break :blk v;
+        };
         if (call.op == .calc_lod or call.op == .calc_lod_unclamped) {
             try e.cap(.image_query);
             const q = try e.opRaw(.image_query_lod, try e.typeId(try e.t.vector(.float, 2)), &.{ si, coord });
