@@ -181,7 +181,7 @@ fn mapRefs(a: Allocator, xs: []const Ref, ctx: anytype) Allocator.Error![]const 
 /// `op` with every operand passed through `ctx.map`.
 fn mapOp(a: Allocator, op: Op, ctx: anytype) Allocator.Error!Op {
     return switch (op) {
-        .constant, .param, .global, .local_var, .input, .input_vertex, .emit, .cut => op,
+        .constant, .param, .global, .local_var, .input, .input_vertex, .emit, .cut, .patch_input, .output_vertex => op,
         .load => |p| .{ .load = ctx.map(p) },
         .store => |x| .{ .store = .{ .ptr = ctx.map(x.ptr), .value = ctx.map(x.value) } },
         .access => |x| .{ .access = .{ .base = ctx.map(x.base), .indices = try mapRefs(a, x.indices, ctx) } },
@@ -202,6 +202,7 @@ fn mapOp(a: Allocator, op: Op, ctx: anytype) Allocator.Error!Op {
         .res_store => |x| .{ .res_store = .{ .res = ctx.map(x.res), .index = ctx.map(x.index), .value = ctx.map(x.value) } },
         .method => |x| .{ .method = .{ .name = x.name, .res = ctx.map(x.res), .args = try mapRefs(a, x.args, ctx) } },
         .output => |x| .{ .output = .{ .element = x.element, .value = ctx.map(x.value) } },
+        .patch_output => |x| .{ .patch_output = .{ .element = x.element, .value = ctx.map(x.value) } },
         .phi => |ps| blk: {
             const out = try a.alloc(@typeInfo(@TypeOf(ps)).pointer.child, ps.len);
             for (ps, out) |p, *o| o.* = .{ .value = ctx.map(p.value), .block = p.block };

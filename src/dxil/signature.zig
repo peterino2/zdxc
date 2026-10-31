@@ -75,55 +75,79 @@ pub const Interpretation = enum(u8) { na, sv, sgv, arb, not_in_sig, not_packed, 
 pub const SigPoint = enum {
     vs_in,
     vs_out,
+    pc_in,
+    hs_in,
+    hs_cp_in,
+    hs_cp_out,
+    pc_out,
+    ds_in,
+    ds_cp_in,
+    ds_out,
     gs_v_in,
     gs_in,
     gs_out,
     ps_in,
     ps_out,
+    cs_in,
+    ms_in,
+    ms_out,
+    ms_p_out,
+    as_in,
 
     fn packing(sp: SigPoint) enum { none, input_assembler, vertex, target } {
         return switch (sp) {
             .vs_in => .input_assembler,
-            .vs_out, .gs_v_in, .gs_out, .ps_in => .vertex,
+            .vs_out, .hs_cp_in, .hs_cp_out, .pc_out, .ds_in, .ds_cp_in, .ds_out, .gs_v_in, .gs_out, .ps_in, .ms_out, .ms_p_out => .vertex,
             .ps_out => .target,
-            .gs_in => .none,
+            .pc_in, .hs_in, .gs_in, .cs_in, .ms_in, .as_in => .none,
         };
     }
 
     pub fn isInput(sp: SigPoint) bool {
         return switch (sp) {
-            .vs_in, .gs_v_in, .gs_in, .ps_in => true,
+            .vs_in, .pc_in, .hs_in, .hs_cp_in, .ds_in, .ds_cp_in, .gs_v_in, .gs_in, .ps_in, .cs_in, .ms_in, .as_in => true,
             else => false,
         };
     }
 };
 
 /// How `kind` is treated at `sp` in shader model 6.`minor` (dxc's
-/// DxilSigPoint interpretation table, for the stages zdxc supports).
+/// DxilSigPoint interpretation table).
 pub fn interpretation(kind: SemanticKind, sp: SigPoint, minor: u8) Interpretation {
     const I = Interpretation;
-    // Columns: vs_in, vs_out, gs_v_in, gs_in, gs_out, ps_in, ps_out.
-    const Row = [7]I;
+    // Columns: VSIn, VSOut, PCIn, HSIn, HSCPIn, HSCPOut, PCOut, DSIn,
+    // DSCPIn, DSOut, GSVIn, GSIn, GSOut, PSIn, PSOut, CSIn, MSIn, MSOut,
+    // MSPOut, ASIn.
+    const Row = [20]I;
     const na: I = .na;
+    const arb: I = .arb;
+    const sv: I = .sv;
+    const nis: I = .not_in_sig;
+    const cc: I = .clip_cull;
     const row: Row = switch (kind) {
-        .arbitrary => .{ .arb, .arb, .arb, na, .arb, .arb, na },
-        .vertex_id => .{ .sv, na, na, na, na, na, na },
-        .instance_id => .{ .sv, .arb, .arb, na, .arb, .arb, na },
-        .position, .render_target_array_index, .viewport_array_index => .{ .arb, .sv, .sv, na, .sv, .sv, na },
-        .clip_distance, .cull_distance => .{ .arb, .clip_cull, .clip_cull, na, .clip_cull, .clip_cull, na },
-        .primitive_id => .{ na, na, na, .shadow, .sgv, .sgv, na },
-        .gs_instance_id => .{ na, na, na, .not_in_sig, na, na, na },
-        .sample_index => .{ na, na, na, na, na, .shadow, na },
-        .is_front_face => .{ na, na, na, na, .sgv, .sgv, na },
-        .coverage => .{ na, na, na, na, na, .not_in_sig, .not_packed },
-        .inner_coverage => .{ na, na, na, na, na, .not_in_sig, na },
-        .target => .{ na, na, na, na, na, na, .target },
-        .depth, .depth_less_equal, .depth_greater_equal, .stencil_ref => .{ na, na, na, na, na, na, .not_packed },
-        .view_id => if (minor >= 1) .{ .not_in_sig, na, na, .not_in_sig, na, .not_in_sig, na } else @splat(na),
-        .barycentrics => if (minor >= 1) .{ na, na, na, na, na, .not_packed, na } else @splat(na),
-        .shading_rate => if (minor >= 4) .{ na, .sv, .sv, na, .sv, .sv, na } else @splat(na),
-        .cull_primitive => .{ na, na, na, na, na, .not_in_sig, na },
-        .start_vertex_location, .start_instance_location => if (minor >= 8) .{ .not_in_sig, na, na, na, na, na, na } else @splat(na),
+        .arbitrary => .{ arb, arb, na, na, arb, arb, arb, arb, arb, arb, arb, na, arb, arb, na, na, na, arb, arb, na },
+        .vertex_id => .{ sv, na, na, na, na, na, na, na, na, na, na, na, na, na, na, na, na, na, na, na },
+        .instance_id => .{ sv, arb, na, na, arb, arb, na, na, arb, arb, arb, na, arb, arb, na, na, na, na, na, na },
+        .position => .{ arb, sv, na, na, sv, sv, arb, arb, sv, sv, sv, na, sv, sv, na, na, na, sv, na, na },
+        .render_target_array_index, .viewport_array_index => .{ arb, sv, na, na, sv, sv, arb, arb, sv, sv, sv, na, sv, sv, na, na, na, na, sv, na },
+        .clip_distance, .cull_distance => .{ arb, cc, na, na, cc, cc, arb, arb, cc, cc, cc, na, cc, cc, na, na, na, cc, na, na },
+        .output_control_point_id => .{ na, na, na, nis, na, na, na, na, na, na, na, na, na, na, na, na, na, na, na, na },
+        .domain_location => .{ na, na, na, na, na, na, na, nis, na, na, na, na, na, na, na, na, na, na, na, na },
+        .primitive_id => .{ na, na, nis, nis, na, na, na, nis, na, na, na, .shadow, .sgv, .sgv, na, na, na, na, sv, na },
+        .gs_instance_id => .{ na, na, na, na, na, na, na, na, na, na, na, nis, na, na, na, na, na, na, na, na },
+        .sample_index => .{ na, na, na, na, na, na, na, na, na, na, na, na, na, .shadow, na, na, na, na, na, na },
+        .is_front_face => .{ na, na, na, na, na, na, na, na, na, na, na, na, .sgv, .sgv, na, na, na, na, na, na },
+        .coverage => .{ na, na, na, na, na, na, na, na, na, na, na, na, na, nis, .not_packed, na, na, na, na, na },
+        .inner_coverage => .{ na, na, na, na, na, na, na, na, na, na, na, na, na, nis, na, na, na, na, na, na },
+        .target => .{ na, na, na, na, na, na, na, na, na, na, na, na, na, na, .target, na, na, na, na, na },
+        .depth, .depth_less_equal, .depth_greater_equal, .stencil_ref => .{ na, na, na, na, na, na, na, na, na, na, na, na, na, na, .not_packed, na, na, na, na, na },
+        .dispatch_thread_id, .group_id, .group_index, .group_thread_id => .{ na, na, na, na, na, na, na, na, na, na, na, na, na, na, na, nis, nis, na, na, nis },
+        .tess_factor, .inside_tess_factor => .{ na, na, na, na, na, na, .tess_factor, .tess_factor, na, na, na, na, na, na, na, na, na, na, na, na },
+        .view_id => if (minor >= 1) .{ nis, na, nis, nis, na, na, na, nis, na, na, na, nis, na, nis, na, na, nis, na, na, na } else @splat(na),
+        .barycentrics => if (minor >= 1) .{ na, na, na, na, na, na, na, na, na, na, na, na, na, .not_packed, na, na, na, na, na, na } else @splat(na),
+        .shading_rate => if (minor >= 4) .{ na, sv, na, na, sv, sv, na, na, sv, sv, sv, na, sv, sv, na, na, na, na, sv, na } else @splat(na),
+        .cull_primitive => .{ na, na, na, na, na, na, na, na, na, na, na, na, na, nis, na, na, na, na, .not_packed, na },
+        .start_vertex_location, .start_instance_location => if (minor >= 8) .{ nis, na, na, na, na, na, na, na, na, na, na, na, na, na, na, na, na, na, na, na } else @splat(na),
         else => @splat(na),
     };
     return row[@intFromEnum(sp)];
@@ -486,8 +510,21 @@ pub fn vectorsUsed(elements: []const Element, stream: u32) u32 {
 // ISG1 / OSG1
 
 /// D3D system-value code of a semantic (DxilProgramSigSemantic).
-fn systemValue(kind: SemanticKind) u32 {
+pub const Domain = enum(u8) { undefined = 0, isoline = 1, tri = 2, quad = 3 };
+
+fn systemValue(kind: SemanticKind, domain: Domain) u32 {
     return switch (kind) {
+        .tess_factor => switch (domain) {
+            .isoline => 16, // FinalLineDensityTessfactor (then Detail)
+            .tri => 13,
+            .quad => 11,
+            .undefined => 0,
+        },
+        .inside_tess_factor => switch (domain) {
+            .tri => 14,
+            .quad => 12,
+            else => 0,
+        },
         .arbitrary, .invalid => 0,
         .position => 1,
         .clip_distance => 2,
@@ -515,7 +552,7 @@ fn systemValue(kind: SemanticKind) u32 {
 
 /// A DxilProgramSignature part (ISG1 or OSG1) for elements in the
 /// signature (not NotInSig ones).
-pub fn programSignature(gpa: Allocator, elements: []const Element, is_input: bool) Allocator.Error![]u8 {
+pub fn programSignature(gpa: Allocator, elements: []const Element, is_input: bool, domain: Domain) Allocator.Error![]u8 {
     const Rec = struct { stream: u32, name: u32, index: u32, sv: u32, comp: u32, reg: u32, mask: u8, rw: u8, min_prec: u32 };
     var recs: std.ArrayList(Rec) = .empty;
     defer recs.deinit(gpa);
@@ -540,9 +577,11 @@ pub fn programSignature(gpa: Allocator, elements: []const Element, is_input: boo
         if (e.start_row != null) usage <<= @intCast(e.start_col);
         const rw: u8 = if (is_input) usage else (usage ^ 0xF) & 0xF;
         var reg: u32 = e.start_row orelse 0xFFFFFFFF;
+        var sv = systemValue(e.kind, domain);
         for (e.indices) |idx| {
-            try recs.append(gpa, .{ .stream = e.stream, .name = name_off, .index = idx, .sv = systemValue(e.kind), .comp = e.comp.sigCompType(), .reg = reg, .mask = e.colsMask(), .rw = rw, .min_prec = e.comp.minPrecision() });
+            try recs.append(gpa, .{ .stream = e.stream, .name = name_off, .index = idx, .sv = sv, .comp = e.comp.sigCompType(), .reg = reg, .mask = e.colsMask(), .rw = rw, .min_prec = e.comp.minPrecision() });
             if (e.start_row != null) reg += 1;
+            if (sv == 16) sv = 15; // isoline: density, then detail
         }
     }
     std.sort.insertion(Rec, recs.items, {}, struct {

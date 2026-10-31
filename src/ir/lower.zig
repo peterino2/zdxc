@@ -69,6 +69,11 @@ const Lowerer = struct {
     early_outputs: std.ArrayList(ir.SigElement) = .empty,
     streams: std.ArrayList(Stream) = .empty,
     entry_fn: ?*const semamod.Function = null,
+    /// Entry inputs / outputs go to the patch constants (domain shader
+    /// inputs other than control points; hull patch constant outputs).
+    patch_io: bool = false,
+    /// Per-vertex reads come from the hull shader's output control points.
+    vertex_from_outputs: bool = false,
     /// The current method's object pointer.
     this_ptr: Ref = .none,
     ret_ty: TypeId = TypeTable.void_type,
@@ -93,12 +98,21 @@ const Lowerer = struct {
         if (isMethod(f)) try params.append(l.arena, .{ .name = "this", .ty = try l.s.types.intern(.{ .@"struct" = f.owner.? }), .by_ref = true });
         for (f.params) |p| {
             if (l.s.types.get(p.type) == .stream) continue;
-            try params.append(l.arena, .{ .name = p.name, .ty = p.type, .by_ref = p.dir != .in });
+            try params.append(l.arena, .{ .name = p.name, .ty = l.irType(p.type), .by_ref = p.dir != .in });
         }
         const i = try l.m.addFunction(.{ .name = f.name, .params = params.items, .ret = f.ret });
         try l.funcs.put(l.arena, f, i);
         try l.pending.append(l.arena, f);
         return i;
+    }
+
+    /// The IR type of a value of Sema type `ty`: InputPatch / OutputPatch
+    /// are arrays of control points.
+    fn irType(l: *Lowerer, ty: TypeId) TypeId {
+        return switch (l.s.types.get(ty)) {
+            .patch => |p| l.s.types.array(p.elem, p.count) catch ty,
+            else => ty,
+        };
     }
 
     fn drain(l: *Lowerer) Error!void {
@@ -126,10 +140,11 @@ const Lowerer = struct {
         }
         for (f.params, 0..) |p, i| {
             if (l.s.types.get(p.type) == .stream) continue;
-            const pv = try l.b.add(.{ .op = .{ .param = ir_index }, .ty = p.type, .ptr = if (p.dir != .in) .function else .none });
+            const pty = l.irType(p.type);
+            const pv = try l.b.add(.{ .op = .{ .param = ir_index }, .ty = pty, .ptr = if (p.dir != .in) .function else .none });
             ir_index += 1;
             const storage = if (p.dir != .in) pv else blk: {
-                const local = try l.b.add(.{ .op = .local_var, .ty = p.type, .ptr = .function });
+                const local = try l.b.add(.{ .op = .local_var, .ty = pty, .ptr = .function });
                 try l.b.store(local, pv);
                 break :blk local;
             };
@@ -1284,6 +1299,25 @@ const Lowerer = struct {
         return r;
     }
 
+    fn addInput(l: *Lowerer, entry: *ir.Entry, el: ir.SigElement) Error!Ref {
+        if (l.patch_io) {
+            try entry.patch_constants.append(l.arena, el);
+            return l.b.add(.{ .op = .{ .patch_input = @intCast(entry.patch_constants.items.len - 1) }, .ty = el.ty });
+        }
+        try entry.inputs.append(l.arena, el);
+        return l.b.add(.{ .op = .{ .input = @intCast(entry.inputs.items.len - 1) }, .ty = el.ty });
+    }
+
+    fn addOutput(l: *Lowerer, entry: *ir.Entry, el: ir.SigElement, value: Ref) Error!void {
+        if (l.patch_io) {
+            try entry.patch_constants.append(l.arena, el);
+            _ = try l.b.add(.{ .op = .{ .patch_output = .{ .element = @intCast(entry.patch_constants.items.len - 1), .value = value } }, .ty = TypeTable.void_type });
+            return;
+        }
+        try entry.outputs.append(l.arena, el);
+        _ = try l.b.add(.{ .op = .{ .output = .{ .element = @intCast(entry.outputs.items.len - 1), .value = value } }, .ty = TypeTable.void_type });
+    }
+
     /// An entry input of type `ty`: one signature element, or for structs
     /// without a semantic one per field (recursively).
     fn entryInput(l: *Lowerer, entry: *ir.Entry, ty: TypeId, semantic: ?[]const u8, attrs: SigAttrs, loc: ast.Loc, what: []const u8) Error!Ref {
@@ -1292,10 +1326,7 @@ const Lowerer = struct {
             var el = sigElement(sem, ty);
             return l.structInput(entry, ty, el.semantic, &el.semantic_index, attrs);
         };
-        if (semantic) |sem| {
-            try entry.inputs.append(l.arena, withAttrs(sigElement(sem, ty), attrs));
-            return l.b.add(.{ .op = .{ .input = @intCast(entry.inputs.items.len - 1) }, .ty = ty });
-        }
+        if (semantic) |sem| return l.addInput(entry, withAttrs(sigElement(sem, ty), attrs));
         switch (l.s.types.get(ty)) {
             .@"struct" => |st| {
                 const parts = try l.arena.alloc(Ref, st.fields.items.len);
@@ -1317,9 +1348,8 @@ const Lowerer = struct {
                 p.* = try l.structInput(entry, fld.type, name, index, attrs.field(fld));
                 continue;
             }
-            try entry.inputs.append(l.arena, withAttrs(.{ .semantic = name, .semantic_index = index.*, .ty = fld.type, .system_value = std.ascii.startsWithIgnoreCase(name, "SV_") }, attrs.field(fld)));
+            p.* = try l.addInput(entry, withAttrs(.{ .semantic = name, .semantic_index = index.*, .ty = fld.type, .system_value = std.ascii.startsWithIgnoreCase(name, "SV_") }, attrs.field(fld)));
             index.* += 1;
-            p.* = try l.b.add(.{ .op = .{ .input = @intCast(entry.inputs.items.len - 1) }, .ty = fld.type });
         }
         return l.b.add(.{ .op = .{ .construct = parts }, .ty = ty });
     }
@@ -1332,9 +1362,8 @@ const Lowerer = struct {
                 try l.structOutput(entry, fld.type, name, index, v, attrs.field(fld));
                 continue;
             }
-            try entry.outputs.append(l.arena, withAttrs(.{ .semantic = name, .semantic_index = index.*, .ty = fld.type, .system_value = std.ascii.startsWithIgnoreCase(name, "SV_") }, attrs.field(fld)));
+            try l.addOutput(entry, withAttrs(.{ .semantic = name, .semantic_index = index.*, .ty = fld.type, .system_value = std.ascii.startsWithIgnoreCase(name, "SV_") }, attrs.field(fld)), v);
             index.* += 1;
-            _ = try l.b.add(.{ .op = .{ .output = .{ .element = @intCast(entry.outputs.items.len - 1), .value = v } }, .ty = TypeTable.void_type });
         }
     }
 
@@ -1343,11 +1372,7 @@ const Lowerer = struct {
             var el = sigElement(sem, ty);
             return l.structOutput(entry, ty, el.semantic, &el.semantic_index, value, attrs);
         };
-        if (semantic) |sem| {
-            try entry.outputs.append(l.arena, withAttrs(sigElement(sem, ty), attrs));
-            _ = try l.b.add(.{ .op = .{ .output = .{ .element = @intCast(entry.outputs.items.len - 1), .value = value } }, .ty = TypeTable.void_type });
-            return;
-        }
+        if (semantic) |sem| return l.addOutput(entry, withAttrs(sigElement(sem, ty), attrs), value);
         switch (l.s.types.get(ty)) {
             .@"struct" => |st| for (st.fields.items, 0..) |fld, k| {
                 const v = try l.b.add(.{ .op = .{ .extract = .{ .agg = value, .index = @intCast(k) } }, .ty = fld.type });
@@ -1477,6 +1502,11 @@ const Lowerer = struct {
         const t = l.types();
         const leaf = struct {
             fn f(lw: *Lowerer, en: *ir.Entry, el: ir.SigElement, vx: u32, reg: bool, nx: *u32) Error!Ref {
+                if (lw.vertex_from_outputs) {
+                    const r = try lw.b.add(.{ .op = .{ .output_vertex = .{ .element = nx.*, .vertex = vx } }, .ty = el.ty });
+                    nx.* += 1;
+                    return r;
+                }
                 var e2 = el;
                 e2.per_vertex = true;
                 if (reg) try en.inputs.append(lw.arena, e2);
@@ -1521,6 +1551,128 @@ const Lowerer = struct {
         return l.b.add(.{ .op = .{ .construct = parts }, .ty = to });
     }
 
+    /// `[domain(...)]`, `[partitioning(...)]` and the other hull / domain
+    /// attributes.
+    fn tessAttributes(l: *Lowerer, f: *const semamod.Function, entry: *ir.Entry) void {
+        for (f.decl.attrs) |a| {
+            const name = a.name;
+            const eqi = std.ascii.eqlIgnoreCase;
+            const str: []const u8 = if (a.args.len == 1 and a.args[0].kind == .string_lit) blk: {
+                const lit = a.args[0].kind.string_lit;
+                break :blk if (lit.len >= 2) lit[1 .. lit.len - 1] else lit;
+            } else "";
+            if (eqi(name, "domain")) {
+                entry.tess.domain = std.meta.stringToEnum(ir.Domain, str) orelse entry.tess.domain;
+            } else if (eqi(name, "partitioning")) {
+                entry.tess.partitioning = std.meta.stringToEnum(ir.Partitioning, str) orelse entry.tess.partitioning;
+            } else if (eqi(name, "outputtopology")) {
+                entry.tess.output_topology = std.meta.stringToEnum(ir.OutputTopology, str) orelse entry.tess.output_topology;
+            } else if (eqi(name, "outputcontrolpoints") and a.args.len == 1) {
+                entry.tess.output_control_points = @intCast(@max(0, l.s.evalInt(a.args[0]) orelse 0));
+            } else if (eqi(name, "maxtessfactor") and a.args.len == 1) {
+                if (l.s.evalConst(a.args[0])) |c| entry.tess.max_tess_factor = switch (c) {
+                    .float => |x| @floatCast(x),
+                    .int => |x| @floatFromInt(x),
+                    .bool => |x| @floatFromInt(@intFromBool(x)),
+                };
+            }
+        }
+    }
+
+    /// Reads the control points of a patch parameter (registering their
+    /// elements when `register`) and stores them into `local`.
+    fn storeControlPoints(l: *Lowerer, entry: *ir.Entry, local: Ref, pty: TypeId, pd: ast.VarDecl, first: u32, register: bool) Error!void {
+        const patch = l.s.types.get(pty).patch;
+        if (!l.vertex_from_outputs) entry.tess.input_control_points = patch.count;
+        const points = try l.arena.alloc(Ref, patch.count);
+        for (points, 0..) |*v, k| {
+            var next = first;
+            v.* = try l.vertexIn(entry, patch.elem, semanticOf(pd.semantics), paramAttrs(pd.quals), @intCast(k), register and k == 0, &next, null, pd.name_loc);
+        }
+        try l.b.store(local, try l.b.add(.{ .op = .{ .construct = points }, .ty = l.irType(pty) }));
+    }
+
+    fn writesTessFactor(l: *Lowerer, f: *const semamod.Function) bool {
+        if (f.ret != TypeTable.void_type and l.hasTessFactor(f.ret, semanticOf(f.decl.ret_semantics))) return true;
+        for (f.decl.params, f.params) |pd, p| {
+            if (p.dir != .in and l.hasTessFactor(p.type, semanticOf(pd.semantics))) return true;
+        }
+        return false;
+    }
+
+    /// An SV_TessFactor array in `ty` (dxc's HasTessFactorSemanticRecurse).
+    fn hasTessFactor(l: *Lowerer, ty: TypeId, semantic: ?[]const u8) bool {
+        switch (l.s.types.get(ty)) {
+            .@"struct" => |st| {
+                for (st.fields.items) |fld| if (l.hasTessFactor(fld.type, fld.semantic)) return true;
+                return false;
+            },
+            .array => {
+                const sem = semantic orelse return false;
+                return std.ascii.eqlIgnoreCase(sigElement(sem, ty).semantic, "SV_TessFactor");
+            },
+            else => return false,
+        }
+    }
+
+    /// The hull shader's patch constant function, wrapped like the entry:
+    /// reads control points (the entry's inputs and outputs), writes the
+    /// patch constants.
+    fn patchConstantWrapper(l: *Lowerer, f: *const semamod.Function, entry: *ir.Entry, cp_first: ?u32) Error!void {
+        const name: []const u8 = for (f.decl.attrs) |a| {
+            if (std.ascii.eqlIgnoreCase(a.name, "patchconstantfunc") and a.args.len == 1 and a.args[0].kind == .string_lit) {
+                const lit = a.args[0].kind.string_lit;
+                break if (lit.len >= 2) lit[1 .. lit.len - 1] else lit;
+            }
+        } else {
+            l.unsupported(f.loc, "hull shader without a patch constant function", .{});
+            return error.Unsupported;
+        };
+        // Among overloads, the one that can be a patch constant function
+        // (writes a tess factor array), as dxc.
+        const pcf = for (l.s.all_functions.items) |g| {
+            if (g.owner == null and g.defined and std.mem.eql(u8, g.name, name) and l.writesTessFactor(g)) break g;
+        } else {
+            l.unsupported(f.loc, "patch constant function '{s}' has no definition", .{name});
+            return error.Unsupported;
+        };
+        const pci = try l.functionIndex(pcf);
+        try l.drain();
+        const wrapper = try l.m.addFunction(.{ .name = try std.fmt.allocPrint(l.arena, "{s}.wrapper", .{name}), .params = &.{}, .ret = TypeTable.void_type });
+        l.b = .{ .m = &l.m, .f = l.m.functions.items[wrapper] };
+        l.b.setBlock(try l.b.newBlock());
+        const args = try l.arena.alloc(Ref, pcf.params.len);
+        const locals = try l.arena.alloc(Ref, pcf.params.len);
+        for (pcf.decl.params, pcf.params, 0..) |pd, p, i| {
+            locals[i] = try l.b.add(.{ .op = .local_var, .ty = l.irType(p.type), .ptr = .function });
+            if (l.s.types.get(p.type) == .patch) {
+                if (l.s.types.get(p.type).patch.output) {
+                    // The entry's output control points, read back.
+                    l.vertex_from_outputs = true;
+                    defer l.vertex_from_outputs = false;
+                    try l.storeControlPoints(entry, locals[i], p.type, pd, 0, false);
+                } else {
+                    const first = cp_first orelse @as(u32, @intCast(entry.inputs.items.len));
+                    try l.storeControlPoints(entry, locals[i], p.type, pd, first, cp_first == null);
+                }
+                args[i] = try l.b.load(locals[i]);
+                continue;
+            }
+            if (p.dir != .out) try l.b.store(locals[i], try l.entryInput(entry, p.type, semanticOf(pd.semantics), paramAttrs(pd.quals), pd.name_loc, pd.name));
+            args[i] = if (p.dir == .in) try l.b.load(locals[i]) else locals[i];
+        }
+        const ret = try l.b.add(.{ .op = .{ .call = .{ .func = pci, .args = args } }, .ty = pcf.ret });
+        l.patch_io = true;
+        defer l.patch_io = false;
+        if (pcf.ret != TypeTable.void_type) try l.entryOutput(entry, pcf.ret, semanticOf(pcf.decl.ret_semantics), paramAttrs(pcf.decl.quals), ret, pcf.loc, "return value");
+        for (pcf.decl.params, pcf.params, 0..) |pd, p, i| {
+            if (p.dir == .in) continue;
+            try l.entryOutput(entry, p.type, semanticOf(pd.semantics), paramAttrs(pd.quals), try l.b.load(locals[i]), pd.name_loc, pd.name);
+        }
+        l.b.terminate(.{ .ret = .none });
+        entry.patch_wrapper = wrapper;
+    }
+
     fn buildEntry(l: *Lowerer, f: *const semamod.Function, main: u32, opts: Options) Error!void {
         const inits = try l.staticInits();
         var entry: ir.Entry = .{ .func = main, .name = opts.entry, .stage = opts.stage };
@@ -1549,11 +1701,31 @@ const Lowerer = struct {
         const args = try l.arena.alloc(Ref, f.params.len);
         const locals = try l.arena.alloc(Ref, f.params.len);
         var n_args: usize = 0;
+        const tess = opts.stage == .hull or opts.stage == .domain;
+        if (tess) l.tessAttributes(f, &entry);
+        // Hull shaders: where the control point inputs start.
+        var cp_first: ?u32 = null;
         for (f.decl.params, f.params, 0..) |pd, p, i| {
             if (l.s.types.get(p.type) == .stream) continue;
             n_args += 1;
-            locals[i] = try l.b.add(.{ .op = .local_var, .ty = p.type, .ptr = .function });
+            locals[i] = try l.b.add(.{ .op = .local_var, .ty = l.irType(p.type), .ptr = .function });
             const q = pd.quals;
+            if (tess and l.s.types.get(p.type) == .patch) {
+                // Control points: one value per point of the patch.
+                const first: u32 = @intCast(entry.inputs.items.len);
+                cp_first = first;
+                try l.storeControlPoints(&entry, locals[i], p.type, pd, first, true);
+                args[i] = try l.b.load(locals[i]);
+                continue;
+            }
+            if (opts.stage == .domain and p.dir != .out) {
+                // Everything else a domain shader reads is per patch.
+                l.patch_io = true;
+                defer l.patch_io = false;
+                try l.b.store(locals[i], try l.entryInput(&entry, p.type, semanticOf(pd.semantics), paramAttrs(pd.quals), pd.name_loc, pd.name));
+                args[i] = if (p.dir == .in) try l.b.load(locals[i]) else locals[i];
+                continue;
+            }
             if (opts.stage == .geometry and (q.point or q.line or q.triangle or q.lineadj or q.triangleadj) and l.s.types.get(p.type) == .array) {
                 // Per-vertex inputs: one value per vertex of the primitive.
                 const arr = l.s.types.get(p.type).array;
@@ -1587,6 +1759,11 @@ const Lowerer = struct {
         }
         l.b.terminate(.{ .ret = .none });
         entry.wrapper = wrapper;
+        if (opts.stage == .hull) {
+            // Output control points are arrays over the patch.
+            for (entry.outputs.items) |*el| el.per_vertex = true;
+            try l.patchConstantWrapper(f, &entry, cp_first);
+        }
         // The HLSL entry keeps its name with a prefix (as dxc's SPIR-V).
         l.m.functions.items[main].name = try std.fmt.allocPrint(l.arena, "src.{s}", .{opts.entry});
         l.m.entry = entry;

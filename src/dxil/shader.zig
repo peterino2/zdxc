@@ -145,6 +145,7 @@ pub const PsvInfo = struct {
     resources: []const ResourceBind = &.{},
     inputs: []const signature.Element = &.{},
     outputs: []const signature.Element = &.{},
+    patch_constants: []const signature.Element = &.{},
     groupshared_bytes: u32 = 0,
     max_vertex_count: u16 = 0,
 };
@@ -161,6 +162,7 @@ pub fn psv(gpa: Allocator, info: PsvInfo) ![]u8 {
     const in_vectors = signature.vectorsUsed(info.inputs, 0);
     var out_vectors: [4]u32 = undefined;
     for (&out_vectors, 0..) |*v, s| v.* = signature.vectorsUsed(info.outputs, @intCast(s));
+    const pc_vectors = signature.vectorsUsed(info.patch_constants, 0);
 
     try w(&buf, gpa, 60); // sizeof(PSVRuntimeInfo4)
     // PSVRuntimeInfo0
@@ -169,8 +171,11 @@ pub fn psv(gpa: Allocator, info: PsvInfo) ![]u8 {
     try w(&buf, gpa, 0xFFFFFFFF); // MaximumExpectedWaveLaneCount
     // PSVRuntimeInfo1: stage, UsesViewID, MaxVertexCount, element counts,
     // vector counts.
-    try buf.appendSlice(gpa, &.{ @backingInt(info.kind), 0, @truncate(info.max_vertex_count), @truncate(info.max_vertex_count >> 8) });
-    try buf.appendSlice(gpa, &.{ @intCast(info.inputs.len), @intCast(info.outputs.len), 0, @intCast(in_vectors) });
+    // (The MaxVertexCount union holds SigPatchConstOrPrimVectors for hull
+    // and domain shaders.)
+    const union16: u16 = if (info.kind == .hull or info.kind == .domain) @intCast(pc_vectors) else info.max_vertex_count;
+    try buf.appendSlice(gpa, &.{ @backingInt(info.kind), 0, @truncate(union16), @truncate(union16 >> 8) });
+    try buf.appendSlice(gpa, &.{ @intCast(info.inputs.len), @intCast(info.outputs.len), @intCast(info.patch_constants.len), @intCast(in_vectors) });
     for (out_vectors) |v| try buf.append(gpa, @intCast(v));
     // PSVRuntimeInfo2
     for (info.num_threads) |t| try w(&buf, gpa, t);
@@ -184,7 +189,7 @@ pub fn psv(gpa: Allocator, info: PsvInfo) ![]u8 {
     defer indices.deinit(gpa);
     var records: std.ArrayList(u8) = .empty;
     defer records.deinit(gpa);
-    for ([_][]const signature.Element{ info.inputs, info.outputs }) |els| for (els) |e| {
+    for ([_][]const signature.Element{ info.inputs, info.outputs, info.patch_constants }) |els| for (els) |e| {
         var name_off: u32 = 0;
         if (e.kind == .arbitrary and e.name.len > 0) {
             name_off = @intCast(strings.items.len);
@@ -228,7 +233,7 @@ pub fn psv(gpa: Allocator, info: PsvInfo) ![]u8 {
     try buf.appendSlice(gpa, strings.items);
     try w(&buf, gpa, @intCast(indices.items.len));
     for (indices.items) |v| try w(&buf, gpa, v);
-    if (info.inputs.len + info.outputs.len > 0) {
+    if (info.inputs.len + info.outputs.len + info.patch_constants.len > 0) {
         try w(&buf, gpa, 16); // sizeof(PSVSignatureElement0)
         try buf.appendSlice(gpa, records.items);
     }
@@ -237,12 +242,18 @@ pub fn psv(gpa: Allocator, info: PsvInfo) ![]u8 {
     // (One per output stream for geometry shaders.)
     for (out_vectors, 0..) |ov, stream| {
         if (stream > 0 and info.kind != .geometry) break;
-        if (in_vectors > 0 and ov > 0) {
-            const dwords = ((ov + 7) >> 3) * in_vectors * 4;
-            try buf.appendNTimes(gpa, 0, dwords * 4);
-        }
+        if (in_vectors > 0 and ov > 0) try buf.appendNTimes(gpa, 0, tableDwords(in_vectors, ov) * 4);
     }
+    // Inputs to patch constants (hull), patch constants to outputs
+    // (domain).
+    if (info.kind == .hull and pc_vectors > 0 and in_vectors > 0) try buf.appendNTimes(gpa, 0, tableDwords(in_vectors, pc_vectors) * 4);
+    if (info.kind == .domain and out_vectors[0] > 0 and pc_vectors > 0) try buf.appendNTimes(gpa, 0, tableDwords(pc_vectors, out_vectors[0]) * 4);
     return buf.toOwnedSlice(gpa);
+}
+
+/// PSVComputeInputOutputTableDwords.
+fn tableDwords(in_vectors: u32, out_vectors: u32) u32 {
+    return ((out_vectors + 7) >> 3) * in_vectors * 4;
 }
 
 test "profile parsing" {

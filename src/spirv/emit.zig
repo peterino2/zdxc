@@ -28,6 +28,7 @@ const StorageClass = enum(u32) { uniform_constant = 0, input = 1, uniform = 2, o
 const Capability = enum(u32) {
     shader = 1,
     geometry = 2,
+    tessellation = 3,
     float16 = 9,
     float64 = 10,
     int64 = 11,
@@ -134,13 +135,20 @@ const Emitter = struct {
     /// Entry inputs / outputs: interface variable and its value type.
     inputs: []Interface = &.{},
     outputs: []Interface = &.{},
+    patches: []Interface = &.{},
     interface_ids: std.ArrayList(Id) = .empty,
 
     // Per function.
     vals: []Id = &.{},
     f: *const ir.Function = undefined,
 
-    const Interface = struct { var_id: Id, ty: TypeId };
+    const Interface = struct {
+        var_id: Id,
+        ty: TypeId,
+        /// TessLevelOuter / TessLevelInner: float[4] / float[2] builtins
+        /// holding a shorter array (or a scalar), accessed element-wise.
+        tess_level: bool = false,
+    };
     const LayoutKey = struct { TypeId, layout.Rules, bool };
     const PtrLayout = struct { rules: layout.Rules, row_major: bool };
 
@@ -539,6 +547,23 @@ const Emitter = struct {
                 } else 27;
                 try e.b.emit(.execution_modes, .execution_mode, &.{ wrapper, out_mode });
             },
+            .hull => {
+                const ts = entry.tess;
+                try e.b.emit(.execution_modes, .execution_mode, &.{ wrapper, domainMode(ts.domain) });
+                try e.b.emit(.execution_modes, .execution_mode, &.{ wrapper, switch (ts.partitioning) {
+                    .integer, .pow2 => 1, // SpacingEqual
+                    .fractional_even => 2,
+                    .fractional_odd => 3,
+                } });
+                switch (ts.output_topology) {
+                    .triangle_cw => try e.b.emit(.execution_modes, .execution_mode, &.{ wrapper, 4 }), // VertexOrderCw
+                    .triangle_ccw => try e.b.emit(.execution_modes, .execution_mode, &.{ wrapper, 5 }), // VertexOrderCcw
+                    .point => try e.b.emit(.execution_modes, .execution_mode, &.{ wrapper, 10 }), // PointMode
+                    .line => {},
+                }
+                try e.b.emit(.execution_modes, .execution_mode, &.{ wrapper, 26, ts.output_control_points }); // OutputVertices
+            },
+            .domain => try e.b.emit(.execution_modes, .execution_mode, &.{ wrapper, domainMode(entry.tess.domain) }),
             .pixel => {
                 try e.b.emit(.execution_modes, .execution_mode, &.{ wrapper, 7 }); // OriginUpperLeft
                 for (entry.outputs.items) |o| if (std.ascii.eqlIgnoreCase(o.semantic, "SV_Depth")) {
@@ -550,6 +575,14 @@ const Emitter = struct {
         for (m.functions.items, e.func_ids) |f, id| {
             if (!e.hasResourceParams(f)) try e.b.emitWithString(.debug_names, .name, &.{id}, f.name, &.{});
         }
+    }
+
+    fn domainMode(d: ir.Domain) u32 {
+        return switch (d) {
+            .tri => 22, // Triangles
+            .quad => 24, // Quads
+            .isoline => 25, // Isolines
+        };
     }
 
     fn emitGlobals(e: *Emitter) Error!void {
@@ -732,6 +765,13 @@ const Emitter = struct {
             return .{ .id = 18, .ty = uint1 }; // SampleId
         }
         if (stage == .pixel and !input and eq(n, "SV_Depth")) return .{ .id = 22, .ty = try t.scalar(.float) }; // FragDepth
+        if (stage == .hull or stage == .domain) {
+            if (eq(n, "SV_TessFactor")) return .{ .id = 11, .ty = try t.array(try t.scalar(.float), 4) }; // TessLevelOuter
+            if (eq(n, "SV_InsideTessFactor")) return .{ .id = 12, .ty = try t.array(try t.scalar(.float), 2) }; // TessLevelInner
+            if (input and eq(n, "SV_PrimitiveID")) return .{ .id = 7, .ty = uint1 }; // PrimitiveId
+        }
+        if (stage == .domain and input and eq(n, "SV_DomainLocation")) return .{ .id = 13, .ty = try t.vector(.float, 3) }; // TessCoord
+        if (stage == .hull and input and eq(n, "SV_OutputControlPointID")) return .{ .id = 8, .ty = uint1 }; // InvocationId
         if (eq(n, "SV_Target") or eq(n, "SV_VertexID") or eq(n, "SV_InstanceID") or eq(n, "SV_Position")) return null;
         if (el.system_value) return e.unsupported("system value '{s}' is not supported yet", .{n});
         return null;
@@ -740,30 +780,47 @@ const Emitter = struct {
     fn emitInterface(e: *Emitter, entry: ir.Entry) Error!void {
         e.inputs = try e.arena.alloc(Interface, entry.inputs.items.len);
         e.outputs = try e.arena.alloc(Interface, entry.outputs.items.len);
-        var location: [2]u32 = .{ 0, 0 };
-        for ([_][]const ir.SigElement{ entry.inputs.items, entry.outputs.items }, 0..) |els, dir| {
-            const input = dir == 0;
-            const out = if (input) e.inputs else e.outputs;
+        e.patches = try e.arena.alloc(Interface, entry.patch_constants.items.len);
+        if (entry.stage == .hull or entry.stage == .domain) try e.cap(.tessellation);
+        // Variables needing a Location, assigned once all exist.
+        const Located = struct { var_id: Id, key: []const u8, count: u32, input: bool, target: ?u32 };
+        var located: std.ArrayList(Located) = .empty;
+        const lists = [_][]const ir.SigElement{ entry.inputs.items, entry.outputs.items, entry.patch_constants.items };
+        const ifaces = [_][]Interface{ e.inputs, e.outputs, e.patches };
+        for (lists, ifaces, 0..) |els, out, li| {
+            const patch = li == 2;
+            const input = if (patch) entry.stage == .domain else li == 0;
             for (els, out) |el, *iface| {
                 const bi = try e.builtinFor(el, input, entry.stage);
                 // bool is not allowed in located interface variables.
                 var ty = if (bi) |x| x.ty else if (e.t.component(el.ty) == .bool) try e.t.withComponent(el.ty, .uint) else el.ty;
-                // Geometry inputs per vertex are arrays over the primitive.
+                // Per-vertex values are arrays over the primitive / patch.
                 const vty = ty;
-                if (el.per_vertex) ty = try e.t.array(ty, entry.geometry.input_vertices);
+                if (el.per_vertex) ty = try e.t.array(ty, switch (entry.stage) {
+                    .geometry => entry.geometry.input_vertices,
+                    .hull => if (input) entry.tess.input_control_points else entry.tess.output_control_points,
+                    else => entry.tess.input_control_points,
+                });
                 const sc: StorageClass = if (input) .input else .output;
+                if (bi != null and input and !el.per_vertex) {
+                    // One variable per input builtin, shared by its uses.
+                    iface.* = .{ .var_id = try e.builtinInput(bi.?.id, ty), .ty = vty, .tess_level = bi.?.id == 11 or bi.?.id == 12 };
+                    if (iface.tess_level) try e.b.emit(.annotations, .decorate, &.{ iface.var_id, 15 }); // Patch
+                    continue;
+                }
                 const ptr = try e.pointerType(sc, try e.typeId(ty));
                 const var_id = e.b.newId();
                 try e.b.emit(.types_globals, .variable, &.{ ptr, var_id, @backingInt(sc) });
+                if (patch) try e.b.emit(.annotations, .decorate, &.{ var_id, 15 }); // Patch
                 if (bi) |x| {
                     try e.b.emit(.annotations, .decorate, &.{ var_id, 11, x.id }); // BuiltIn
                     if (input and entry.stage == .pixel and !e.t.component(x.ty).?.isFloat() and e.t.component(x.ty).? != .bool) {
                         try e.b.emit(.annotations, .decorate, &.{ var_id, 14 }); // Flat
                     }
                 } else {
-                    const loc = if (std.ascii.eqlIgnoreCase(el.semantic, "SV_Target")) el.semantic_index else location[dir];
-                    try e.b.emit(.annotations, .decorate, &.{ var_id, 30, loc }); // Location
-                    location[dir] = @max(location[dir], loc) + try e.locationCount(ty);
+                    const key = if (el.semantic_index > 0) try std.fmt.allocPrint(e.arena, "{s}{d}", .{ el.semantic, el.semantic_index }) else el.semantic;
+                    const target: ?u32 = if (std.ascii.eqlIgnoreCase(el.semantic, "SV_Target")) el.semantic_index else null;
+                    try located.append(e.arena, .{ .var_id = var_id, .key = key, .count = try e.locationCount(vty), .input = input, .target = target });
                     // Interpolation (as dxc: pixel inputs and vertex
                     // outputs; integers are always flat).
                     if ((input and entry.stage == .pixel) or (!input and entry.stage == .vertex)) {
@@ -788,8 +845,28 @@ const Emitter = struct {
                 }
                 const name = try std.fmt.allocPrint(e.arena, "{s}.var.{s}{d}", .{ if (input) "in" else "out", el.semantic, el.semantic_index });
                 try e.b.emitWithString(.debug_names, .name, &.{var_id}, name, &.{});
-                iface.* = .{ .var_id = var_id, .ty = vty };
+                iface.* = .{ .var_id = var_id, .ty = vty, .tess_level = bi != null and (bi.?.id == 11 or bi.?.id == 12) };
                 try e.interface_ids.append(e.arena, var_id);
+            }
+        }
+        // Locations in declaration order, except hull outputs and domain
+        // inputs (control points and patch constants together), which
+        // dxc orders by semantic so the two stages agree.
+        for ([_]bool{ true, false }) |input| {
+            var vars: std.ArrayList(Located) = .empty;
+            for (located.items) |x| if (x.input == input) try vars.append(e.arena, x);
+            if ((!input and entry.stage == .hull) or (input and entry.stage == .domain)) {
+                std.sort.insertion(Located, vars.items, {}, struct {
+                    fn lt(_: void, a: Located, b: Located) bool {
+                        return std.mem.order(u8, a.key, b.key) == .lt;
+                    }
+                }.lt);
+            }
+            var next: u32 = 0;
+            for (vars.items) |x| {
+                const loc = x.target orelse next;
+                try e.b.emit(.annotations, .decorate, &.{ x.var_id, 30, loc }); // Location
+                next = @max(next, loc) + x.count;
             }
         }
     }
@@ -886,7 +963,25 @@ const Emitter = struct {
             }
             switch (blk.term) {
                 .none, .@"unreachable" => try e.b.emit(.functions, .@"unreachable", &.{}),
-                .ret => |v| if (v == .none) try e.b.emit(.functions, .@"return", &.{}) else try e.b.emit(.functions, .return_value, &.{e.vals[v.index()]}),
+                .ret => |v| if (v == .none) {
+                    if (e.hullEpilogue(fn_id)) |pw| {
+                        // After the control points: the patch constant
+                        // function, once per patch.
+                        const uint_ty = try e.t.scalar(.uint);
+                        try e.b.emit(.functions, .control_barrier, &.{ try e.constUint(2), try e.constUint(4), try e.constUint(0) });
+                        const id = try e.op1(.load, uint_ty, &.{try e.builtinInput(8, uint_ty)});
+                        const first = try e.op1(.i_equal, try e.t.scalar(.bool), &.{ id, try e.constUint(0) });
+                        const then_l = e.b.newId();
+                        const merge_l = e.b.newId();
+                        try e.b.emit(.functions, .selection_merge, &.{ merge_l, 0 });
+                        try e.b.emit(.functions, .branch_conditional, &.{ first, then_l, merge_l });
+                        try e.b.emit(.functions, .label, &.{then_l});
+                        _ = try e.op1(.function_call, TypeTable.void_type, &.{pw});
+                        try e.b.emit(.functions, .branch, &.{merge_l});
+                        try e.b.emit(.functions, .label, &.{merge_l});
+                    }
+                    try e.b.emit(.functions, .@"return", &.{});
+                } else try e.b.emit(.functions, .return_value, &.{e.vals[v.index()]}),
                 .br => |t| try e.b.emit(.functions, .branch, &.{labels[t.index()]}),
                 .cond_br => |c| try e.b.emit(.functions, .branch_conditional, &.{ e.vals[c.cond.index()], labels[c.then.index()], labels[c.@"else".index()] }),
                 .@"switch" => |sw| {
@@ -899,6 +994,14 @@ const Emitter = struct {
             }
         }
         try e.b.emit(.functions, .function_end, &.{});
+    }
+
+    /// For the hull shader's entry wrapper: the patch constant wrapper it
+    /// calls before returning.
+    fn hullEpilogue(e: *Emitter, fn_id: Id) ?Id {
+        const entry = e.m.entry.?;
+        if (entry.stage != .hull or fn_id != e.func_ids[entry.wrapper]) return null;
+        return e.func_ids[entry.patch_wrapper orelse return null];
     }
 
     /// Scalars, 1-vectors and 1x1 matrices (all a SPIR-V scalar).
@@ -1349,6 +1452,13 @@ const Emitter = struct {
                 const ptr = try e.opRaw(.access_chain, try e.pointerType(.input, try e.typeId(iface.ty)), &.{ iface.var_id, try e.constUint(x.vertex) });
                 e.vals[ri] = try e.reshape(try e.op1(.load, iface.ty, &.{ptr}), iface.ty, i.ty);
             },
+            .patch_input => |k| e.vals[ri] = try e.loadInterface(e.patches[k], .input, i.ty),
+            .patch_output => |o| try e.storeInterface(e.patches[o.element], f.inst(o.value).ty, e.val(o.value)),
+            .output_vertex => |x| {
+                const iface = e.outputs[x.element];
+                const ptr = try e.opRaw(.access_chain, try e.pointerType(.output, try e.typeId(iface.ty)), &.{ iface.var_id, try e.constUint(x.vertex) });
+                e.vals[ri] = try e.reshape(try e.op1(.load, iface.ty, &.{ptr}), iface.ty, i.ty);
+            },
             .emit, .cut => |stream| {
                 const multi = e.m.entry.?.geometry.streams[1] != null;
                 if (multi) {
@@ -1358,9 +1468,43 @@ const Emitter = struct {
             .output => |o| {
                 const iface = e.outputs[o.element];
                 const v = try e.reshape(e.val(o.value), f.inst(o.value).ty, iface.ty);
-                try e.b.emit(.functions, .store, &.{ iface.var_id, v });
+                if (e.m.entry.?.outputs.items[o.element].per_vertex) {
+                    // Hull output control points: this invocation's element.
+                    const id = try e.op1(.load, try e.t.scalar(.uint), &.{try e.builtinInput(8, try e.t.scalar(.uint))});
+                    const ptr = try e.opRaw(.access_chain, try e.pointerType(.output, try e.typeId(iface.ty)), &.{ iface.var_id, id });
+                    try e.b.emit(.functions, .store, &.{ ptr, v });
+                } else try e.b.emit(.functions, .store, &.{ iface.var_id, v });
             },
             .phi => return e.unsupported("phi", .{}),
+        }
+    }
+
+    /// Reads an interface variable as a value of type `ty`.
+    fn loadInterface(e: *Emitter, iface: Interface, sc: StorageClass, ty: TypeId) Error!Id {
+        if (!iface.tess_level) return e.reshape(try e.op1(.load, iface.ty, &.{iface.var_id}), iface.ty, ty);
+        const ft = try e.t.scalar(.float);
+        const n: u32 = if (e.t.get(ty) == .array) e.t.get(ty).array.len else 1;
+        const parts = try e.arena.alloc(Id, n);
+        for (parts, 0..) |*p, k| {
+            const ptr = try e.opRaw(.access_chain, try e.pointerType(sc, try e.typeId(ft)), &.{ iface.var_id, try e.constUint(@intCast(k)) });
+            p.* = try e.op1(.load, ft, &.{ptr});
+        }
+        if (e.t.get(ty) != .array) return parts[0];
+        return e.op1(.composite_construct, ty, parts);
+    }
+
+    /// Writes value `v` of type `ty` to an output interface variable.
+    fn storeInterface(e: *Emitter, iface: Interface, ty: TypeId, v: Id) Error!void {
+        if (!iface.tess_level) {
+            try e.b.emit(.functions, .store, &.{ iface.var_id, try e.reshape(v, ty, iface.ty) });
+            return;
+        }
+        const ft = try e.t.scalar(.float);
+        const n: u32 = if (e.t.get(ty) == .array) e.t.get(ty).array.len else 1;
+        for (0..n) |k| {
+            const ptr = try e.opRaw(.access_chain, try e.pointerType(.output, try e.typeId(ft)), &.{ iface.var_id, try e.constUint(@intCast(k)) });
+            const x = if (e.t.get(ty) == .array) try e.op1(.composite_extract, ft, &.{ v, @intCast(k) }) else v;
+            try e.b.emit(.functions, .store, &.{ ptr, x });
         }
     }
 
@@ -2009,7 +2153,10 @@ const Emitter = struct {
         const v = e.b.newId();
         try e.b.emit(.types_globals, .variable, &.{ try e.pointerType(.input, try e.typeId(ty)), v, @backingInt(StorageClass.input) });
         try e.b.emit(.annotations, .decorate, &.{ v, 11, builtin }); // BuiltIn
-        if (e.m.entry.?.stage == .pixel and !e.t.component(ty).?.isFloat()) try e.b.emit(.annotations, .decorate, &.{ v, 14 }); // Flat
+        var et = ty;
+        while (e.t.get(et) == .array) et = e.t.get(et).array.elem;
+        const c = e.t.component(et).?;
+        if (e.m.entry.?.stage == .pixel and !c.isFloat() and c != .bool) try e.b.emit(.annotations, .decorate, &.{ v, 14 }); // Flat
         try e.interface_ids.append(e.arena, v);
         try e.builtin_inputs.put(e.arena, builtin, v);
         return v;

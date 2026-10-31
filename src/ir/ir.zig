@@ -110,6 +110,12 @@ pub const Op = union(enum) {
     /// A per-vertex input (geometry shaders): element, vertex index.
     input_vertex: struct { element: u32, vertex: u32 },
     output: struct { element: u32, value: Ref },
+    /// Hull / domain shaders: a patch constant read (domain) or written
+    /// (hull patch constant function), and a hull output control point
+    /// read back by the patch constant function.
+    patch_input: u32,
+    patch_output: struct { element: u32, value: Ref },
+    output_vertex: struct { element: u32, vertex: u32 },
     /// Geometry shaders: emit the vertex written to the outputs of a stream,
     /// or end its strip.
     emit: u32,
@@ -221,6 +227,21 @@ pub const GeometryInfo = struct {
     streams: [4]?enum { point, line, triangle } = .{ null, null, null, null },
 };
 
+pub const Domain = enum(u8) { isoline = 1, tri = 2, quad = 3 };
+pub const Partitioning = enum(u8) { integer = 1, pow2 = 2, fractional_odd = 3, fractional_even = 4 };
+pub const OutputTopology = enum(u8) { point = 1, line = 2, triangle_cw = 3, triangle_ccw = 4 };
+
+pub const TessInfo = struct {
+    domain: Domain = .tri,
+    partitioning: Partitioning = .integer,
+    output_topology: OutputTopology = .triangle_cw,
+    /// Control points per input patch (hull: InputPatch; domain:
+    /// OutputPatch).
+    input_control_points: u32 = 0,
+    output_control_points: u32 = 0,
+    max_tess_factor: f32 = 64,
+};
+
 pub const Entry = struct {
     /// The function the entry wraps (the HLSL entry, in memory form).
     func: u32,
@@ -228,8 +249,16 @@ pub const Entry = struct {
     stage: Stage,
     num_threads: [3]u32 = .{ 1, 1, 1 },
     geometry: GeometryInfo = .{},
+    tess: TessInfo = .{},
     inputs: std.ArrayList(SigElement) = .empty,
     outputs: std.ArrayList(SigElement) = .empty,
+    /// Patch constants: written by the hull shader's patch constant
+    /// function, read by the domain shader.
+    patch_constants: std.ArrayList(SigElement) = .empty,
+    /// Hull shaders: the wrapper of the patch constant function (no
+    /// parameters; reads inputs and output control points, writes patch
+    /// constants).
+    patch_wrapper: ?u32 = null,
     /// The wrapper with no parameters that reads `inputs`, calls `func`
     /// and writes `outputs`.
     wrapper: u32 = 0,
@@ -392,6 +421,9 @@ fn dumpInst(m: *const Module, f: *const Function, r: Ref, w: *std.Io.Writer) !vo
         },
         .input_vertex => |x| try w.print("input {d} vertex {d}", .{ x.element, x.vertex }),
         .emit => |k| try w.print("emit stream {d}", .{k}),
+        .patch_input => |k| try w.print("patch input {d}", .{k}),
+        .patch_output => |x| try w.print("patch output {d} = %{d}", .{ x.element, x.value.index() }),
+        .output_vertex => |x| try w.print("output {d} vertex {d}", .{ x.element, x.vertex }),
         .cut => |k| try w.print("cut stream {d}", .{k}),
         .res_load => |x| try w.print("res_load %{d}[%{d}]", .{ x.res.index(), x.index.index() }),
         .res_store => |x| try w.print("res_store %{d}[%{d}], %{d}", .{ x.res.index(), x.index.index(), x.value.index() }),

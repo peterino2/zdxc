@@ -1126,7 +1126,7 @@ pub const Sema = struct {
         return null;
     }
 
-    fn evalConst(s: *Sema, e: *const ast.Expr) ?Const {
+    pub fn evalConst(s: *Sema, e: *const ast.Expr) ?Const {
         return switch (e.kind) {
             .int_lit => |t| .{ .int = parseIntLiteral(t) orelse return null },
             .float_lit => |t| .{ .float = parseFloatLiteral(t) orelse return null },
