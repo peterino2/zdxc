@@ -47,6 +47,7 @@ pub fn lowerUnit(arena: Allocator, s: *Sema, opts: Options) Error!ir.Module {
             } else continue;
             try l.lowerEntry(f, f.name, stage);
         }
+        try l.subobjects();
         for (s.all_functions.items) |f| {
             if (f.owner != null or !f.defined or !f.decl.quals.@"export" or f.decl.quals.static) continue;
             l.cur_entry = 0;
@@ -129,6 +130,64 @@ const Lowerer = struct {
         const main = try l.functionIndex(f);
         try l.drain();
         try l.buildEntry(f, main, .{ .entry = name, .stage = stage });
+    }
+
+    /// The library's subobject declarations (`TriangleHitGroup hg = {...};`).
+    fn subobjects(l: *Lowerer) Error!void {
+        const Kind = ir.Subobject.Kind;
+        const kinds = [_]struct { []const u8, Kind }{
+            .{ "StateObjectConfig", .state_object_config },                       .{ "GlobalRootSignature", .global_root_signature },
+            .{ "LocalRootSignature", .local_root_signature },                     .{ "SubobjectToExportsAssociation", .subobject_to_exports_association },
+            .{ "RaytracingShaderConfig", .raytracing_shader_config },             .{ "RaytracingPipelineConfig", .raytracing_pipeline_config },
+            .{ "TriangleHitGroup", .hit_group },                                  .{ "ProceduralPrimitiveHitGroup", .hit_group },
+            .{ "RaytracingPipelineConfig1", .raytracing_pipeline_config1 },
+        };
+        // (Builtin objects are static globals.)
+        for (l.s.static_globals.items) |v| {
+            const r = switch (l.s.types.get(v.type)) {
+                .resource => |r| r,
+                else => continue,
+            };
+            if (r.kind != .other) continue;
+            const kind = for (kinds) |k| {
+                if (std.mem.eql(u8, r.name, k[0])) break k[1];
+            } else continue;
+            const init_e = v.init orelse continue;
+            const items: []const *ast.Expr = if (init_e.kind == .init_list) init_e.kind.init_list else &.{init_e};
+            var so: ir.Subobject = .{ .name = v.name, .kind = kind };
+            var strs: std.ArrayList([]const u8) = .empty;
+            var ints: std.ArrayList(u32) = .empty;
+            for (items) |it| switch (it.kind) {
+                .string_lit => |lit| try strs.append(l.arena, lit[1 .. lit.len - 1]),
+                else => try ints.append(l.arena, @truncate(@as(u64, @bitCast(l.s.evalInt(it) orelse 0)))),
+            };
+            for (ints.items[0..@min(2, ints.items.len)], 0..) |x, k| so.ints[k] = x;
+            switch (kind) {
+                .hit_group => {
+                    // Triangle groups: any hit, closest hit; procedural ones
+                    // add the intersection shader.
+                    so.ints[0] = @intFromBool(std.mem.eql(u8, r.name, "ProceduralPrimitiveHitGroup"));
+                    for (strs.items[0..@min(3, strs.items.len)], 0..) |x, k| so.strings[k] = x;
+                },
+                .subobject_to_exports_association => {
+                    if (strs.items.len > 0) so.strings[0] = strs.items[0];
+                    var exports: std.ArrayList([]const u8) = .empty;
+                    if (strs.items.len > 1) {
+                        var it = std.mem.splitScalar(u8, strs.items[1], ';');
+                        while (it.next()) |x| {
+                            const t = std.mem.trim(u8, x, " \t");
+                            if (t.len > 0) try exports.append(l.arena, t);
+                        }
+                    }
+                    so.exports = exports.items;
+                },
+                .global_root_signature, .local_root_signature => if (strs.items.len > 0) {
+                    so.strings[0] = strs.items[0];
+                },
+                else => {},
+            }
+            try l.m.subobjects.append(l.arena, so);
+        }
     }
 
     fn unsupported(l: *Lowerer, loc: ast.Loc, comptime fmt: []const u8, args: anytype) void {

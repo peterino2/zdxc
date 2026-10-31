@@ -321,6 +321,30 @@ pub const Entry = struct {
     wrapper: u32 = 0,
 };
 
+/// A ray tracing state object subobject (DXIL::SubobjectKind values).
+pub const Subobject = struct {
+    name: []const u8,
+    kind: Kind,
+    /// Flags, sizes, depths and hit group type, by kind.
+    ints: [2]u32 = .{ 0, 0 },
+    /// Hit group shaders (any hit, closest hit, intersection); the
+    /// associated subobject; root signature text.
+    strings: [3][]const u8 = .{ "", "", "" },
+    /// Associations: the exports.
+    exports: []const []const u8 = &.{},
+
+    pub const Kind = enum(u32) {
+        state_object_config = 0,
+        global_root_signature = 1,
+        local_root_signature = 2,
+        subobject_to_exports_association = 8,
+        raytracing_shader_config = 9,
+        raytracing_pipeline_config = 10,
+        hit_group = 11,
+        raytracing_pipeline_config1 = 12,
+    };
+};
+
 pub const Module = struct {
     arena: Allocator,
     types: *TypeTable,
@@ -331,6 +355,8 @@ pub const Module = struct {
     entries: std.ArrayList(Entry) = .empty,
     /// Libraries: functions exported by name (`export`).
     exports: std.ArrayList(u32) = .empty,
+    /// Libraries: state object subobjects, in declaration order.
+    subobjects: std.ArrayList(Subobject) = .empty,
 
     pub fn addFunction(m: *Module, f: Function) !u32 {
         const p = try m.arena.create(Function);

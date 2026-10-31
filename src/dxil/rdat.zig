@@ -50,6 +50,8 @@ pub const Builder = struct {
     indices: std.ArrayList(u32) = .empty,
     resources: std.ArrayList([8]u32) = .empty,
     functions: std.ArrayList([14]u32) = .empty,
+    raw: std.ArrayList(u8) = .empty,
+    subobjects: std.ArrayList([6]u32) = .empty,
 
     pub fn init(gpa: Allocator) Allocator.Error!Builder {
         var b: Builder = .{ .gpa = gpa };
@@ -96,6 +98,19 @@ pub const Builder = struct {
         });
     }
 
+    /// RuntimeDataSubobjectInfo: kind, name, then four kind-specific
+    /// words.
+    pub fn addSubobject(b: *Builder, rec: [6]u32) Allocator.Error!void {
+        try b.subobjects.append(b.gpa, rec);
+    }
+
+    /// Offset of `bytes` in the raw bytes part.
+    pub fn bytes(b: *Builder, data: []const u8) Allocator.Error!u32 {
+        const off: u32 = @intCast(b.raw.items.len);
+        try b.raw.appendSlice(b.gpa, data);
+        return off;
+    }
+
     /// The finished part.
     pub fn finish(b: *Builder) Allocator.Error![]u8 {
         const Part = struct { ty: u32, data: []const u8 };
@@ -118,6 +133,12 @@ pub const Builder = struct {
             try parts.append(b.gpa, .{ .ty = 4, .data = t });
         }
         if (b.indices.items.len > 0) try parts.append(b.gpa, .{ .ty = 2, .data = std.mem.sliceAsBytes(b.indices.items) });
+        if (b.raw.items.len > 0) try parts.append(b.gpa, .{ .ty = 5, .data = b.raw.items });
+        if (b.subobjects.items.len > 0) {
+            const t = try table(b.gpa, 6, std.mem.sliceAsBytes(b.subobjects.items), b.subobjects.items.len);
+            try tables.append(b.gpa, t);
+            try parts.append(b.gpa, .{ .ty = 6, .data = t });
+        }
 
         var size: usize = 8 + 4 * parts.items.len;
         for (parts.items) |p| size += 8 + std.mem.alignForward(usize, p.data.len, 4);
@@ -151,6 +172,8 @@ pub const Builder = struct {
         b.indices.deinit(b.gpa);
         b.resources.deinit(b.gpa);
         b.functions.deinit(b.gpa);
+        b.raw.deinit(b.gpa);
+        b.subobjects.deinit(b.gpa);
     }
 };
 

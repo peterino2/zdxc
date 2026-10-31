@@ -4259,6 +4259,25 @@ const Emitter = struct {
                 .min_shader_target = (kind << 16) | (6 << 4) | libinfo.minMinor(info, kind),
             });
         }
+        for (e.m.subobjects.items) |so| {
+            var rec: [6]u32 = .{ @intFromEnum(so.kind), try b.string(so.name), 0, 0, 0, 0 };
+            switch (so.kind) {
+                .state_object_config, .raytracing_pipeline_config => rec[2] = so.ints[0],
+                .raytracing_shader_config, .raytracing_pipeline_config1 => rec[2..4].* = so.ints,
+                .subobject_to_exports_association => {
+                    rec[2] = try b.string(so.strings[0]);
+                    const idx = try e.arena.alloc(u32, so.exports.len);
+                    for (idx, so.exports) |*x, name| x.* = try b.string(name);
+                    rec[3] = try b.array(idx);
+                },
+                .hit_group => {
+                    rec[2] = so.ints[0];
+                    for (so.strings, 0..) |x, k| rec[3 + k] = try b.string(x);
+                },
+                .global_root_signature, .local_root_signature => return e.unsupported("root signature subobjects are not supported yet", .{}),
+            }
+            try b.addSubobject(rec);
+        }
         const rdat_part = try b.finish();
         defer gpa.free(rdat_part);
         var sfi0: [8]u8 = @splat(0);
