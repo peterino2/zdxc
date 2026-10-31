@@ -15,6 +15,7 @@ const container = @import("container.zig");
 const hash = @import("hash.zig");
 const layout = @import("../ir/layout.zig");
 const signature = @import("signature.zig");
+const texture = @import("../ir/texture.zig");
 
 const TypeId = types.TypeId;
 const TypeTable = types.TypeTable;
@@ -71,6 +72,8 @@ const Resource = struct {
     kind: u32,
     handle: Value = undefined,
     elem: TypeId,
+    /// SamplerComparisonState.
+    comparison: bool = false,
 
     const Class = enum(u8) { srv = 0, uav = 1, cbuffer = 2, sampler = 3 };
 };
@@ -110,6 +113,8 @@ const Emitter = struct {
     /// 16-bit min-precision values cross the signature.
     uses_min_precision: bool = false,
     uses_view_id: bool = false,
+    /// A typed UAV load of more than one component.
+    uses_typed_uav_load: bool = false,
     uses_inner_coverage: bool = false,
 
     sig_in: []signature.Element = &.{},
@@ -290,6 +295,13 @@ const Emitter = struct {
         };
         for (e.m.globals.items, 0..) |g, gi| {
             if (g.space != .resource) continue;
+            if (e.t.get(g.ty) == .sampler) {
+                if (g.binding.explicit and g.binding.class != 's') return e.unsupported("binding '{s}' to the wrong register class", .{g.name});
+                try e.resources.append(e.arena, .{ .global = @intCast(gi), .class = .sampler, .id = counts[3], .kind = 14, .elem = g.ty, .comparison = e.t.get(g.ty).sampler.comparison });
+                counts[3] += 1;
+                try e.resource_of_global.put(e.arena, @intCast(gi), @intCast(e.resources.items.len - 1));
+                continue;
+            }
             const r = switch (e.t.get(g.ty)) {
                 .resource => |r| r,
                 else => return e.unsupported("global '{s}' is not supported yet", .{g.name}),
@@ -298,6 +310,15 @@ const Emitter = struct {
                 .structured_buffer, .rw_structured_buffer => 12,
                 .byte_address_buffer, .rw_byte_address_buffer => 11,
                 .buffer, .rw_buffer => 10,
+                .texture1d, .rw_texture1d => 1,
+                .texture2d, .rw_texture2d => 2,
+                .texture2dms, .rw_texture2dms => 3,
+                .texture3d, .rw_texture3d => 4,
+                .texture_cube => 5,
+                .texture1d_array, .rw_texture1d_array => 6,
+                .texture2d_array, .rw_texture2d_array => 7,
+                .texture2dms_array, .rw_texture2dms_array => 8,
+                .texture_cube_array => 9,
                 else => return e.unsupported("resource type '{s}' is not supported yet", .{r.name}),
             };
             const class: Resource.Class = if (r.kind.isWritable()) .uav else .srv;
@@ -375,10 +396,12 @@ const Emitter = struct {
     fn resourceProperties(e: *Emitter, res: Resource) Error![2]i64 {
         var basic: i64 = res.kind;
         if (res.class == .uav) basic |= 0x1000;
+        if (res.comparison) basic |= 0x8000;
         const extra: i64 = switch (res.kind) {
             13 => try e.cbufferSize(res),
             12 => try e.stride(res.elem),
-            10 => blk: {
+            14 => 0,
+            1...10 => blk: {
                 const n = try e.flatCount(res.elem);
                 break :blk try e.compType(e.compOf(res.elem)) | (@as(i64, n) << 8);
             },
@@ -801,7 +824,7 @@ const Emitter = struct {
                 try e.resourceStore(frame, x.res, x.index, x.value);
                 return .none;
             },
-            .method => |x| return e.unsupported("method '{s}' is not supported yet", .{x.name}),
+            .method => |x| return e.method(frame, x.name, x.res, x.args, i.ty),
             .input => |k| return e.input(k, i.ty),
             .output => |o| {
                 try e.output(frame, o.element, o.value);
@@ -1479,6 +1502,225 @@ const Emitter = struct {
     // ------------------------------------------------------------------
     // Resources and stage inputs
 
+    fn resourceKind(e: *Emitter, res: Resource) types.ResourceKind {
+        return e.t.get(e.m.globals.items[res.global].ty).resource.kind;
+    }
+
+    /// The scalar a texture's ResRet carries for elements of `elem`.
+    fn texelScalar(e: *Emitter, elem: TypeId) Error!Scalar {
+        const c = e.compOf(elem);
+        return switch (c) {
+            .bool => .uint,
+            .float, .int, .uint => c,
+            else => e.unsupported("textures of '{s}' are not supported yet", .{try e.t.format(e.arena, elem)}),
+        };
+    }
+
+    /// Components [0, n) of a ResRet, converted to `ty`'s component type.
+    fn resRetComponents(e: *Emitter, call: Value, st: DType, via: Scalar, ty: TypeId) Error![]const Value {
+        const n = try e.flatCount(ty);
+        const out = try e.arena.alloc(Value, n);
+        for (out, 0..) |*o, k| {
+            const v = try e.add(st, .{ .extractvalue = .{ .agg = call, .index = @intCast(k) } });
+            o.* = try e.convertScalar(v, via, e.compOf(ty));
+        }
+        return out;
+    }
+
+    /// `n` values from `src` padded with undef to `width`.
+    fn padded(e: *Emitter, src: []const Value, n: usize, width: usize, ty: DType) Error![]Value {
+        const out = try e.arena.alloc(Value, width);
+        const undef = try e.dm.constant(.{ .ty = ty, .kind = .undef });
+        for (out, 0..) |*o, k| o.* = if (k < n and k < src.len) src[k] else undef;
+        return out;
+    }
+
+    fn textureLoad(e: *Emitter, res: Resource, mip: Value, coords: []const Value, offset: ?[]const Value, ty: TypeId) Error![]const Value {
+        const via = try e.texelScalar(res.elem);
+        const st = try e.scalarTy(via);
+        const ret_ty = try e.resRetType(st);
+        const i32t = try e.dm.intType(32);
+        if (res.class == .uav and try e.flatCount(res.elem) > 1) e.uses_typed_uav_load = true;
+        const fn_i = try e.dxOp(try std.fmt.allocPrint(e.arena, "dx.op.textureLoad.{s}", .{e.overloadName(st)}), ret_ty, &.{ i32t, e.handle_ty, i32t, i32t, i32t, i32t, i32t, i32t, i32t }, .nounwind_readonly);
+        const c = try e.padded(coords, coords.len, 3, i32t);
+        const o = try e.padded(offset orelse &.{}, if (offset) |x| x.len else 0, 3, i32t);
+        const call = try e.callOp(fn_i, ret_ty, &.{ try e.i32Const(66), res.handle, mip, c[0], c[1], c[2], o[0], o[1], o[2] });
+        return e.resRetComponents(call, st, via, ty);
+    }
+
+    fn textureStore(e: *Emitter, res: Resource, coords: []const Value, vals: []const Value, vty: TypeId) Error!void {
+        const via = try e.texelScalar(res.elem);
+        const st = try e.scalarTy(via);
+        const i32t = try e.dm.intType(32);
+        const i8t = try e.dm.intType(8);
+        const void_ty = try e.voidTy();
+        const fn_i = try e.dxOp(try std.fmt.allocPrint(e.arena, "dx.op.textureStore.{s}", .{e.overloadName(st)}), void_ty, &.{ i32t, e.handle_ty, i32t, i32t, i32t, st, st, st, st, i8t }, .nounwind);
+        const from = e.compOf(vty);
+        // Typed stores write all four components (replicated, as dxc).
+        var v: [4]Value = undefined;
+        for (&v, 0..) |*x, k| x.* = try e.convertScalar(vals[if (k < vals.len) k else 0], from, via);
+        const c = try e.padded(coords, coords.len, 3, i32t);
+        const mask = try e.dm.constant(.{ .ty = i8t, .kind = .{ .int = 15 } });
+        _ = try e.callOp(fn_i, void_ty, &.{ try e.i32Const(67), res.handle, c[0], c[1], c[2], v[0], v[1], v[2], v[3], mask });
+    }
+
+    fn method(e: *Emitter, frame: *Frame, name: []const u8, res_ref: Ref, arg_refs: []const Ref, ty: TypeId) Error!Lowered {
+        const res = try e.resourceOf(frame, res_ref);
+        const kind = e.resourceKind(res.*);
+        const eq = std.mem.eql;
+        const i32t = try e.dm.intType(32);
+        const f32t = try e.dm.getType(.float);
+        const undef_i32 = try e.dm.constant(.{ .ty = i32t, .kind = .undef });
+        if (eq(u8, name, "GetDimensions")) return e.getDimensions(frame, res.*, kind, arg_refs);
+        if (res.kind == 10 and eq(u8, name, "Load")) {
+            if (arg_refs.len > 1) return e.unsupported("Load with a status argument is not supported yet", .{});
+            return e.resourceLoad(frame, res_ref, arg_refs[0], ty);
+        }
+        if (res.kind == 12 and eq(u8, name, "Load")) return e.resourceLoad(frame, res_ref, arg_refs[0], ty);
+        const sh = texture.shape(kind) orelse return e.unsupported("method '{s}' is not supported yet", .{name});
+        const call = texture.decode(name, sh, arg_refs.len) orelse return e.unsupported("method '{s}' is not supported yet", .{name});
+        if (call.status != null) return e.unsupported("texture methods with a status argument are not supported yet", .{});
+        if (call.offsets4) return e.unsupported("Gather with four offsets is not supported yet", .{});
+        if (call.op.implicitLod() and e.m.entry.?.stage != .pixel) return e.unsupported("'{s}' outside pixel shaders is not supported yet", .{name});
+        const arg = struct {
+            fn f(em: *Emitter, fr: *Frame, refs: []const Ref, idx: ?u8) Error!?[]const Value {
+                return if (idx) |k| try em.scalars(fr, refs[k]) else null;
+            }
+        }.f;
+        const coord = (try arg(e, frame, arg_refs, call.coord)).?;
+        const offset = try arg(e, frame, arg_refs, call.offset);
+        if (offset) |off| for (off) |x| if (x != .constant) {
+            return e.unsupported("texel offsets that are not constants (they need loop unrolling) are not supported yet", .{});
+        };
+        if (call.op == .load) {
+            const coords = coord[0 .. sh.coords() + @intFromBool(sh.array)];
+            const mip = if (call.sample_index) |k| (try e.scalars(frame, arg_refs[k]))[0] else if (sh.hasMips()) coord[coord.len - 1] else undef_i32;
+            return .{ .scalars = try e.textureLoad(res.*, mip, coords, offset, ty) };
+        }
+        if (call.op == .sample_position) {
+            const pos_ty = try e.dm.getType(.{ .@"struct" = .{ .name = "dx.types.SamplePos", .elems = &.{ f32t, f32t } } });
+            const fn_i = try e.dxOp("dx.op.texture2DMSGetSamplePosition", pos_ty, &.{ i32t, e.handle_ty, i32t }, .nounwind_readonly);
+            const pos = try e.callOp(fn_i, pos_ty, &.{ try e.i32Const(75), res.handle, (try e.scalars(frame, arg_refs[0]))[0] });
+            const out = try e.arena.alloc(Value, 2);
+            for (out, 0..) |*o, k| o.* = try e.add(f32t, .{ .extractvalue = .{ .agg = pos, .index = @intCast(k) } });
+            return .{ .scalars = out };
+        }
+        const smp = try e.resourceOf(frame, arg_refs[call.sampler.?]);
+        const ncoord = sh.coords() + @intFromBool(sh.array);
+        if (call.op == .calc_lod or call.op == .calc_lod_unclamped) {
+            const i1t = try e.dm.intType(1);
+            const fn_i = try e.dxOp("dx.op.calculateLOD.f32", f32t, &.{ i32t, e.handle_ty, e.handle_ty, f32t, f32t, f32t, i1t }, .nounwind_readonly);
+            const c = try e.padded(coord, sh.coords(), 3, f32t);
+            const clamped = try e.dm.constInt(1, @intFromBool(call.op == .calc_lod));
+            return e.list(&.{try e.callOp(fn_i, f32t, &.{ try e.i32Const(81), res.handle, smp.handle, c[0], c[1], c[2], clamped })});
+        }
+        const via = if (call.op.isCmp()) Scalar.float else try e.texelScalar(res.elem);
+        const st = try e.scalarTy(via);
+        const ret_ty = try e.resRetType(st);
+        const c = try e.padded(coord, ncoord, 4, f32t);
+        // Absent offsets are zero (undef for cubes and unused components).
+        const zero = try e.i32Const(0);
+        const n_off: usize = if (call.op == .gather or call.op == .gather_cmp) 2 else 3;
+        const o = try e.arena.alloc(Value, n_off);
+        for (o, 0..) |*x, k| x.* = if (k >= sh.offsets()) undef_i32 else if (offset) |off| off[k] else zero;
+        const undef_f = try e.dm.constant(.{ .ty = f32t, .kind = .undef });
+        const scalar1 = struct {
+            fn f(em: *Emitter, fr: *Frame, refs: []const Ref, idx: ?u8, dflt: Value) Error!Value {
+                return if (idx) |k| (try em.scalars(fr, refs[k]))[0] else dflt;
+            }
+        }.f;
+        const clamp = try scalar1(e, frame, arg_refs, call.clamp, undef_f);
+        var args: std.ArrayList(Value) = .empty;
+        var params: std.ArrayList(DType) = .empty;
+        const Spec = struct { op: i64, fname: []const u8 };
+        const spec: Spec = switch (call.op) {
+            .sample => .{ .op = 60, .fname = "sample" },
+            .sample_bias => .{ .op = 61, .fname = "sampleBias" },
+            .sample_level => .{ .op = 62, .fname = "sampleLevel" },
+            .sample_grad => .{ .op = 63, .fname = "sampleGrad" },
+            .sample_cmp => .{ .op = 64, .fname = "sampleCmp" },
+            .sample_cmp_level_zero => .{ .op = 65, .fname = "sampleCmpLevelZero" },
+            .sample_cmp_level => .{ .op = 224, .fname = "sampleCmpLevel" },
+            .sample_cmp_grad => .{ .op = 254, .fname = "sampleCmpGrad" },
+            .sample_cmp_bias => .{ .op = 255, .fname = "sampleCmpBias" },
+            .gather => .{ .op = 73, .fname = "textureGather" },
+            .gather_cmp => .{ .op = 74, .fname = "textureGatherCmp" },
+            else => unreachable,
+        };
+        const min_minor: u8 = switch (call.op) {
+            .sample_cmp_level => 7,
+            .sample_cmp_grad, .sample_cmp_bias => 8,
+            else => 0,
+        };
+        if (e.profile.minor < min_minor) return e.unsupported("'{s}' needs shader model 6.{d}", .{ name, min_minor });
+        try args.appendSlice(e.arena, &.{ try e.i32Const(spec.op), res.handle, smp.handle });
+        try params.appendSlice(e.arena, &.{ i32t, e.handle_ty, e.handle_ty });
+        for (c) |x| {
+            try args.append(e.arena, x);
+            try params.append(e.arena, f32t);
+        }
+        for (o) |x| {
+            try args.append(e.arena, x);
+            try params.append(e.arena, i32t);
+        }
+        const pushF = struct {
+            fn f(em: *Emitter, a: *std.ArrayList(Value), p: *std.ArrayList(DType), v: Value) Error!void {
+                try a.append(em.arena, v);
+                try p.append(em.arena, try em.dm.getType(.float));
+            }
+        }.f;
+        if (call.op == .gather or call.op == .gather_cmp) {
+            try args.append(e.arena, try e.i32Const(call.channel));
+            try params.append(e.arena, i32t);
+        }
+        if (call.compare) |k| try pushF(e, &args, &params, (try e.scalars(frame, arg_refs[k]))[0]);
+        if (call.bias) |k| try pushF(e, &args, &params, (try e.scalars(frame, arg_refs[k]))[0]);
+        if (call.lod) |k| try pushF(e, &args, &params, (try e.scalars(frame, arg_refs[k]))[0]);
+        if (call.ddx) |k| {
+            for (try e.padded(try e.scalars(frame, arg_refs[k]), sh.coords(), 3, f32t)) |x| try pushF(e, &args, &params, x);
+            for (try e.padded(try e.scalars(frame, arg_refs[call.ddy.?]), sh.coords(), 3, f32t)) |x| try pushF(e, &args, &params, x);
+        }
+        switch (call.op) {
+            .sample, .sample_bias, .sample_grad, .sample_cmp, .sample_cmp_bias, .sample_cmp_grad => try pushF(e, &args, &params, clamp),
+            else => {},
+        }
+        const fname = try std.fmt.allocPrint(e.arena, "dx.op.{s}.{s}", .{ spec.fname, e.overloadName(st) });
+        const fn_i = try e.dxOp(fname, ret_ty, params.items, .nounwind_readonly);
+        const result = try e.callOp(fn_i, ret_ty, args.items);
+        return .{ .scalars = try e.resRetComponents(result, st, via, ty) };
+    }
+
+    fn getDimensions(e: *Emitter, frame: *Frame, res: Resource, kind: types.ResourceKind, arg_refs: []const Ref) Error!Lowered {
+        const i32t = try e.dm.intType(32);
+        const dims_ty = try e.dm.getType(.{ .@"struct" = .{ .name = "dx.types.Dimensions", .elems = &.{ i32t, i32t, i32t, i32t } } });
+        const fn_i = try e.dxOp("dx.op.getDimensions", dims_ty, &.{ i32t, e.handle_ty, i32t }, .nounwind_readonly);
+        const store = struct {
+            fn f(em: *Emitter, fr: *Frame, ref: Ref, v: Value) Error!void {
+                const ptr = switch (fr.vals[ref.index()]) {
+                    .ptr => |p| p,
+                    else => return em.unsupported("internal: out argument is not a pointer", .{}),
+                };
+                const ty = fr.f.inst(ref).ty;
+                try em.storePtr(ptr, &.{try em.convertScalar(v, .int, em.compOf(ty))}, ty);
+            }
+        }.f;
+        const undef_i32 = try e.dm.constant(.{ .ty = i32t, .kind = .undef });
+        if (res.kind == 12 or res.kind == 11 or res.kind == 10) {
+            const dims = try e.callOp(fn_i, dims_ty, &.{ try e.i32Const(72), res.handle, undef_i32 });
+            try store(e, frame, arg_refs[0], try e.add(i32t, .{ .extractvalue = .{ .agg = dims, .index = 0 } }));
+            if (res.kind == 12 and arg_refs.len > 1) try store(e, frame, arg_refs[1], try e.i32Const(try e.stride(res.elem)));
+            return .none;
+        }
+        const sh = texture.shape(kind) orelse return e.unsupported("GetDimensions on this resource is not supported yet", .{});
+        const d = texture.getDimensions(sh, arg_refs.len);
+        const mip = if (d.mip) |k| (try e.scalars(frame, arg_refs[k]))[0] else try e.i32Const(0);
+        const dims = try e.callOp(fn_i, dims_ty, &.{ try e.i32Const(72), res.handle, mip });
+        for (d.outs[0..d.count]) |o| {
+            try store(e, frame, arg_refs[o.arg], try e.add(i32t, .{ .extractvalue = .{ .agg = dims, .index = o.comp } }));
+        }
+        return .none;
+    }
+
     fn resourceOf(e: *Emitter, frame: *Frame, r: Ref) Error!*Resource {
         return switch (frame.vals[r.index()]) {
             .handle => |h| &e.resources.items[h],
@@ -1607,6 +1849,13 @@ const Emitter = struct {
 
     fn resourceLoad(e: *Emitter, frame: *Frame, res_ref: Ref, index_ref: Ref, ty: TypeId) Error!Lowered {
         const res = try e.resourceOf(frame, res_ref);
+        if (res.kind >= 1 and res.kind <= 9) {
+            const coords = try e.scalars(frame, index_ref);
+            const sh = texture.shape(e.resourceKind(res.*)).?;
+            const i32t = try e.dm.intType(32);
+            const mip = if (sh.hasMips() or sh.ms) try e.i32Const(0) else try e.dm.constant(.{ .ty = i32t, .kind = .undef });
+            return .{ .scalars = try e.textureLoad(res.*, mip, coords, null, ty) };
+        }
         const idx = (try e.scalars(frame, index_ref))[0];
         if (res.kind == 12) return .{ .scalars = try e.structuredLoad(res.*, idx, 0, null, false, ty) };
         const n = try e.flatCount(ty);
@@ -1624,6 +1873,7 @@ const Emitter = struct {
             const chunk = @min(4, n - done);
             var call: Value = undefined;
             if (res.kind == 10) {
+                if (res.class == .uav and try e.flatCount(res.elem) > 1) e.uses_typed_uav_load = true;
                 const fn_i = try e.dxOp(try std.fmt.allocPrint(e.arena, "dx.op.bufferLoad.{s}", .{e.overloadName(st)}), ret_ty, &.{ i32t, e.handle_ty, i32t, i32t }, .nounwind_readonly);
                 call = try e.callOp(fn_i, ret_ty, &.{ try e.i32Const(68), res.handle, idx, undef_i32 });
             } else {
@@ -1651,6 +1901,7 @@ const Emitter = struct {
 
     fn resourceStore(e: *Emitter, frame: *Frame, res_ref: Ref, index_ref: Ref, value_ref: Ref) Error!void {
         const res = try e.resourceOf(frame, res_ref);
+        if (res.kind >= 1 and res.kind <= 9) return e.textureStore(res.*, try e.scalars(frame, index_ref), try e.scalars(frame, value_ref), frame.f.inst(value_ref).ty);
         const idx = (try e.scalars(frame, index_ref))[0];
         const vals = try e.scalars(frame, value_ref);
         if (res.kind == 12) return e.structuredStore(res.*, idx, 0, null, false, frame.f.inst(value_ref).ty, vals);
@@ -1974,6 +2225,7 @@ const Emitter = struct {
             if (r.class == .uav) uavs += 1;
         }
         if (uavs > 8) flags |= 1 << 15;
+        if (e.uses_typed_uav_load) flags |= 1 << 13;
         // Resources may not alias (DXIL 1.7+, when UAVs are used).
         if (uavs > 0 and e.profile.minor >= 7) flags |= 1 << 33;
         const stage = e.m.entry.?.stage;
@@ -1999,7 +2251,7 @@ const Emitter = struct {
         const map = [_][2]u64{
             .{ 1 << 2, 0x1 },      .{ 1 << 16, 0x4 },     .{ 1 << 15, 0x8 },        .{ 1 << 5, 0x10 },
             .{ 1 << 11, 0x200 },   .{ 1 << 10, 0x400 },   .{ 1 << 9, 0x2000 },      .{ 1 << 20, 0x8000 },
-            .{ 1 << 21, 0x10000 }, .{ 1 << 24, 0x80000 },
+            .{ 1 << 21, 0x10000 }, .{ 1 << 24, 0x80000 },   .{ 1 << 13, 0x800 },
         };
         var f: u64 = 0;
         for (map) |m| if (flags & m[0] != 0) {
@@ -2041,11 +2293,22 @@ const Emitter = struct {
                 try lists[2].append(e.arena, try dm.mdNode(&.{ try mdI32(dm, r.id), try dm.mdValue(try dm.ptrType(cb_ty), undef_cb), try dm.mdString(""), try mdI32(dm, b.space), try mdI32(dm, b.index), try mdI32(dm, 1), try mdI32(dm, try e.cbufferSize(r)), null }));
                 continue;
             }
+            if (r.class == .sampler) {
+                const name = if (r.comparison) "struct.SamplerComparisonState" else "struct.SamplerState";
+                const st = try dm.getType(.{ .@"struct" = .{ .name = name, .elems = &.{try dm.intType(32)} } });
+                const undef_s = try dm.constant(.{ .ty = try dm.ptrType(st), .kind = .undef });
+                const b = g.binding;
+                try lists[3].append(e.arena, try dm.mdNode(&.{ try mdI32(dm, r.id), try dm.mdValue(try dm.ptrType(st), undef_s), try dm.mdString(""), try mdI32(dm, b.space), try mdI32(dm, b.index), try mdI32(dm, 1), try mdI32(dm, @intFromBool(r.comparison)), null }));
+                continue;
+            }
             const rt = e.t.get(g.ty).resource;
             const class_name = try std.fmt.allocPrint(e.arena, "class.{s}<{s}>", .{ rt.name, try e.t.format(e.arena, r.elem) });
             // The class type only names the resource; aggregates get a
             // placeholder element.
-            const elem_dt = try e.scalarTy(if (r.kind == 11) .uint else if (e.t.shape(r.elem) == null) .int else e.compOf(r.elem));
+            var elem_dt = try e.scalarTy(if (r.kind == 11) .uint else if (e.t.shape(r.elem) == null) .int else e.compOf(r.elem));
+            // Typed resources carry their component count in the element
+            // (the validator reads it from here).
+            if (r.kind >= 1 and r.kind <= 10 and e.t.get(r.elem) == .vector) elem_dt = try dm.getType(.{ .vector = .{ .len = e.t.get(r.elem).vector.len, .elem = elem_dt } });
             const class_ty = try dm.getType(.{ .@"struct" = .{ .name = class_name, .elems = &.{elem_dt} } });
             const undef_ptr = try dm.constant(.{ .ty = try dm.ptrType(class_ty), .kind = .undef });
             const b = g.binding;
@@ -2056,7 +2319,7 @@ const Emitter = struct {
             } else try fields.append(e.arena, try mdI32(dm, 0)); // sample count
             const extra: ?module.MdId = switch (r.kind) {
                 12 => try dm.mdNode(&.{ try mdI32(dm, 1), try mdI32(dm, try e.stride(r.elem)) }),
-                10 => try dm.mdNode(&.{ try mdI32(dm, 0), try mdI32(dm, try e.compType(e.compOf(r.elem))) }),
+                1...10 => try dm.mdNode(&.{ try mdI32(dm, 0), try mdI32(dm, try e.compType(e.compOf(r.elem))) }),
                 else => null,
             };
             try fields.append(e.arena, extra);

@@ -7,6 +7,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const ir = @import("../ir/ir.zig");
 const types = @import("../sema/types.zig");
+const texture = @import("../ir/texture.zig");
 const builder = @import("builder.zig");
 const diag = @import("../diag.zig");
 const layout = @import("../ir/layout.zig");
@@ -24,7 +25,27 @@ pub const Error = Allocator.Error || error{Unsupported};
 /// SPIR-V storage classes.
 const StorageClass = enum(u32) { uniform_constant = 0, input = 1, uniform = 2, output = 3, workgroup = 4, private = 6, function = 7, storage_buffer = 12 };
 
-const Capability = enum(u32) { shader = 1, float16 = 9, float64 = 10, int64 = 11, int16 = 22, sampled_buffer = 46, image_buffer = 47, storage_image_extended_formats = 49, image_query = 50 };
+const Capability = enum(u32) {
+    shader = 1,
+    float16 = 9,
+    float64 = 10,
+    int64 = 11,
+    int16 = 22,
+    image_gather_extended = 25,
+    storage_image_multisample = 27,
+    sample_rate_shading = 35,
+    min_lod = 42,
+    sampled1d = 43,
+    image1d = 44,
+    sampled_cube_array = 45,
+    sampled_buffer = 46,
+    image_buffer = 47,
+    image_ms_array = 48,
+    storage_image_extended_formats = 49,
+    image_query = 50,
+    storage_image_read_without_format = 55,
+    storage_image_write_without_format = 56,
+};
 
 pub fn emit(gpa: Allocator, m: *const ir.Module, diags: *diag.Diagnostics) Error![]u8 {
     var arena_state = std.heap.ArenaAllocator.init(gpa);
@@ -60,6 +81,12 @@ const Emitter = struct {
     /// type.
     global_vars: []Id = &.{},
     buffer_elem_ptr: []Id = &.{},
+    /// Per global: its image type (textures, typed buffers) or 0.
+    global_images: []Id = &.{},
+    /// Image types by (sampled type, dim, arrayed, ms, sampled, format).
+    image_types: std.AutoHashMapUnmanaged([6]u32, Id) = .empty,
+    sampled_image_types: std.AutoHashMapUnmanaged(Id, Id) = .empty,
+    sampler_type: Id = 0,
     /// Entry inputs / outputs: interface variable and its value type.
     inputs: []Interface = &.{},
     outputs: []Interface = &.{},
@@ -439,6 +466,8 @@ const Emitter = struct {
         const m = e.m;
         e.global_vars = try e.arena.alloc(Id, m.globals.items.len);
         e.buffer_elem_ptr = try e.arena.alloc(Id, m.globals.items.len);
+        e.global_images = try e.arena.alloc(Id, m.globals.items.len);
+        @memset(e.global_images, 0);
         @memset(e.buffer_elem_ptr, 0);
         // Registers without an explicit binding take the next free one.
         var used: std.AutoHashMapUnmanaged(struct { u32, u32 }, void) = .empty;
@@ -447,7 +476,7 @@ const Emitter = struct {
         for (m.globals.items, 0..) |g, gi| {
             switch (g.space) {
                 .resource => {
-                    const r = switch (e.t.get(g.ty)) {
+                    const r = if (e.t.get(g.ty) == .sampler) @FieldType(types.Type, "resource"){ .kind = .other, .elem = g.ty, .name = "SamplerState" } else switch (e.t.get(g.ty)) {
                         .resource => |r| r,
                         else => return e.unsupported("global '{s}' of type '{s}' is not supported yet", .{ g.name, try e.t.format(e.arena, g.ty) }),
                     };
@@ -471,7 +500,15 @@ const Emitter = struct {
                             try e.b.emit(.types_globals, .variable, &.{ ptr, var_id, @backingInt(StorageClass.uniform) });
                             e.buffer_elem_ptr[gi] = try e.pointerType(.uniform, elem);
                         },
-                        else => return e.unsupported("resource type '{s}' is not supported yet", .{r.name}),
+                        else => if (e.t.get(g.ty) == .sampler) {
+                            const ptr = try e.pointerType(.uniform_constant, try e.samplerType());
+                            try e.b.emit(.types_globals, .variable, &.{ ptr, var_id, @backingInt(StorageClass.uniform_constant) });
+                        } else if (texture.shape(r.kind)) |sh| {
+                            const img = try e.imageType(sh, r.elem);
+                            e.global_images[gi] = img;
+                            const ptr = try e.pointerType(.uniform_constant, img);
+                            try e.b.emit(.types_globals, .variable, &.{ ptr, var_id, @backingInt(StorageClass.uniform_constant) });
+                        } else return e.unsupported("resource type '{s}' is not supported yet", .{r.name}),
                     }
                     var binding = g.binding.index;
                     if (!g.binding.explicit) {
@@ -581,9 +618,22 @@ const Emitter = struct {
                     const loc = if (std.ascii.eqlIgnoreCase(el.semantic, "SV_Target")) el.semantic_index else location[dir];
                     try e.b.emit(.annotations, .decorate, &.{ var_id, 30, loc }); // Location
                     location[dir] = @max(location[dir], loc) + try e.locationCount(ty);
-                    // Integer fragment inputs cannot be interpolated.
-                    if (input and entry.stage == .pixel and !e.t.component(ty).?.isFloat()) {
-                        try e.b.emit(.annotations, .decorate, &.{ var_id, 14 }); // Flat
+                    // Interpolation (as dxc: pixel inputs and vertex
+                    // outputs; integers are always flat).
+                    if ((input and entry.stage == .pixel) or (!input and entry.stage == .vertex)) {
+                        var et = ty;
+                        while (e.t.get(et) == .array) et = e.t.get(et).array.elem;
+                        if (!e.t.component(et).?.isFloat()) {
+                            try e.b.emit(.annotations, .decorate, &.{ var_id, 14 }); // Flat
+                        } else {
+                            if (el.interp.centroid) try e.b.emit(.annotations, .decorate, &.{ var_id, 16 }); // Centroid
+                            if (el.interp.nointerpolation) try e.b.emit(.annotations, .decorate, &.{ var_id, 14 }); // Flat
+                            if (el.interp.noperspective) try e.b.emit(.annotations, .decorate, &.{ var_id, 13 }); // NoPerspective
+                            if (el.interp.sample) {
+                                try e.cap(.sample_rate_shading);
+                                try e.b.emit(.annotations, .decorate, &.{ var_id, 17 }); // Sample
+                            }
+                        }
                     }
                 }
                 const name = try std.fmt.allocPrint(e.arena, "{s}.var.{s}{d}", .{ if (input) "in" else "out", el.semantic, el.semantic_index });
@@ -1045,16 +1095,24 @@ const Emitter = struct {
             },
             .intrinsic => |c| e.vals[ri] = try e.intrinsic(c.name, i.ty, c.args),
             .res_load => |x| {
+                if (e.imageGlobal(x.res)) |g| {
+                    e.vals[ri] = try e.imageIndexLoad(g, e.val(x.index), i.ty);
+                    return;
+                }
                 const ptr = try e.bufferElement(x.res, x.index);
                 const raw = try e.opRaw(.load, try e.layoutTypeId(i.ty, .std430, false), &.{ptr});
                 e.vals[ri] = try e.fromLayout(raw, i.ty, .std430, false);
             },
             .res_store => |x| {
+                if (e.imageGlobal(x.res)) |g| {
+                    try e.imageWrite(g, e.val(x.index), e.val(x.value));
+                    return;
+                }
                 const ptr = try e.bufferElement(x.res, x.index);
                 const v = try e.toLayout(e.val(x.value), f.inst(x.value).ty, .std430, false);
                 try e.b.emit(.functions, .store, &.{ ptr, v });
             },
-            .method => |x| return e.unsupported("method '{s}' is not supported yet", .{x.name}),
+            .method => |x| e.vals[ri] = try e.method(x.name, x.res, x.args, i.ty),
             .input => |k| {
                 const iface = e.inputs[k];
                 const loaded = try e.op1(.load, iface.ty, &.{iface.var_id});
@@ -1087,6 +1145,330 @@ const Emitter = struct {
         const id = e.b.newId();
         try e.b.emit(.functions, .access_chain, &.{ elem_ptr, id, e.global_vars[g], try e.constInt(0), e.val(index) });
         return id;
+    }
+
+    // ------------------------------------------------------------------
+    // Images and samplers
+
+    fn samplerType(e: *Emitter) Error!Id {
+        if (e.sampler_type == 0) {
+            e.sampler_type = e.b.newId();
+            try e.b.emit(.types_globals, .type_sampler, &.{e.sampler_type});
+        }
+        return e.sampler_type;
+    }
+
+    fn sampledImageType(e: *Emitter, img: Id) Error!Id {
+        if (e.sampled_image_types.get(img)) |id| return id;
+        const id = e.b.newId();
+        try e.b.emit(.types_globals, .type_sampled_image, &.{ id, img });
+        try e.sampled_image_types.put(e.arena, img, id);
+        return id;
+    }
+
+    /// The scalar an image of `elem` texels samples to (bool as uint).
+    fn texelScalar(e: *Emitter, elem: TypeId) Error!Scalar {
+        const c = storageScalar(e.t.component(elem) orelse return e.unsupported("textures of '{s}' are not supported yet", .{try e.t.format(e.arena, elem)}));
+        return switch (c) {
+            .float, .int, .uint => c,
+            else => e.unsupported("textures of '{s}' are not supported yet", .{try e.t.format(e.arena, elem)}),
+        };
+    }
+
+    /// dxc's image format for typed buffers and RW textures.
+    fn imageFormat(e: *Emitter, elem: TypeId) u32 {
+        const n = e.t.componentCount(elem) orelse return 0;
+        const c = e.t.component(elem) orelse return 0;
+        const k: usize = switch (n) {
+            1 => 0,
+            2 => 1,
+            4 => 2,
+            else => return 0,
+        };
+        const table: [3]u32 = switch (c) {
+            .float => .{ 3, 6, 1 }, // R32f, Rg32f, Rgba32f
+            .half, .min16float, .min10float => .{ 9, 7, 2 }, // R16f, Rg16f, Rgba16f
+            .int => .{ 24, 25, 21 }, // R32i, Rg32i, Rgba32i
+            .min16int, .min12int => .{ 28, 26, 22 }, // R16i, Rg16i, Rgba16i
+            .uint => .{ 33, 35, 30 }, // R32ui, Rg32ui, Rgba32ui
+            .min16uint => .{ 38, 36, 31 }, // R16ui, Rg16ui, Rgba16ui
+            else => return 0,
+        };
+        return table[k];
+    }
+
+    fn imageType(e: *Emitter, sh: texture.Shape, elem: TypeId) Error!Id {
+        const st = try e.scalarType(try e.texelScalar(elem));
+        const dim: u32 = switch (sh.dim) {
+            .d1 => 0,
+            .d2 => 1,
+            .d3 => 2,
+            .cube => 3,
+            .buffer => 5,
+        };
+        const sampled: u32 = if (sh.rw) 2 else 1;
+        const format: u32 = if (sh.rw or sh.dim == .buffer) e.imageFormat(elem) else 0;
+        const key: [6]u32 = .{ st, dim, @intFromBool(sh.array), @intFromBool(sh.ms), sampled, format };
+        if (e.image_types.get(key)) |id| return id;
+        switch (sh.dim) {
+            .d1 => try e.cap(if (sh.rw) .image1d else .sampled1d),
+            .buffer => try e.cap(if (sh.rw) .image_buffer else .sampled_buffer),
+            .cube => if (sh.array) try e.cap(.sampled_cube_array),
+            else => {},
+        }
+        if (sh.rw and sh.ms) try e.cap(if (sh.array) .image_ms_array else .storage_image_multisample);
+        switch (format) {
+            6, 7, 9, 25, 26, 28, 35, 36, 38 => try e.cap(.storage_image_extended_formats),
+            else => {},
+        }
+        const id = e.b.newId();
+        try e.b.emit(.types_globals, .type_image, &.{ id, st, dim, 2, key[2], key[3], sampled, format });
+        try e.image_types.put(e.arena, key, id);
+        return id;
+    }
+
+    /// The global behind an image value, if it is one.
+    fn imageGlobal(e: *Emitter, r: Ref) ?u32 {
+        const g = e.globalOf(r) orelse return null;
+        return if (e.global_images[g] != 0) g else null;
+    }
+
+    fn loadImage(e: *Emitter, g: u32) Error!Id {
+        return e.opRaw(.load, e.global_images[g], &.{e.global_vars[g]});
+    }
+
+    fn resourceInfo(e: *Emitter, g: u32) @FieldType(types.Type, "resource") {
+        return e.t.get(e.m.globals.items[g].ty).resource;
+    }
+
+    /// The first components of a four-component texel, as `ty`.
+    fn texelResult(e: *Emitter, v4: Id, s: Scalar, ty: TypeId) Error!Id {
+        const n = e.t.componentCount(ty) orelse return e.unsupported("texel type '{s}'", .{try e.t.format(e.arena, ty)});
+        if (storageScalar(e.t.component(ty).?) != s) return e.unsupported("texel type '{s}'", .{try e.t.format(e.arena, ty)});
+        if (n == 4) return v4;
+        if (n == 1) return e.op1(.composite_extract, ty, &.{ v4, 0 });
+        var ops: std.ArrayList(u32) = .empty;
+        try ops.appendSlice(e.arena, &.{ v4, v4 });
+        for (0..n) |k| try ops.append(e.arena, @intCast(k));
+        return e.op1(.vector_shuffle, ty, ops.items);
+    }
+
+    fn vec4Of(e: *Emitter, s: Scalar) Error!Id {
+        return e.typeId(try e.t.vector(s, 4));
+    }
+
+    /// `res[index]` on a texture or typed buffer.
+    fn imageIndexLoad(e: *Emitter, g: u32, coord: Id, ty: TypeId) Error!Id {
+        const r = e.resourceInfo(g);
+        const sh = texture.shape(r.kind).?;
+        const s = try e.texelScalar(r.elem);
+        const img = try e.loadImage(g);
+        var v: Id = undefined;
+        if (sh.rw) {
+            if (e.imageFormat(r.elem) == 0) try e.cap(.storage_image_read_without_format);
+            v = if (sh.ms)
+                try e.opRaw(.image_read, try e.vec4Of(s), &.{ img, coord, 0x40, try e.constInt(0) })
+            else
+                try e.opRaw(.image_read, try e.vec4Of(s), &.{ img, coord });
+        } else if (sh.dim == .buffer) {
+            v = try e.opRaw(.image_fetch, try e.vec4Of(s), &.{ img, coord });
+        } else {
+            const operand: u32 = if (sh.ms) 0x40 else 0x2; // Sample 0 / Lod 0
+            v = try e.opRaw(.image_fetch, try e.vec4Of(s), &.{ img, coord, operand, try e.constUint(0) });
+        }
+        return e.texelResult(v, s, ty);
+    }
+
+    fn imageWrite(e: *Emitter, g: u32, coord: Id, value: Id) Error!void {
+        const r = e.resourceInfo(g);
+        _ = try e.texelScalar(r.elem);
+        if (e.imageFormat(r.elem) == 0) try e.cap(.storage_image_write_without_format);
+        const img = try e.loadImage(g);
+        try e.b.emit(.functions, .image_write, &.{ img, coord, value });
+    }
+
+    /// The constant id of an IR value built only from constants, or null.
+    fn constValue(e: *Emitter, r: Ref) Error!?Id {
+        const i = e.f.inst(r);
+        switch (i.op) {
+            .constant => return e.val(r),
+            .construct => |xs| {
+                if (e.t.get(i.ty) != .vector) return null;
+                var ops: std.ArrayList(u32) = .empty;
+                const id = e.b.newId();
+                try ops.appendSlice(e.arena, &.{ try e.typeId(i.ty), id });
+                for (xs) |x| try ops.append(e.arena, (try e.constValue(x)) orelse return null);
+                try e.b.emit(.types_globals, .constant_composite, ops.items);
+                return id;
+            },
+            else => return null,
+        }
+    }
+
+    fn method(e: *Emitter, name: []const u8, res: Ref, args: []const Ref, ty: TypeId) Error!Id {
+        const eq = std.mem.eql;
+        const g = e.globalOf(res) orelse return e.unsupported("resources not tied to a global are not supported yet", .{});
+        const gty = e.m.globals.items[g].ty;
+        if (e.t.get(gty) != .resource) return e.unsupported("method '{s}' is not supported yet", .{name});
+        const r = e.resourceInfo(g);
+        if (eq(u8, name, "GetDimensions")) {
+            try e.getDimensions(g, r, args);
+            return 0;
+        }
+        if (eq(u8, name, "Load") and (r.kind == .structured_buffer or r.kind == .rw_structured_buffer)) {
+            const ptr = try e.bufferElement(res, args[0]);
+            const raw = try e.opRaw(.load, try e.layoutTypeId(ty, .std430, false), &.{ptr});
+            return e.fromLayout(raw, ty, .std430, false);
+        }
+        const sh = texture.shape(r.kind) orelse return e.unsupported("method '{s}' is not supported yet", .{name});
+        const call = texture.decode(name, sh, args.len) orelse return e.unsupported("method '{s}' is not supported yet", .{name});
+        if (call.status != null) return e.unsupported("texture methods with a status argument are not supported yet", .{});
+        if (call.offsets4) return e.unsupported("Gather with four offsets is not supported yet", .{});
+        if (call.op.implicitLod() and e.m.entry.?.stage != .pixel) return e.unsupported("'{s}' outside pixel shaders is not supported yet", .{name});
+        const s = try e.texelScalar(r.elem);
+        const img = try e.loadImage(g);
+        const coord = e.val(args[call.coord]);
+        // Image operands, in operand-mask bit order.
+        var mask: u32 = 0;
+        var extra: std.ArrayList(u32) = .empty;
+        if (call.bias) |k| {
+            mask |= 0x1;
+            try extra.append(e.arena, e.val(args[k]));
+        }
+        if (call.lod) |k| {
+            mask |= 0x2;
+            try extra.append(e.arena, e.val(args[k]));
+        } else if (call.op == .sample_cmp_level_zero) {
+            mask |= 0x2;
+            try extra.append(e.arena, try e.constant(try e.t.scalar(.float), .{ .float = 0 }));
+        }
+        if (call.ddx) |k| {
+            mask |= 0x4;
+            try extra.appendSlice(e.arena, &.{ e.val(args[k]), e.val(args[call.ddy.?]) });
+        }
+        var lod_from_coord: ?Id = null;
+        var coord_id = coord;
+        if (call.op == .load and !sh.rw and !sh.ms and sh.dim != .buffer) {
+            // Load(int3 x): the last component is the mip level.
+            const n = sh.coords() + @intFromBool(sh.array);
+            const ct = try e.t.vector(.int, @intCast(n + 1));
+            _ = ct;
+            const it = try e.t.scalar(.int);
+            lod_from_coord = try e.op1(.composite_extract, it, &.{ coord, n });
+            if (n == 1) {
+                coord_id = try e.op1(.composite_extract, it, &.{ coord, 0 });
+            } else {
+                var ops: std.ArrayList(u32) = .empty;
+                try ops.appendSlice(e.arena, &.{ coord, coord });
+                for (0..n) |k| try ops.append(e.arena, @intCast(k));
+                coord_id = try e.op1(.vector_shuffle, try e.t.vector(.int, @intCast(n)), ops.items);
+            }
+            mask |= 0x2;
+            try extra.append(e.arena, lod_from_coord.?);
+        }
+        if (call.offset) |k| {
+            if (try e.constValue(args[k])) |c| {
+                mask |= 0x8;
+                try extra.append(e.arena, c);
+            } else {
+                if (call.op != .gather and call.op != .gather_cmp) return e.unsupported("texel offsets that are not constants (they need loop unrolling) are not supported yet", .{});
+                try e.cap(.image_gather_extended);
+                mask |= 0x10;
+                try extra.append(e.arena, e.val(args[k]));
+            }
+        }
+        if (call.sample_index) |k| {
+            mask |= 0x40;
+            try extra.append(e.arena, e.val(args[k]));
+        }
+        if (call.clamp) |k| {
+            try e.cap(.min_lod);
+            mask |= 0x80;
+            try extra.append(e.arena, e.val(args[k]));
+        }
+        var ops: std.ArrayList(u32) = .empty;
+        if (call.op == .load) {
+            if (sh.rw and e.imageFormat(r.elem) == 0) try e.cap(.storage_image_read_without_format);
+            try ops.appendSlice(e.arena, &.{ img, coord_id });
+            if (mask != 0) {
+                try ops.append(e.arena, mask);
+                try ops.appendSlice(e.arena, extra.items);
+            }
+            const v = try e.opRaw(if (sh.rw) .image_read else .image_fetch, try e.vec4Of(s), ops.items);
+            return e.texelResult(v, s, ty);
+        }
+        if (call.op == .sample_position) return e.unsupported("GetSamplePosition is not supported yet", .{});
+        const smp = try e.opRaw(.load, try e.samplerType(), &.{e.val(args[call.sampler.?])});
+        const si = try e.opRaw(.sampled_image, try e.sampledImageType(e.global_images[g]), &.{ img, smp });
+        if (call.op == .calc_lod or call.op == .calc_lod_unclamped) {
+            try e.cap(.image_query);
+            const q = try e.opRaw(.image_query_lod, try e.typeId(try e.t.vector(.float, 2)), &.{ si, coord });
+            return e.op1(.composite_extract, try e.t.scalar(.float), &.{ q, @intFromBool(call.op == .calc_lod_unclamped) });
+        }
+        try ops.appendSlice(e.arena, &.{ si, coord });
+        if (call.compare) |k| try ops.append(e.arena, e.val(args[k]));
+        if (call.op == .gather) try ops.append(e.arena, try e.constInt(call.channel));
+        if (call.op == .gather_cmp and call.channel != 0) return e.unsupported("'{s}' is not supported for SPIR-V", .{name});
+        try ops.append(e.arena, mask);
+        try ops.appendSlice(e.arena, extra.items);
+        const op: Op = switch (call.op) {
+            .sample, .sample_bias => .image_sample_implicit_lod,
+            .sample_level, .sample_grad => .image_sample_explicit_lod,
+            .sample_cmp, .sample_cmp_bias => .image_sample_dref_implicit_lod,
+            .sample_cmp_level_zero, .sample_cmp_level, .sample_cmp_grad => .image_sample_dref_explicit_lod,
+            .gather => .image_gather,
+            .gather_cmp => .image_dref_gather,
+            else => unreachable,
+        };
+        if (call.op.isCmp() and call.op != .gather_cmp) return e.opRaw(op, try e.scalarType(s), ops.items);
+        const v = try e.opRaw(op, try e.vec4Of(s), ops.items);
+        return e.texelResult(v, s, ty);
+    }
+
+    fn getDimensions(e: *Emitter, g: u32, r: @FieldType(types.Type, "resource"), args: []const Ref) Error!void {
+        const uint_ty = try e.t.scalar(.uint);
+        const store = struct {
+            fn f(em: *Emitter, arg: Ref, v: Id) Error!void {
+                const ty = em.f.inst(arg).ty;
+                const cv = try em.convert(v, try em.t.scalar(.uint), ty);
+                try em.b.emit(.functions, .store, &.{ em.val(arg), cv });
+            }
+        }.f;
+        switch (r.kind) {
+            .structured_buffer, .rw_structured_buffer, .byte_address_buffer, .rw_byte_address_buffer => {
+                const len = try e.op1(.array_length, uint_ty, &.{ e.global_vars[g], 0 });
+                if (r.kind == .byte_address_buffer or r.kind == .rw_byte_address_buffer) {
+                    try store(e, args[0], try e.op1(.i_mul, uint_ty, &.{ len, try e.constUint(4) }));
+                } else {
+                    try store(e, args[0], len);
+                    if (args.len > 1) {
+                        const stride = layout.arrayStride(e.t, r.elem, false, .std430) catch return e.unsupported("buffer element type", .{});
+                        try store(e, args[1], try e.constUint(stride));
+                    }
+                }
+                return;
+            },
+            else => {},
+        }
+        const sh = texture.shape(r.kind) orelse return e.unsupported("GetDimensions on this resource is not supported yet", .{});
+        try e.cap(.image_query);
+        const img = try e.loadImage(g);
+        const d = texture.getDimensions(sh, args.len);
+        const n: u8 = if (sh.dim == .buffer) 1 else (if (sh.dim == .cube) 2 else sh.coords()) + @intFromBool(sh.array);
+        const size_ty = if (n == 1) uint_ty else try e.t.vector(.uint, n);
+        const size = if (sh.hasMips())
+            try e.op1(.image_query_size_lod, size_ty, &.{ img, if (d.mip) |k| e.val(args[k]) else try e.constUint(0) })
+        else
+            try e.op1(.image_query_size, size_ty, &.{img});
+        for (d.outs[0..d.count]) |o| {
+            const v = if (o.comp == 3)
+                try e.op1(if (sh.ms) .image_query_samples else .image_query_levels, uint_ty, &.{img})
+            else if (n == 1)
+                size
+            else
+                try e.op1(.composite_extract, uint_ty, &.{ size, o.comp });
+            try store(e, args[o.arg], v);
+        }
     }
 
     /// The global a resource value comes from (`load (global g)`).

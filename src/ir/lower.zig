@@ -742,7 +742,7 @@ const Lowerer = struct {
         switch (bt) {
             .scalar, .vector => {
                 const v = try l.rvalue(base);
-                const comps = swizzleComponents(name) orelse return l.fail(e, "this swizzle");
+                const comps = (try swizzleComponents(l.arena, name)) orelse return l.fail(e, "this swizzle");
                 const ty = try l.concrete(e.ty);
                 if (bt == .scalar) {
                     if (comps.len == 1) return v;
@@ -821,14 +821,28 @@ const Lowerer = struct {
         switch (r) {
             .intrinsic => |it| {
                 const name = table.intrinsics[it.index].name;
+                const spec = table.intrinsics[it.index];
                 if (it.object) |_| {
                     const obj = callee.kind.member.base;
                     const res = try l.rvalue(obj);
+                    // Out parameters (GetDimensions, ...) are passed as
+                    // pointers to temporaries, copied back afterwards.
                     const vals = try l.arena.alloc(Ref, args.len);
-                    for (args, 0..) |a, i| vals[i] = try l.converted(a, try l.concrete(it.params[i]));
-                    return l.b.add(.{ .op = .{ .method = .{ .name = name, .res = res, .args = vals } }, .ty = ret_ty });
+                    var any_out = false;
+                    for (args, 0..) |a, i| {
+                        const pt = try l.concrete(it.params[i]);
+                        if (i < spec.params.len and spec.params[i].qual != .in) {
+                            vals[i] = try l.b.add(.{ .op = .local_var, .ty = pt, .ptr = .function });
+                            any_out = true;
+                        } else vals[i] = try l.converted(a, pt);
+                    }
+                    const result = try l.b.add(.{ .op = .{ .method = .{ .name = name, .res = res, .args = vals } }, .ty = ret_ty });
+                    if (any_out) for (args, 0..) |a, i| {
+                        if (i >= spec.params.len or spec.params[i].qual == .in) continue;
+                        try l.storeTo(a, try l.convert(try l.b.load(vals[i]), a.ty));
+                    };
+                    return result;
                 }
-                const spec = table.intrinsics[it.index];
                 const vals = try l.arena.alloc(Ref, args.len);
                 for (args, 0..) |a, i| {
                     if (i < spec.params.len and spec.params[i].qual != .in) {
@@ -912,7 +926,7 @@ const Lowerer = struct {
                 return l.storeTo(m.base, whole);
             } else if (t.get(m.base.ty) == .vector or t.get(m.base.ty) == .scalar) {
                 // Swizzle store: read, replace the named components, write.
-                const comps = swizzleComponents(m.name) orelse return error.Unsupported;
+                const comps = (try swizzleComponents(l.arena, m.name)) orelse return error.Unsupported;
                 if (t.get(m.base.ty) == .scalar) return l.storeTo(m.base, value);
                 var whole = try l.rvalue(m.base);
                 const ec = try t.scalar(t.component(m.base.ty).?);
@@ -1154,16 +1168,11 @@ fn parseBinding(values: []const []const u8) ir.Binding {
 }
 
 /// `xyzw` / `rgba` swizzle -> component indices.
-fn swizzleComponents(name: []const u8) ?[]const u8 {
+fn swizzleComponents(a: Allocator, name: []const u8) Allocator.Error!?[]const u8 {
     if (name.len == 0 or name.len > 4) return null;
-    const static = struct {
-        var buf: [16][4]u8 = undefined;
-        var next: usize = 0;
-    };
-    const out = &static.buf[static.next % 16];
-    static.next += 1;
-    for (name, 0..) |c, i| {
-        out[i] = switch (c) {
+    const out = try a.alloc(u8, name.len);
+    for (name, out) |c, *o| {
+        o.* = switch (c) {
             'x', 'r' => 0,
             'y', 'g' => 1,
             'z', 'b' => 2,
@@ -1171,7 +1180,7 @@ fn swizzleComponents(name: []const u8) ?[]const u8 {
             else => return null,
         };
     }
-    return out[0..name.len];
+    return out;
 }
 
 /// `_m01_m10` (zero-based) or `_12_21` (one-based) -> row-major component

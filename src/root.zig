@@ -29,6 +29,7 @@ pub const ir = struct {
     pub const ir = @import("ir/ir.zig");
     pub const lower = @import("ir/lower.zig");
     pub const layout = @import("ir/layout.zig");
+    pub const texture = @import("ir/texture.zig");
 };
 
 pub const sema = struct {
@@ -48,6 +49,7 @@ test {
     const std = @import("std");
     std.testing.refAllDecls(front);
     std.testing.refAllDecls(dxil);
+    std.testing.refAllDecls(ir);
     _ = @import("sema/types.zig");
     _ = @import("sema/sema.zig");
     std.testing.refAllDecls(spirv);
