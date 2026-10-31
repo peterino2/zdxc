@@ -125,7 +125,7 @@ const Lowerer = struct {
         if (l.globals.get(v)) |i| return i;
         const space: ir.Space = switch (v.storage) {
             .groupshared => .groupshared,
-            .global_static, .constant => if (isObject(&l.s.types, v.type)) .resource else .private,
+            .global_static, .constant, .local_static => if (isObject(&l.s.types, v.type)) .resource else .private,
             .global_uniform, .cbuffer => unreachable, // see cbufferMember
             else => unreachable,
         };
@@ -351,8 +351,12 @@ const Lowerer = struct {
             .@"var" => |*v| {
                 const variable = l.s.decl_vars.get(v) orelse return;
                 if (variable.storage == .local_static) {
-                    l.unsupported(d.loc, "static locals are not supported yet", .{});
-                    return error.Unsupported;
+                    // A private global, initialized on entry with the other
+                    // statics.
+                    const gi = try l.globalIndex(variable);
+                    const glob = l.m.globals.items[gi];
+                    try l.vars.put(l.arena, variable, try l.b.add(.{ .op = .{ .global = gi }, .ty = glob.ty, .ptr = glob.space }));
+                    return;
                 }
                 const local = try l.b.add(.{ .op = .local_var, .ty = variable.type, .ptr = .function });
                 try l.vars.put(l.arena, variable, local);

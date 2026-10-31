@@ -1370,7 +1370,7 @@ pub const Sema = struct {
         try s.decl_vars.put(s.arena, v, variable);
         if (ctx == .cbuffer) variable.block = s.current_block;
         if (storage == .global_uniform) try s.uniform_globals.append(s.arena, variable);
-        if (storage == .global_static or storage == .constant) try s.static_globals.append(s.arena, variable);
+        if (storage == .global_static or storage == .constant or storage == .local_static) try s.static_globals.append(s.arena, variable);
         // Unsized arrays take their size from the initializer.
         if (v.init) |init_e| if (!is_auto) {
             if (s.types.get(ty) == .array and s.types.get(ty).array.len == 0 and init_e.kind == .init_list) {

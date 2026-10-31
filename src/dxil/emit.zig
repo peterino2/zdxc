@@ -133,6 +133,7 @@ const Emitter = struct {
     /// 16-bit min-precision values cross the signature.
     uses_min_precision: bool = false,
     uses_view_id: bool = false,
+    uses_wave: bool = false,
     groupshared_bytes: u32 = 0,
     /// A typed UAV load of more than one component.
     uses_typed_uav_load: bool = false,
@@ -1334,6 +1335,9 @@ const Emitter = struct {
             return .none;
         }
         if (try e.mathIntrinsic(name, a[0..args.len], ac, rc, out)) return .{ .scalars = out };
+        if (std.mem.startsWith(u8, name, "Wave") or std.mem.startsWith(u8, name, "Quad")) {
+            if (try e.waveIntrinsic(name, a[0..args.len], ac, out)) return .{ .scalars = out };
+        }
         if (eq(u8, name, "NonUniformResourceIndex")) {
             try e.nonuniform.put(e.arena, a[0][0], {});
             return .{ .scalars = a[0] };
@@ -1506,6 +1510,95 @@ const Emitter = struct {
         const op: i64 = if (eq(u8, op_name, "Add")) 0 else if (eq(u8, op_name, "And")) 1 else if (eq(u8, op_name, "Or")) 2 else if (eq(u8, op_name, "Xor")) 3 else if (eq(u8, op_name, "Min")) (if (dc.isUnsigned()) 6 else 4) else if (eq(u8, op_name, "Max")) (if (dc.isUnsigned()) 7 else 5) else if (eq(u8, op_name, "Exchange")) 8 else return e.unsupported("'Interlocked{s}' is not supported yet", .{op_name});
         const fn_i = try e.dxOp("dx.op.atomicBinOp.i32", i32t, &.{ i32t, e.handle_ty, i32t, i32t, i32t, i32t, i32t }, .nounwind);
         return e.callOp(fn_i, i32t, &.{ try e.i32Const(78), res.handle, try e.i32Const(op), c[0], c[1], c[2], val });
+    }
+
+    /// Wave and quad intrinsics (component-wise on vectors).
+    fn waveIntrinsic(e: *Emitter, name: []const u8, a: []const []const Value, ac: Scalar, out: []Value) Error!bool {
+        const eq = std.mem.eql;
+        const i32t = try e.dm.intType(32);
+        const i1t = try e.dm.intType(1);
+        const i8t = try e.dm.intType(8);
+        const at = try e.scalarTy(ac);
+        e.uses_wave = true;
+        const i8c = struct {
+            fn f(em: *Emitter, v: i64) Error!Value {
+                return em.dm.constant(.{ .ty = try em.dm.intType(8), .kind = .{ .int = v } });
+            }
+        }.f;
+        const Nullary = struct { name: []const u8, op: i64, fname: []const u8, ret_bool: bool };
+        for ([_]Nullary{
+            .{ .name = "WaveIsFirstLane", .op = 110, .fname = "dx.op.waveIsFirstLane", .ret_bool = true },
+            .{ .name = "WaveGetLaneIndex", .op = 111, .fname = "dx.op.waveGetLaneIndex", .ret_bool = false },
+            .{ .name = "WaveGetLaneCount", .op = 112, .fname = "dx.op.waveGetLaneCount", .ret_bool = false },
+        }) |w| if (eq(u8, name, w.name)) {
+            const rt = if (w.ret_bool) i1t else i32t;
+            out[0] = try e.callOp(try e.dxOp(w.fname, rt, &.{i32t}, .nounwind), rt, &.{try e.i32Const(w.op)});
+            return true;
+        };
+        // Bool reductions over the wave.
+        const BoolOp = struct { name: []const u8, op: i64, fname: []const u8, ret: enum { bool, int } };
+        for ([_]BoolOp{
+            .{ .name = "WaveActiveAnyTrue", .op = 113, .fname = "dx.op.waveAnyTrue", .ret = .bool },
+            .{ .name = "WaveActiveAllTrue", .op = 114, .fname = "dx.op.waveAllTrue", .ret = .bool },
+            .{ .name = "WaveActiveCountBits", .op = 135, .fname = "dx.op.waveAllOp", .ret = .int },
+            .{ .name = "WavePrefixCountBits", .op = 136, .fname = "dx.op.wavePrefixOp", .ret = .int },
+        }) |w| if (eq(u8, name, w.name)) {
+            const rt = if (w.ret == .bool) i1t else i32t;
+            out[0] = try e.callOp(try e.dxOp(w.fname, rt, &.{ i32t, i1t }, .nounwind), rt, &.{ try e.i32Const(w.op), a[0][0] });
+            return true;
+        };
+        if (eq(u8, name, "WaveActiveBallot")) {
+            const st = try e.dm.getType(.{ .@"struct" = .{ .name = "dx.types.fouri32", .elems = &.{ i32t, i32t, i32t, i32t } } });
+            const r = try e.callOp(try e.dxOp("dx.op.waveActiveBallot", st, &.{ i32t, i1t }, .nounwind), st, &.{ try e.i32Const(116), a[0][0] });
+            for (out, 0..) |*o, k| o.* = try e.add(i32t, .{ .extractvalue = .{ .agg = r, .index = @intCast(k) } });
+            return true;
+        }
+        const ovl = e.overloadName(at);
+        const sign: i64 = if (ac.isUnsigned()) 1 else 0;
+        // Component-wise operations on values.
+        const Op = struct { name: []const u8, op: i64, fname: []const u8, extra: []const i64 = &.{}, lane: bool = false, ret_bool: bool = false, signed: bool = false };
+        const ops = [_]Op{
+            .{ .name = "WaveActiveAllEqual", .op = 115, .fname = "waveActiveAllEqual", .ret_bool = true },
+            .{ .name = "WaveReadLaneAt", .op = 117, .fname = "waveReadLaneAt", .lane = true },
+            .{ .name = "WaveReadLaneFirst", .op = 118, .fname = "waveReadLaneFirst" },
+            .{ .name = "WaveActiveSum", .op = 119, .fname = "waveActiveOp", .extra = &.{0}, .signed = true },
+            .{ .name = "WaveActiveProduct", .op = 119, .fname = "waveActiveOp", .extra = &.{1}, .signed = true },
+            .{ .name = "WaveActiveMin", .op = 119, .fname = "waveActiveOp", .extra = &.{2}, .signed = true },
+            .{ .name = "WaveActiveMax", .op = 119, .fname = "waveActiveOp", .extra = &.{3}, .signed = true },
+            .{ .name = "WaveActiveBitAnd", .op = 120, .fname = "waveActiveBit", .extra = &.{0} },
+            .{ .name = "WaveActiveBitOr", .op = 120, .fname = "waveActiveBit", .extra = &.{1} },
+            .{ .name = "WaveActiveBitXor", .op = 120, .fname = "waveActiveBit", .extra = &.{2} },
+            .{ .name = "WavePrefixSum", .op = 121, .fname = "wavePrefixOp", .extra = &.{0}, .signed = true },
+            .{ .name = "WavePrefixProduct", .op = 121, .fname = "wavePrefixOp", .extra = &.{1}, .signed = true },
+            .{ .name = "QuadReadLaneAt", .op = 122, .fname = "quadReadLaneAt", .lane = true },
+            .{ .name = "QuadReadAcrossX", .op = 123, .fname = "quadOp", .extra = &.{0} },
+            .{ .name = "QuadReadAcrossY", .op = 123, .fname = "quadOp", .extra = &.{1} },
+            .{ .name = "QuadReadAcrossDiagonal", .op = 123, .fname = "quadOp", .extra = &.{2} },
+        };
+        for (ops) |w| if (eq(u8, name, w.name)) {
+            var params: std.ArrayList(DType) = .empty;
+            try params.appendSlice(e.arena, &.{ i32t, at });
+            if (w.lane) try params.append(e.arena, i32t);
+            for (w.extra) |_| try params.append(e.arena, i8t);
+            if (w.signed) try params.append(e.arena, i8t);
+            const rt = if (w.ret_bool) i1t else at;
+            const fn_i = try e.dxOp(try std.fmt.allocPrint(e.arena, "dx.op.{s}.{s}", .{ w.fname, ovl }), rt, params.items, .nounwind);
+            for (out, 0..) |*o, k| {
+                var args: std.ArrayList(Value) = .empty;
+                try args.appendSlice(e.arena, &.{ try e.i32Const(w.op), a[0][k] });
+                if (w.lane) try args.append(e.arena, a[1][0]);
+                for (w.extra) |x| try args.append(e.arena, try i8c(e, x));
+                if (w.signed) try args.append(e.arena, try i8c(e, sign));
+                o.* = try e.callOp(fn_i, rt, args.items);
+            }
+            return true;
+        };
+        if (eq(u8, name, "QuadAny") or eq(u8, name, "QuadAll")) {
+            const fn_i = try e.dxOp("dx.op.quadVote.i1", i1t, &.{ i32t, i1t, i8t }, .nounwind);
+            out[0] = try e.callOp(fn_i, i1t, &.{ try e.i32Const(222), a[0][0], try i8c(e, if (eq(u8, name, "QuadAll")) 1 else 0) });
+            return true;
+        }
+        return false;
     }
 
     fn fbin(e: *Emitter, op: module.BinOp, x: Value, y: Value, ty: DType) Error!Value {
@@ -2627,6 +2720,7 @@ const Emitter = struct {
             flags |= 1 << 24;
         };
         if (e.uses_view_id) flags |= 1 << 21;
+        if (e.uses_wave) flags |= 1 << 19;
         if (e.uses_inner_coverage) flags |= 1 << 10;
         return flags;
     }
@@ -2636,7 +2730,7 @@ const Emitter = struct {
         const map = [_][2]u64{
             .{ 1 << 2, 0x1 },      .{ 1 << 16, 0x4 },     .{ 1 << 15, 0x8 },        .{ 1 << 5, 0x10 },
             .{ 1 << 11, 0x200 },   .{ 1 << 10, 0x400 },   .{ 1 << 9, 0x2000 },      .{ 1 << 20, 0x8000 },
-            .{ 1 << 21, 0x10000 }, .{ 1 << 24, 0x80000 },   .{ 1 << 13, 0x800 },
+            .{ 1 << 21, 0x10000 }, .{ 1 << 24, 0x80000 },   .{ 1 << 19, 0x4000 },   .{ 1 << 13, 0x800 },
         };
         var f: u64 = 0;
         for (map) |m| if (flags & m[0] != 0) {
