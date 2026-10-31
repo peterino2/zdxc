@@ -47,6 +47,19 @@ pub fn build(b: *std.Build) void {
     oracle.has_side_effects = true;
     oracle_step.dependOn(&oracle.step);
 
+    // Benchmarks always build optimized so numbers are comparable.
+    const bench = b.addExecutable(.{
+        .name = "pp_bench",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("bench/pp_bench.zig"),
+            .target = target,
+            .optimize = .ReleaseFast,
+            .imports = &.{.{ .name = "zdxc", .module = mod }},
+        }),
+    });
+    const bench_step = b.step("bench", "Build the preprocessor benchmark (zig-out/bin/pp_bench)");
+    bench_step.dependOn(&b.addInstallArtifact(bench, .{}).step);
+
     const oracle_pp_step = b.step("oracle-pp", "Compare zdxc -P with dxc -P over the DXC test corpus");
     const oracle_pp = b.addSystemCommand(&.{ "sh", "test/oracle/pp.sh" });
     oracle_pp.addArtifactArg(exe);

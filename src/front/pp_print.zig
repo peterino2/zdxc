@@ -11,11 +11,13 @@ pub fn print(pp: *Preprocessor, w: *std.Io.Writer) !void {
     var cur_line: u32 = 0;
     var prev: ?Token = null;
     var line_has_tokens = false;
+    var cursor: Preprocessor.LineCursor = .{};
     while (true) {
         const t = try pp.next();
         if (t.kind == .eof) break;
-        const p = pp.presumedLoc(t.loc);
-        const same_file = cur_file != null and std.mem.eql(u8, cur_file.?, p.file);
+        const p = pp.presumedLocCursor(t.loc, &cursor);
+        // Paths usually share storage, so compare pointers before bytes.
+        const same_file = if (cur_file) |cf| (cf.ptr == p.file.ptr and cf.len == p.file.len) or std.mem.eql(u8, cf, p.file) else false;
         if (!same_file) {
             if (line_has_tokens) try w.writeByte('\n');
             try w.print("#line {d} \"", .{p.line});

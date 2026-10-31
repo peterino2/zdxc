@@ -2,6 +2,7 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const scan = @import("scan.zig");
 
 pub const FileId = u32;
 
@@ -147,10 +148,9 @@ pub const SourceManager = struct {
         const no_bom = if (std.mem.startsWith(u8, raw, "\xEF\xBB\xBF")) raw[3..] else raw;
         const text = try spliceLines(a, no_bom);
         var starts: std.ArrayList(u32) = .empty;
-        try starts.append(a, 0);
-        for (text, 0..) |c, i| {
-            if (c == '\n') try starts.append(a, @intCast(i + 1));
-        }
+        try starts.ensureTotalCapacity(a, text.len / 32 + 16);
+        starts.appendAssumeCapacity(0);
+        try scan.appendLineStarts(a, &starts, text);
         const content = try a.create(Content);
         content.* = .{ .text = text, .line_starts = try starts.toOwnedSlice(a) };
         return content;

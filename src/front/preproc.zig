@@ -72,6 +72,29 @@ const Macro = struct {
     }
 };
 
+const MacroFilter = struct {
+    bits: [filter_words]u64 = @splat(0),
+
+    const filter_words = 16; // 1024 bits
+
+    fn slot(name: []const u8) u10 {
+        const first: u32 = name[0];
+        const last: u32 = name[name.len - 1];
+        const len: u32 = @truncate(name.len);
+        return @truncate(first *% 31 +% last *% 7 +% len *% 131);
+    }
+
+    fn add(f: *MacroFilter, name: []const u8) void {
+        const s = slot(name);
+        f.bits[s >> 6] |= @as(u64, 1) << @as(u6, @truncate(s));
+    }
+
+    fn mayContain(f: *const MacroFilter, name: []const u8) bool {
+        const s = slot(name);
+        return f.bits[s >> 6] & (@as(u64, 1) << @as(u6, @truncate(s))) != 0;
+    }
+};
+
 const Context = struct {
     tokens: []const Token,
     pos: usize = 0,
@@ -121,6 +144,9 @@ pub const Preprocessor = struct {
     diags: *Diagnostics,
     opts: Options,
     macros: std.StringHashMapUnmanaged(*Macro) = .empty,
+    /// Conservative filter over defined macro names (bits are never
+    /// cleared), letting most identifiers skip the hash lookup.
+    macro_filter: MacroFilter = .{},
     contexts: std.ArrayList(Context) = .empty,
     includes: std.ArrayList(IncludeFrame) = .empty,
     conds: std.ArrayList(Cond) = .empty,
@@ -182,10 +208,11 @@ pub const Preprocessor = struct {
             .{ "__has_attribute", .has_nothing },          .{ "__has_cpp_attribute", .has_nothing },
             .{ "__has_declspec_attribute", .has_nothing },
         };
+        try pp.macros.ensureTotalCapacity(pp.arena, 64);
         for (builtins) |b| {
             const m = try pp.arena.create(Macro);
             m.* = .{ .name = b[0], .builtin = b[1] };
-            try pp.macros.put(pp.arena, b[0], m);
+            try pp.defineMacro(b[0], m);
         }
 
         var text: std.Io.Writer.Allocating = .init(pp.arena);
@@ -221,6 +248,16 @@ pub const Preprocessor = struct {
 
         const id = try pp.sm.addFile("<built-in>", text.written());
         try pp.enterFileId(id);
+    }
+
+    fn defineMacro(pp: *Preprocessor, name: []const u8, m: *Macro) Error!void {
+        pp.macro_filter.add(name);
+        try pp.macros.put(pp.arena, name, m);
+    }
+
+    fn lookupMacro(pp: *const Preprocessor, name: []const u8) ?*Macro {
+        if (!pp.macro_filter.mayContain(name)) return null;
+        return pp.macros.get(name);
     }
 
     // ---------------------------------------------------------------------
@@ -283,7 +320,7 @@ pub const Preprocessor = struct {
                 if (try pp.pragmaOperator(t)) |pragma| return pragma;
                 continue;
             }
-            const m = pp.macros.get(t.text) orelse return t;
+            const m = pp.lookupMacro(t.text) orelse return t;
             if (m.disabled) {
                 var painted = t;
                 painted.flags.no_expand = true;
@@ -411,7 +448,7 @@ pub const Preprocessor = struct {
             }
             // Identifiers naming a currently disabled macro stay painted.
             if (t.kind == .identifier and !t.flags.no_expand) {
-                if (pp.macros.get(t.text)) |am| {
+                if (pp.lookupMacro(t.text)) |am| {
                     if (am.disabled) t.flags.no_expand = true;
                 }
             }
@@ -608,9 +645,33 @@ pub const Preprocessor = struct {
 
     pub fn presumedLoc(pp: *const Preprocessor, loc: Loc) PresumedLoc {
         if (loc.isNone()) return .{ .file = "<unknown>", .line = 0 };
-        const phys = pp.sm.lineCol(loc).line;
-        var result: PresumedLoc = .{ .file = pp.sm.file(loc.file).path, .line = phys };
-        if (pp.line_overrides.get(loc.file)) |list| {
+        return pp.applyLineOverrides(loc.file, pp.sm.lineCol(loc).line);
+    }
+
+    /// Tracks the physical line of the previous lookup so that a stream of
+    /// increasing locations (as when printing) costs O(1) per token instead
+    /// of a binary search.
+    pub const LineCursor = struct {
+        file: source.FileId = Loc.none.file,
+        /// 0-based index into line_starts of the current line.
+        line_index: u32 = 0,
+    };
+
+    pub fn presumedLocCursor(pp: *const Preprocessor, loc: Loc, cursor: *LineCursor) PresumedLoc {
+        if (loc.isNone()) return .{ .file = "<unknown>", .line = 0 };
+        const starts = pp.sm.file(loc.file).line_starts;
+        if (cursor.file != loc.file or starts[cursor.line_index] > loc.offset) {
+            cursor.* = .{ .file = loc.file, .line_index = pp.sm.lineCol(loc).line - 1 };
+        } else {
+            while (cursor.line_index + 1 < starts.len and starts[cursor.line_index + 1] <= loc.offset) cursor.line_index += 1;
+        }
+        return pp.applyLineOverrides(loc.file, cursor.line_index + 1);
+    }
+
+    fn applyLineOverrides(pp: *const Preprocessor, file: source.FileId, phys: u32) PresumedLoc {
+        var result: PresumedLoc = .{ .file = pp.sm.file(file).path, .line = phys };
+        if (pp.line_overrides.count() == 0) return result;
+        if (pp.line_overrides.get(file)) |list| {
             for (list.items) |ov| {
                 if (ov.phys_line >= phys) break;
                 result.line = ov.line + (phys - ov.phys_line - 1);
@@ -884,7 +945,7 @@ pub const Preprocessor = struct {
                 pp.diags.warn(name.loc, "'{s}' macro redefined", .{name.text});
             }
         }
-        try pp.macros.put(pp.arena, name.text, m);
+        try pp.defineMacro(name.text, m);
     }
 
     fn handleInclude(pp: *Preprocessor, directive: Token) Error!void {

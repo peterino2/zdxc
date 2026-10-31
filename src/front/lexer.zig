@@ -3,6 +3,7 @@
 
 const std = @import("std");
 const source = @import("source.zig");
+const scan = @import("scan.zig");
 
 pub const Kind = enum(u8) {
     eof,
@@ -133,21 +134,14 @@ pub const Lexer = struct {
                 '/' => {
                     const n = l.peekAt(l.pos + 1);
                     if (n == '/') {
-                        while (l.pos < l.text.len and l.text[l.pos] != '\n') l.pos += 1;
+                        l.pos = @intCast(scan.findNewline(l.text, l.pos + 2));
                         space = true;
                     } else if (n == '*') {
-                        l.pos += 2;
                         // A newline inside a block comment does not start a
                         // new line for directive purposes (the comment is one
-                        // space after translation phase 3).
-                        while (l.pos < l.text.len) : (l.pos += 1) {
-                            if (l.text[l.pos] == '*' and l.peekAt(l.pos + 1) == '/') {
-                                l.pos += 2;
-                                break;
-                            }
-                        } else {
-                            // Unterminated block comment: consume to EOF.
-                        }
+                        // space after translation phase 3). An unterminated
+                        // comment runs to EOF.
+                        l.pos = @intCast(scan.skipBlockComment(l.text, l.pos + 2));
                         space = true;
                     } else break;
                 },
@@ -235,7 +229,7 @@ pub const Lexer = struct {
         l.pos += 1;
         switch (c) {
             'a'...'z', 'A'...'Z', '_' => {
-                while (l.pos < l.text.len and isIdentChar(l.text[l.pos])) l.pos += 1;
+                l.pos = @intCast(scan.skipIdent(l.text, l.pos));
                 return .identifier;
             },
             '0'...'9' => {

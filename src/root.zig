@@ -5,6 +5,7 @@ pub const Diagnostics = @import("diag.zig").Diagnostics;
 pub const front = struct {
     pub const source = @import("front/source.zig");
     pub const lexer = @import("front/lexer.zig");
+    pub const scan = @import("front/scan.zig");
     pub const preproc = @import("front/preproc.zig");
     pub const pp_print = @import("front/pp_print.zig");
 };
