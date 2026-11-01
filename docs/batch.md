@@ -50,7 +50,7 @@ Every job writes its own `-Fo` / `-Fh` / ... outputs. What a job prints —
 diagnostics, and text output such as `-P` without a file — comes out
 exactly as one zdxc run of that command line would print it, kept together
 and in job order, whatever order the jobs finish in. The outputs are
-byte-identical to separate runs (`test/job/check.sh` checks this).
+byte-identical to separate runs.
 
 When jobs fail, the other jobs still run, and a last line says how many
 failed:
