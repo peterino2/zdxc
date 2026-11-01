@@ -1942,7 +1942,7 @@ const Emitter = struct {
                 try e.cap(.variable_pointers);
                 if (e.spv_minor < 3) try e.extension("SPV_KHR_variable_pointers");
             }
-            try params.append(e.arena, if (p.by_ref) try e.pointerType(.function, t) else t);
+            try params.append(e.arena, if (p.by_ref) try e.pointerType(if (p.groupshared) .workgroup else .function, t) else t);
         }
         const fn_ty = try e.functionType(ret, params.items);
         try e.b.emit(.functions, .function, &.{ ret, fn_id, 0, fn_ty });

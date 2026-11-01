@@ -184,6 +184,9 @@ pub const Param = struct {
     ty: TypeId,
     /// out / inout: passed as a pointer to caller storage.
     by_ref: bool,
+    /// `groupshared` parameters: a pointer to the caller's groupshared
+    /// variable (by_ref too).
+    groupshared: bool = false,
     /// in, out, inout (library function annotations).
     dir: enum { in, out, inout } = .in,
     /// The HLSL type (before patches become arrays), for mangled names.

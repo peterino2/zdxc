@@ -18,6 +18,7 @@ const signature = @import("signature.zig");
 const texture = @import("../ir/texture.zig");
 const mangle = @import("mangle.zig");
 const rdat = @import("rdat.zig");
+const linalg_info = @import("linalg_info.zig");
 const libinfo = @import("libinfo.zig");
 const rootsig = @import("rootsig.zig");
 
@@ -183,6 +184,9 @@ const Emitter = struct {
     uses_tiled_resources: bool = false,
     uses_mesh_derivatives: bool = false,
     uses_ray_query: bool = false,
+    /// SM 6.10 matrix types used (`!dx.targetTypes`), in first-use order.
+    linalg_types: std.ArrayList(struct { ty: TypeId, dty: DType }) = .empty,
+    uses_linalg: bool = false,
     /// RayQuery locals: the query handle (allocated in the prologue on
     /// first use, or a copy of another query) and the query type.
     rq_locals: std.ArrayList(struct { h: ?Value, ty: TypeId }) = .empty,
@@ -300,7 +304,8 @@ const Emitter = struct {
     /// Number of flattened scalar components of `ty`.
     fn flatCount(e: *Emitter, ty: TypeId) Error!u32 {
         return switch (e.t.get(ty)) {
-            .scalar, .@"enum" => 1,
+            // (A matrix handle is one opaque component.)
+            .scalar, .@"enum", .linalg => 1,
             .vector => |v| v.len,
             .matrix => |m| @as(u32, m.rows) * m.cols,
             .array => |a| a.len * try e.flatCount(a.elem),
@@ -1434,7 +1439,7 @@ const Emitter = struct {
                 // inlined into it).
                 if (e.m.globals.items[g].space == .private) {
                     const gty = e.m.globals.items[g].ty;
-                    if (try e.mixedSizes(gty)) {
+                    if (try e.mixedSizes(gty) or e.containsLinAlg(gty)) {
                         const tg = try e.private_typed.getOrPut(e.arena, g);
                         if (!tg.found_existing) {
                             const dty = try e.memoryType(gty);
@@ -1479,8 +1484,9 @@ const Emitter = struct {
                     try e.res_locals.append(e.arena, null);
                     return .{ .res_local = @intCast(e.res_locals.items.len - 1) };
                 }
-                if (try e.mixedSizes(i.ty)) {
-                    // Components of several sizes: a struct-typed alloca.
+                if (try e.mixedSizes(i.ty) or e.containsLinAlg(i.ty)) {
+                    // Components of several sizes (or matrix handles): a
+                    // struct-typed alloca.
                     const dty = try e.memoryType(i.ty);
                     const base = try e.addPrologue(try e.dm.ptrType(dty), .{ .alloca = .{ .elem = dty, .size = try e.i32Const(1) } });
                     return .{ .typed = .{ .base = base, .dty = dty, .addr_space = 0, .ty = i.ty } };
@@ -1875,7 +1881,10 @@ const Emitter = struct {
         for (vals, 0..) |v, c| {
             if (ptr.offset_dyn == null) {
                 const key = .{ ptr.base, ptr.offset_const + @as(u32, @intCast(c)) };
-                if (e.status_vals.contains(v)) try e.forwarded.put(e.arena, key, .{ .v = v, .block = e.cur }) else _ = e.forwarded.remove(key);
+                // (Constants too, in locals: ops such as linear algebra
+                // layouts need immediates passed through parameters.)
+                const forward = e.status_vals.contains(v) or (v == .constant and ptr.addr_space == 0);
+                if (forward) try e.forwarded.put(e.arena, key, .{ .v = v, .block = e.cur }) else _ = e.forwarded.remove(key);
             } else e.forwarded.clearRetainingCapacity();
             const p = try e.elementPtr(ptr, @intCast(c));
             const ct = e.compOf(try e.componentType(ty, @intCast(c)));
@@ -1980,6 +1989,7 @@ const Emitter = struct {
         const eq = std.mem.eql;
         if (try e.rayIntrinsic(frame, name, ty, args)) |r| return r;
         if (try e.outIntrinsic(frame, name, ty, args)) |r| return r;
+        if (std.mem.startsWith(u8, name, "__builtin_LinAlg_")) return e.linAlg(frame, name[17..], ty, args);
         if (eq(u8, name, "DispatchMesh")) {
             const tp = switch (frame.vals[args[3].index()]) {
                 .typed => |x| x,
@@ -2822,7 +2832,7 @@ const Emitter = struct {
     /// The scalar type of flattened component `k` of `ty`.
     fn componentType(e: *Emitter, ty: TypeId, k: u32) Error!TypeId {
         switch (e.t.get(ty)) {
-            .scalar, .@"enum" => return ty,
+            .scalar, .@"enum", .linalg => return ty,
             .vector, .matrix => return e.t.scalar(e.t.component(ty).?),
             .array => |a| return e.componentType(a.elem, k % try e.flatCount(a.elem)),
             .@"struct" => |s| {
@@ -4042,8 +4052,201 @@ const Emitter = struct {
 
     /// The memory type of an HLSL value in struct-typed memory: vectors
     /// and matrices (by row) become arrays, bools 32-bit integers.
+    // ------------------------------------------------------------------
+    // SM 6.10 linear algebra
+
+    /// `%dx.types.LinAlgMatrixC<c>M<m>N<n>U<use>S<scope>` = { i8* }.
+    fn matrixType(e: *Emitter, ty: TypeId) Error!DType {
+        for (e.linalg_types.items) |x| if (x.ty == ty) return x.dty;
+        const la = e.t.get(ty).linalg;
+        const name = try std.fmt.allocPrint(e.arena, "dx.types.LinAlgMatrixC{d}M{d}N{d}U{d}S{d}", .{ la.comp, la.m, la.n, la.use, la.scope });
+        const dty = try e.dm.getType(.{ .@"struct" = .{ .name = name, .elems = &.{try e.dm.ptrType(try e.dm.intType(8))} } });
+        try e.linalg_types.append(e.arena, .{ .ty = ty, .dty = dty });
+        return dty;
+    }
+
+    fn containsLinAlg(e: *Emitter, ty: TypeId) bool {
+        return switch (e.t.get(ty)) {
+            .linalg => true,
+            .array => |a| e.containsLinAlg(a.elem),
+            .@"struct" => |st| for (st.fields.items) |fld| {
+                if (e.containsLinAlg(fld.type)) break true;
+            } else false,
+            else => false,
+        };
+    }
+
+    /// The overload suffix of an operand: `mC4M5N4U1S2`, `v4f32`, `f32`.
+    fn linAlgSuffix(e: *Emitter, ty: TypeId) Error![]const u8 {
+        return switch (e.t.get(ty)) {
+            .linalg => |la| std.fmt.allocPrint(e.arena, "mC{d}M{d}N{d}U{d}S{d}", .{ la.comp, la.m, la.n, la.use, la.scope }),
+            .vector => |v| if (v.len == 1) e.overloadName(try e.scalarTy(e.compOf(ty))) else std.fmt.allocPrint(e.arena, "v{d}{s}", .{ v.len, e.overloadName(try e.scalarTy(e.compOf(ty))) }),
+            else => e.overloadName(try e.scalarTy(e.compOf(ty))),
+        };
+    }
+
+    /// An operand of a linear algebra op: a matrix handle, a native vector
+    /// or a scalar, with its LLVM type.
+    fn linAlgValue(e: *Emitter, frame: *Frame, r: Ref) Error!struct { Value, DType } {
+        const ty = frame.f.inst(r).ty;
+        const vals = try e.scalars(frame, r);
+        if (e.t.get(ty) == .linalg) return .{ vals[0], try e.matrixType(ty) };
+        if (e.t.get(ty) == .vector and vals.len > 1) return .{ try e.libJoin(vals, ty), try e.libValueType(ty) };
+        return .{ vals[0], try e.valueType(vals[0]) };
+    }
+
+    /// Writes an op result (a matrix, vector or scalar) to an `out`
+    /// argument's storage.
+    fn linAlgStore(e: *Emitter, frame: *Frame, dst: Ref, v: Value) Error!void {
+        const ty = frame.f.inst(dst).ty;
+        const vals = if (e.t.get(ty) == .vector and e.t.get(ty).vector.len > 1) try e.libSplit(v, ty) else try e.arena.dupe(Value, &.{v});
+        switch (frame.vals[dst.index()]) {
+            .typed => |tp| try e.typedStore(tp, vals, ty),
+            .ptr => |p| try e.storePtr(p, vals, ty),
+            else => return e.unsupported("this destination of a linear algebra result is not supported yet", .{}),
+        }
+    }
+
+    /// A groupshared array argument: a pointer to its first element.
+    fn linAlgMemory(e: *Emitter, frame: *Frame, r: Ref) Error!struct { Value, DType, []const u8 } {
+        const arr = frame.f.inst(r).ty;
+        if (e.t.get(arr) != .array) return e.unsupported("linear algebra memory that is not a groupshared array", .{});
+        const elem = e.t.get(arr).array.elem;
+        if (e.t.get(elem) != .scalar) return e.unsupported("groupshared arrays of type '{s}' for linear algebra are not supported yet", .{try e.t.format(e.arena, arr)});
+        const p = switch (frame.vals[r.index()]) {
+            .ptr => |x| x,
+            else => return e.unsupported("linear algebra memory that is not a groupshared array", .{}),
+        };
+        if (p.addr_space != 3 or p.mixed or p.bool_storage) return e.unsupported("linear algebra memory that is not a groupshared array", .{});
+        const pt = try e.dm.getType(.{ .pointer = .{ .elem = p.scalar_ty, .addr_space = 3 } });
+        const off = if (p.offset_dyn) |d| d else try e.i32Const(@intCast(p.offset_const));
+        const ptr = try e.add(pt, .{ .gep = .{ .elem = p.array_ty, .ptr = p.base, .indices = try e.arena.dupe(Value, &.{ try e.i32Const(0), off }) } });
+        return .{ ptr, pt, e.overloadName(p.scalar_ty) };
+    }
+
+    /// `dx::__builtin_LinAlg_<name>(...)`: DXIL ops 322-342. Results go to
+    /// the first (`out` / `ref`) argument, or are returned.
+    fn linAlg(e: *Emitter, frame: *Frame, name: []const u8, ty: TypeId, args: []const Ref) Error!Lowered {
+        const eq = std.mem.eql;
+        if (e.profile.minor < 10) return e.unsupported("linear algebra needs shader model 6.10", .{});
+        e.uses_linalg = true;
+        const i32t = try e.dm.intType(32);
+        const Op = struct { code: u32, op: []const u8 };
+        const table = [_]struct { []const u8, Op }{
+            .{ "MatrixMatrixMultiplyAccumulate", .{ .code = 322, .op = "linAlgMatrixMultiplyAccumulate" } },
+            .{ "FillMatrix", .{ .code = 323, .op = "linAlgFillMatrix" } },
+            .{ "CopyConvertMatrix", .{ .code = 324, .op = "linAlgCopyConvertMatrix" } },
+            .{ "MatrixLoadFromDescriptor", .{ .code = 325, .op = "linAlgMatrixLoadFromDescriptor" } },
+            .{ "MatrixLoadFromMemory", .{ .code = 326, .op = "linAlgMatrixLoadFromMemory" } },
+            .{ "MatrixLength", .{ .code = 327, .op = "linAlgMatrixLength" } },
+            .{ "MatrixGetCoordinate", .{ .code = 328, .op = "linAlgMatrixGetCoordinate" } },
+            .{ "MatrixGetElement", .{ .code = 329, .op = "linAlgMatrixGetElement" } },
+            .{ "MatrixSetElement", .{ .code = 330, .op = "linAlgMatrixSetElement" } },
+            .{ "MatrixStoreToDescriptor", .{ .code = 331, .op = "linAlgMatrixStoreToDescriptor" } },
+            .{ "MatrixStoreToMemory", .{ .code = 332, .op = "linAlgMatrixStoreToMemory" } },
+            .{ "MatrixQueryAccumulatorLayout", .{ .code = 333, .op = "linAlgMatrixQueryAccumulatorLayout" } },
+            .{ "MatrixMatrixMultiply", .{ .code = 334, .op = "linAlgMatrixMultiply" } },
+            .{ "MatrixAccumulate", .{ .code = 335, .op = "linAlgMatrixAccumulate" } },
+            .{ "MatrixVectorMultiply", .{ .code = 336, .op = "linAlgMatVecMul" } },
+            .{ "MatrixVectorMultiplyAdd", .{ .code = 337, .op = "linAlgMatVecMulAdd" } },
+            .{ "MatrixAccumulateToDescriptor", .{ .code = 338, .op = "linAlgMatrixAccumulateToDescriptor" } },
+            .{ "MatrixAccumulateToMemory", .{ .code = 339, .op = "linAlgMatrixAccumulateToMemory" } },
+            .{ "MatrixOuterProduct", .{ .code = 340, .op = "linAlgMatrixOuterProduct" } },
+            .{ "Convert", .{ .code = 341, .op = "linAlgConvert" } },
+            .{ "VectorAccumulateToDescriptor", .{ .code = 342, .op = "linAlgVectorAccumulateToDescriptor" } },
+        };
+        const op = for (table) |x| {
+            if (eq(u8, x[0], name)) break x[1];
+        } else return e.unsupported("linear algebra builtin '{s}' is not supported yet", .{name});
+
+        // Which leading argument receives the result (out / ref), and the
+        // overload suffixes in dxc's order.
+        const out_first = switch (op.code) {
+            322, 323, 324, 325, 326, 329, 330, 334, 335, 336, 337, 340, 341 => true,
+            else => false,
+        };
+        var params: std.ArrayList(DType) = .empty;
+        var vals: std.ArrayList(Value) = .empty;
+        var suffix: std.ArrayList(u8) = .empty;
+        try params.append(e.arena, i32t);
+        try vals.append(e.arena, try e.i32Const(op.code));
+        const ret_ty: DType = blk: {
+            if (out_first) {
+                const dst_ty = frame.f.inst(args[0]).ty;
+                try suffix.print(e.arena, ".{s}", .{try e.linAlgSuffix(dst_ty)});
+                break :blk if (e.t.get(dst_ty) == .linalg) try e.matrixType(dst_ty) else if (e.t.get(dst_ty) == .vector and e.t.get(dst_ty).vector.len > 1) try e.libValueType(dst_ty) else try e.scalarTy(e.compOf(dst_ty));
+            }
+            if (ty == TypeTable.void_type) break :blk try e.voidTy();
+            break :blk if (e.t.get(ty) == .vector) try e.libValueType(ty) else try e.scalarTy(e.compOf(ty));
+        };
+        for (args[@intFromBool(out_first)..], @intFromBool(out_first)..) |a, k| {
+            const aty = frame.f.inst(a).ty;
+            // The `ref` destination of SetElement / accumulates is not an
+            // operand (its value is the result).
+            if (e.t.get(aty) == .array) {
+                const mem = try e.linAlgMemory(frame, a);
+                try vals.append(e.arena, mem[0]);
+                try params.append(e.arena, mem[1]);
+                try suffix.print(e.arena, ".{s}", .{mem[2]});
+                continue;
+            }
+            if (e.t.get(aty) == .resource) {
+                try vals.append(e.arena, (try e.resourceOf(frame, a)).handle);
+                try params.append(e.arena, e.handle_ty);
+                continue;
+            }
+            const v = try e.linAlgValue(frame, a);
+            try vals.append(e.arena, v[0]);
+            try params.append(e.arena, v[1]);
+            const overloaded = e.t.get(aty) == .linalg or (e.t.get(aty) == .vector and e.t.get(aty).vector.len > 1) or
+                // The filled / set value.
+                (op.code == 323 and k == 2) or (op.code == 330 and k == 3);
+            if (overloaded) try suffix.print(e.arena, ".{s}", .{try e.linAlgSuffix(aty)});
+        }
+        // GetElement and the vector results name their result first.
+        const fname = try std.fmt.allocPrint(e.arena, "dx.op.{s}{s}", .{ op.op, suffix.items });
+        const attrs: module.FnAttrs = switch (op.code) {
+            327, 328, 329, 333 => .nounwind_readnone,
+            else => .nounwind,
+        };
+        const fn_i = try e.dxOp(fname, ret_ty, params.items, attrs);
+        const r = try e.callOp(fn_i, ret_ty, vals.items);
+        if (out_first) {
+            try e.linAlgStore(frame, args[0], r);
+            return .none;
+        }
+        if (ty == TypeTable.void_type) return .none;
+        if (e.t.get(ty) == .vector) return .{ .scalars = try e.libSplit(r, ty) };
+        return .{ .scalars = try e.arena.dupe(Value, &.{r}) };
+    }
+
+    /// What the module does with matrices (PSV0), when it has any.
+    fn linAlgTables(e: *Emitter) Error!?linalg_info.Tables {
+        if (!e.uses_linalg) return null;
+        const mats = try e.arena.alloc(struct { module.TypeId, linalg_info.Matrix }, e.linalg_types.items.len);
+        for (mats, e.linalg_types.items) |*m, x| {
+            const la = e.t.get(x.ty).linalg;
+            m.* = .{ x.dty, .{ .comp = la.comp, .m = la.m, .n = la.n, .use = la.use, .scope = la.scope } };
+        }
+        return try linalg_info.collect(e.arena, &e.dm, mats);
+    }
+
+    /// `!dx.targetTypes`: each matrix type with its attributes.
+    fn targetTypesMd(e: *Emitter) Error!void {
+        if (e.linalg_types.items.len == 0) return;
+        const dm = &e.dm;
+        var nodes: std.ArrayList(module.MdId) = .empty;
+        for (e.linalg_types.items) |x| {
+            const la = e.t.get(x.ty).linalg;
+            const undef = try dm.constant(.{ .ty = x.dty, .kind = .undef });
+            try nodes.append(e.arena, try dm.mdNode(&.{ try dm.mdValue(x.dty, undef), try dm.mdI32(la.comp), try dm.mdI32(la.m), try dm.mdI32(la.n), try dm.mdI32(la.use), try dm.mdI32(la.scope) }));
+        }
+        try dm.addNamedMetadata("dx.targetTypes", nodes.items);
+    }
+
     fn memoryType(e: *Emitter, ty: TypeId) Error!DType {
         return switch (e.t.get(ty)) {
+            .linalg => e.matrixType(ty),
             .scalar, .@"enum" => e.scalarTy(memScalar(e.compOf(ty))),
             .vector => |v| e.dm.getType(.{ .array = .{ .len = v.len, .elem = try e.scalarTy(memScalar(e.compOf(ty))) } }),
             .matrix => |m| e.dm.getType(.{ .array = .{ .len = m.rows, .elem = try e.dm.getType(.{ .array = .{ .len = m.cols, .elem = try e.scalarTy(memScalar(e.compOf(ty))) } }) } }),
@@ -4065,6 +4268,7 @@ const Emitter = struct {
     /// Size and alignment of `ty`'s memory type.
     fn memLayout(e: *Emitter, ty: TypeId) Error![2]u32 {
         switch (e.t.get(ty)) {
+            .linalg => return .{ 8, 8 },
             .scalar, .@"enum", .vector, .matrix => {
                 const sz = memScalar(e.compOf(ty)).size();
                 return .{ sz * (e.t.componentCount(ty) orelse 1), sz };
@@ -4098,7 +4302,7 @@ const Emitter = struct {
             }
         }.f;
         switch (e.t.get(ty)) {
-            .scalar, .@"enum" => try out.append(e.arena, prefix),
+            .scalar, .@"enum", .linalg => try out.append(e.arena, prefix),
             .vector => |v| for (0..v.len) |k| try out.append(e.arena, try sub(e, prefix, @intCast(k))),
             .matrix => |m| for (0..m.rows) |r| {
                 const rp = try sub(e, prefix, @intCast(r));
@@ -4124,7 +4328,13 @@ const Emitter = struct {
         try e.scalarPaths(ty, &.{}, &paths);
         const out = try e.arena.alloc(Value, paths.items.len);
         for (out, paths.items, 0..) |*o, sub, c| {
-            const ct = e.compOf(try e.componentType(ty, @intCast(c)));
+            const cty = try e.componentType(ty, @intCast(c));
+            if (e.t.get(cty) == .linalg) {
+                const mt = try e.matrixType(cty);
+                o.* = try e.add(mt, .{ .load = .{ .ptr = try e.typedScalarPtr(tp, sub, mt), .@"align" = 0 } });
+                continue;
+            }
+            const ct = e.compOf(cty);
             const st = try e.scalarTy(memScalar(ct));
             const raw = try e.add(st, .{ .load = .{ .ptr = try e.typedScalarPtr(tp, sub, st), .@"align" = memScalar(ct).size() } });
             o.* = if (ct == .bool) try e.add(try e.dm.intType(1), .{ .cmp = .{ .pred = 33, .lhs = raw, .rhs = try e.i32Const(0) } }) else raw;
@@ -4136,7 +4346,12 @@ const Emitter = struct {
         var paths: std.ArrayList([]const Value) = .empty;
         try e.scalarPaths(ty, &.{}, &paths);
         for (vals, paths.items, 0..) |v, sub, c| {
-            const ct = e.compOf(try e.componentType(ty, @intCast(c)));
+            const cty = try e.componentType(ty, @intCast(c));
+            if (e.t.get(cty) == .linalg) {
+                _ = try e.add(try e.voidTy(), .{ .store = .{ .ptr = try e.typedScalarPtr(tp, sub, try e.matrixType(cty)), .val = v, .@"align" = 0 } });
+                continue;
+            }
+            const ct = e.compOf(cty);
             const st = try e.scalarTy(memScalar(ct));
             const sv = if (ct == .bool) try e.add(st, .{ .cast = .{ .op = .zext, .val = v } }) else v;
             _ = try e.add(try e.voidTy(), .{ .store = .{ .ptr = try e.typedScalarPtr(tp, sub, st), .val = sv, .@"align" = memScalar(ct).size() } });
@@ -4294,6 +4509,7 @@ const Emitter = struct {
         if (e.uses_wave) flags |= 1 << 19;
         if (e.uses_inner_coverage) flags |= 1 << 10;
         if (e.uses_ray_query) flags |= 1 << 25;
+        if (e.uses_linalg) flags |= 1 << 41;
         // UseNativeLowPrecision: set whenever 16-bit types are native.
         if (e.native16()) flags |= 1 << 23;
         return flags;
@@ -4433,6 +4649,8 @@ const Emitter = struct {
     }
 
     fn writeLibraryModule(e: *Emitter, funcs: []const LibFunc) Error![]u8 {
+        // (RDAT's per-function linear algebra properties are not written.)
+        if (e.uses_linalg) return e.unsupported("linear algebra in libraries is not supported yet", .{});
         const dm = &e.dm;
         const mdI32 = struct {
             fn f(m: *module.Module, v: i64) !module.MdId {
@@ -4499,6 +4717,7 @@ const Emitter = struct {
             try entries.append(e.arena, try dm.mdNode(&.{ try dm.mdValue(try dm.ptrType(fty), .{ .function = lf.func }), try dm.mdString(lf.name), lf.sigs, null, try dm.mdNode(props.items) }));
         }
 
+        try e.targetTypesMd();
         try dm.addNamedMetadata("llvm.ident", &.{ident});
         try dm.addNamedMetadata("dx.version", &.{version});
         try dm.addNamedMetadata("dx.valver", &.{val_ver});
@@ -4689,6 +4908,7 @@ const Emitter = struct {
         const fn_ref = try dm.mdValue(try dm.ptrType(main_ty), .{ .function = e.main_fn });
         const entry_md = try dm.mdNode(&.{ fn_ref, try dm.mdString(entry.name), sigs, resources, props_node });
 
+        try e.targetTypesMd();
         try dm.addNamedMetadata("llvm.ident", &.{ident});
         try dm.addNamedMetadata("dx.version", &.{version});
         try dm.addNamedMetadata("dx.valver", &.{val_ver});
@@ -4819,6 +5039,7 @@ const Emitter = struct {
             .patch_constants = e.sig_pc,
             .groupshared_bytes = if (threaded) e.groupshared_bytes else 0,
             .max_vertex_count = if (entry.stage == .geometry) @intCast(entry.geometry.max_vertex_count) else 0,
+            .linalg = try e.linAlgTables(),
         });
         defer gpa.free(psv);
         const domain: signature.Domain = if (entry.stage == .hull or entry.stage == .domain) @enumFromInt(@intFromEnum(entry.tess.domain)) else .undefined;

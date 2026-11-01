@@ -2,6 +2,7 @@
 //! only covers an empty compute shader; later milestones feed it from the IR.
 
 const std = @import("std");
+const linalg_info = @import("linalg_info.zig");
 const Allocator = std.mem.Allocator;
 const Module = @import("module.zig").Module;
 const container = @import("container.zig");
@@ -150,6 +151,8 @@ pub const PsvInfo = struct {
     max_vertex_count: u16 = 0,
     mesh_topology: u8 = 0,
     uses_view_id: bool = false,
+    /// SM 6.10 linear algebra usage.
+    linalg: ?linalg_info.Tables = null,
 };
 
 pub fn psvCompute(gpa: Allocator, entry: []const u8, num_threads: [3]u32, resources: []const ResourceBind) ![]u8 {
@@ -194,6 +197,9 @@ pub fn psv(gpa: Allocator, info: PsvInfo) ![]u8 {
     // Semantic index table, with runs shared between elements.
     var indices: std.ArrayList(u32) = .empty;
     defer indices.deinit(gpa);
+    // (Linear algebra shape runs come first, as in dxc.)
+    const linalg: ?linalg_info.Tables = if (info.linalg) |t| (if (t.empty()) null else t) else null;
+    if (linalg) |t| try indices.appendSlice(gpa, t.semantic_indices);
     var records: std.ArrayList(u8) = .empty;
     defer records.deinit(gpa);
     for ([_][]const signature.Element{ info.inputs, info.outputs, info.patch_constants }) |els| for (els) |e| {
@@ -226,7 +232,7 @@ pub fn psv(gpa: Allocator, info: PsvInfo) ![]u8 {
     try w(&buf, gpa, entry_off);
     // PSVRuntimeInfo4
     try w(&buf, gpa, info.groupshared_bytes); // NumBytesGroupSharedMemory
-    try w(&buf, gpa, 0); // Flags
+    try w(&buf, gpa, @intFromBool(linalg != null)); // Flags: LinAlgRuntimeInfoPresent
 
     try w(&buf, gpa, @intCast(info.resources.len));
     if (info.resources.len > 0) {
@@ -264,6 +270,7 @@ pub fn psv(gpa: Allocator, info: PsvInfo) ![]u8 {
     // (domain).
     if (info.kind == .hull and pc_vectors > 0 and in_vectors > 0) try buf.appendNTimes(gpa, 0, tableDwords(in_vectors, pc_vectors) * 4);
     if (info.kind == .domain and out_vectors[0] > 0 and pc_vectors > 0) try buf.appendNTimes(gpa, 0, tableDwords(pc_vectors, out_vectors[0]) * 4);
+    if (linalg) |t| try linalg_info.psvBlock(gpa, t, &buf);
     return buf.toOwnedSlice(gpa);
 }
 

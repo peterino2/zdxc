@@ -1210,6 +1210,17 @@ pub const Sema = struct {
             };
             return s.types.intern(.{ .resource = .{ .kind = vn[1], .elem = elem, .name = n } });
         };
+        // An SM 6.10 matrix handle: its attributes are its type.
+        if (eql(n, "__builtin_LinAlgMatrix")) {
+            for (t.attrs) |a| if (eql(a.name, "__LinAlgMatrix_Attributes") and a.args.len == 5) {
+                var v: [5]u32 = undefined;
+                for (a.args, &v) |x, *o| o.* = @intCast(s.evalInt(x) orelse {
+                    s.err(x.loc, "expression is not an integral constant expression", .{});
+                    return TypeTable.error_type;
+                });
+                return s.types.intern(.{ .linalg = .{ .comp = v[0], .m = v[1], .n = v[2], .use = v[3], .scope = v[4] } });
+            };
+        }
         // vk::SpirvType<opcode, size, alignment, operands...> and
         // vk::SpirvOpaqueType<opcode, operands...>.
         if (s.opts.spirv and (eql(n, "SpirvType") or eql(n, "SpirvOpaqueType"))) return s.inlineSpirvType(t, eql(n, "SpirvType"));

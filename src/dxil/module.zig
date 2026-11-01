@@ -613,14 +613,14 @@ const Encoder = struct {
                 .load => |l| {
                     try e.pushValueAndType(f, inst_id, l.ptr);
                     try e.push(inst.ty);
-                    try e.push(@as(u64, std.math.log2_int(u32, l.@"align")) + 1);
+                    try e.push(if (l.@"align" == 0) 0 else @as(u64, std.math.log2_int(u32, l.@"align")) + 1);
                     try e.push(0);
                     try e.rec(20);
                 },
                 .store => |s| {
                     try e.pushValueAndType(f, inst_id, s.ptr);
                     try e.pushValueAndType(f, inst_id, s.val);
-                    try e.push(@as(u64, std.math.log2_int(u32, s.@"align")) + 1);
+                    try e.push(if (s.@"align" == 0) 0 else @as(u64, std.math.log2_int(u32, s.@"align")) + 1);
                     try e.push(0);
                     try e.rec(44);
                 },

@@ -50,6 +50,7 @@ pub const bit = struct {
     pub const extended_command_info = 1 << 38;
     pub const uses_derivatives = 1 << 39;
     pub const requires_group = 1 << 40;
+    pub const linear_algebra = 1 << 41;
     /// Not part of the module's flags.
     pub const local = uses_derivatives | requires_group;
 };
@@ -148,6 +149,7 @@ pub fn analyze(m: *const module.Module, f: *const module.Function, o: Options) I
         const args = inst.op.call.args;
         if ((code >= 110 and code <= 123) or (code >= 135 and code <= 136) or (code >= 165 and code <= 167) or code == 222 or (code >= 312 and code <= 313)) fl |= bit.wave;
         if (code >= 174 and code <= 177) fl |= bit.sampler_feedback;
+        if (code >= 322 and code <= 342) fl |= bit.linear_algebra;
         switch (code) {
             71 => check_access = true,
             50 => fl |= bit.msad,
@@ -227,7 +229,7 @@ pub fn featureInfo(fl: u64) u64 {
         .{ bit.view_id, 0x10000 },     .{ 1 << 24, 0x80000 },            .{ bit.wave, 0x4000 },
         .{ bit.typed_uav_load, 0x800 }, .{ bit.resource_heap, 0x2000000 }, .{ bit.sampler_heap, 0x4000000 },
         .{ bit.barycentrics, 0x20000 }, .{ bit.extended_command_info, 0x100000000 }, .{ bit.tiled_resources, 0x100 },
-        .{ 1 << 29, 0x1000000 },       .{ 1 << 18, 0x1000 },       .{ bit.raytracing_1_1, 0x100000 }, .{ bit.sampler_feedback, 0x200000 },
+        .{ 1 << 29, 0x1000000 },       .{ 1 << 18, 0x1000 },        .{ 1 << 41, 0x200000000 },       .{ bit.raytracing_1_1, 0x100000 }, .{ bit.sampler_feedback, 0x200000 },
         .{ bit.advanced_texture_ops, 0x20000000 }, .{ bit.uses_derivatives, 0x100 << 32 }, .{ bit.requires_group, 0x200 << 32 },
     };
     var out: u64 = 0;

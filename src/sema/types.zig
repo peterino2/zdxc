@@ -467,7 +467,12 @@ pub const Type = union(enum) {
     /// `tex.mips` / `tex.sample` and their slices (`tex.mips[level]`).
     texture_view: struct { texture: TypeId, kind: enum { mips, mips_slice, sample, sample_slice } },
     spirv: *const SpirvTypeInfo,
+    /// `__builtin_LinAlgMatrix [[__LinAlgMatrix_Attributes(c, m, n, use,
+    /// scope)]]` (SM 6.10): an opaque matrix handle.
+    linalg: LinAlgMatrix,
 };
+
+pub const LinAlgMatrix = struct { comp: u32, m: u32, n: u32, use: u32, scope: u32 };
 
 /// Interns types. Ids 0 and 1 are `error` and `void`.
 pub const TypeTable = struct {
@@ -514,6 +519,7 @@ pub const TypeTable = struct {
             .descriptor_heap => |h| .{ .tag = 12, .a = @intFromBool(h.sampler), .b = 0 },
             .dynamic_resource => .{ .tag = 13, .a = 0, .b = 0 },
             .texture_view => |v| .{ .tag = 14, .a = v.texture, .b = @backingInt(v.kind) },
+            .linalg => |x| .{ .tag = 16, .a = (@as(u64, x.comp) << 32) | x.m, .b = (@as(u64, x.n) << 32) | (@as(u64, x.use) << 16) | x.scope },
             .spirv => |x| .{ .tag = 15, .a = (@as(u64, x.opcode) << 32) | x.size, .b = std.hash.Wyhash.hash(x.alignment, std.mem.sliceAsBytes(x.operands)) },
         };
     }
@@ -703,6 +709,7 @@ pub const TypeTable = struct {
                 .sample_slice => "sample_slice_type",
             } }),
             .spirv => |x| if (x.size == 0) "SpirvOpaqueType" else "SpirvType",
+            .linalg => "__builtin_LinAlgMatrix",
         };
     }
 };

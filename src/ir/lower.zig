@@ -355,7 +355,7 @@ const Lowerer = struct {
         for (f.params, 0..) |p, k| {
             if (l.s.types.get(p.type) == .stream) continue;
             const sem = if (k < f.decl.params.len) semanticOf(f.decl.params[k].semantics) else null;
-            try params.append(l.arena, .{ .name = p.name, .ty = l.irType(p.type), .by_ref = p.dir != .in, .dir = switch (p.dir) {
+            try params.append(l.arena, .{ .name = p.name, .ty = l.irType(p.type), .by_ref = p.dir != .in or p.groupshared, .groupshared = p.groupshared, .dir = switch (p.dir) {
                 .in => .in,
                 .out => .out,
                 .inout => .inout,
@@ -404,14 +404,14 @@ const Lowerer = struct {
             if (l.s.types.get(p.type) == .stream) continue;
             const pty = l.irType(p.type);
             const mq = if (i < f.decl.params.len) f.decl.params[i].quals else ast.Qualifiers{};
-            const space: ir.Space = if (mq.vertices or mq.indices or mq.primitives) .mesh else if (p.dir != .in) .function else .none;
+            const space: ir.Space = if (mq.vertices or mq.indices or mq.primitives) .mesh else if (p.groupshared) .groupshared else if (p.dir != .in) .function else .none;
             const pv = try l.b.add(.{ .op = .{ .param = ir_index }, .ty = pty, .ptr = space });
             ir_index += 1;
             if (p.dir == .in and isSpirvPointer(&l.s.types, p.type)) {
                 if (i < f.param_vars.len) if (f.param_vars[i]) |v| try l.value_vars.put(l.arena, v, pv);
                 continue;
             }
-            const storage = if (p.dir != .in) pv else blk: {
+            const storage = if (p.dir != .in or p.groupshared) pv else blk: {
                 const local = try l.b.add(.{ .op = .local_var, .ty = pty, .ptr = .function });
                 try l.b.store(local, pv);
                 break :blk local;
@@ -942,7 +942,7 @@ const Lowerer = struct {
                         if (l.value_vars.get(v)) |val| return val;
                         if (l.isSpecConstant(v)) return l.specConstant(v);
                         // Integer `static const` scalars are constants.
-                        if (v.storage == .constant and v.init != null and l.s.types.get(v.type) == .scalar and !l.s.types.get(v.type).scalar.isFloat()) {
+                        if (v.storage == .constant and v.init != null and isIntConstantType(&l.s.types, v.type)) {
                             if (l.s.evalVarInt(v)) |val| return l.b.constInt(try l.concrete(e.ty), val);
                         }
                         return l.b.load(try l.lvalue(e));
@@ -1214,7 +1214,7 @@ const Lowerer = struct {
                 // A static member through an object.
                 if (r == .variable) {
                     const v = r.variable;
-                    if (v.storage == .constant and v.init != null and l.s.types.get(v.type) == .scalar and !l.s.types.get(v.type).scalar.isFloat()) {
+                    if (v.storage == .constant and v.init != null and isIntConstantType(&l.s.types, v.type)) {
                         if (l.s.evalVarInt(v)) |val| return l.b.constInt(try l.concrete(e.ty), val);
                     }
                     return l.b.load(try l.variableLvalue(e, v));
@@ -1413,7 +1413,11 @@ const Lowerer = struct {
                 for (args, f.params, 0..) |a, p, i| {
                     if (l.s.types.get(p.type) == .stream) continue;
                     n_vals += 1;
-                    if (p.dir == .in) {
+                    if (p.groupshared) {
+                        // The caller's groupshared variable itself.
+                        vals[i] = try l.lvalue(a);
+                        temps[i] = .none;
+                    } else if (p.dir == .in) {
                         vals[i] = try l.converted(a, p.type);
                     } else {
                         // Copy-in / copy-out through a temporary.
@@ -1429,7 +1433,7 @@ const Lowerer = struct {
                 if (isMethod(f)) try packed_vals.insert(l.arena, 0, object orelse (if (l.this_ptr != .none) l.this_ptr else return error.Unsupported));
                 const res = try l.b.add(.{ .op = .{ .call = .{ .func = fi, .args = packed_vals.items } }, .ty = ret_ty });
                 for (args, f.params, 0..) |a, p, i| {
-                    if (p.dir == .in or l.s.types.get(p.type) == .stream) continue;
+                    if (p.dir == .in or p.groupshared or l.s.types.get(p.type) == .stream) continue;
                     const back = try l.b.load(temps[i]);
                     try l.storeTo(a, try l.convert(back, a.ty));
                 }
@@ -1475,6 +1479,22 @@ const Lowerer = struct {
                     vals[3] = try l.lvalue(args[3]);
                     l.mesh_payload = args[3].ty;
                     return l.b.add(.{ .op = .{ .intrinsic = .{ .name = name, .args = vals } }, .ty = TypeTable.void_type });
+                }
+                // SM 6.10 matrices: results go straight to the `out` /
+                // `ref` argument's storage; groupshared arrays by reference.
+                if (std.mem.startsWith(u8, name, "__builtin_LinAlg_")) {
+                    const vals = try l.arena.alloc(Ref, args.len);
+                    for (args, 0..) |a, i| {
+                        const q = if (i < spec.params.len) spec.params[i].qual else .in;
+                        const pt = it.params[i];
+                        vals[i] = if (q != .in or l.s.types.get(a.ty) == .array)
+                            try l.lvalue(a)
+                        else if (pt == TypeTable.error_type or l.s.types.get(pt) == .resource)
+                            try l.rvalue(a)
+                        else
+                            try l.converted(a, try l.concrete(pt));
+                    }
+                    return l.b.add(.{ .op = .{ .intrinsic = .{ .name = name, .args = vals } }, .ty = ret_ty });
                 }
                 // `out` parameters go through temporaries copied back
                 // afterwards; `ref` ones (atomic destinations) pass the
@@ -2314,6 +2334,15 @@ pub fn saturatingInt(f: f64) i64 {
 
 /// Non-static member functions take their object as a hidden first
 /// parameter.
+/// Integer (and enum) `static const` values are folded to constants.
+fn isIntConstantType(t: *const TypeTable, ty: TypeId) bool {
+    return switch (t.get(ty)) {
+        .scalar => |sc| !sc.isFloat(),
+        .@"enum" => true,
+        else => false,
+    };
+}
+
 /// `vk::SpirvOpaqueType<OpTypePointer, ...>` (WorkgroupSpirvPointer).
 fn isSpirvPointer(t: *const TypeTable, ty: TypeId) bool {
     return t.get(ty) == .spirv and t.get(ty).spirv.opcode == 32;
