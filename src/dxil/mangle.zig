@@ -114,7 +114,7 @@ fn typeCode(a: Allocator, t: *TypeTable, ty: TypeId, out: *std.ArrayList(u8), na
     if (ty == TypeTable.void_type) return out.append(a, 'X');
     switch (t.get(ty)) {
         .scalar => |s| try out.appendSlice(a, scalarCode(s)),
-        .@"enum" => |en| try className(a, 'W', try std.fmt.allocPrint(a, "4{s}", .{en.name}), out, names),
+        .@"enum" => |en| try qualifiedName(a, t, "W4", en.name, en.scopes, out, names),
         .vector => |v| {
             var args: std.ArrayList(u8) = .empty;
             try args.appendSlice(a, scalarCode(v.elem));
@@ -141,7 +141,7 @@ fn typeCode(a: Allocator, t: *TypeTable, ty: TypeId, out: *std.ArrayList(u8), na
             for (dims.items) |d| try number(a, d, out);
             try typeCode(a, t, et, out, names);
         },
-        .@"struct" => |st| try className(a, 'U', st.name, out, names),
+        .@"struct" => |st| try qualifiedName(a, t, if (st.is_class) "V" else "U", try structName(a, t, st), st.scopes, out, names),
         .resource => |r| {
             if (r.elem == TypeTable.void_type or r.kind == .raytracing_acceleration_structure) return className(a, 'U', r.name, out, names);
             // Template arguments have names of their own.
@@ -164,6 +164,47 @@ fn typeCode(a: Allocator, t: *TypeTable, ty: TypeId, out: *std.ArrayList(u8), na
         },
         else => try out.append(a, 'X'),
     }
+}
+
+/// A struct's own name: `name`, or `?$name@<args>@` for a template
+/// instance (its arguments with names of their own).
+fn structName(a: Allocator, t: *TypeTable, st: *const types.StructInfo) Allocator.Error![]const u8 {
+    const base = st.base_name orelse return st.name;
+    var out: std.ArrayList(u8) = .empty;
+    var inner: Names = .{};
+    try inner.add(a, base);
+    try out.print(a, "?${s}@", .{base});
+    for (st.template_args) |arg| switch (arg) {
+        .type => |ty| try typeCode(a, t, ty, &out, &inner),
+        .value => |v| {
+            try out.appendSlice(a, "$0");
+            if (v < 0) try out.append(a, '?');
+            try number(a, @abs(v), &out);
+        },
+    };
+    try out.append(a, '@');
+    return out.items;
+}
+
+/// `<kind><name><scope>@...@`: the name and each enclosing scope's,
+/// innermost first, each a back-reference when already spelled.
+fn qualifiedName(a: Allocator, t: *TypeTable, kind: []const u8, name: []const u8, scopes: []const types.ScopeName, out: *std.ArrayList(u8), names: *Names) Allocator.Error!void {
+    try out.appendSlice(a, kind);
+    try namePart(a, name, out, names);
+    for (scopes) |sc| try namePart(a, switch (sc) {
+        .name => |n| n,
+        .strct => |st| try structName(a, t, st),
+    }, out, names);
+    try out.append(a, '@');
+}
+
+/// One part of a qualified name: `name@` (template instances end in `@`
+/// themselves), or a back-reference digit.
+fn namePart(a: Allocator, name: []const u8, out: *std.ArrayList(u8), names: *Names) Allocator.Error!void {
+    if (names.find(name)) |k| return out.append(a, '0' + @as(u8, @intCast(k)));
+    try out.appendSlice(a, name);
+    if (name[0] != '?') try out.append(a, '@');
+    try names.add(a, name);
 }
 
 /// `<kind><name>@@`, or `<kind><backref>@` for a name already spelled

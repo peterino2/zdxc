@@ -714,6 +714,23 @@ const Emitter = struct {
         var mparams: std.ArrayList(mangle.Param) = .empty;
         var ann: std.ArrayList(ParamAnn) = .empty;
         const ret_void = f.ret == TypeTable.void_type;
+        if (!internal) {
+            // (dxc's check; the validator counts matrix handles as
+            // resources too.)
+            const holds = struct {
+                fn check(em: *Emitter, ty: TypeId) bool {
+                    return isResourceType(em.t, ty) or em.holdsResources(ty) or em.containsLinAlg(ty);
+                }
+            }.check;
+            var bad = holds(e, f.ret);
+            for (f.params) |p| bad = bad or holds(e, p.ty);
+            if (bad) {
+                const mps = try e.arena.alloc(mangle.Param, f.params.len);
+                for (mps, f.params) |*mp, p| mp.* = .{ .ty = p.ty, .by_ref = p.by_ref };
+                _ = e.diags.report(.{ .severity = .@"error", .loc = .none }, "Exported function \\01{s} must not contain a resource in parameter or return type.", .{(try mangle.function(e.arena, e.t, f.name, f.ret, mps))[1..]});
+                return error.Unsupported;
+            }
+        }
         try ann.append(e.arena, .{ .qual = 1, .comp = if (ret_void) null else try e.compType(e.compOf(f.ret)), .semantic = f.ret_semantic });
         for (f.params) |p| {
             // Structs go by pointer.

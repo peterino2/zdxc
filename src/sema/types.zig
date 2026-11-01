@@ -377,8 +377,22 @@ pub const Interp = packed struct(u8) {
 };
 
 /// A struct's layout-relevant information. Methods live in Sema.
+/// A template argument: a type or an integral value.
+pub const TemplateArg = union(enum) { type: TypeId, value: i64 };
+
+/// A scope enclosing a declaration (for mangled names): a namespace or a
+/// struct.
+pub const ScopeName = union(enum) { name: []const u8, strct: *const StructInfo };
+
 pub const StructInfo = struct {
     name: []const u8,
+    /// For mangled names: the name without template arguments, the
+    /// arguments of a template instance, the enclosing scopes (innermost
+    /// first) and whether it was declared `class`.
+    base_name: ?[]const u8 = null,
+    template_args: []const TemplateArg = &.{},
+    scopes: []const ScopeName = &.{},
+    is_class: bool = false,
     fields: std.ArrayList(Field) = .empty,
     /// Direct base structs (HLSL 2021 single inheritance, in practice).
     bases: std.ArrayList(*StructInfo) = .empty,
@@ -438,6 +452,8 @@ pub const EnumInfo = struct {
     name: []const u8,
     underlying: Scalar,
     scoped: bool,
+    /// Enclosing scopes, innermost first (mangled names).
+    scopes: []const ScopeName = &.{},
 };
 
 pub const Type = union(enum) {

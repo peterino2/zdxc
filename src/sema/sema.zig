@@ -112,7 +112,7 @@ pub const Function = struct {
 };
 
 /// A bound template argument.
-pub const Bound = union(enum) { type: TypeId, value: i64 };
+pub const Bound = types.TemplateArg;
 
 pub const FuncSet = struct {
     funcs: std.ArrayList(*Function) = .empty,
@@ -139,6 +139,8 @@ pub const Scope = struct {
     syms: std.StringHashMapUnmanaged(Symbol) = .empty,
     kind: enum { global, namespace, function, block, @"struct" } = .block,
     name: []const u8 = "",
+    /// The struct of a struct scope.
+    strct: ?*const types.StructInfo = null,
 };
 
 /// Per-struct data kept by Sema (methods, nested scope).
@@ -567,7 +569,7 @@ pub const Sema = struct {
                 // Register the type before checking members, so the struct
                 // may name itself.
                 const info = try s.arena.create(types.StructInfo);
-                info.* = .{ .name = name.items };
+                info.* = .{ .name = name.items, .base_name = st.name, .template_args = b.args, .scopes = try s.scopeNames(b.scope), .is_class = st.keyword == .class };
                 const ty = try s.types.intern(.{ .@"struct" = info });
                 try b.scope.syms.put(s.arena, name.items, .{ .type = ty });
                 // The injected class name: `S` alone is this instance.
@@ -1702,6 +1704,18 @@ pub const Sema = struct {
         }
     }
 
+    /// The namespaces and structs enclosing `scope`, innermost first.
+    fn scopeNames(s: *Sema, scope: *const Scope) Allocator.Error![]const types.ScopeName {
+        var out: std.ArrayList(types.ScopeName) = .empty;
+        var sc: ?*const Scope = scope;
+        while (sc) |x| : (sc = x.parent) switch (x.kind) {
+            .namespace => try out.append(s.arena, .{ .name = x.name }),
+            .@"struct" => if (x.strct) |st| try out.append(s.arena, .{ .strct = st }),
+            else => {},
+        };
+        return out.items;
+    }
+
     fn enumDecl(s: *Sema, d: *const ast.Decl, e: ast.EnumDecl) Allocator.Error!void {
         const info = try s.arena.create(types.EnumInfo);
         var underlying: Scalar = .int;
@@ -1709,7 +1723,7 @@ pub const Sema = struct {
             const ut = try s.resolveType(u);
             underlying = s.types.component(ut) orelse .int;
         }
-        info.* = .{ .name = e.name orelse "<anonymous enum>", .underlying = underlying, .scoped = e.scoped };
+        info.* = .{ .name = e.name orelse "<anonymous enum>", .underlying = underlying, .scoped = e.scoped, .scopes = try s.scopeNames(s.scope) };
         const ty = try s.types.intern(.{ .@"enum" = info });
         if (e.name) |n| try s.declare(n, .{ .type = ty }, d.loc);
         const sc = try s.arena.create(Scope);
@@ -1751,13 +1765,13 @@ pub const Sema = struct {
             return;
         } else {
             info = try s.arena.create(types.StructInfo);
-            info.* = .{ .name = name };
+            info.* = .{ .name = name, .scopes = try s.scopeNames(s.scope), .is_class = st.keyword == .class };
             ty = try s.types.intern(.{ .@"struct" = info });
             try s.declare(name, .{ .type = ty }, d.loc);
         }
         const members = st.members orelse return;
         const sc = try s.arena.create(Scope);
-        sc.* = .{ .parent = s.scope, .kind = .@"struct", .name = name };
+        sc.* = .{ .parent = s.scope, .kind = .@"struct", .name = name, .strct = info };
         const ss = try s.arena.create(StructSema);
         ss.* = .{ .scope = sc, .decl = d };
         info.sema = ss;
