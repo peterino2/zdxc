@@ -306,6 +306,9 @@ pub const BindingDecl = struct {
     /// [[vk::combinedImageSampler]]: `s` registers shift like `t` ones.
     combined: bool = false,
     /// Resources in the declaration (array elements).
+    /// A global struct of resources: its resources' globals (null:
+    /// unused) at offsets within the struct's bindings (`count` of them).
+    members: []const struct { global: ?u32, offset: u32 } = &.{},
     count: u32 = 1,
 };
 

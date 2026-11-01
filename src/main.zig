@@ -373,6 +373,14 @@ fn run(cli: Cli, arena: std.mem.Allocator, args: []const [:0]const u8, stdout: *
                 return;
             }
             if (opts.spirv) {
+                zdxc.ir.split_resources.run(arena, m, &diags) catch |err| switch (err) {
+                    error.Unsupported => {
+                        try diags.render(&sm, cli.stderr, .{ .format = opts.diag_format, .color = false });
+                        try cli.stderr.flush();
+                        return error.CompileFailed;
+                    },
+                    else => |x| return x,
+                };
                 const bytes = zdxc.spirv.emit.emit(arena, m, &diags, zdxc.spirv.emit.TargetEnv.parse(opts.target_env) orelse return cli.fail("unknown SPIR-V target environment '{s}'", .{opts.target_env})) catch |err| switch (err) {
                     error.Unsupported => {
                         try diags.render(&sm, cli.stderr, .{ .format = opts.diag_format, .color = false });

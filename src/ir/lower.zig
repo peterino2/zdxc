@@ -250,14 +250,22 @@ const Lowerer = struct {
                     }
                     var leaves: std.ArrayList(LeafPath) = .empty;
                     try l.resourceLeaves(v.type, &.{}, &leaves);
-                    for (leaves.items, 0..) |leaf, k| {
-                        const name = try l.leafName(v, leaf.path);
-                        var bd: ir.BindingDecl = .{ .global = l.leaf_globals.get(name) };
-                        if (k == 0) if (v.decl) |d| {
-                            bd = try l.bindingDecl(d.semantics, d.attrs, bd.global);
-                        };
-                        try l.m.binding_decls.append(l.arena, bd);
+                    // One range for the whole struct (as dxc): each
+                    // resource at its offset.
+                    var bd: ir.BindingDecl = if (v.decl) |d| try l.bindingDecl(d.semantics, d.attrs, null) else .{ .global = null };
+                    bd.global = null;
+                    var members: std.ArrayList(@typeInfo(@FieldType(ir.BindingDecl, "members")).pointer.child) = .empty;
+                    var offset: u32 = 0;
+                    for (leaves.items) |leaf| {
+                        try members.append(l.arena, .{ .global = l.leaf_globals.get(try l.leafName(v, leaf.path)), .offset = offset });
+                        var n: u32 = 1;
+                        var at = leaf.ty;
+                        while (l.s.types.get(at) == .array) : (at = l.s.types.get(at).array.elem) n *= @max(1, l.s.types.get(at).array.len);
+                        offset += n;
                     }
+                    bd.count = @max(1, offset);
+                    bd.members = members.items;
+                    try l.m.binding_decls.append(l.arena, bd);
                     if (layout.flatCount(&l.s.types, v.type) catch 0 == 0) continue;
                 }
                 if (!isObject(&l.s.types, v.type)) {
@@ -1030,6 +1038,7 @@ const Lowerer = struct {
             },
             .member => |m| return l.member(e, m.base, m.name),
             .index => |x| {
+                if (l.uniformPath(e)) |up| return l.uniformValue(up.v, up.path, e.ty);
                 const bt = t.get(x.base.ty);
                 if (bt == .descriptor_heap) {
                     const idx = try l.converted(x.index, try t.scalar(.uint));
@@ -1583,6 +1592,17 @@ const Lowerer = struct {
                 const path = std.mem.concat(l.arena, u32, &.{ base.path, &.{r.field} }) catch return null;
                 return .{ .v = base.v, .path = path };
             },
+            // An element of an array of structs holding resources (at a
+            // constant index).
+            .index => |x| {
+                const bt = l.s.types.get(x.base.ty);
+                if (bt != .array or !holdsResources(&l.s.types, x.base.ty) or isResourceLike(&l.s.types, bt.array.elem)) return null;
+                const base = l.uniformPath(x.base) orelse return null;
+                const k = l.s.evalInt(x.index) orelse return null;
+                if (k < 0 or k >= bt.array.len) return null;
+                const path = std.mem.concat(l.arena, u32, &.{ base.path, &.{@intCast(k)} }) catch return null;
+                return .{ .v = base.v, .path = path };
+            },
             else => return null,
         }
     }
@@ -1592,24 +1612,40 @@ const Lowerer = struct {
     /// The resources of a struct type, in member order.
     fn resourceLeaves(l: *Lowerer, ty: TypeId, prefix: []const u32, out: *std.ArrayList(LeafPath)) Error!void {
         const t = l.types();
-        if (isResourceLike(t, ty)) return out.append(l.arena, .{ .path = prefix, .ty = ty });
+        if (isResourceLike(t, ty) or layout.isOpaque(t, ty)) return out.append(l.arena, .{ .path = prefix, .ty = ty });
+        if (t.get(ty) == .array) {
+            for (0..t.get(ty).array.len) |k| try l.resourceLeaves(t.get(ty).array.elem, try std.mem.concat(l.arena, u32, &.{ prefix, &.{@intCast(k)} }), out);
+            return;
+        }
         if (t.get(ty) != .@"struct") return;
         for (t.get(ty).@"struct".fields.items, 0..) |f, k| {
-            if (!isResourceLike(t, f.type) and !holdsResources(t, f.type)) continue;
+            if (!layout.isOpaque(t, f.type) and !holdsResources(t, f.type)) continue;
             try l.resourceLeaves(f.type, try std.mem.concat(l.arena, u32, &.{ prefix, &.{@intCast(k)} }), out);
         }
     }
 
     /// `g.inner.tex`.
+    /// (Array elements by flattened index, as dxc: `g[5].tex`.)
     fn leafName(l: *Lowerer, v: *const Variable, path: []const u32) Error![]const u8 {
         var name: std.ArrayList(u8) = .empty;
         try name.appendSlice(l.arena, v.name);
         var cur = v.type;
-        for (path) |k| {
-            const f = l.s.types.get(cur).@"struct".fields.items[k];
-            try name.print(l.arena, ".{s}", .{f.name});
-            cur = f.type;
-        }
+        var flat: ?u32 = null;
+        for (path) |k| switch (l.s.types.get(cur)) {
+            .array => |arr| {
+                flat = (flat orelse 0) * arr.len + k;
+                cur = arr.elem;
+            },
+            .@"struct" => |st| {
+                if (flat) |fl| try name.print(l.arena, "[{d}]", .{fl});
+                flat = null;
+                const f = st.fields.items[k];
+                try name.print(l.arena, ".{s}", .{f.name});
+                cur = f.type;
+            },
+            else => {},
+        };
+        if (flat) |fl| try name.print(l.arena, "[{d}]", .{fl});
         return name.items;
     }
 
@@ -1629,11 +1665,13 @@ const Lowerer = struct {
     /// resources from their globals, its data from $Globals.
     fn uniformValue(l: *Lowerer, v: *const Variable, path: []const u32, ty: TypeId) Error!Ref {
         const t = l.types();
-        if (isResourceLike(t, ty)) return l.b.load(try l.leafGlobal(v, path, ty));
+        if (layout.isOpaque(t, ty)) return l.b.load(try l.leafGlobal(v, path, ty));
         if (holdsResources(t, ty)) {
-            if (t.get(ty) != .@"struct") {
-                l.unsupported(v.loc, "arrays of structs holding resources in global '{s}' are not supported yet", .{v.name});
-                return error.Unsupported;
+            if (t.get(ty) == .array) {
+                const arr = t.get(ty).array;
+                const parts = try l.arena.alloc(Ref, arr.len);
+                for (parts, 0..) |*p, k| p.* = try l.uniformValue(v, try std.mem.concat(l.arena, u32, &.{ path, &.{@intCast(k)} }), arr.elem);
+                return l.b.add(.{ .op = .{ .construct = parts }, .ty = ty });
             }
             const st = t.get(ty).@"struct";
             const parts = try l.arena.alloc(Ref, st.fields.items.len);
@@ -1686,7 +1724,7 @@ const Lowerer = struct {
     fn lvalue(l: *Lowerer, e: *ast.Expr) Error!Ref {
         const t = l.types();
         // A resource inside a global struct: its own global.
-        if (e.kind == .member) if (l.uniformPath(e)) |up| if (isResourceLike(t, e.ty)) return l.leafGlobal(up.v, up.path, e.ty);
+        if (e.kind == .member or e.kind == .index) if (l.uniformPath(e)) |up| if (layout.isOpaque(t, e.ty)) return l.leafGlobal(up.v, up.path, e.ty);
         switch (e.kind) {
             .this => {
                 if (l.this_ptr == .none) return l.fail(e, "this expression");

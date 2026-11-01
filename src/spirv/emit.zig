@@ -1299,6 +1299,7 @@ const Emitter = struct {
             try vars.append(e.arena, .{ .bd = bd, .counter = false });
             if (bd.acs) try vars.append(e.arena, .{ .bd = bd, .counter = true });
             if (bd.global) |g| try declared.put(e.arena, g, {});
+            for (bd.members) |mb| if (mb.global) |g| try declared.put(e.arena, g, {});
         }
         // Resources with no declaration of their own (none in practice),
         // and counters of RW structured buffers, in the order first used.
@@ -1320,6 +1321,10 @@ const Emitter = struct {
         }
         const record = struct {
             fn f(em: *Emitter, v: Var, slot: Slot) void {
+                // A struct of resources: each at its offset.
+                for (v.bd.members) |mb| if (mb.global) |g| {
+                    em.slots[g] = .{ .set = slot.set, .binding = slot.binding + mb.offset };
+                };
                 const g = v.bd.global orelse return;
                 if (v.counter) em.counter_slots[g] = slot else em.slots[g] = slot;
             }
@@ -2462,16 +2467,28 @@ const Emitter = struct {
                     e.vals[ri] = e.val(x.agg);
                     return;
                 }
-                e.vals[ri] = try e.op1(.composite_extract, i.ty, &.{ e.val(x.agg), x.index });
+                e.vals[ri] = try e.op1(.composite_extract, i.ty, &.{ e.val(x.agg), memberIndex(e.t, at, x.index) });
             },
             .insert => |x| {
                 if (e.isScalarLike(i.ty) or (e.t.get(i.ty) == .matrix and e.t.get(i.ty).matrix.rows == 1)) {
                     e.vals[ri] = e.val(x.value);
                     return;
                 }
-                e.vals[ri] = try e.op1(.composite_insert, i.ty, &.{ e.val(x.value), e.val(x.agg), x.index });
+                e.vals[ri] = try e.op1(.composite_insert, i.ty, &.{ e.val(x.value), e.val(x.agg), memberIndex(e.t, i.ty, x.index) });
             },
             .construct => |xs| {
+                // Struct values leave their resources out (split off).
+                if (e.t.get(i.ty) == .@"struct" and xs.len == e.t.get(i.ty).@"struct".fields.items.len) {
+                    const st = e.t.get(i.ty).@"struct";
+                    var any = false;
+                    for (st.fields.items) |fld| any = any or layout.isOpaque(e.t, fld.type);
+                    if (any) {
+                        var parts: std.ArrayList(u32) = .empty;
+                        for (xs, st.fields.items) |x, fld| if (!layout.isOpaque(e.t, fld.type)) try parts.append(e.arena, e.val(x));
+                        e.vals[ri] = try e.op1(.composite_construct, i.ty, parts.items);
+                        return;
+                    }
+                }
                 if (xs.len == 1 and e.isScalarLike(i.ty)) {
                     e.vals[ri] = e.val(xs[0]);
                     return;
@@ -4706,6 +4723,11 @@ fn isRayQuery(t: *TypeTable, ty: TypeId) bool {
 
 /// Resources and samplers (not RayQuery objects, which are function
 /// storage passed by pointer).
+/// A composite member index in SPIR-V (struct resource members dropped).
+fn memberIndex(t: *const TypeTable, ty: TypeId, k: u32) u32 {
+    return if (t.get(ty) == .@"struct") dataIndex(t, t.get(ty).@"struct", k) else k;
+}
+
 /// Member `k`'s index in the SPIR-V struct (resource members dropped).
 fn dataIndex(t: *const TypeTable, st: *const types.StructInfo, k: u32) u32 {
     var n: u32 = 0;
