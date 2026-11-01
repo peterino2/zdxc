@@ -230,6 +230,9 @@ const Emitter = struct {
     lib: bool = false,
     /// The current function's arguments (ray tracing payload / attributes).
     lib_args: []const Value = &.{},
+    /// Libraries: `[noinline]` functions kept as functions of their own
+    /// (IR function -> module function).
+    lib_calls: std.AutoHashMapUnmanaged(u32, u32) = .empty,
     /// Prologue instructions dropped again if unused (resource handles).
     lib_removable: std.AutoHashMapUnmanaged(u32, void) = .empty,
 
@@ -513,7 +516,7 @@ const Emitter = struct {
             r.lib_global = v.global;
         }
         // Definitions in declaration order (as dxc): create them all first.
-        const Unit = struct { order: u32, kind: enum { entry, patch, exported }, index: u32 };
+        const Unit = struct { order: u32, kind: enum { entry, patch, exported, internal }, index: u32 };
         var units: std.ArrayList(Unit) = .empty;
         for (m.entries.items, 0..) |entry, k| {
             switch (entry.stage) {
@@ -524,6 +527,9 @@ const Emitter = struct {
             if (entry.patch_func) |pf| try units.append(e.arena, .{ .order = m.functions.items[pf].decl_order, .kind = .patch, .index = @intCast(k) });
         }
         for (m.exports.items, 0..) |fi, k| try units.append(e.arena, .{ .order = m.functions.items[fi].decl_order, .kind = .exported, .index = @intCast(k) });
+        for (m.functions.items, 0..) |f, fi| if (e.libCallable(@intCast(fi))) {
+            try units.append(e.arena, .{ .order = f.decl_order, .kind = .internal, .index = @intCast(fi) });
+        };
         std.sort.insertion(Unit, units.items, {}, struct {
             fn lt(_: void, x: Unit, y: Unit) bool {
                 return x.order < y.order;
@@ -532,6 +538,7 @@ const Emitter = struct {
         const entry_fn = try e.arena.alloc(u32, m.entries.items.len);
         const patch_fn = try e.arena.alloc(u32, m.entries.items.len);
         const export_fn = try e.arena.alloc(LibFunc, m.exports.items.len);
+        var internal_fn: std.ArrayList(struct { u32, LibFunc }) = .empty;
         for (units.items) |u| switch (u.kind) {
             .entry => {
                 const entry = m.entries.items[u.index];
@@ -545,7 +552,12 @@ const Emitter = struct {
                 const name = try mangle.function(e.arena, e.t, pf.name, pf.ret, mparams);
                 patch_fn[u.index] = try e.dm.addFunction(.{ .name = name, .ty = try e.dm.fnType(try e.voidTy(), &.{}), .num_blocks = 1 });
             },
-            .exported => export_fn[u.index] = try e.exportSignature(m.exports.items[u.index]),
+            .exported => export_fn[u.index] = try e.exportSignature(m.exports.items[u.index], false),
+            .internal => {
+                const lf = try e.exportSignature(u.index, true);
+                try internal_fn.append(e.arena, .{ u.index, lf });
+                try e.lib_calls.put(e.arena, u.index, lf.func);
+            },
         };
 
         var funcs: std.ArrayList(LibFunc) = .empty;
@@ -605,6 +617,7 @@ const Emitter = struct {
             if (pc_func) |pf| try funcs.append(e.arena, pf);
         }
         for (m.exports.items, export_fn) |fi, lf| try funcs.append(e.arena, try e.emitExport(fi, lf));
+        for (internal_fn.items) |x| try funcs.append(e.arena, try e.emitExport(x[0], x[1]));
         std.sort.insertion(LibFunc, funcs.items, {}, struct {
             fn lt(_: void, x: LibFunc, y: LibFunc) bool {
                 return x.func < y.func;
@@ -670,9 +683,32 @@ const Emitter = struct {
         return v;
     }
 
-    /// An exported function's definition: scalars and vectors by value,
-    /// structs and out / inout values by pointer, under its mangled name.
-    fn exportSignature(e: *Emitter, fi: u32) Error!LibFunc {
+    /// Whether IR function `fi` stays a function of its own in a library:
+    /// `[noinline]`, not exported, with values exportSignature can pass
+    /// and the validator allows (others are inlined).
+    fn libCallable(e: *Emitter, fi: u32) bool {
+        const f = e.m.functions.items[fi];
+        if (!f.no_inline or std.mem.indexOfScalar(u32, e.m.exports.items, fi) != null) return false;
+        for (f.params) |p| {
+            if (p.groupshared) return false;
+            switch (e.t.get(p.ty)) {
+                .scalar, .@"enum", .vector => {},
+                // (The validator counts matrix handles as resources, which
+                // no signature may hold.)
+                .@"struct" => if (e.holdsResources(p.ty) or e.containsLinAlg(p.ty)) return false,
+                else => return false,
+            }
+        }
+        return f.ret == TypeTable.void_type or switch (e.t.get(f.ret)) {
+            .scalar, .@"enum", .vector => true,
+            else => false,
+        };
+    }
+
+    /// An exported (or, `internal`, a `[noinline]`) function's definition:
+    /// scalars and vectors by value, structs and out / inout values by
+    /// pointer, under its mangled name.
+    fn exportSignature(e: *Emitter, fi: u32, internal: bool) Error!LibFunc {
         const f = e.m.functions.items[fi];
         var params: std.ArrayList(DType) = .empty;
         var mparams: std.ArrayList(mangle.Param) = .empty;
@@ -693,7 +729,7 @@ const Emitter = struct {
         }
         const ret_ty = if (ret_void) try e.voidTy() else try e.libValueType(f.ret);
         const name = try mangle.function(e.arena, e.t, f.name, f.ret, mparams.items);
-        const func = try e.dm.addFunction(.{ .name = name, .ty = try e.dm.fnType(ret_ty, params.items), .num_blocks = 1 });
+        const func = try e.dm.addFunction(.{ .name = name, .ty = try e.dm.fnType(ret_ty, params.items), .num_blocks = 1, .linkage = if (internal) .internal else .external, .attrs = if (internal) .noinline_nounwind else .none });
         return .{ .func = func, .name = name, .unmangled = f.name, .stage = .library, .entry = undefined, .ann = ann.items };
     }
 
@@ -1301,6 +1337,56 @@ const Emitter = struct {
         return &.{};
     }
 
+    /// A call of `[noinline]` function `fi` (module function `func`), as
+    /// exportSignature passes values: out / inout values and structs
+    /// through temporaries.
+    fn libCall(e: *Emitter, frame: *Frame, fi: u32, func: u32, refs: []const Ref) Error!Lowered {
+        const f = e.m.functions.items[fi];
+        const void_ty = try e.voidTy();
+        const args = try e.arena.alloc(Value, refs.len);
+        const temps = try e.arena.alloc(?Value, refs.len);
+        for (f.params, refs, args, temps) |p, r, *a, *tmp| {
+            tmp.* = null;
+            const is_struct = e.t.get(p.ty) == .@"struct";
+            if (!p.by_ref and !is_struct) {
+                a.* = try e.libJoin(try e.scalars(frame, r), p.ty);
+                continue;
+            }
+            const dty = if (is_struct) try e.memoryType(p.ty) else try e.libValueType(p.ty);
+            const base = try e.addPrologue(try e.dm.ptrType(dty), .{ .alloca = .{ .elem = dty, .size = try e.i32Const(1) } });
+            a.* = base;
+            const vals: ?[]const Value = if (!p.by_ref) try e.scalars(frame, r) else if (p.dir == .out) null else switch (frame.vals[r.index()]) {
+                .ptr => |ptr| (try e.loadPtr(ptr, p.ty)).scalars,
+                .typed => |tp| (try e.typedLoad(tp, p.ty)).scalars,
+                else => return e.unsupported("this argument of a [noinline] function is not supported yet", .{}),
+            };
+            if (vals) |vs| {
+                if (is_struct)
+                    try e.typedStore(.{ .base = base, .dty = dty, .addr_space = 0, .ty = p.ty }, vs, p.ty)
+                else
+                    _ = try e.add(void_ty, .{ .store = .{ .ptr = base, .val = try e.libJoin(vs, p.ty), .@"align" = 4 } });
+            }
+            if (p.by_ref) tmp.* = base;
+        }
+        const ret_ty = if (f.ret == TypeTable.void_type) void_ty else try e.libValueType(f.ret);
+        const res = try e.add(ret_ty, .{ .call = .{ .callee = func, .args = args } });
+        // (Locals may have changed through the pointers.)
+        e.forwarded.clearRetainingCapacity();
+        for (f.params, refs, temps) |p, r, tmp| if (tmp) |base| {
+            const vals = if (e.t.get(p.ty) == .@"struct")
+                (try e.typedLoad(.{ .base = base, .dty = try e.memoryType(p.ty), .addr_space = 0, .ty = p.ty }, p.ty)).scalars
+            else
+                try e.libSplit(try e.add(try e.libValueType(p.ty), .{ .load = .{ .ptr = base, .@"align" = 4 } }), p.ty);
+            switch (frame.vals[r.index()]) {
+                .ptr => |ptr| try e.storePtr(ptr, vals, p.ty),
+                .typed => |tp| try e.typedStore(tp, vals, p.ty),
+                else => return e.unsupported("this argument of a [noinline] function is not supported yet", .{}),
+            }
+        };
+        if (f.ret == TypeTable.void_type) return .none;
+        return .{ .scalars = try e.libSplit(res, f.ret) };
+    }
+
     fn blockFor(e: *Emitter, frame: *Frame, bi: u32) Error!u32 {
         if (frame.blocks[bi]) |b| return b;
         const b = try e.newBlock();
@@ -1818,6 +1904,7 @@ const Emitter = struct {
                 return .{ .scalars = out };
             },
             .call => |c| {
+                if (e.lib_calls.get(c.func)) |func| return e.libCall(frame, c.func, func, c.args);
                 const args = try e.arena.alloc(Lowered, c.args.len);
                 for (c.args, args) |a, *o| o.* = frame.vals[a.index()];
                 const res = try e.inlineCall(c.func, args);
@@ -4914,8 +5001,24 @@ const Emitter = struct {
         const opts: libinfo.Options = .{ .native16 = e.native16(), .res_may_not_alias = e.profile.minor >= 7, .globals = globals };
         const infos = try e.arena.alloc(libinfo.Info, funcs.len);
         var flags: u64 = 0;
+        // Each function's own usage, then its callees' merged in (dxc's
+        // ComputeShaderCompatInfo).
+        const direct = try e.arena.alloc(?libinfo.Info, e.dm.functions.items.len);
+        @memset(direct, null);
+        for (funcs) |lf| direct[lf.func] = libinfo.analyze(&e.dm, &e.dm.functions.items[lf.func], opts);
         for (funcs, infos) |lf, *info| {
-            info.* = libinfo.analyze(&e.dm, &e.dm.functions.items[lf.func], opts);
+            info.* = direct[lf.func].?;
+            var seen: std.AutoArrayHashMapUnmanaged(u32, void) = .empty;
+            try seen.put(e.arena, lf.func, {});
+            var k: usize = 0;
+            while (k < seen.count()) : (k += 1) {
+                const fi = seen.keys()[k];
+                if (k > 0) info.merge(direct[fi] orelse continue);
+                for (e.dm.functions.items[fi].insts.items) |inst| if (inst.op == .call) {
+                    const callee = inst.op.call.callee;
+                    if (e.dm.functions.items[callee].num_blocks > 0) try seen.put(e.arena, callee, {});
+                };
+            }
             flags |= info.flags;
         }
         flags &= ~@as(u64, libinfo.bit.local);

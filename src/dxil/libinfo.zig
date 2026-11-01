@@ -25,6 +25,13 @@ pub const Info = struct {
     flags: u64 = 0,
     min_minor: u8 = 0,
     mask: u32 = op_compat.all_stages,
+
+    /// A callee's requirements added to its caller's.
+    pub fn merge(info: *Info, callee: Info) void {
+        info.flags |= callee.flags;
+        info.min_minor = @max(info.min_minor, callee.min_minor);
+        info.mask &= callee.mask;
+    }
 };
 
 pub const bit = struct {

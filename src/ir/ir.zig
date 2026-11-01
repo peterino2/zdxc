@@ -205,6 +205,9 @@ pub const Function = struct {
     /// Declaration order of the HLSL function (libraries define functions
     /// in this order).
     decl_order: u32 = std.math.maxInt(u32),
+    /// `[noinline]` (plain functions, not methods or template instances):
+    /// libraries keep it a function of its own.
+    no_inline: bool = false,
     insts: std.ArrayList(Inst) = .empty,
     blocks: std.ArrayList(Block) = .empty,
 

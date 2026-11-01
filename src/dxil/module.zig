@@ -55,7 +55,7 @@ pub const Constant = struct {
 pub const Linkage = enum(u32) { external = 0, internal = 3 };
 
 /// Attribute group for function declarations (e.g. dx.op functions).
-pub const FnAttrs = enum { none, nounwind, nounwind_readnone, nounwind_readonly, noreturn_nounwind };
+pub const FnAttrs = enum { none, nounwind, nounwind_readnone, nounwind_readonly, noreturn_nounwind, noinline_nounwind };
 
 pub const Value = union(enum) {
     /// Index into Module.globals (a pointer to the variable).
@@ -382,11 +382,12 @@ const Encoder = struct {
     }
 
     fn writeAttributes(e: *Encoder) !void {
-        // Groups 1..4 match FnAttrs order; each applies to the function (index 0xFFFFFFFF).
-        // Attribute kinds: noreturn = 17, nounwind = 18, readnone = 20, readonly = 21.
+        // Groups 1..5 match FnAttrs order; each applies to the function (index 0xFFFFFFFF).
+        // Attribute kinds: noinline = 14, noreturn = 17, nounwind = 18,
+        // readnone = 20, readonly = 21.
         const w = &e.w;
         try w.enterBlock(block_paramattr_group, 3);
-        const groups = [_][]const u64{ &.{18}, &.{ 18, 20 }, &.{ 18, 21 }, &.{ 17, 18 } };
+        const groups = [_][]const u64{ &.{18}, &.{ 18, 20 }, &.{ 18, 21 }, &.{ 17, 18 }, &.{ 14, 18 } };
         for (groups, 1..) |kinds, id| {
             try e.push(id);
             try e.push(0xFFFFFFFF);

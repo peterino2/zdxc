@@ -400,7 +400,10 @@ const Lowerer = struct {
             }, .semantic = sem, .sema_ty = p.type });
         }
         const order: u32 = @intCast(std.mem.indexOfScalar(*semamod.Function, l.s.all_functions.items, @constCast(f)) orelse std.math.maxInt(u32));
-        const i = try l.m.addFunction(.{ .name = f.name, .params = params.items, .ret = f.ret, .entry = l.cur_entry, .ret_semantic = semanticOf(f.decl.ret_semantics), .decl_order = order });
+        const no_inline = !isMethod(f) and f.template_args.len == 0 and for (f.decl.attrs) |a| {
+            if (std.mem.eql(u8, a.name, "noinline")) break true;
+        } else false;
+        const i = try l.m.addFunction(.{ .name = f.name, .params = params.items, .ret = f.ret, .entry = l.cur_entry, .ret_semantic = semanticOf(f.decl.ret_semantics), .decl_order = order, .no_inline = no_inline });
         try l.funcs.put(l.arena, f, i);
         try l.pending.append(l.arena, f);
         return i;
