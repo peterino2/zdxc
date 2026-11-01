@@ -29,11 +29,12 @@ pub const Extra = enum {
     zdxc_ast,
     zdxc_sema,
     zdxc_ir,
+    job,
     fcolor_diagnostics,
     fno_color_diagnostics,
 };
 
-const extra_options = [_]struct { id: Extra, spelling: []const u8, help: []const u8 }{
+const extra_options = [_]struct { id: Extra, spelling: []const u8, help: []const u8, kind: Kind = .flag, meta: []const u8 = "" }{
     .{ .id = .zdxc_empty, .spelling = "zdxc-empty", .help = "Emit an empty shader for -T instead of compiling the input (development)" },
     .{ .id = .zdxc_check_hash, .spelling = "zdxc-check-hash", .help = "Verify the container hash of the input (development)" },
     .{ .id = .zdxc_lex, .spelling = "zdxc-lex", .help = "Print the input's tokens, one per line (development)" },
@@ -41,6 +42,7 @@ const extra_options = [_]struct { id: Extra, spelling: []const u8, help: []const
     .{ .id = .zdxc_ast, .spelling = "zdxc-ast", .help = "Preprocess, parse and dump the syntax tree (development)" },
     .{ .id = .zdxc_sema, .spelling = "zdxc-sema", .help = "Run the front end through semantic analysis only (development)" },
     .{ .id = .zdxc_ir, .spelling = "zdxc-ir", .help = "Print the lowered IR instead of compiling (development)" },
+    .{ .id = .job, .spelling = "-job=", .kind = .joined, .meta = "<job.json>", .help = "Compile every shader a JSON job file lists, in one process, on all cores (see docs/batch.md)" },
     .{ .id = .fcolor_diagnostics, .spelling = "fcolor-diagnostics", .help = "Always use colors in diagnostics" },
     .{ .id = .fno_color_diagnostics, .spelling = "fno-color-diagnostics", .help = "Never use colors in diagnostics" },
 };
@@ -133,7 +135,7 @@ fn parseOne(arena: Allocator, argv: []const []const u8, index: *usize, failure: 
     }
     for (extra_options) |o| {
         if (prefixFits(str, "-", o.spelling) and n < cands.len) {
-            cands[n] = .{ .which = .{ .extra = o.id }, .kind = .flag, .count = 0, .prefix_len = 1, .spelling_len = o.spelling.len };
+            cands[n] = .{ .which = .{ .extra = o.id }, .kind = o.kind, .count = 0, .prefix_len = 1, .spelling_len = o.spelling.len };
             n += 1;
         }
     }
@@ -287,7 +289,7 @@ pub fn printHelp(w: *std.Io.Writer, show_hidden: bool) !void {
         }
     }
     try w.writeAll("\nzdxc options:\n");
-    for (extra_options) |o| try printOption(w, o.spelling, .flag, "", o.help, false);
+    for (extra_options) |o| try printOption(w, o.spelling, o.kind, o.meta, o.help, false);
 }
 
 fn printOption(w: *std.Io.Writer, spelling: []const u8, kind: Kind, meta: []const u8, help: []const u8, ignored: bool) !void {

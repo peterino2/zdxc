@@ -6,6 +6,7 @@ const container = zdxc.dxil.container;
 const front = zdxc.front;
 
 const options = zdxc.options;
+const job = @import("job.zig");
 
 const Options = struct {
     profile: ?[]const u8 = null,
@@ -45,6 +46,8 @@ const Options = struct {
     opt_level: enum { od, o0, o1, o2, o3 } = .o3,
     /// Accepted options with no effect yet, reported once each.
     ignored: std.ArrayList([]const u8) = .empty,
+    /// `--job=<file>` (handled before run; here only inside a job file).
+    job: ?[]const u8 = null,
 };
 
 const Cli = struct {
@@ -62,20 +65,41 @@ pub fn main(init: std.process.Init) !u8 {
     const arena = init.arena.allocator();
     const io = init.io;
     var stderr_buf: [1024]u8 = undefined;
-    var stderr_writer: Io.File.Writer = .init(.stderr(), io, &stderr_buf);
+    // Streaming, not positional: `2>> log` must append.
+    var stderr_writer: Io.File.Writer = .initStreaming(.stderr(), io, &stderr_buf);
     var stdout_buf: [4096]u8 = undefined;
-    var stdout_writer: Io.File.Writer = .init(.stdout(), io, &stdout_buf);
+    var stdout_writer: Io.File.Writer = .initStreaming(.stdout(), io, &stdout_buf);
     const cli: Cli = .{ .io = io, .stderr = &stderr_writer.interface };
     defer stderr_writer.interface.flush() catch {};
 
+    const args = try init.minimal.args.toSlice(arena);
+    if (job.find(args)) |at| {
+        const code = try job.run(io, arena, args, at, compileJob, &stdout_writer.interface, &stderr_writer.interface);
+        try stdout_writer.interface.flush();
+        return code;
+    }
     // Exit codes follow dxc: 1 for command-line and I/O errors, 5 when the
     // compilation reports errors.
-    run(cli, arena, try init.minimal.args.toSlice(arena), &stdout_writer.interface) catch |err| switch (err) {
+    run(cli, arena, args, &stdout_writer.interface) catch |err| switch (err) {
         error.Fatal => return 1,
         error.CompileFailed => return 5,
         else => return err,
     };
     try stdout_writer.interface.flush();
+    return 0;
+}
+
+/// One job of a `--job` file: `run`, with its exit code.
+fn compileJob(io: Io, arena: std.mem.Allocator, args: []const [:0]const u8, stdout: *Io.Writer, stderr: *Io.Writer) u8 {
+    const cli: Cli = .{ .io = io, .stderr = stderr };
+    run(cli, arena, args, stdout) catch |err| switch (err) {
+        error.Fatal => return 1,
+        error.CompileFailed => return 5,
+        else => {
+            stderr.print("zdxc: error: {s}\n", .{@errorName(err)}) catch {};
+            return 1;
+        },
+    };
     return 0;
 }
 
@@ -105,6 +129,7 @@ fn parseArgs(cli: Cli, arena: std.mem.Allocator, argv: []const [:0]const u8, std
                 },
                 .zdxc_sema => opts.sema = true,
                 .zdxc_ir => opts.dump_ir = true,
+                .job => opts.job = a.value(),
                 .fcolor_diagnostics => opts.color = true,
                 .fno_color_diagnostics => opts.color = false,
             },
@@ -244,6 +269,7 @@ fn parseArgs(cli: Cli, arena: std.mem.Allocator, argv: []const [:0]const u8, std
 
 fn run(cli: Cli, arena: std.mem.Allocator, args: []const [:0]const u8, stdout: *Io.Writer) !void {
     const opts = try parseArgs(cli, arena, args, stdout) orelse return;
+    if (opts.job != null) return cli.fail("--job cannot be used inside a job file", .{});
 
     if (opts.check_hash) {
         const path = opts.input orelse return cli.fail("no input file", .{});
@@ -313,7 +339,8 @@ fn run(cli: Cli, arena: std.mem.Allocator, args: []const [:0]const u8, stdout: *
         });
         var out: Io.Writer.Allocating = .init(arena);
         var module: ?zdxc.ir.ir.Module = null;
-        if (try pp.enterMainFile(input)) {
+        const opened = try pp.enterMainFile(input);
+        if (opened) {
             if (opts.preprocess) {
                 try front.pp_print.print(&pp, &out.writer);
             } else {
@@ -364,6 +391,8 @@ fn run(cli: Cli, arena: std.mem.Allocator, args: []const [:0]const u8, stdout: *
         const color = opts.color orelse (Io.File.stderr().supportsAnsiEscapeCodes(cli.io) catch false);
         try diags.render(&sm, cli.stderr, .{ .format = opts.diag_format, .color = color });
         try cli.stderr.flush();
+        // An unreadable input is an I/O error, as in dxc.
+        if (!opened) return error.Fatal;
         if (diags.hasErrors()) return error.CompileFailed;
         if (opts.preprocess) {
             if (opts.pp_output) |path| {
