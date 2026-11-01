@@ -445,7 +445,7 @@ pub const Type = union(enum) {
     /// The type of an ill-formed expression: suppresses follow-on errors.
     @"error",
     scalar: Scalar,
-    vector: struct { elem: Scalar, len: u8 },
+    vector: struct { elem: Scalar, len: u16 },
     matrix: struct { elem: Scalar, rows: u8, cols: u8 },
     /// `len == 0` means unsized (`float a[]`).
     array: struct { elem: TypeId, len: u32 },
@@ -538,7 +538,7 @@ pub const TypeTable = struct {
     }
 
     /// `len == 1` vectors are kept distinct from scalars (float1 != float).
-    pub fn vector(t: *TypeTable, s: Scalar, len: u8) !TypeId {
+    pub fn vector(t: *TypeTable, s: Scalar, len: u16) !TypeId {
         return t.intern(.{ .vector = .{ .elem = s, .len = len } });
     }
 
@@ -563,7 +563,7 @@ pub const TypeTable = struct {
 
     pub const Shape = struct {
         rows: u8,
-        cols: u8,
+        cols: u16,
         kind: enum { scalar, vector, matrix },
 
         pub fn count(sh: Shape) u32 {
@@ -650,7 +650,7 @@ pub const TypeTable = struct {
         return switch (sh.kind) {
             .scalar => t.scalar(s),
             .vector => t.vector(s, sh.cols),
-            .matrix => t.matrix(s, sh.rows, sh.cols),
+            .matrix => t.matrix(s, sh.rows, @intCast(sh.cols)),
         };
     }
 

@@ -350,6 +350,7 @@ const Emitter = struct {
             .vector => |v| blk: {
                 // vector<T, 1> is a plain T (SPIR-V has no 1-vectors).
                 if (v.len == 1) break :blk try e.scalarType(v.elem);
+                if (v.len > 4) return e.unsupported("vectors of over 4 elements are not supported in SPIR-V (Vulkan has no long vectors)", .{});
                 if (storageScalar(v.elem) != v.elem) break :blk try e.typeId(try e.t.vector(storageScalar(v.elem), v.len));
                 const elem = try e.scalarType(v.elem);
                 const id = e.b.newId();

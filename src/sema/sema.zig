@@ -1109,7 +1109,6 @@ pub const Sema = struct {
                     s.err(templateArgLoc(args[1]), "invalid value, valid range is between 1 and {d} inclusive", .{max});
                     return TypeTable.error_type;
                 }
-                if (len > 4) return TypeTable.error_type; // long vectors: not modelled
                 return s.types.vector(comp, @intCast(len));
             }
             if (std.mem.eql(u8, n, "matrix")) {
@@ -1169,16 +1168,19 @@ pub const Sema = struct {
                         },
                     }
                 }
+                if ((kind == .constant_buffer or kind == .texture_buffer) and args.len > 0) s.checkLongVectors(elem, templateArgLoc(args[0]), "ConstantBuffers or TextureBuffers");
                 return s.types.intern(.{ .resource = .{ .kind = kind, .elem = elem, .name = n } });
             }
             const streams = [_]struct { []const u8, @FieldType(@FieldType(types.Type, "stream"), "kind") }{ .{ "PointStream", .point }, .{ "LineStream", .line }, .{ "TriangleStream", .triangle } };
             for (streams) |st| if (std.mem.eql(u8, n, st[0])) {
                 const elem = if (args.len > 0) try s.typeArg(args[0]) orelse TypeTable.error_type else TypeTable.error_type;
+                s.checkLongVectors(elem, t.loc, "geometry streams");
                 return s.types.intern(.{ .stream = .{ .kind = st[1], .elem = elem } });
             };
             if (std.mem.eql(u8, n, "InputPatch") or std.mem.eql(u8, n, "OutputPatch")) {
                 const elem = if (args.len > 0) try s.typeArg(args[0]) orelse TypeTable.error_type else TypeTable.error_type;
                 const count: u32 = if (args.len > 1) @intCast(@max(0, s.constArg(args[1]) orelse 0)) else 0;
+                s.checkLongVectors(elem, t.loc, "tessellation patches");
                 return s.types.intern(.{ .patch = .{ .output = n[0] == 'O', .elem = elem, .count = count } });
             }
         }
@@ -1341,6 +1343,23 @@ pub const Sema = struct {
             return null;
         };
         return .{ .type = ty };
+    }
+
+    /// SM 6.9 long vectors (over 4 elements) are not allowed in `context`.
+    fn checkLongVectors(s: *Sema, ty: TypeId, loc: Loc, comptime context: []const u8) void {
+        if (s.hasLongVector(ty, 0)) s.err(loc, "vectors of over 4 elements in " ++ context ++ " are not supported", .{});
+    }
+
+    fn hasLongVector(s: *Sema, ty: TypeId, depth: u32) bool {
+        if (depth > 32) return false;
+        return switch (s.types.get(ty)) {
+            .vector => |v| v.len > 4,
+            .array => |a| s.hasLongVector(a.elem, depth + 1),
+            .@"struct" => |st| for (st.fields.items) |f| {
+                if (s.hasLongVector(f.type, depth + 1)) break true;
+            } else false,
+            else => false,
+        };
     }
 
     /// The string argument of attribute `name` (`[[vk::builtin("X")]]`).
@@ -1525,6 +1544,19 @@ pub const Sema = struct {
 
     pub fn checkUnit(s: *Sema, tu: ast.TranslationUnit) Allocator.Error!void {
         for (tu.decls) |d| try s.decl(d, .global);
+        // Entry points take and return no long vectors (SM 6.9).
+        for (s.all_functions.items) |f| {
+            if (f.owner != null) continue;
+            const entry = if (s.opts.library) for (f.decl.attrs) |a| {
+                if (eql(a.name, "shader")) break true;
+            } else false else if (s.opts.entry) |en| eql(f.name, en) else false;
+            if (!entry) continue;
+            for (f.params, f.decl.params) |p, pd| switch (s.types.get(p.type)) {
+                .patch, .stream => {},
+                else => s.checkLongVectors(p.type, pd.name_loc, "entry function parameters"),
+            };
+            s.checkLongVectors(f.ret, f.decl.name.loc, "entry function return type");
+        }
         if (s.opts.entry) |entry| {
             const found = if (s.global.syms.get(entry)) |sym| sym == .functions else false;
             if (!found) _ = s.diags.report(.{ .severity = .@"error", .loc = .none }, "missing entry point definition", .{});
@@ -2203,8 +2235,14 @@ pub const Sema = struct {
         };
         try s.declare(v.name, .{ .variable = variable }, v.name_loc);
         try s.decl_vars.put(s.arena, v, variable);
-        if (ctx == .cbuffer) variable.block = s.current_block;
-        if (storage == .global_uniform) try s.uniform_globals.append(s.arena, variable);
+        if (ctx == .cbuffer) {
+            variable.block = s.current_block;
+            s.checkLongVectors(ty, v.name_loc, "cbuffers or tbuffers");
+        }
+        if (storage == .global_uniform) {
+            try s.uniform_globals.append(s.arena, variable);
+            s.checkLongVectors(ty, v.name_loc, "cbuffers or tbuffers");
+        }
         if (storage == .global_uniform or (storage == .global_static and !q.static and ctx == .global)) try s.global_order.append(s.arena, .{ .variable = variable });
         if (storage == .global_static or storage == .constant or storage == .local_static) try s.static_globals.append(s.arena, variable);
         // Unsized arrays take their size from the initializer.
@@ -3191,8 +3229,12 @@ pub const Sema = struct {
         switch (s.types.get(b.ty)) {
             .scalar, .vector => {
                 const comp = s.types.component(b.ty).?;
-                const len: u8 = if (s.types.get(b.ty) == .vector) s.types.get(b.ty).vector.len else 1;
-                const sw = parseSwizzle(name, len) orelse {
+                const len: u16 = if (s.types.get(b.ty) == .vector) s.types.get(b.ty).vector.len else 1;
+                if (len > 4) {
+                    s.err(name_loc, "invalid swizzle '{s}' on vector of over 4 elements.", .{name});
+                    return err_typed;
+                }
+                const sw = parseSwizzle(name, @intCast(len)) orelse {
                     s.err(name_loc, "invalid format for vector swizzle '{s}'", .{name});
                     return err_typed;
                 };

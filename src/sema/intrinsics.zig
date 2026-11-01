@@ -120,20 +120,20 @@ const Layout = struct { rows: u8, cols: u8, kind: TypeTable.Shape };
 /// Symbolic dimension bindings (`r`, `c`, `r2`, `c2`, ...).
 const Bindings = struct {
     names: [8][]const u8 = undefined,
-    values: [8]u8 = undefined,
+    values: [8]u16 = undefined,
     n: usize = 0,
     /// The widest shape of the arguments declared `<>`: all such types of
     /// an intrinsic share their dimensions (dxc's r / c), scalars
     /// splatting to the widest.
     any_shape: ?TypeTable.Shape = null,
 
-    fn get(b: *const Bindings, name: []const u8) ?u8 {
+    fn get(b: *const Bindings, name: []const u8) ?u16 {
         for (b.names[0..b.n], b.values[0..b.n]) |k, v| if (std.mem.eql(u8, k, name)) return v;
         return null;
     }
 
     /// Bind or check; false on conflict.
-    fn bind(b: *Bindings, name: []const u8, v: u8) bool {
+    fn bind(b: *Bindings, name: []const u8, v: u16) bool {
         if (b.get(name)) |old| return old == v;
         if (b.n == b.names.len) return false;
         b.names[b.n] = name;
@@ -291,18 +291,19 @@ fn layoutType(sema: anytype, ls: *const table.Spec, comp: Scalar, group: usize, 
     const arg_shape: ?TypeTable.Shape = if (group > 0 and group - 1 < args.len) t.shape(args[group - 1].ty) else null;
     if (ls.dims.len == 1) {
         const len = dimValue(ls.dims[0], bindings, if (arg_shape) |sh| (if (sh.kind == .vector) sh.cols else if (sh.kind == .scalar) 1 else sh.cols) else null) orelse return null;
-        if (len < 1 or len > 4) return null;
+        // (Long vectors, SM 6.9: only arguments can make them.)
+        if (len < 1 or len > 1024) return null;
         return try t.vector(comp, len);
     }
     const rows = dimValue(ls.dims[0], bindings, if (arg_shape) |sh| sh.rows else null) orelse return null;
     const cols = dimValue(ls.dims[1], bindings, if (arg_shape) |sh| sh.cols else null) orelse return null;
     if (rows < 1 or rows > 4 or cols < 1 or cols > 4) return null;
-    return try t.matrix(comp, rows, cols);
+    return try t.matrix(comp, @intCast(rows), @intCast(cols));
 }
 
 /// A layout dimension: a number, or a symbol bound from the argument.
-fn dimValue(dim: []const u8, b: *Bindings, from_arg: ?u8) ?u8 {
-    if (std.fmt.parseInt(u8, dim, 10)) |v| return v else |_| {}
+fn dimValue(dim: []const u8, b: *Bindings, from_arg: ?u16) ?u16 {
+    if (std.fmt.parseInt(u16, dim, 10)) |v| return v else |_| {}
     if (b.get(dim)) |v| return v;
     const v = from_arg orelse return null;
     if (!b.bind(dim, v)) return null;
