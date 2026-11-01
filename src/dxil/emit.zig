@@ -1717,7 +1717,10 @@ const Emitter = struct {
                 }
                 if (frame.vals[s.ptr.index()] == .buf) {
                     const b = frame.vals[s.ptr.index()].buf;
-                    if (b.mat != null) return e.unsupported("writing part of a matrix in a buffer is not supported yet", .{});
+                    if (b.mat) |mat| {
+                        try e.matrixPartStore(b, mat, try e.scalars(frame, s.value));
+                        return .none;
+                    }
                     try e.structuredStore(e.resources.items[b.res], b.index, b.offset, b.dyn, b.row_major, f.inst(s.value).ty, try e.scalars(frame, s.value));
                     return .none;
                 }
@@ -3734,6 +3737,30 @@ const Emitter = struct {
             }
         }
         return .{ .buf = b };
+    }
+
+    /// Stores a row (or one component) of a matrix in a structured buffer
+    /// element by element: the row need not be contiguous.
+    fn matrixPartStore(e: *Emitter, b: @FieldType(Lowered, "buf"), mat: @typeInfo(@FieldType(@FieldType(Lowered, "buf"), "mat")).optional.child, vals: []const Value) Error!void {
+        const m = e.t.get(mat.ty).matrix;
+        const ec = try e.t.scalar(m.elem);
+        const i32t = try e.dm.intType(32);
+        const res = e.resources.items[b.res];
+        for (vals, 0..) |v, j| {
+            const c: u32 = mat.col orelse @intCast(j);
+            const off0 = layout.componentOffset(e.arena, e.t, mat.ty, b.row_major, c, .dx_packed) catch return e.unsupported("buffer element types", .{});
+            const const_row: ?i64 = if (m.rows == 1) 0 else e.constIntOf(mat.row);
+            if (const_row) |row| {
+                const off = layout.componentOffset(e.arena, e.t, mat.ty, b.row_major, @as(u32, @intCast(row)) * m.cols + c, .dx_packed) catch return e.unsupported("buffer element types", .{});
+                try e.structuredStore(res, b.index, b.offset + off, b.dyn, b.row_major, ec, &.{v});
+                continue;
+            }
+            // A dynamic row: rows are a constant byte step apart.
+            const step = (layout.componentOffset(e.arena, e.t, mat.ty, b.row_major, m.cols + c, .dx_packed) catch return e.unsupported("buffer element types", .{})) - off0;
+            var dyn = try e.add(i32t, .{ .binop = .{ .op = .mul, .lhs = mat.row, .rhs = try e.i32Const(step) } });
+            if (b.dyn) |d| dyn = try e.add(i32t, .{ .binop = .{ .op = .add, .lhs = d, .rhs = dyn } });
+            try e.structuredStore(res, b.index, b.offset + off0, dyn, b.row_major, ec, &.{v});
+        }
     }
 
     /// Loads a value of `ty` at a byte offset of a structured buffer

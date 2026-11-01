@@ -1787,6 +1787,25 @@ const Lowerer = struct {
         };
     }
 
+    /// Whether `e` designates part of an RW structured buffer element or a
+    /// groupshared variable: memory other threads may write.
+    fn isSharedMemory(l: *Lowerer, e: *const ast.Expr) bool {
+        const t = l.types();
+        var x = e;
+        while (true) switch (x.kind) {
+            .member => |m| x = m.base,
+            .index => |ix| {
+                if (t.get(ix.base.ty) == .resource) return t.get(ix.base.ty).resource.kind == .rw_structured_buffer;
+                x = ix.base;
+            },
+            .name => {
+                const r = l.s.resolution(x) orelse return false;
+                return r == .variable and r.variable.storage == .groupshared;
+            },
+            else => return false,
+        };
+    }
+
     /// Pointer to the storage field holding bitfield `bf` of the struct
     /// `ptr` points to.
     fn bitStorage(l: *Lowerer, ptr: Ref, bf: Bitfield) Error!Ref {
@@ -1863,6 +1882,22 @@ const Lowerer = struct {
             .member => |m| if (t.get(m.base.ty) == .matrix) {
                 const mt = t.get(m.base.ty).matrix;
                 const ks = matrixSwizzle(l.arena, m.name, mt.cols) orelse return error.Unsupported;
+                if (l.isSharedMemory(m.base)) {
+                    // Other threads may write the other elements: store
+                    // only the named ones (as dxc).
+                    const base_ptr = try l.lvalue(m.base);
+                    const space = l.b.f.inst(base_ptr).ptr;
+                    const row_ty = try t.vector(mt.elem, mt.cols);
+                    const ec = try t.scalar(mt.elem);
+                    for (ks, 0..) |k, i| {
+                        const part = if (ks.len == 1) value else try l.component(value, @intCast(i));
+                        const r = try l.b.constInt(try t.scalar(.uint), k / mt.cols);
+                        const c = try l.b.constInt(try t.scalar(.uint), k % mt.cols);
+                        const row = try l.b.add(.{ .op = .{ .access = .{ .base = base_ptr, .indices = try l.arena.dupe(Ref, &.{r}) } }, .ty = row_ty, .ptr = space });
+                        try l.b.store(try l.b.add(.{ .op = .{ .access = .{ .base = row, .indices = try l.arena.dupe(Ref, &.{c}) } }, .ty = ec, .ptr = space }), part);
+                    }
+                    return;
+                }
                 var whole = try l.rvalue(m.base);
                 const row_ty = try t.vector(mt.elem, mt.cols);
                 for (ks, 0..) |k, i| {
@@ -1885,6 +1920,17 @@ const Lowerer = struct {
                         const part = if (comps.len == 1) value else try l.b.add(.{ .op = .{ .extract = .{ .agg = value, .index = @intCast(i) } }, .ty = ec });
                         const idx = try l.b.constInt(try t.scalar(.uint), c);
                         try l.b.store(try l.b.add(.{ .op = .{ .access = .{ .base = base_ptr, .indices = try l.arena.dupe(Ref, &.{idx}) } }, .ty = ec, .ptr = .mesh }), part);
+                    }
+                    return;
+                }
+                if (l.isSharedMemory(m.base)) {
+                    // Store only the named components (as dxc).
+                    const base_ptr = try l.lvalue(m.base);
+                    const ec = try t.scalar(t.component(m.base.ty).?);
+                    for (comps, 0..) |c, i| {
+                        const part = if (comps.len == 1) value else try l.b.add(.{ .op = .{ .extract = .{ .agg = value, .index = @intCast(i) } }, .ty = ec });
+                        const idx = try l.b.constInt(try t.scalar(.uint), c);
+                        try l.b.store(try l.b.add(.{ .op = .{ .access = .{ .base = base_ptr, .indices = try l.arena.dupe(Ref, &.{idx}) } }, .ty = ec, .ptr = l.b.f.inst(base_ptr).ptr }), part);
                     }
                     return;
                 }

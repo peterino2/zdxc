@@ -140,6 +140,9 @@ const Emitter = struct {
     /// spellings are one type).
     spirv_types: std.StringHashMapUnmanaged(Id) = .empty,
     /// Explicitly laid out variants of arrays and structs (buffers).
+    /// Arrays with an ArrayStride by element type, length (0: runtime
+    /// array) and stride: one type per layout, as in dxc.
+    strided_arrays: std.AutoHashMapUnmanaged([3]u32, Id) = .empty,
     layout_types: std.AutoHashMapUnmanaged(LayoutKey, Id) = .empty,
     /// Per instruction (current function): the buffer layout its pointer
     /// result points into, if any.
@@ -479,24 +482,32 @@ const Emitter = struct {
         }
         const key: LayoutKey = .{ ty, rules, row_major };
         if (e.layout_types.get(key)) |id| return id;
-        const id = e.b.newId();
-        switch (e.t.get(ty)) {
-            .matrix => |m| {
-                // Row-major integer matrix: an array of its rows.
-                const row_ty = try e.layoutTypeId(try e.t.vector(m.elem, m.cols), rules, false);
-                try e.b.emit(.types_globals, .type_array, &.{ id, row_ty, try e.constUint(m.rows) });
-                try e.b.emit(.annotations, .decorate, &.{ id, 6, layout.matrixStride(e.t, ty, true, rules) }); // ArrayStride
+        const id = switch (e.t.get(ty)) {
+            // Row-major integer matrix: an array of its rows.
+            .matrix => |m| try e.stridedArray(try e.layoutTypeId(try e.t.vector(m.elem, m.cols), rules, false), m.rows, layout.matrixStride(e.t, ty, true, rules)),
+            .array => |a| try e.stridedArray(try e.layoutTypeId(a.elem, rules, row_major), a.len, layout.arrayStride(e.t, a.elem, row_major, rules) catch return e.unsupported("buffer member type", .{})),
+            .@"struct" => |st| blk: {
+                const id = e.b.newId();
+                try e.layoutStruct(id, st, rules, st.name);
+                break :blk id;
             },
-            .array => |a| {
-                const elem = try e.layoutTypeId(a.elem, rules, row_major);
-                try e.b.emit(.types_globals, .type_array, &.{ id, elem, try e.constUint(a.len) });
-                const stride = layout.arrayStride(e.t, a.elem, row_major, rules) catch return e.unsupported("buffer member type", .{});
-                try e.b.emit(.annotations, .decorate, &.{ id, 6, stride }); // ArrayStride
-            },
-            .@"struct" => |st| try e.layoutStruct(id, st, rules, st.name),
             else => return e.unsupported("buffer members of type '{s}' are not supported yet", .{try e.t.format(e.arena, ty)}),
-        }
+        };
         try e.layout_types.put(e.arena, key, id);
+        return id;
+    }
+
+    /// `elem[len]` (a runtime array for `len` 0) with an ArrayStride.
+    fn stridedArray(e: *Emitter, elem: Id, len: u32, stride: u32) Error!Id {
+        const len_id = if (len == 0) 0 else try e.constUint(len);
+        const gop = try e.strided_arrays.getOrPut(e.arena, .{ elem, len_id, stride });
+        if (gop.found_existing) return gop.value_ptr.*;
+        const id = e.b.newId();
+        if (len == 0) {
+            try e.b.emit(.types_globals, .type_runtime_array, &.{ id, elem });
+        } else try e.b.emit(.types_globals, .type_array, &.{ id, elem, len_id });
+        try e.b.emit(.annotations, .decorate, &.{ id, 6, stride }); // ArrayStride
+        gop.value_ptr.* = id;
         return id;
     }
 
@@ -2982,9 +2993,7 @@ const Emitter = struct {
         const elem_ty = if (r.kind == .byte_address_buffer or r.kind == .rw_byte_address_buffer) try e.t.scalar(.uint) else r.elem;
         const elem = (try e.bufferElemType(ty)).?;
         const stride = layout.arrayStride(e.t, elem_ty, r.row_major, e.sbRules()) catch return e.unsupported("buffer element type '{s}'", .{try e.t.format(e.arena, elem_ty)});
-        const rt = e.b.newId();
-        try e.b.emit(.types_globals, .type_runtime_array, &.{ rt, elem });
-        try e.b.emit(.annotations, .decorate, &.{ rt, 6, stride }); // ArrayStride
+        const rt = try e.stridedArray(elem, 0, stride);
         const st = e.b.newId();
         try e.b.emit(.types_globals, .type_struct, &.{ st, rt });
         try e.b.emit(.annotations, .member_decorate, &.{ st, 0, 35, 0 }); // Offset 0
