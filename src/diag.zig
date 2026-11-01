@@ -161,6 +161,19 @@ pub const Diagnostics = struct {
         _ = d.report(.{ .severity = severity, .loc = loc }, fmt, args);
     }
 
+    /// A point to roll back to (substitution failures are not errors).
+    pub const Mark = struct { len: usize, errors: u32, warnings: u32 };
+
+    pub fn mark(d: *const Diagnostics) Mark {
+        return .{ .len = d.list.items.len, .errors = d.error_count, .warnings = d.warning_count };
+    }
+
+    pub fn rollback(d: *Diagnostics, m: Mark) void {
+        d.list.shrinkRetainingCapacity(m.len);
+        d.error_count = m.errors;
+        d.warning_count = m.warnings;
+    }
+
     pub fn hasErrors(d: *const Diagnostics) bool {
         return d.error_count != 0;
     }

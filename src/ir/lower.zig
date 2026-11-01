@@ -926,7 +926,7 @@ const Lowerer = struct {
                         if (l.isSpecConstant(v)) return l.specConstant(v);
                         // Integer `static const` scalars are constants.
                         if (v.storage == .constant and v.init != null and l.s.types.get(v.type) == .scalar and !l.s.types.get(v.type).scalar.isFloat()) {
-                            if (l.s.evalInt(v.init.?)) |val| return l.b.constInt(try l.concrete(e.ty), val);
+                            if (l.s.evalVarInt(v)) |val| return l.b.constInt(try l.concrete(e.ty), val);
                         }
                         return l.b.load(try l.lvalue(e));
                     },

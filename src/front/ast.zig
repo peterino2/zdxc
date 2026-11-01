@@ -234,6 +234,9 @@ pub const FuncDecl = struct {
     quals: Qualifiers,
     qual_words: []const QualWord = &.{},
     template_params: []const TemplateParam,
+    /// `template <class T> template <class U> R S<T>::f()`: the class
+    /// template's parameters (`template_params` are the member's own).
+    outer_template_params: []const TemplateParam = &.{},
     ret: *TypeRef,
     /// Function name; for operators `operator+`, `operator[]`, `operator()`.
     name: Name,

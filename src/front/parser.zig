@@ -42,6 +42,9 @@ pub const Parser = struct {
     /// Set while parsing template arguments: a top-level `>` ends the
     /// argument instead of being a comparison.
     no_greater: bool = false,
+    /// The last parseName ended in `::template X`: X takes template
+    /// arguments whatever it names.
+    forced_template: bool = false,
 
     /// Collect every token from `pp` and set up a parser over them.
     pub fn fromPreprocessor(arena: Allocator, diags: *Diagnostics, pp: *Preprocessor) !Parser {
@@ -527,7 +530,7 @@ pub const Parser = struct {
             return error.Syntax;
         }
         var args: []const ast.TemplateArg = &.{};
-        if (p.at(.less) and p.isTemplateName(name.last())) args = try p.parseTemplateArgs();
+        if (p.at(.less) and (p.forced_template or p.isTemplateName(name.last()))) args = try p.parseTemplateArgs();
         return p.mk(ast.TypeRef, .{ .loc = start.loc, .name = name, .args = args });
     }
 
@@ -535,7 +538,7 @@ pub const Parser = struct {
     fn parseNameWithFinalArgs(p: *Parser) Error!struct { name: ast.Name, args: []const ast.TemplateArg } {
         const name = try p.parseName();
         var args: []const ast.TemplateArg = &.{};
-        if (p.at(.less) and p.isTemplateName(name.last())) args = try p.parseTemplateArgs();
+        if (p.at(.less) and (p.forced_template or p.isTemplateName(name.last()))) args = try p.parseTemplateArgs();
         return .{ .name = name, .args = args };
     }
 
@@ -550,6 +553,7 @@ pub const Parser = struct {
         var parts: std.ArrayList([]const u8) = .empty;
         var args: std.ArrayList([]const ast.TemplateArg) = .empty;
         var any_args = false;
+        p.forced_template = false;
         if (p.eat(.colon_colon)) {
             try parts.append(p.arena, "");
             try args.append(p.arena, &.{});
@@ -570,6 +574,11 @@ pub const Parser = struct {
             try args.append(p.arena, part_args);
             if (!(p.at(.colon_colon) and p.peek(1).kind == .identifier and !p.peek(1).isIdent("operator"))) break;
             _ = p.advance();
+            // `X<T>::template Y<U>`: the disambiguator.
+            if (p.atIdent("template") and p.peek(1).kind == .identifier) {
+                _ = p.advance();
+                p.forced_template = true;
+            }
         }
         return .{ .loc = loc, .parts = parts.items, .args = if (any_args) args.items else &.{} };
     }
@@ -684,14 +693,25 @@ pub const Parser = struct {
 
         var attrs = try p.parseAttributes();
         var template_params: []const ast.TemplateParam = &.{};
+        var outer_params: []const ast.TemplateParam = &.{};
         var in_template = false;
+        var in_inner = false;
         if (p.atIdent("template")) {
             _ = p.advance();
             try p.pushScope();
             in_template = true;
             template_params = try p.parseTemplateParams();
+            // An out-of-line member template of a class template.
+            if (p.atIdent("template")) {
+                _ = p.advance();
+                try p.pushScope();
+                in_inner = true;
+                outer_params = template_params;
+                template_params = try p.parseTemplateParams();
+            }
         }
         defer if (in_template) p.popScope();
+        defer if (in_inner) p.popScope();
         const more_attrs = try p.parseAttributes();
         if (more_attrs.len > 0) attrs = try std.mem.concat(p.arena, ast.Attribute, &.{ attrs, more_attrs });
 
@@ -734,7 +754,11 @@ pub const Parser = struct {
         const words = p.last_quals;
         const ty = try p.parseType();
         p.decl_quals = words;
+        const first = out.items.len;
         try p.parseDeclaratorsInto(out, attrs, quals, template_params, ty, ctx);
+        if (outer_params.len > 0) for (out.items[first..]) |d| if (d.kind == .func) {
+            d.kind.func.outer_template_params = outer_params;
+        };
     }
 
     fn parseTemplateParams(p: *Parser) Error![]const ast.TemplateParam {
@@ -1757,7 +1781,9 @@ pub const Parser = struct {
         }
         const name = try p.parseName();
         // Explicit template arguments: `f<float>(x)`.
-        if (p.at(.less) and p.isTemplateName(name.last())) {
+        // (Members of a class are unknown here: `S::f<1>(x)` is a call
+        // when it reads as one.)
+        if (p.at(.less) and (p.forced_template or p.isTemplateName(name.last()) or (name.parts.len > 1 and p.looksLikeTemplateCall()))) {
             const targs = try p.parseTemplateArgs();
             if (!p.at(.l_paren)) {
                 // Variable template use: `is_same_v<int, bool>`.
