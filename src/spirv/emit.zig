@@ -8,6 +8,7 @@ const Allocator = std.mem.Allocator;
 const ir = @import("../ir/ir.zig");
 const types = @import("../sema/types.zig");
 const texture = @import("../ir/texture.zig");
+const op_caps = @import("op_caps.zig");
 const builder = @import("builder.zig");
 const diag = @import("../diag.zig");
 const layout = @import("../ir/layout.zig");
@@ -46,6 +47,8 @@ const Capability = enum(u32) {
     cull_distance = 33,
     draw_parameters = 4427,
     device_group = 4437,
+    input_attachment = 40,
+    int64_image_ext = 5016,
     multi_view = 4439,
     fragment_shading_rate_khr = 4422,
     stencil_export_ext = 5013,
@@ -89,6 +92,8 @@ const Capability = enum(u32) {
     sampled_image_array_non_uniform_indexing = 5307,
     storage_buffer_array_non_uniform_indexing = 5308,
     storage_image_array_non_uniform_indexing = 5309,
+    /// (Inline SPIR-V may use any value.)
+    _,
 };
 
 /// A Vulkan (or universal) target and the SPIR-V version it implies.
@@ -161,6 +166,7 @@ const Emitter = struct {
     counter_slots: []?Slot = &.{},
     used_bindings: std.AutoHashMapUnmanaged(struct { u32, u32 }, void) = .empty,
     spec_ids: std.AutoHashMapUnmanaged(u32, Id) = .empty,
+    ext_imports: std.StringHashMapUnmanaged(Id) = .empty,
     /// Flattened resource arrays: a variable per element.
     flat_vars: std.AutoHashMapUnmanaged(u32, []const Id) = .empty,
     flat_iface: std.ArrayList(Id) = .empty,
@@ -171,6 +177,10 @@ const Emitter = struct {
     sampler_type: Id = 0,
     accel_type: Id = 0,
     ray_query_type: Id = 0,
+    /// [[vk::image_format]] of the image type being made.
+    format_override: ?u32 = null,
+    /// int2(0, 0), the coordinate of subpass reads.
+    subpass_coord: Id = 0,
     counter_vars: []Id = &.{},
     builtin_inputs: std.AutoHashMapUnmanaged(u32, Id) = .empty,
     /// Per instruction (current function): texel places (`tex[i]`).
@@ -232,6 +242,9 @@ const Emitter = struct {
         iface: std.ArrayList(Id) = .empty,
         /// Compute derivatives' execution mode (0: none).
         derivative_mode: u32 = 0,
+        /// vk::ext_execution_mode(...): mode and operands (ids for
+        /// ext_execution_mode_id).
+        ext_modes: std.ArrayList(struct { words: []const u32, id: bool }) = .empty,
         /// Mesh shaders: the primitive indices builtin and the payload
         /// variable (both made on first use); amplification shaders: the
         /// groupshared variable sent by DispatchMesh.
@@ -599,6 +612,93 @@ const Emitter = struct {
         }
     }
 
+    /// The storage class `[[vk::ext_builtin_*]]` / `[[vk::ext_storage_class]]`
+    /// give a global, if any.
+    fn extStorage(g: ir.Global) ?StorageClass {
+        if (g.ext.builtin != null) return if (g.ext.builtin_output) .output else .input;
+        if (g.ext.storage_class) |c| return @enumFromInt(c);
+        return null;
+    }
+
+    /// Inline SPIR-V decorations, capabilities and extensions of a
+    /// declaration (decorations on `v` when non-zero).
+    fn applyExt(e: *Emitter, v: Id, x: ir.SpirvExt) Error!void {
+        for (x.capabilities) |c| try e.capabilities.put(e.arena, @enumFromInt(c), {});
+        for (x.extensions) |name| try e.extension(name);
+        if (v != 0) try e.extDecorate(v, x.decorations);
+    }
+
+    /// What an enumerant used by inline SPIR-V needs (as dxc infers).
+    fn requireNeed(e: *Emitter, n: ?op_caps.Need) Error!void {
+        const x = n orelse return;
+        switch (x.cap) {
+            // (Not kernel capabilities: Addresses, Linkage, Kernel,
+            // SubgroupDispatch.)
+            0, 4, 5, 6, 58 => {},
+            else => try e.capabilities.put(e.arena, @enumFromInt(x.cap), {}),
+        }
+        if (x.ext.len > 0 and x.core > 100 + @as(u32, e.spv_minor)) try e.extension(x.ext);
+    }
+
+    fn extDecorate(e: *Emitter, v: Id, decs: []const ir.ExtDecoration) Error!void {
+        for (decs) |d| {
+            if (d.decoration == 11 and d.ints.len > 0) try e.requireNeed(op_caps.need(&op_caps.builtins, d.ints[0])) else try e.requireNeed(op_caps.need(&op_caps.decorations, d.decoration));
+        }
+        for (decs) |d| switch (d.kind) {
+            .literal => {
+                var words: std.ArrayList(u32) = .empty;
+                try words.appendSlice(e.arena, &.{ v, d.decoration });
+                try words.appendSlice(e.arena, d.ints);
+                try e.b.emit(.annotations, .decorate, words.items);
+            },
+            .id => {
+                var words: std.ArrayList(u32) = .empty;
+                try words.appendSlice(e.arena, &.{ v, d.decoration });
+                for (d.ints) |x| try words.append(e.arena, try e.constUint(x));
+                try e.b.emit(.annotations, .decorate_id, words.items);
+            },
+            .string => for (d.strings) |str| try e.b.emitWithString(.annotations, .decorate_string, &.{ v, d.decoration }, str, &.{}),
+        };
+    }
+
+    /// Inline SPIR-V: the instruction with its operands (OpExtInst for an
+    /// instruction set).
+    fn spirvInst(e: *Emitter, x: *const ir.SpirvInst, ty: TypeId) Error!Id {
+        for (x.capabilities) |c| try e.capabilities.put(e.arena, @enumFromInt(c), {});
+        for (x.extensions) |name| try e.extension(name);
+        // The capability the grammar gives the instruction (not ones for
+        // kernels).
+        if (x.set == null) if (op_caps.get(x.opcode)) |c| switch (c) {
+            4, 5, 6 => {},
+            else => try e.capabilities.put(e.arena, @enumFromInt(c), {}),
+        };
+        var words: std.ArrayList(u32) = .empty;
+        const has_result = ty != TypeTable.void_type or x.set != null;
+        const id: Id = if (has_result) e.b.newId() else 0;
+        if (has_result) try words.appendSlice(e.arena, &.{ try e.typeId(ty), id });
+        if (x.set) |set| try words.appendSlice(e.arena, &.{ try e.extInstImport(set), x.opcode });
+        for (x.operands) |o| try words.append(e.arena, switch (o) {
+            .value => |r| e.val(r),
+            .literal => |w| w,
+        });
+        const op: Op = if (x.set != null) .ext_inst else @enumFromInt(@as(u16, @intCast(x.opcode)));
+        try e.b.emit(.functions, op, words.items);
+        return id;
+    }
+
+    /// An OpExtInstImport of `name` (made once).
+    fn extInstImport(e: *Emitter, name: []const u8) Error!Id {
+        if (std.mem.eql(u8, name, "GLSL.std.450")) {
+            if (e.glsl == 0) e.glsl = e.b.newId();
+            return e.glsl;
+        }
+        if (e.ext_imports.get(name)) |id| return id;
+        const id = e.b.newId();
+        try e.b.emitWithString(.ext_inst_imports, .ext_inst_import, &.{id}, name, &.{});
+        try e.ext_imports.put(e.arena, name, id);
+        return id;
+    }
+
     /// A [[vk::constant_id]] constant: OpSpecConstant* with its SpecId.
     fn specConstant(e: *Emitter, k: u32) Error!Id {
         if (e.spec_ids.get(k)) |id| return id;
@@ -665,6 +765,7 @@ const Emitter = struct {
         if (m.entries.items.len == 0 and !link) return e.unsupported("libraries without entry points need a universal target environment (-fspv-target-env=universal1.5)", .{});
         if (link) try e.cap(.linkage);
         for (m.entries.items) |*entry| {
+            try e.applyExt(0, entry.ext);
             if (entry.stage == .geometry) try e.cap(.geometry);
             if (entry.stage == .mesh or entry.stage == .amplification) {
                 if (e.spv_minor < 4) return e.unsupported("mesh and amplification shaders need SPIR-V 1.4 or later (-fspv-target-env=vulkan1.2 or later)", .{});
@@ -847,6 +948,13 @@ const Emitter = struct {
             else => {},
         }
         if (e.st.derivative_mode != 0) try e.b.emit(.execution_modes, .execution_mode, &.{ wrapper, e.st.derivative_mode });
+        // vk::ext_execution_mode(...) / ext_execution_mode_id(...).
+        for (e.st.ext_modes.items) |em| {
+            var words: std.ArrayList(u32) = .empty;
+            try words.append(e.arena, wrapper);
+            try words.appendSlice(e.arena, em.words);
+            try e.b.emit(.execution_modes, if (em.id) .execution_mode_id else .execution_mode, words.items);
+        }
     }
 
     fn domainMode(d: ir.Domain) u32 {
@@ -904,13 +1012,16 @@ const Emitter = struct {
                         continue;
                     }
                     const var_id = e.b.newId();
+                    e.format_override = g.image_format;
                     const p = try e.resourcePointee(g.ty);
+                    e.format_override = null;
                     try e.b.emit(.types_globals, .variable, &.{ try e.pointerType(p.sc, p.ty), var_id, @backingInt(p.sc) });
                     const slot = try e.slotOf(@intCast(gi), false);
                     try e.b.emit(.annotations, .decorate, &.{ var_id, 34, slot.set }); // DescriptorSet
                     try e.b.emit(.annotations, .decorate, &.{ var_id, 33, slot.binding }); // Binding
                     try e.b.emitWithString(.debug_names, .name, &.{var_id}, g.name, &.{});
                     try e.userType(var_id, g.ty, g);
+                    if (g.input_attachment) |ia| try e.b.emit(.annotations, .decorate, &.{ var_id, 43, ia }); // InputAttachmentIndex
                     e.global_vars[gi] = var_id;
                 },
                 .cbuffer => {
@@ -935,15 +1046,23 @@ const Emitter = struct {
                 },
                 .groupshared, .private => {
                     const ty = try e.typeId(g.ty);
-                    const sc: StorageClass = if (e.payload_global == @as(u32, @intCast(gi))) .task_payload_workgroup else if (g.space == .groupshared) .workgroup else .private;
+                    const sc: StorageClass = if (extStorage(g)) |x| x else if (e.payload_global == @as(u32, @intCast(gi))) .task_payload_workgroup else if (g.space == .groupshared) .workgroup else .private;
                     const ptr = try e.pointerType(sc, ty);
                     const var_id = e.b.newId();
                     try e.b.emit(.types_globals, .variable, &.{ ptr, var_id, @backingInt(sc) });
                     try e.b.emitWithString(.debug_names, .name, &.{var_id}, g.name, &.{});
+                    if (g.ext.builtin) |bi| {
+                        try e.b.emit(.annotations, .decorate, &.{ var_id, 11, bi }); // BuiltIn
+                        try e.requireNeed(op_caps.need(&op_caps.builtins, bi));
+                        // Integer pixel shader inputs are flat.
+                        const c = e.t.component(g.ty);
+                        if (!g.ext.builtin_output and c != null and !c.?.isFloat() and e.entry.stage == .pixel) try e.b.emit(.annotations, .decorate, &.{ var_id, 14 }); // Flat
+                    }
                     e.global_vars[gi] = var_id;
                 },
                 else => return e.unsupported("global '{s}' is not supported yet", .{g.name}),
             }
+            if (e.global_vars[gi] != 0) try e.applyExt(e.global_vars[gi], g.ext);
         }
 
         // Descriptor heaps: the next free bindings of set 0 (resources,
@@ -1539,6 +1658,7 @@ const Emitter = struct {
                 const name = if (el.spelling) |sp| try std.fmt.allocPrint(e.arena, "{s}.var.{s}", .{ if (input) "in" else "out", sp }) else try std.fmt.allocPrint(e.arena, "{s}.var.{s}{d}", .{ if (input) "in" else "out", el.semantic, el.semantic_index });
                 try e.b.emitWithString(.debug_names, .name, &.{var_id}, name, &.{});
                 try e.userSemantic(var_id, el);
+                try e.extDecorate(var_id, el.ext_decorations);
                 iface.* = .{ .var_id = var_id, .ty = vty, .elem_array = bi != null and e.t.get(bi.?.ty) == .array, .builtin = if (bi) |x| x.id else std.math.maxInt(u32) };
                 try e.useVar(var_id);
             }
@@ -1898,6 +2018,7 @@ const Emitter = struct {
         switch (i.op) {
             .constant, .param, .local_var => {},
             .spec_constant => |k| e.vals[ri] = try e.specConstant(k),
+            .spirv_inst => |x| e.vals[ri] = try e.spirvInst(x, i.ty),
             .ray_incoming => |k| e.vals[ri] = try e.rayVar(switch (k) {
                 .payload => .incoming_ray_payload_khr,
                 .attributes => .hit_attribute_khr,
@@ -1905,6 +2026,7 @@ const Emitter = struct {
             }, i.ty),
             .global => |g| {
                 e.vals[ri] = e.global_vars[g];
+                if (extStorage(e.m.globals.items[g])) |sc| if (sc == .input or sc == .output or e.spv_minor >= 4) try e.useVar(e.global_vars[g]);
                 if (ownStorage(e.m.globals.items[g]) != null) {
                     // (Interfaces list them from SPIR-V 1.4.)
                     if (e.spv_minor >= 4) try e.useVar(e.global_vars[g]);
@@ -2021,7 +2143,7 @@ const Emitter = struct {
                 const shader_record = own != null;
                 const sc: StorageClass = if (own) |x| x else if (into_cb) .uniform else if (into_buffer or (base_pl != null and base_pl.?.buffer)) e.bufferSc() else if (base_pl != null) .uniform else switch (i.ptr) {
                     .function => .function,
-                    .private => .private,
+                    .private => if (e.rootGlobal(a.base)) |rg| (extStorage(e.m.globals.items[rg]) orelse .private) else .private,
                     .groupshared => if (e.payload_global != null and e.rootGlobal(a.base) == e.payload_global) .task_payload_workgroup else .workgroup,
                     .cbuffer, .resource => .uniform,
                     else => return e.unsupported("access into this storage is not supported yet", .{}),
@@ -2686,6 +2808,7 @@ const Emitter = struct {
             .sampler => return .{ .sc = .uniform_constant, .ty = try e.samplerType() },
             .resource => |r| switch (r.kind) {
                 .raytracing_acceleration_structure => return .{ .sc = .uniform_constant, .ty = try e.accelType() },
+                .other => if (std.mem.startsWith(u8, r.name, "SubpassInput")) return .{ .sc = .uniform_constant, .ty = try e.subpassType(ty) },
                 .structured_buffer, .rw_structured_buffer, .append_structured_buffer, .consume_structured_buffer, .byte_address_buffer, .rw_byte_address_buffer => return .{ .sc = e.bufferSc(), .ty = try e.bufferBlockType(ty) },
                 .constant_buffer => if (e.t.get(r.elem) == .@"struct") return .{ .sc = .uniform, .ty = try e.constantBufferBlock(r.elem) },
                 .texture_buffer => if (e.t.get(r.elem) == .@"struct") return .{ .sc = e.bufferSc(), .ty = try e.textureBufferBlock(r.elem) },
@@ -2770,7 +2893,9 @@ const Emitter = struct {
             e.vals[ri] = ids[k];
             return;
         };
+        e.format_override = e.formatFor(a.base);
         const p = try e.resourcePointee(ty);
+        e.format_override = null;
         var ops: std.ArrayList(u32) = .empty;
         const id = e.b.newId();
         var nonuniform = false;
@@ -2877,6 +3002,20 @@ const Emitter = struct {
         };
     }
 
+    /// SubpassInput[MS]<T>: an image of SubpassData dimension.
+    fn subpassType(e: *Emitter, ty: TypeId) Error!Id {
+        const r = e.t.get(ty).resource;
+        try e.cap(.input_attachment);
+        const ms: u32 = @intFromBool(std.mem.eql(u8, r.name, "SubpassInputMS"));
+        const st = try e.scalarType(storageScalar(e.t.component(r.elem).?));
+        const key: [6]u32 = .{ st, 6, 0, ms, 2, 0 };
+        if (e.image_types.get(key)) |id| return id;
+        const id = e.b.newId();
+        try e.b.emit(.types_globals, .type_image, &.{ id, st, 6, 2, 0, ms, 2, 0 }); // SubpassData, Unknown
+        try e.image_types.put(e.arena, key, id);
+        return id;
+    }
+
     fn accelType(e: *Emitter) Error!Id {
         if (e.accel_type == 0) {
             e.accel_type = e.b.newId();
@@ -2905,6 +3044,20 @@ const Emitter = struct {
     /// and the system values as builtins. Null for other names.
     fn rayIntrinsic(e: *Emitter, name: []const u8, ty: TypeId, args: []const Ref) Error!?Id {
         const eq = std.mem.eql;
+        if (eq(u8, name, "ext_execution_mode") or eq(u8, name, "ext_execution_mode_id")) {
+            const id = eq(u8, name, "ext_execution_mode_id");
+            const words = try e.arena.alloc(u32, args.len);
+            for (words, args, 0..) |*w, a, k| {
+                const c = switch (e.f.inst(a).op) {
+                    .constant => |c| c,
+                    else => return e.unsupported("'{s}' with non-constant operands", .{name}),
+                };
+                w.* = if (k > 0 and id) try e.constant(e.f.inst(a).ty, c) else @truncate(@as(u64, @bitCast(c.int)));
+            }
+            try e.st.ext_modes.append(e.arena, .{ .words = words, .id = id });
+            if (words.len > 0) try e.requireNeed(op_caps.need(&op_caps.execution_modes, words[0]));
+            return 0;
+        }
         if (eq(u8, name, "TraceRay") or eq(u8, name, "CallShader")) {
             // Through the payload / callable data variable, copied in and
             // back out.
@@ -3094,7 +3247,7 @@ const Emitter = struct {
             .buffer => 5,
         };
         const sampled: u32 = if (sh.rw) 2 else 1;
-        const format: u32 = if (sh.rw or sh.dim == .buffer) e.imageFormat(elem) else 0;
+        const format: u32 = if (e.format_override) |f| f else if (sh.rw or sh.dim == .buffer) e.imageFormat(elem) else 0;
         const key: [6]u32 = .{ st, dim, @intFromBool(sh.array), @intFromBool(sh.ms), sampled, format };
         if (e.image_types.get(key)) |id| return id;
         switch (sh.dim) {
@@ -3105,7 +3258,11 @@ const Emitter = struct {
         }
         if (sh.rw and sh.ms) try e.cap(if (sh.array) .image_ms_array else .storage_image_multisample);
         switch (format) {
-            6, 7, 9, 25, 26, 28, 35, 36, 38 => try e.cap(.storage_image_extended_formats),
+            6...20, 25...29, 34...39 => try e.cap(.storage_image_extended_formats),
+            40, 41 => {
+                try e.cap(.int64_image_ext);
+                try e.extension("SPV_EXT_shader_image_int64");
+            },
             else => {},
         }
         const id = e.b.newId();
@@ -3124,7 +3281,18 @@ const Emitter = struct {
 
     fn imageTypeOf(e: *Emitter, r: Ref) Error!Id {
         const rk = e.resourceInfo(r);
+        e.format_override = e.formatFor(r);
+        defer e.format_override = null;
         return e.imageType(texture.shape(rk.kind).?, rk.elem);
+    }
+
+    /// The [[vk::image_format]] of the variable image value `r` comes
+    /// from, if any.
+    fn formatFor(e: *Emitter, r: Ref) ?u32 {
+        var x = r;
+        while (e.f.inst(x).op == .access) x = e.f.inst(x).op.access.base;
+        const g = e.globalOf(x) orelse return null;
+        return e.m.globals.items[g].image_format;
     }
 
     fn loadImage(e: *Emitter, r: Ref) Error!Id {
@@ -3167,7 +3335,7 @@ const Emitter = struct {
         const img = try e.loadImage(res);
         var v: Id = undefined;
         if (sh.rw) {
-            if (e.imageFormat(r.elem) == 0) try e.cap(.storage_image_read_without_format);
+            if ((e.formatFor(res) orelse e.imageFormat(r.elem)) == 0) try e.cap(.storage_image_read_without_format);
             v = if (sh.ms)
                 try e.opRaw(.image_read, try e.vec4Of(s), &.{ img, coord, 0x40, try e.constInt(0) })
             else
@@ -3184,7 +3352,7 @@ const Emitter = struct {
     fn imageWrite(e: *Emitter, res: Ref, coord: Id, value: Id) Error!void {
         const r = e.resourceInfo(res);
         _ = try e.texelScalar(r.elem);
-        if (e.imageFormat(r.elem) == 0) try e.cap(.storage_image_write_without_format);
+        if ((e.formatFor(res) orelse e.imageFormat(r.elem)) == 0) try e.cap(.storage_image_write_without_format);
         const img = try e.loadImage(res);
         try e.b.emit(.functions, .image_write, &.{ img, coord, value });
     }
@@ -3213,6 +3381,25 @@ const Emitter = struct {
         const eq = std.mem.eql;
         if (e.t.get(e.f.inst(res).ty) != .resource) return e.unsupported("method '{s}' is not supported yet", .{name});
         if (isRayQuery(e.t, e.f.inst(res).ty)) return e.rayQueryMethod(name, res, args, ty);
+        if (e.t.get(e.f.inst(res).ty).resource.kind == .other and std.mem.eql(u8, name, "SubpassLoad")) {
+            // OpImageRead at (0, 0) (relative to the fragment), with the
+            // sample for SubpassInputMS.
+            var it = e.f.inst(res).ty;
+            while (e.t.get(it) == .array) it = e.t.get(it).array.elem;
+            const r = e.t.get(it).resource;
+            const img = try e.opRaw(.load, try e.subpassType(it), &.{e.val(res)});
+            const v4 = try e.t.vector(e.t.component(r.elem).?, 4);
+            if (e.subpass_coord == 0) {
+                e.subpass_coord = e.b.newId();
+                try e.b.emit(.types_globals, .constant_composite, &.{ try e.typeId(try e.t.vector(.int, 2)), e.subpass_coord, try e.constInt(0), try e.constInt(0) });
+            }
+            const coord = e.subpass_coord;
+            const texel = if (args.len == 1)
+                try e.op1(.image_read, v4, &.{ img, coord, 0x40, e.val(args[0]) }) // Sample
+            else
+                try e.op1(.image_read, v4, &.{ img, coord, 0 });
+            return e.reshape(texel, v4, ty);
+        }
         const r = e.resourceInfo(res);
         if (eq(u8, name, "GetDimensions")) {
             try e.getDimensions(res, r, args);
@@ -3322,7 +3509,7 @@ const Emitter = struct {
         }
         var ops: std.ArrayList(u32) = .empty;
         if (call.op == .load) {
-            if (sh.rw and e.imageFormat(r.elem) == 0) try e.cap(.storage_image_read_without_format);
+            if (sh.rw and (e.formatFor(res) orelse e.imageFormat(r.elem)) == 0) try e.cap(.storage_image_read_without_format);
             try ops.appendSlice(e.arena, &.{ img, coord_id });
             if (mask != 0) {
                 try ops.append(e.arena, mask);

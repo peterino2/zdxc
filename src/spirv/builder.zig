@@ -38,6 +38,7 @@ pub const Op = enum(u16) {
     spec_constant_false = 49,
     spec_constant = 50,
     decorate_id = 332,
+    execution_mode_id = 331,
     decorate_string = 5632,
     constant_false = 42,
     constant = 43,
@@ -245,6 +246,8 @@ pub const Op = enum(u16) {
     end_primitive = 219,
     emit_stream_vertex = 220,
     end_stream_primitive = 221,
+    /// (Inline SPIR-V may use any value.)
+    _,
 };
 
 pub const Section = enum {

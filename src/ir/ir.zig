@@ -131,6 +131,9 @@ pub const Op = union(enum) {
     ray_incoming: RayIncoming,
     /// SPIR-V specialization constant (index into Module.spec_constants).
     spec_constant: u32,
+    /// Inline SPIR-V (`[[vk::ext_instruction]]` functions): an instruction
+    /// of `set` (null: core), with the capabilities and extensions it needs.
+    spirv_inst: *const SpirvInst,
     patch_output: struct { element: u32, value: Ref },
     output_vertex: struct { element: u32, vertex: u32 },
     /// Geometry shaders: emit the vertex written to the outputs of a stream,
@@ -311,6 +314,11 @@ pub const Global = struct {
     shader_record: bool = false,
     /// `[[vk::push_constant]]` buffers (SPIR-V PushConstant storage).
     push_constant: bool = false,
+    /// [[vk::input_attachment_index(n)]] (SubpassInput).
+    input_attachment: ?u32 = null,
+    /// [[vk::image_format("...")]]: the SPIR-V ImageFormat.
+    image_format: ?u32 = null,
+    ext: SpirvExt = .{},
 };
 
 pub const Stage = enum {
@@ -355,6 +363,7 @@ pub const SigElement = struct {
     vk_location: ?u32 = null,
     vk_index: ?u32 = null,
     vk_builtin: ?[]const u8 = null,
+    ext_decorations: []const ExtDecoration = &.{},
 };
 
 pub const Primitive = enum(u8) { point = 1, line = 2, triangle = 3, line_adj = 6, triangle_adj = 7 };
@@ -418,9 +427,41 @@ pub const Entry = struct {
     patch_func: ?u32 = null,
     /// `[RootSignature("...")]`: the root signature text.
     root_signature: ?[]const u8 = null,
+    /// Inline SPIR-V capabilities / extensions of the entry function.
+    ext: SpirvExt = .{},
     /// The wrapper with no parameters that reads `inputs`, calls `func`
     /// and writes `outputs`.
     wrapper: u32 = 0,
+};
+
+/// `[[vk::ext_decorate(...)]]`, `ext_decorate_id`, `ext_decorate_string`.
+pub const ExtDecoration = struct {
+    decoration: u32,
+    kind: enum { literal, id, string },
+    /// Literal words, or the constants for `id`.
+    ints: []const u32 = &.{},
+    strings: []const []const u8 = &.{},
+};
+
+/// Inline SPIR-V attributes of a declaration.
+pub const SpirvExt = struct {
+    decorations: []const ExtDecoration = &.{},
+    capabilities: []const u32 = &.{},
+    extensions: []const []const u8 = &.{},
+    /// `[[vk::ext_builtin_input(n)]]` / `ext_builtin_output(n)`.
+    builtin: ?u32 = null,
+    builtin_output: bool = false,
+    /// `[[vk::ext_storage_class(n)]]`.
+    storage_class: ?u32 = null,
+};
+
+pub const SpirvInst = struct {
+    opcode: u32,
+    set: ?[]const u8 = null,
+    /// Values, pointers (`[[vk::ext_reference]]`) or literal words.
+    operands: []const union(enum) { value: Ref, literal: u32 },
+    capabilities: []const u32 = &.{},
+    extensions: []const []const u8 = &.{},
 };
 
 /// A ray tracing state object subobject (DXIL::SubobjectKind values).
@@ -625,6 +666,7 @@ fn dumpInst(m: *const Module, f: *const Function, r: Ref, w: *std.Io.Writer) !vo
         .mesh_payload => try w.print("mesh payload", .{}),
         .ray_incoming => |k| try w.print("ray incoming {s}", .{@tagName(k)}),
         .spec_constant => |k| try w.print("spec constant {d}", .{k}),
+        .spirv_inst => |x| try w.print("spirv op {d}", .{x.opcode}),
         .heap_resource => |h| try w.print("{s}[%{d}]", .{ if (h.sampler) "SamplerDescriptorHeap" else "ResourceDescriptorHeap", h.index.index() }),
         .patch_output => |x| try w.print("patch output {d} = %{d}", .{ x.element, x.value.index() }),
         .output_vertex => |x| try w.print("output {d} vertex {d}", .{ x.element, x.vertex }),

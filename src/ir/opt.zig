@@ -203,6 +203,17 @@ fn mapOp(a: Allocator, op: Op, ctx: anytype) Allocator.Error!Op {
         .method => |x| .{ .method = .{ .name = x.name, .res = ctx.map(x.res), .args = try mapRefs(a, x.args, ctx) } },
         .output => |x| .{ .output = .{ .element = x.element, .value = ctx.map(x.value) } },
         .heap_resource => |h| .{ .heap_resource = .{ .index = ctx.map(h.index), .sampler = h.sampler } },
+        .spirv_inst => |x| blk: {
+            const ops = try a.dupe(@typeInfo(@TypeOf(x.operands)).pointer.child, x.operands);
+            for (ops) |*o| switch (o.*) {
+                .value => |*v| v.* = ctx.map(v.*),
+                .literal => {},
+            };
+            const n = try a.create(ir.SpirvInst);
+            n.* = x.*;
+            n.operands = ops;
+            break :blk .{ .spirv_inst = n };
+        },
         .patch_output => |x| .{ .patch_output = .{ .element = x.element, .value = ctx.map(x.value) } },
         .phi => |ps| blk: {
             const out = try a.alloc(@typeInfo(@TypeOf(ps)).pointer.child, ps.len);

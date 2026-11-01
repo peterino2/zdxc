@@ -134,6 +134,54 @@ const Lowerer = struct {
         try l.buildEntry(f, main, .{ .entry = name, .stage = stage });
     }
 
+    /// The inline SPIR-V attributes among `attrs` (SPIR-V only).
+    fn spirvExt(l: *Lowerer, attrs: []const ast.Attribute) Error!ir.SpirvExt {
+        if (!l.s.opts.spirv) return .{};
+        var x: ir.SpirvExt = .{};
+        var decs: std.ArrayList(ir.ExtDecoration) = .empty;
+        var caps: std.ArrayList(u32) = .empty;
+        var exts: std.ArrayList([]const u8) = .empty;
+        for (attrs) |a| {
+            const eq = std.mem.eql;
+            const int = struct {
+                fn f(ll: *Lowerer, e: *const ast.Expr) ?u32 {
+                    const v = ll.s.evalInt(e) orelse return null;
+                    return @truncate(@as(u64, @bitCast(v)));
+                }
+            }.f;
+            if (eq(u8, a.name, "vk::ext_capability")) {
+                for (a.args) |arg| if (int(l, arg)) |c| try caps.append(l.arena, c);
+            } else if (eq(u8, a.name, "vk::ext_extension")) {
+                for (a.args) |arg| if (arg.kind == .string_lit) try exts.append(l.arena, try stringContents(l.arena, arg.kind.string_lit));
+            } else if (eq(u8, a.name, "vk::ext_builtin_input") or eq(u8, a.name, "vk::ext_builtin_output")) {
+                if (a.args.len == 1) x.builtin = int(l, a.args[0]);
+                x.builtin_output = eq(u8, a.name, "vk::ext_builtin_output");
+            } else if (eq(u8, a.name, "vk::ext_storage_class")) {
+                if (a.args.len == 1) x.storage_class = int(l, a.args[0]);
+            } else if ((eq(u8, a.name, "vk::ext_decorate") or eq(u8, a.name, "vk::ext_decorate_id") or eq(u8, a.name, "vk::ext_decorate_string")) and a.args.len >= 1) {
+                var d: ir.ExtDecoration = .{ .decoration = int(l, a.args[0]) orelse continue, .kind = if (eq(u8, a.name, "vk::ext_decorate")) .literal else if (eq(u8, a.name, "vk::ext_decorate_id")) .id else .string };
+                var ints: std.ArrayList(u32) = .empty;
+                var strs: std.ArrayList([]const u8) = .empty;
+                var ok = true;
+                for (a.args[1..]) |arg| {
+                    if (arg.kind == .string_lit) {
+                        try strs.append(l.arena, try stringContents(l.arena, arg.kind.string_lit));
+                    } else if (int(l, arg)) |v| {
+                        try ints.append(l.arena, v);
+                    } else ok = false;
+                }
+                if (!ok) continue;
+                d.ints = ints.items;
+                d.strings = strs.items;
+                try decs.append(l.arena, d);
+            }
+        }
+        x.decorations = decs.items;
+        x.capabilities = caps.items;
+        x.extensions = exts.items;
+        return x;
+    }
+
     /// `[[vk::constant_id(n)]] const T x = v;` (SPIR-V only).
     fn isSpecConstant(l: *Lowerer, v: *const Variable) bool {
         if (!l.s.opts.spirv or v.storage != .global_uniform) return false;
@@ -190,7 +238,7 @@ const Lowerer = struct {
                     .resource => |r| r,
                     else => null,
                 };
-                if (r) |res| if (res.kind == .other) continue;
+                if (r) |res| if (res.kind == .other and !std.mem.startsWith(u8, res.name, "SubpassInput")) continue;
                 const d = v.decl orelse continue;
                 if (isShaderRecord(d.attrs) or hasAttr(d.attrs, "vk::push_constant")) continue;
                 var bd = try l.bindingDecl(d.semantics, d.attrs, l.globals.get(v));
@@ -388,7 +436,7 @@ const Lowerer = struct {
         };
         const shader_record = if (v.decl) |d| isShaderRecord(d.attrs) else false;
         const push_constant = if (v.decl) |d| hasAttr(d.attrs, "vk::push_constant") else false;
-        try l.m.globals.append(l.arena, .{ .name = v.name, .ty = v.type, .space = space, .binding = binding, .shader_record = shader_record, .push_constant = push_constant });
+        try l.m.globals.append(l.arena, .{ .name = v.name, .ty = v.type, .space = space, .binding = binding, .shader_record = shader_record, .push_constant = push_constant, .input_attachment = if (v.decl) |d| l.s.vkAttrInt(d.attrs, "vk::input_attachment_index") else null, .image_format = if (v.decl) |d| imageFormatNamed(semamod.Sema.vkAttrString(d.attrs, "vk::image_format")) else null, .ext = if (v.decl) |d| try l.spirvExt(d.attrs) else .{} });
         const i: u32 = @intCast(l.m.globals.items.len - 1);
         try l.globals.put(l.arena, v, i);
         return i;
@@ -1175,11 +1223,54 @@ const Lowerer = struct {
         }
     }
 
+    /// A call of a `[[vk::ext_instruction(opcode[, set])]]` function: the
+    /// instruction itself (SPIR-V only).
+    fn spirvInstCall(l: *Lowerer, e: *ast.Expr, f: *const semamod.Function, args: []const *ast.Expr, ret_ty: TypeId) Error!Ref {
+        if (!l.s.opts.spirv) return l.fail(e, "inline SPIR-V outside SPIR-V");
+        var inst: ir.SpirvInst = .{ .opcode = 0, .operands = &.{} };
+        var caps: std.ArrayList(u32) = .empty;
+        var exts: std.ArrayList([]const u8) = .empty;
+        for (f.decl.attrs) |a| {
+            if (std.mem.eql(u8, a.name, "vk::ext_instruction") and a.args.len >= 1) {
+                inst.opcode = @intCast(l.s.evalInt(a.args[0]) orelse return l.fail(e, "this inline SPIR-V instruction"));
+                if (a.args.len >= 2 and a.args[1].kind == .string_lit) inst.set = try stringContents(l.arena, a.args[1].kind.string_lit);
+            }
+            if (std.mem.eql(u8, a.name, "vk::ext_capability")) for (a.args) |x| {
+                try caps.append(l.arena, @intCast(l.s.evalInt(x) orelse continue));
+            };
+            if (std.mem.eql(u8, a.name, "vk::ext_extension")) for (a.args) |x| if (x.kind == .string_lit) {
+                try exts.append(l.arena, try stringContents(l.arena, x.kind.string_lit));
+            };
+        }
+        const Operand = @typeInfo(@TypeOf(inst.operands)).pointer.child;
+        var ops: std.ArrayList(Operand) = .empty;
+        for (args, 0..) |a, i| {
+            const pd = if (i < f.decl.params.len) f.decl.params[i] else null;
+            const pattrs: []const ast.Attribute = if (pd) |x| x.attrs else &.{};
+            if (hasAttr(pattrs, "vk::ext_literal")) {
+                const v = l.s.evalInt(a) orelse return l.fail(a, "a non-constant [[vk::ext_literal]] argument");
+                try ops.append(l.arena, .{ .literal = @truncate(@as(u64, @bitCast(v))) });
+            } else if (hasAttr(pattrs, "vk::ext_reference")) {
+                try ops.append(l.arena, .{ .value = try l.lvalue(a) });
+            } else {
+                const pt = if (i < f.params.len) f.params[i].type else a.ty;
+                try ops.append(l.arena, .{ .value = try l.converted(a, pt) });
+            }
+        }
+        inst.operands = ops.items;
+        inst.capabilities = caps.items;
+        inst.extensions = exts.items;
+        const p = try l.arena.create(ir.SpirvInst);
+        p.* = inst;
+        return l.b.add(.{ .op = .{ .spirv_inst = p }, .ty = ret_ty });
+    }
+
     fn call(l: *Lowerer, e: *ast.Expr, callee: *ast.Expr, args: []const *ast.Expr) Error!Ref {
         const r = l.s.resolution(e) orelse return l.fail(e, "this call");
         const ret_ty = try l.concrete(e.ty);
         switch (r) {
             .function => |f| {
+                if (!f.defined and hasAttr(f.decl.attrs, "vk::ext_instruction")) return l.spirvInstCall(e, f, args, ret_ty);
                 const fi = try l.functionIndex(f);
                 // Missing trailing arguments take the parameters' defaults.
                 var full = args;
@@ -1600,6 +1691,7 @@ const Lowerer = struct {
         vk_location: ?u32 = null,
         vk_index: ?u32 = null,
         vk_builtin: ?[]const u8 = null,
+        ext_decorations: []const ir.ExtDecoration = &.{},
 
         /// A field's modifiers, inheriting the enclosing interpolation.
         fn field(outer: SigAttrs, fld: Field) SigAttrs {
@@ -1615,6 +1707,7 @@ const Lowerer = struct {
         r.vk_location = attrs.vk_location;
         r.vk_index = attrs.vk_index;
         r.vk_builtin = attrs.vk_builtin;
+        r.ext_decorations = attrs.ext_decorations;
         return r;
     }
 
@@ -1628,6 +1721,7 @@ const Lowerer = struct {
             const lit = at.args[0].kind.string_lit;
             a.vk_builtin = lit[1 .. lit.len - 1];
         };
+        a.ext_decorations = (l.spirvExt(attrs) catch ir.SpirvExt{}).decorations;
         return a;
     }
 
@@ -2008,7 +2102,7 @@ const Lowerer = struct {
 
     fn buildEntry(l: *Lowerer, f: *const semamod.Function, main: u32, opts: Options) Error!void {
         const inits = try l.staticInits();
-        var entry: ir.Entry = .{ .func = main, .name = opts.entry, .stage = opts.stage };
+        var entry: ir.Entry = .{ .func = main, .name = opts.entry, .stage = opts.stage, .ext = try l.spirvExt(f.decl.attrs) };
         entry.outputs = l.early_outputs;
         for (f.decl.attrs) |a| {
             if (std.ascii.eqlIgnoreCase(a.name, "numthreads") and a.args.len == 3) {
@@ -2220,6 +2314,21 @@ fn packOffset(v: *const Variable) ?u32 {
         };
         return reg * 16 + comp * 4;
     }
+    return null;
+}
+
+/// The SPIR-V ImageFormat a `[[vk::image_format]]` names.
+fn imageFormatNamed(name: ?[]const u8) ?u32 {
+    const n = name orelse return null;
+    const names = [_][]const u8{
+        "unknown",     "rgba32f",     "rgba16f",   "r32f",       "rgba8",      "rgba8snorm",  "rg32f",    "rg16f",
+        "r11g11b10f",  "r16f",        "rgba16",    "rgb10a2",    "rg16",       "rg8",         "r16",      "r8",
+        "rgba16snorm", "rg16snorm",   "rg8snorm",  "r16snorm",   "r8snorm",    "rgba32i",     "rgba16i",  "rgba8i",
+        "r32i",        "rg32i",       "rg16i",     "rg8i",       "r16i",       "r8i",         "rgba32ui", "rgba16ui",
+        "rgba8ui",     "r32ui",       "rgb10a2ui", "rg32ui",     "rg16ui",     "rg8ui",       "r16ui",    "r8ui",
+        "r64ui",       "r64i",
+    };
+    for (names, 0..) |x, k| if (std.ascii.eqlIgnoreCase(x, n)) return @intCast(k);
     return null;
 }
 

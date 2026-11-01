@@ -1067,6 +1067,8 @@ pub const Sema = struct {
             return s.types.intern(.{ .resource = .{ .kind = vn[1], .elem = elem, .name = n } });
         };
         // Any other builtin object (RayQuery, node records, vk:: types...).
+        // vk::ext_result_id<T>: a T (an inline instruction's result).
+        if (eql(n, "ext_result_id") and args.len == 1) return try s.typeArg(args[0]) orelse TypeTable.error_type;
         if (isOtherBuiltinObject(n)) {
             var elem: TypeId = TypeTable.void_type;
             if (eql(n, "RayQuery")) {
@@ -1075,6 +1077,8 @@ pub const Sema = struct {
                 return s.types.intern(.{ .resource = .{ .kind = .other, .elem = elem, .name = n, .flags = flags, .flags2 = flags2 } });
             }
             if (args.len > 0) elem = try s.typeArg(args[0]) orelse TypeTable.void_type;
+            // SubpassInput / SubpassInputMS default to float4.
+            if (elem == TypeTable.void_type and std.mem.startsWith(u8, n, "SubpassInput")) elem = try s.types.vector(.float, 4);
             return s.types.intern(.{ .resource = .{ .kind = .other, .elem = elem, .name = n } });
         }
         // The parser already reported unknown type names.
@@ -3592,7 +3596,7 @@ fn methodNamespace(t: types.Type) ?[]const u8 {
             .sampled_texture_cube => "VkSampledTextureCUBEMethods",
             .sampled_texture_cube_array => "VkSampledTextureCUBEArrayMethods",
             .constant_buffer, .texture_buffer, .raytracing_acceleration_structure => null,
-            .other => if (std.mem.eql(u8, r.name, "RayQuery")) "RayQueryMethods" else null,
+            .other => if (std.mem.eql(u8, r.name, "RayQuery")) "RayQueryMethods" else if (std.mem.eql(u8, r.name, "SubpassInput")) "VkSubpassInputMethods" else if (std.mem.eql(u8, r.name, "SubpassInputMS")) "VkSubpassInputMSMethods" else null,
         },
         else => null,
     };

@@ -1382,6 +1382,7 @@ const Emitter = struct {
             .constant => |c| return e.list(&.{try e.constant(i.ty, c)}),
             .param => |p| return frame.params[p],
             .spec_constant => return e.unsupported("specialization constants outside SPIR-V", .{}),
+            .spirv_inst => return e.unsupported("inline SPIR-V outside SPIR-V", .{}),
             .ray_incoming => |k| {
                 // The shader's payload / attribute / parameter argument.
                 const idx: usize = if (k == .attributes) 1 else 0;
