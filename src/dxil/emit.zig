@@ -1506,7 +1506,8 @@ const Emitter = struct {
                     try e.rq_locals.append(e.arena, .{ .h = null, .ty = i.ty });
                     return .{ .rq_local = @intCast(e.rq_locals.items.len - 1) };
                 }
-                if (isResourceType(e.t, i.ty)) {
+                // (An array of resources is one alias too: of an array.)
+                if (isResourceType(e.t, i.ty) or e.isResourceArray(i.ty)) {
                     try e.res_locals.append(e.arena, null);
                     return .{ .res_local = @intCast(e.res_locals.items.len - 1) };
                 }
@@ -1635,6 +1636,13 @@ const Emitter = struct {
                     return .{ .typed = tp };
                 }
                 if (frame.vals[a.base.index()] == .agg_ptr) return e.aggAccess(frame, frame.vals[a.base.index()].agg_ptr, a.indices);
+                // An element of a local array of resources: of the array
+                // it aliases.
+                if (frame.vals[a.base.index()] == .res_local) {
+                    const held = e.res_locals.items[frame.vals[a.base.index()].res_local] orelse return e.unsupported("a resource local read before it is assigned", .{});
+                    if (held != .res_array) return e.unsupported("indexing this resource is not supported yet", .{});
+                    return e.arrayElement(frame, held.res_array, a.indices);
+                }
                 if (frame.vals[a.base.index()] == .res_array) return e.arrayElement(frame, frame.vals[a.base.index()].res_array, a.indices);
                 if (frame.vals[a.base.index()] == .cbuf) return e.cbufferAccess(frame, frame.vals[a.base.index()].cbuf, f.inst(a.base).ty, a.indices);
                 if (frame.vals[a.base.index()] == .handle) {
@@ -1860,6 +1868,13 @@ const Emitter = struct {
             },
             else => 0,
         };
+    }
+
+    fn isResourceArray(e: *Emitter, ty: TypeId) bool {
+        var t = ty;
+        if (e.t.get(t) != .array) return false;
+        while (e.t.get(t) == .array) t = e.t.get(t).array.elem;
+        return isResourceType(e.t, t) and !isRayQuery(e.t, t);
     }
 
     /// A struct or array with resources in it.

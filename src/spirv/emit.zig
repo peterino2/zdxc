@@ -2212,7 +2212,7 @@ const Emitter = struct {
                     return;
                 }
                 // Resources stay as their variables (accessed by chains).
-                if (i.ptr == .none and (e.t.get(i.ty) == .resource or e.t.get(i.ty) == .sampler)) {
+                if (i.ptr == .none and (e.t.get(i.ty) == .resource or e.t.get(i.ty) == .sampler or (e.t.get(i.ty) == .array and isResourceType(e.t, i.ty)))) {
                     e.vals[ri] = e.val(p);
                     return;
                 }
@@ -3055,6 +3055,8 @@ const Emitter = struct {
                     },
                     .call => |c| for (c.args) |x| if (x.index() == k) return false,
                     .store => |st| if (st.value.index() == k) return false,
+                    // (Read whole: passed on to a function.)
+                    .load => |p| if (p.index() == k) return false,
                     else => {},
                 };
             }
