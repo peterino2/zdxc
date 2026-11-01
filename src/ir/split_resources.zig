@@ -50,6 +50,11 @@ fn leafTypes(a: Allocator, t: *const TypeTable, ty: TypeId, out: *std.ArrayList(
     }
 }
 
+/// An out / inout parameter of a resource (or array of them).
+fn isRefResource(t: *const TypeTable, prm: ir.Param) bool {
+    return prm.by_ref and !prm.groupshared and prm.dir != .in and isOpaque(t, prm.ty);
+}
+
 fn leafCount(t: *const TypeTable, ty: TypeId) u32 {
     if (isOpaque(t, ty)) return 1;
     return switch (t.get(ty)) {
@@ -83,6 +88,13 @@ const FuncInfo = struct {
     done: bool = false,
     /// Original parameter index -> index of its first leaf parameter.
     leaf_params: []?u32 = &.{},
+    /// Original parameter index -> new index (null: an out / inout
+    /// resource, now a local of the callee).
+    param_map: []?u32 = &.{},
+    /// Out / inout resources: the parameter bringing an inout one's value
+    /// in, and where the value going out comes from.
+    ref_in: []?u32 = &.{},
+    ref_out: []?Source = &.{},
     /// The returned resources' origins (functions returning resources).
     ret: ?[]const Source = null,
     /// The function returned only resources and now returns nothing.
@@ -95,6 +107,8 @@ const Pass = struct {
     t: *TypeTable,
     diags: *diag.Diagnostics,
     infos: []FuncInfo,
+    /// The current function's parameter index map.
+    cur_map: []?u32 = &.{},
 
     fn fail(p: *Pass, comptime fmt: []const u8, args: anytype) Error {
         p.diags.err(.none, "SPIR-V code generation: " ++ fmt ++ " is not supported yet", args);
@@ -106,11 +120,33 @@ const Pass = struct {
     fn signature(p: *Pass, fi: u32) Allocator.Error!void {
         const f = p.m.functions.items[fi];
         const info = &p.infos[fi];
-        info.leaf_params = try p.a.alloc(?u32, f.params.len);
+        const np_old = f.params.len;
+        info.leaf_params = try p.a.alloc(?u32, np_old);
+        info.param_map = try p.a.alloc(?u32, np_old);
+        info.ref_in = try p.a.alloc(?u32, np_old);
+        info.ref_out = try p.a.alloc(?Source, np_old);
         @memset(info.leaf_params, null);
+        @memset(info.ref_in, null);
+        @memset(info.ref_out, null);
         var params: std.ArrayList(ir.Param) = .empty;
-        try params.appendSlice(p.a, f.params);
+        // Out / inout resources leave the parameter list (a pointer to a
+        // resource cannot be passed).
         for (f.params, 0..) |prm, k| {
+            if (isRefResource(p.t, prm)) {
+                info.param_map[k] = null;
+                continue;
+            }
+            info.param_map[k] = @intCast(params.items.len);
+            try params.append(p.a, prm);
+        }
+        for (f.params, 0..) |prm, k| {
+            if (isRefResource(p.t, prm)) {
+                if (prm.dir == .inout) {
+                    info.ref_in[k] = @intCast(params.items.len);
+                    try params.append(p.a, .{ .name = prm.name, .ty = prm.ty, .by_ref = false, .sema_ty = prm.ty });
+                }
+                continue;
+            }
             if (!holdsResources(p.t, prm.ty)) continue;
             info.leaf_params[k] = @intCast(params.items.len);
             var leaves: std.ArrayList(TypeId) = .empty;
@@ -125,6 +161,29 @@ const Pass = struct {
         return @enumFromInt(f.insts.items.len - 1);
     }
 
+    fn leafParam(p: *Pass, f: *ir.Function, r: Ref, old: ir.Inst, ty: TypeId, pi: u32, first: u32, out: *std.ArrayList(Ref), leaves: *std.AutoHashMapUnmanaged(Ref, []const Ref), pleaves: *std.AutoHashMapUnmanaged(Ref, []const Ref)) Error!void {
+        f.insts.items[r.index()].op = .{ .param = p.cur_map[pi].? };
+        try out.append(p.a, r);
+        var lts: std.ArrayList(TypeId) = .empty;
+        try leafTypes(p.a, p.t, ty, &lts);
+        const vals = try p.a.alloc(Ref, lts.items.len);
+        for (vals, lts.items, 0..) |*v, lt, n| {
+            v.* = try add(f, p.a, .{ .op = .{ .param = first + @as(u32, @intCast(n)) }, .ty = lt });
+            try out.append(p.a, v.*);
+        }
+        if (old.ptr != .none) {
+            // By reference (`this`, inout): locals of its own, initialized
+            // from the leaf parameters.
+            const ptrs = try p.a.alloc(Ref, vals.len);
+            for (ptrs, vals, lts.items) |*pp, v, lt| {
+                pp.* = try add(f, p.a, .{ .op = .local_var, .ty = lt, .ptr = .function });
+                try out.append(p.a, pp.*);
+                try out.append(p.a, try add(f, p.a, .{ .op = .{ .store = .{ .ptr = pp.*, .value = v } }, .ty = TypeTable.void_type }));
+            }
+            try pleaves.put(p.a, r, ptrs);
+        } else try leaves.put(p.a, r, vals);
+    }
+
     fn function(p: *Pass, fi: u32) Error!void {
         const info = &p.infos[fi];
         if (info.done) return;
@@ -133,6 +192,7 @@ const Pass = struct {
         // Callees first: their returns may be resources.
         for (f.insts.items) |inst| if (inst.op == .call) try p.function(inst.op.call.func);
 
+        p.cur_map = info.param_map;
         var leaves: std.AutoHashMapUnmanaged(Ref, []const Ref) = .empty;
         var pleaves: std.AutoHashMapUnmanaged(Ref, []const Ref) = .empty;
         var repl: std.AutoHashMapUnmanaged(Ref, Ref) = .empty;
@@ -144,6 +204,8 @@ const Pass = struct {
         };
         const mp: Map = .{ .r = &repl };
         var rets: std.ArrayList([]const Ref) = .empty;
+        var ref_locals: std.AutoHashMapUnmanaged(u32, Ref) = .empty;
+        var ref_init: std.AutoHashMapUnmanaged(Ref, void) = .empty;
         const n_old = f.insts.items.len;
         const ret_holds = holdsResources(p.t, f.ret) or isOpaque(p.t, f.ret);
 
@@ -154,27 +216,33 @@ const Pass = struct {
                 const op = try opt.mapOp(p.a, old.op, mp);
                 f.insts.items[r.index()].op = op;
                 const ty = old.ty;
+                // Kept parameters move to their new index.
+                if (op == .param and op.param < info.param_map.len) if (info.param_map[op.param]) |np| if (info.leaf_params[op.param] == null) {
+                    f.insts.items[r.index()].op = .{ .param = np };
+                };
                 switch (op) {
-                    .param => |pi| if (pi < info.leaf_params.len) if (info.leaf_params[pi]) |first| {
-                        try out.append(p.a, r);
-                        var lts: std.ArrayList(TypeId) = .empty;
-                        try leafTypes(p.a, p.t, ty, &lts);
-                        const vals = try p.a.alloc(Ref, lts.items.len);
-                        for (vals, lts.items, 0..) |*v, lt, n| {
-                            v.* = try add(f, p.a, .{ .op = .{ .param = first + @as(u32, @intCast(n)) }, .ty = lt });
-                            try out.append(p.a, v.*);
+                    // An out / inout resource: a local of its own (an
+                    // inout one starts as the value passed in).
+                    .param => |pi| {
+                        if (pi < info.leaf_params.len) if (info.leaf_params[pi]) |first| {
+                            try p.leafParam(f, r, old, ty, pi, first, &out, &leaves, &pleaves);
+                            continue;
+                        };
+                        if (!(pi < info.param_map.len and info.param_map[pi] == null)) {
+                            try out.append(p.a, r);
+                            continue;
                         }
-                        if (old.ptr != .none) {
-                            // By reference (`this`, inout): locals of its
-                            // own, initialized from the leaf parameters.
-                            const ptrs = try p.a.alloc(Ref, vals.len);
-                            for (ptrs, vals, lts.items) |*pp, v, lt| {
-                                pp.* = try add(f, p.a, .{ .op = .local_var, .ty = lt, .ptr = .function });
-                                try out.append(p.a, pp.*);
-                                try out.append(p.a, try add(f, p.a, .{ .op = .{ .store = .{ .ptr = pp.*, .value = v } }, .ty = TypeTable.void_type }));
-                            }
-                            try pleaves.put(p.a, r, ptrs);
-                        } else try leaves.put(p.a, r, vals);
+                        f.insts.items[r.index()].op = .local_var;
+                        f.insts.items[r.index()].ptr = .function;
+                        try out.append(p.a, r);
+                        try ref_locals.put(p.a, pi, r);
+                        if (info.ref_in[pi]) |in| {
+                            const v = try add(f, p.a, .{ .op = .{ .param = in }, .ty = ty });
+                            try out.append(p.a, v);
+                            const st = try add(f, p.a, .{ .op = .{ .store = .{ .ptr = r, .value = v } }, .ty = TypeTable.void_type });
+                            try out.append(p.a, st);
+                            try ref_init.put(p.a, st, {});
+                        }
                         continue;
                     },
                     .local_var => if (holdsResources(p.t, ty)) {
@@ -271,8 +339,15 @@ const Pass = struct {
                     .call => |c| {
                         const ci = &p.infos[c.func];
                         var args: std.ArrayList(Ref) = .empty;
-                        try args.appendSlice(p.a, c.args);
+                        for (c.args, 0..) |arg, k| if (k >= ci.param_map.len or ci.param_map[k] != null) try args.append(p.a, arg);
                         for (c.args, 0..) |arg, k| {
+                            if (k < ci.ref_in.len) if (ci.ref_in[k] != null) {
+                                // An inout resource's value goes in.
+                                const v = try add(f, p.a, .{ .op = .{ .load = arg }, .ty = f.insts.items[arg.index()].ty });
+                                try out.append(p.a, v);
+                                try args.append(p.a, v);
+                                continue;
+                            };
                             if (k >= ci.leaf_params.len or ci.leaf_params[k] == null) continue;
                             if (leaves.get(arg)) |vals| {
                                 try args.appendSlice(p.a, vals);
@@ -287,6 +362,24 @@ const Pass = struct {
                         f.insts.items[r.index()].op = .{ .call = .{ .func = c.func, .args = args.items } };
                         if (ci.ret_void) f.insts.items[r.index()].ty = TypeTable.void_type;
                         try out.append(p.a, r);
+                        // Out / inout resources come back: the argument's
+                        // storage gets the parameter or global they are.
+                        for (c.args, 0..) |arg, k| {
+                            if (k >= ci.ref_out.len) continue;
+                            const src = ci.ref_out[k] orelse continue;
+                            const at = f.insts.items[arg.index()].ty;
+                            const v = switch (src) {
+                                .param => |pi| args.items[pi],
+                                .global => |g| blk: {
+                                    const gp = try add(f, p.a, .{ .op = .{ .global = g }, .ty = at, .ptr = .resource });
+                                    try out.append(p.a, gp);
+                                    const l = try add(f, p.a, .{ .op = .{ .load = gp }, .ty = at });
+                                    try out.append(p.a, l);
+                                    break :blk l;
+                                },
+                            };
+                            try out.append(p.a, try add(f, p.a, .{ .op = .{ .store = .{ .ptr = arg, .value = v } }, .ty = TypeTable.void_type }));
+                        }
                         // What the callee returns: its arguments or
                         // globals.
                         if (ci.ret) |srcs| {
@@ -331,6 +424,23 @@ const Pass = struct {
             _ = bi;
         }
         _ = n_old;
+        // What each out / inout resource holds when the function returns:
+        // every store into it (other than the incoming value) the same
+        // parameter or global.
+        var it = ref_locals.iterator();
+        while (it.next()) |kv| {
+            var src: ?Source = if (info.ref_in[kv.key_ptr.*]) |in| .{ .param = in } else null;
+            var seen = false;
+            for (f.insts.items, 0..) |inst, ii| {
+                if (inst.op != .store or inst.op.store.ptr != kv.value_ptr.*) continue;
+                if (ref_init.contains(@enumFromInt(ii))) continue;
+                const here = p.trace(f, inst.op.store.value) orelse return p.fail("passing out a resource that is not a parameter or global", .{});
+                if (seen and !std.meta.eql(src.?, here)) return p.fail("passing out different resources from one function", .{});
+                src = here;
+                seen = true;
+            }
+            info.ref_out[kv.key_ptr.*] = src;
+        }
         if (ret_holds) {
             var srcs: ?[]Source = null;
             for (rets.items) |vals| {
@@ -374,7 +484,7 @@ const Pass = struct {
 pub fn run(a: Allocator, m: *ir.Module, diags: *diag.Diagnostics) Error!void {
     var any = false;
     for (m.functions.items) |f| {
-        for (f.params) |prm| if (holdsResources(m.types, prm.ty)) {
+        for (f.params) |prm| if (holdsResources(m.types, prm.ty) or isRefResource(m.types, prm)) {
             any = true;
         };
         if (holdsResources(m.types, f.ret) or isOpaque(m.types, f.ret)) any = true;

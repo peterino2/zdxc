@@ -1595,6 +1595,12 @@ const Emitter = struct {
                     try e.aggStore(frame.vals[s.ptr.index()].agg_ptr, frame.vals[s.value.index()]);
                     return .none;
                 }
+                // A resource written back to the global it is (an inout
+                // argument): nothing to do.
+                if (frame.vals[s.ptr.index()] == .handle or frame.vals[s.ptr.index()] == .res_array) {
+                    if (std.meta.eql(frame.vals[s.ptr.index()], frame.vals[s.value.index()])) return .none;
+                    return e.unsupported("assigning another resource to a global resource", .{});
+                }
                 if (frame.vals[s.ptr.index()] == .mesh) {
                     try e.meshStore(frame.vals[s.ptr.index()].mesh, try e.scalars(frame, s.value), f.inst(s.value).ty);
                     return .none;

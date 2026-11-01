@@ -708,10 +708,8 @@ const Lowerer = struct {
                     try l.vars.put(l.arena, variable, try l.b.add(.{ .op = .{ .global = gi }, .ty = glob.ty, .ptr = glob.space }));
                     return;
                 }
-                if (v.init == null and isObject(&l.s.types, variable.type) and !isRayQuery(&l.s.types, variable.type)) {
-                    l.unsupported(d.loc, "uninitialized local resource '{s}' is not supported yet", .{variable.name});
-                    return error.Unsupported;
-                }
+                // (A resource local is an alias of what is stored into it:
+                // reading it before that is reported by the backends.)
                 if (isSpirvPointer(&l.s.types, variable.type)) {
                     const init_e = v.init orelse {
                         l.unsupported(d.loc, "uninitialized inline SPIR-V pointer '{s}' is not supported", .{variable.name});

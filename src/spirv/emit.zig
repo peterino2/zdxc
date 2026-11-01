@@ -908,6 +908,12 @@ const Emitter = struct {
             try e.emitFunction(m.functions.items[v.fi], v.id, v.bindings);
         }
 
+        // An acceleration structure only declared (dxc's optimizer drops
+        // it): its type needs ray queries or ray tracing.
+        if (e.accel_type != 0 and !e.capabilities.contains(.ray_tracing_khr) and !e.capabilities.contains(.ray_query_khr)) {
+            try e.cap(.ray_query_khr);
+            try e.extension("SPV_KHR_ray_query");
+        }
         // The Vulkan memory model, when asked for or needed (as dxc).
         const vulkan_mm = e.vk.vulkan_memory_model or e.capabilities.contains(.vulkan_memory_model);
         if (vulkan_mm) {
@@ -2213,6 +2219,7 @@ const Emitter = struct {
                 }
                 // Resources stay as their variables (accessed by chains).
                 if (i.ptr == .none and (e.t.get(i.ty) == .resource or e.t.get(i.ty) == .sampler or (e.t.get(i.ty) == .array and isResourceType(e.t, i.ty)))) {
+                    if (e.val(p) == 0 and f.inst(p).op == .local_var) return e.unsupported("a resource local read before it is assigned", .{});
                     e.vals[ri] = e.val(p);
                     return;
                 }
@@ -2234,6 +2241,12 @@ const Emitter = struct {
                     // A copy of a RayQuery is the same query object.
                     e.vals[s.ptr.index()] = e.val(s.value);
                     return;
+                }
+                // A resource written back to the global it is (an inout
+                // argument): nothing to do.
+                if (target.op != .local_var and isResourceType(e.t, target.ty) and target.ptr == .resource) {
+                    if (e.val(s.value) == e.val(s.ptr)) return;
+                    return e.unsupported("assigning another resource to a global resource", .{});
                 }
                 if (target.op == .local_var and isResourceType(e.t, target.ty)) {
                     const old = e.vals[s.ptr.index()];
