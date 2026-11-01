@@ -4495,12 +4495,17 @@ const Emitter = struct {
     /// What the module does with matrices (PSV0), when it has any.
     fn linAlgTables(e: *Emitter) Error!?linalg_info.Tables {
         if (!e.uses_linalg) return null;
+        return try linalg_info.collect(e.arena, &e.dm, try e.linAlgMatrices());
+    }
+
+    /// Each matrix type's attributes.
+    fn linAlgMatrices(e: *Emitter) Error!linalg_info.Matrices {
         const mats = try e.arena.alloc(struct { module.TypeId, linalg_info.Matrix }, e.linalg_types.items.len);
         for (mats, e.linalg_types.items) |*m, x| {
             const la = e.t.get(x.ty).linalg;
             m.* = .{ x.dty, .{ .comp = la.comp, .m = la.m, .n = la.n, .use = la.use, .scope = la.scope } };
         }
-        return try linalg_info.collect(e.arena, &e.dm, mats);
+        return mats;
     }
 
     /// `!dx.targetTypes`: each matrix type with its attributes.
@@ -4925,8 +4930,6 @@ const Emitter = struct {
     }
 
     fn writeLibraryModule(e: *Emitter, funcs: []const LibFunc) Error![]u8 {
-        // (RDAT's per-function linear algebra properties are not written.)
-        if (e.uses_linalg) return e.unsupported("linear algebra in libraries is not supported yet", .{});
         const dm = &e.dm;
         const mdI32 = struct {
             fn f(m: *module.Module, v: i64) !module.MdId {
@@ -5028,6 +5031,7 @@ const Emitter = struct {
             if (r.lib_global) |lg| try res_index.put(e.arena, lg, count);
             count += 1;
         };
+        const mats = try e.linAlgMatrices();
         for (funcs, analysis.infos) |lf, info| {
             const f = &e.dm.functions.items[lf.func];
             const name = try b.string(lf.name);
@@ -5040,11 +5044,13 @@ const Emitter = struct {
                 }
             };
             std.mem.sort(u32, used.items, {}, std.sort.asc(u32));
+            const resources = if (used.items.len > 0) try b.array(used.items) else rdat.null_ref;
+            const props = if (e.uses_linalg) try linalg_info.rdatProperties(e.arena, &b, &try linalg_info.functionInfo(e.arena, &e.dm, mats, lf.func)) else rdat.null_ref;
             const kind = shaderKind(lf.stage);
             try b.addFunction(.{
                 .name = name,
                 .unmangled_name = unmangled,
-                .resources = if (used.items.len > 0) try b.array(used.items) else rdat.null_ref,
+                .resources = resources,
                 .shader_kind = kind,
                 .payload_size = lf.payload_size,
                 .attribute_size = lf.attr_size,
@@ -5052,6 +5058,7 @@ const Emitter = struct {
                 .feature_info2 = @truncate(libinfo.featureInfo(info.flags) >> 32),
                 .shader_stage_flag = if (lf.stage == .library) info.mask & 0xffff else info.mask & (@as(u32, 1) << @intCast(kind)),
                 .min_shader_target = (kind << 16) | (6 << 4) | libinfo.minMinor(info, if (lf.stage == .library) null else kind),
+                .extended_properties = props,
             });
         }
         for (e.m.subobjects.items) |so| {

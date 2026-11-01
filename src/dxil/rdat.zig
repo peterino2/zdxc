@@ -5,7 +5,8 @@
 //! Layout: a header (version, part count), part offsets, then each
 //! non-empty part as (type, size) and its 4-byte aligned contents. Parts
 //! come in the order dxc adds them: strings, resources, functions, index
-//! arrays, raw bytes, subobjects (only the first four are produced here).
+//! arrays, raw bytes, subobjects, then the record tables of the extended
+//! function properties (SM 6.10 linear algebra).
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -43,6 +44,28 @@ pub const Function = struct {
     extended_properties: u32 = null_ref,
 };
 
+/// The extended function property tables, in part order (part types
+/// 13..20).
+pub const Ext = enum(u32) {
+    properties = 13,
+    shapes,
+    constructions,
+    thread_matvec,
+    wave_multiplies,
+    group_multiplies,
+    outer_products,
+    accumulate_stores,
+
+    /// Record size in bytes.
+    pub fn stride(t: Ext) usize {
+        return switch (t) {
+            .shapes => 12,
+            .properties, .constructions, .wave_multiplies, .group_multiplies => 8,
+            .thread_matvec, .outer_products, .accumulate_stores => 4,
+        };
+    }
+};
+
 pub const Builder = struct {
     gpa: Allocator,
     strings: std.ArrayList(u8) = .empty,
@@ -52,6 +75,7 @@ pub const Builder = struct {
     functions: std.ArrayList([14]u32) = .empty,
     raw: std.ArrayList(u8) = .empty,
     subobjects: std.ArrayList([6]u32) = .empty,
+    ext: [8]std.ArrayList(u8) = @splat(.empty),
 
     pub fn init(gpa: Allocator) Allocator.Error!Builder {
         var b: Builder = .{ .gpa = gpa };
@@ -104,6 +128,19 @@ pub const Builder = struct {
         try b.subobjects.append(b.gpa, rec);
     }
 
+    /// Index of a record in table `t`; an identical record is shared
+    /// (record deduplication, validator 1.7+).
+    pub fn record(b: *Builder, t: Ext, rec: []const u8) Allocator.Error!u32 {
+        std.debug.assert(rec.len == t.stride());
+        const tab = &b.ext[@intFromEnum(t) - 13];
+        var at: usize = 0;
+        while (at < tab.items.len) : (at += rec.len) {
+            if (std.mem.eql(u8, tab.items[at..][0..rec.len], rec)) return @intCast(at / rec.len);
+        }
+        try tab.appendSlice(b.gpa, rec);
+        return @intCast(at / rec.len);
+    }
+
     /// Offset of `bytes` in the raw bytes part.
     pub fn bytes(b: *Builder, data: []const u8) Allocator.Error!u32 {
         const off: u32 = @intCast(b.raw.items.len);
@@ -139,6 +176,12 @@ pub const Builder = struct {
             try tables.append(b.gpa, t);
             try parts.append(b.gpa, .{ .ty = 6, .data = t });
         }
+        for (b.ext, 13..) |rows, ty| if (rows.items.len > 0) {
+            const stride = @as(Ext, @enumFromInt(ty)).stride();
+            const t = try table(b.gpa, stride / 4, rows.items, rows.items.len / stride);
+            try tables.append(b.gpa, t);
+            try parts.append(b.gpa, .{ .ty = @intCast(ty), .data = t });
+        };
 
         var size: usize = 8 + 4 * parts.items.len;
         for (parts.items) |p| size += 8 + std.mem.alignForward(usize, p.data.len, 4);
@@ -174,6 +217,7 @@ pub const Builder = struct {
         b.functions.deinit(b.gpa);
         b.raw.deinit(b.gpa);
         b.subobjects.deinit(b.gpa);
+        for (&b.ext) |*t| t.deinit(b.gpa);
     }
 };
 

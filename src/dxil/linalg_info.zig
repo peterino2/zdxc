@@ -6,6 +6,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const module = @import("module.zig");
+const rdat = @import("rdat.zig");
 
 /// A matrix type's attributes (`!dx.targetTypes`).
 pub const Matrix = struct { comp: u32, m: u32, n: u32, use: u32, scope: u32 };
@@ -35,7 +36,7 @@ const Key2 = [2]u8;
 const Key3 = [3]u8;
 const Key4 = [4]u8;
 
-const Info = struct {
+pub const Info = struct {
     constructions: std.AutoArrayHashMapUnmanaged(Key2, std.AutoArrayHashMapUnmanaged(Shape, void)) = .empty,
     matvec: std.AutoArrayHashMapUnmanaged(Key3, u8) = .empty,
     multiplies: std.AutoArrayHashMapUnmanaged(Key4, std.AutoArrayHashMapUnmanaged(Shape, void)) = .empty,
@@ -46,117 +47,142 @@ const Info = struct {
 const transposed: u8 = 1;
 const non_mul_optimal: u8 = 2;
 
+pub const Matrices = []const struct { module.TypeId, Matrix };
+
 /// Collects the usage in every function of `m`; `matrices` maps matrix
 /// types to their attributes.
-pub fn collect(a: Allocator, m: *const module.Module, matrices: []const struct { module.TypeId, Matrix }) Allocator.Error!Tables {
+pub fn collect(a: Allocator, m: *const module.Module, matrices: Matrices) Allocator.Error!Tables {
     var info: Info = .{};
-    const C = struct {
-        m: *const module.Module,
-        mats: []const struct { module.TypeId, Matrix },
-
-        fn matrix(c: @This(), ty: ?module.TypeId) ?Matrix {
-            const t = ty orelse return null;
-            for (c.mats) |x| if (x[0] == t) return x[1];
-            return null;
-        }
-
-        fn constInt(c: @This(), v: module.Value) ?u32 {
-            if (v != .constant) return null;
-            return switch (c.m.constants.items[v.constant].kind) {
-                .int => |x| @truncate(@as(u64, @bitCast(x))),
-                else => null,
-            };
-        }
-
-        /// DXIL::ComponentType of a scalar (or a vector's element).
-        fn component(c: @This(), ty: module.TypeId, signed: bool) u8 {
-            const t = switch (c.m.types.items[ty]) {
-                .vector => |v| c.m.types.items[v.elem],
-                else => |x| x,
-            };
-            return switch (t) {
-                .half => 8,
-                .float => 9,
-                .double => 10,
-                .int => |w| switch (w) {
-                    8 => if (signed) 19 else 20,
-                    16 => if (signed) 2 else 3,
-                    32 => if (signed) 4 else 5,
-                    64 => if (signed) 6 else 7,
-                    else => 0,
-                },
-                else => 0,
-            };
-        }
-    };
     const c: C = .{ .m = m, .mats = matrices };
-    for (m.functions.items) |*f| {
-        const fty = m.types.items[f.ty].function;
-        const typeOf = struct {
-            fn t(mm: *const module.Module, ff: *const module.Function, ft: @FieldType(module.Type, "function"), v: module.Value) ?module.TypeId {
-                return switch (v) {
-                    .global => |g| mm.globals.items[g].ptr_ty,
-                    .function => null,
-                    .constant => |k| mm.constants.items[k].ty,
-                    .arg => |x| ft.params[x],
-                    .inst => |i| ff.insts.items[i].ty,
-                };
+    for (m.functions.items) |*f| try collectFunction(a, c, &info, f);
+    return serialize(a, &info);
+}
+
+/// The usage of function `func` and of the functions it calls (dxc merges
+/// callee usage into callers).
+pub fn functionInfo(a: Allocator, m: *const module.Module, matrices: Matrices, func: u32) Allocator.Error!Info {
+    var info: Info = .{};
+    const c: C = .{ .m = m, .mats = matrices };
+    var seen: std.AutoArrayHashMapUnmanaged(u32, void) = .empty;
+    try seen.put(a, func, {});
+    var k: usize = 0;
+    while (k < seen.count()) : (k += 1) {
+        const f = &m.functions.items[seen.keys()[k]];
+        try collectFunction(a, c, &info, f);
+        for (f.insts.items) |inst| if (inst.op == .call) {
+            const callee = inst.op.call.callee;
+            if (m.functions.items[callee].num_blocks > 0) try seen.put(a, callee, {});
+        };
+    }
+    return info;
+}
+
+const C = struct {
+    m: *const module.Module,
+    mats: Matrices,
+
+    fn matrix(c: @This(), ty: ?module.TypeId) ?Matrix {
+        const t = ty orelse return null;
+        for (c.mats) |x| if (x[0] == t) return x[1];
+        return null;
+    }
+
+    fn constInt(c: @This(), v: module.Value) ?u32 {
+        if (v != .constant) return null;
+        return switch (c.m.constants.items[v.constant].kind) {
+            .int => |x| @truncate(@as(u64, @bitCast(x))),
+            else => null,
+        };
+    }
+
+    /// DXIL::ComponentType of a scalar (or a vector's element).
+    fn component(c: @This(), ty: module.TypeId, signed: bool) u8 {
+        const t = switch (c.m.types.items[ty]) {
+            .vector => |v| c.m.types.items[v.elem],
+            else => |x| x,
+        };
+        return switch (t) {
+            .half => 8,
+            .float => 9,
+            .double => 10,
+            .int => |w| switch (w) {
+                8 => if (signed) 19 else 20,
+                16 => if (signed) 2 else 3,
+                32 => if (signed) 4 else 5,
+                64 => if (signed) 6 else 7,
+                else => 0,
+            },
+            else => 0,
+        };
+    }
+};
+
+fn collectFunction(a: Allocator, c: C, info: *Info, f: *const module.Function) Allocator.Error!void {
+    const m = c.m;
+    const fty = m.types.items[f.ty].function;
+    const typeOf = struct {
+        fn t(mm: *const module.Module, ff: *const module.Function, ft: @FieldType(module.Type, "function"), v: module.Value) ?module.TypeId {
+            return switch (v) {
+                .global => |g| mm.globals.items[g].ptr_ty,
+                .function => null,
+                .constant => |k| mm.constants.items[k].ty,
+                .arg => |x| ft.params[x],
+                .inst => |i| ff.insts.items[i].ty,
+            };
+        }
+    }.t;
+    for (f.insts.items) |inst| {
+        if (inst.op != .call) continue;
+        const call = inst.op.call;
+        if (!std.mem.startsWith(u8, m.functions.items[call.callee].name, "dx.op.linAlg") or call.args.len == 0) continue;
+        const op = c.constInt(call.args[0]) orelse continue;
+        const arg = struct {
+            fn t(cc: C, ff: *const module.Function, ft: @FieldType(module.Type, "function"), args: []const module.Value, k: usize) ?module.TypeId {
+                return if (k < args.len) typeOf(cc.m, ff, ft, args[k]) else null;
             }
         }.t;
-        for (f.insts.items) |inst| {
-            if (inst.op != .call) continue;
-            const call = inst.op.call;
-            if (!std.mem.startsWith(u8, m.functions.items[call.callee].name, "dx.op.linAlg") or call.args.len == 0) continue;
-            const op = c.constInt(call.args[0]) orelse continue;
-            const arg = struct {
-                fn t(cc: C, ff: *const module.Function, ft: @FieldType(module.Type, "function"), args: []const module.Value, k: usize) ?module.TypeId {
-                    return if (k < args.len) typeOf(cc.m, ff, ft, args[k]) else null;
-                }
-            }.t;
-            switch (op) {
-                336, 337 => {
-                    const mat = c.matrix(arg(c, f, fty, call.args, 1)) orelse continue;
-                    const signed = (c.constInt(call.args[2]) orelse 0) != 0;
-                    const key: Key3 = .{ c.component(inst.ty, signed), @intCast(mat.comp), @intCast(c.constInt(call.args[4]) orelse 0) };
-                    const gop = try info.matvec.getOrPut(a, key);
-                    if (!gop.found_existing) gop.value_ptr.* = 0;
-                    gop.value_ptr.* |= layoutFlags(c, f, call.args[1]);
-                },
-                334, 322 => {
-                    const r = c.matrix(inst.ty) orelse continue;
-                    const ma = c.matrix(arg(c, f, fty, call.args, 1)) orelse continue;
-                    const mb = c.matrix(arg(c, f, fty, call.args, 2)) orelse continue;
-                    const key: Key4 = .{ @intCast(r.scope), @intCast(r.comp), @intCast(ma.comp), @intCast(mb.comp) };
-                    const gop = try info.multiplies.getOrPut(a, key);
-                    if (!gop.found_existing) gop.value_ptr.* = .empty;
-                    try gop.value_ptr.put(a, .{ .m = ma.m, .n = mb.n, .k = ma.n }, {});
-                },
-                340 => {
-                    const r = c.matrix(inst.ty) orelse continue;
-                    const signed = (c.constInt(call.args[1]) orelse 0) != 0;
-                    const vt = arg(c, f, fty, call.args, 2) orelse continue;
-                    try info.outer.put(a, .{ @intCast(r.comp), c.component(vt, signed) }, {});
-                },
-                338, 339 => {
-                    const mat = c.matrix(arg(c, f, fty, call.args, 1)) orelse continue;
-                    const gop = try info.accumulate.getOrPut(a, @intCast(mat.comp));
-                    if (!gop.found_existing) gop.value_ptr.* = 0;
-                    gop.value_ptr.* |= if (op == 338) 1 else 2;
-                },
-                342 => {
-                    const vt = arg(c, f, fty, call.args, 4) orelse continue;
-                    const gop = try info.accumulate.getOrPut(a, c.component(vt, true));
-                    if (!gop.found_existing) gop.value_ptr.* = 0;
-                    gop.value_ptr.* |= 1;
-                },
-                else => {
-                    try construction(a, &info, c.matrix(inst.ty));
-                    for (call.args, 0..) |_, k| try construction(a, &info, c.matrix(arg(c, f, fty, call.args, k)));
-                },
-            }
+        switch (op) {
+            336, 337 => {
+                const mat = c.matrix(arg(c, f, fty, call.args, 1)) orelse continue;
+                const signed = (c.constInt(call.args[2]) orelse 0) != 0;
+                const key: Key3 = .{ c.component(inst.ty, signed), @intCast(mat.comp), @intCast(c.constInt(call.args[4]) orelse 0) };
+                const gop = try info.matvec.getOrPut(a, key);
+                if (!gop.found_existing) gop.value_ptr.* = 0;
+                gop.value_ptr.* |= layoutFlags(c, f, call.args[1]);
+            },
+            334, 322 => {
+                const r = c.matrix(inst.ty) orelse continue;
+                const ma = c.matrix(arg(c, f, fty, call.args, 1)) orelse continue;
+                const mb = c.matrix(arg(c, f, fty, call.args, 2)) orelse continue;
+                const key: Key4 = .{ @intCast(r.scope), @intCast(r.comp), @intCast(ma.comp), @intCast(mb.comp) };
+                const gop = try info.multiplies.getOrPut(a, key);
+                if (!gop.found_existing) gop.value_ptr.* = .empty;
+                try gop.value_ptr.put(a, .{ .m = ma.m, .n = mb.n, .k = ma.n }, {});
+            },
+            340 => {
+                const r = c.matrix(inst.ty) orelse continue;
+                const signed = (c.constInt(call.args[1]) orelse 0) != 0;
+                const vt = arg(c, f, fty, call.args, 2) orelse continue;
+                try info.outer.put(a, .{ @intCast(r.comp), c.component(vt, signed) }, {});
+            },
+            338, 339 => {
+                const mat = c.matrix(arg(c, f, fty, call.args, 1)) orelse continue;
+                const gop = try info.accumulate.getOrPut(a, @intCast(mat.comp));
+                if (!gop.found_existing) gop.value_ptr.* = 0;
+                gop.value_ptr.* |= if (op == 338) 1 else 2;
+            },
+            342 => {
+                const vt = arg(c, f, fty, call.args, 4) orelse continue;
+                const gop = try info.accumulate.getOrPut(a, c.component(vt, true));
+                if (!gop.found_existing) gop.value_ptr.* = 0;
+                gop.value_ptr.* |= 1;
+            },
+            else => {
+                try construction(a, info, c.matrix(inst.ty));
+                for (call.args, 0..) |_, k| try construction(a, info, c.matrix(arg(c, f, fty, call.args, k)));
+            },
         }
     }
-    return serialize(a, &info);
 }
 
 fn construction(a: Allocator, info: *Info, mat: ?Matrix) Allocator.Error!void {
@@ -308,4 +334,67 @@ pub fn psvBlock(a: Allocator, t: Tables, out: *std.ArrayList(u8)) Allocator.Erro
         try put32(a, out, sz);
         try out.appendSlice(a, r);
     };
+}
+
+/// AddLinAlgShapes: the shape records' index array.
+fn rdatShapes(a: Allocator, b: *rdat.Builder, set: std.AutoArrayHashMapUnmanaged(Shape, void)) Allocator.Error!u32 {
+    var idx: std.ArrayList(u32) = .empty;
+    for (try sortedShapes(a, set)) |s| {
+        var rec: [12]u8 = undefined;
+        for ([_]u32{ s.m, s.n, s.k }, 0..) |v, k| std.mem.writeInt(u32, rec[4 * k ..][0..4], v, .little);
+        try idx.append(a, try b.record(.shapes, &rec));
+    }
+    return b.array(idx.items);
+}
+
+/// A record with an index array reference, then four bytes.
+fn refRecord(ref: u32, tail: [4]u8) [8]u8 {
+    var rec: [8]u8 = undefined;
+    std.mem.writeInt(u32, rec[0..4], ref, .little);
+    rec[4..8].* = tail;
+    return rec;
+}
+
+/// The function's RDAT ExtendedProperties (dxc's
+/// AddLinAlgFunctionProperties): one property per non-empty kind, in
+/// FunctionPropertyType order.
+pub fn rdatProperties(a: Allocator, b: *rdat.Builder, info: *const Info) Allocator.Error!u32 {
+    var props: std.ArrayList(u32) = .empty;
+    var recs: std.ArrayList(u32) = .empty;
+    const flush = struct {
+        fn f(aa: Allocator, bb: *rdat.Builder, ps: *std.ArrayList(u32), rs: *std.ArrayList(u32), ty: u32) Allocator.Error!void {
+            if (rs.items.len == 0) return;
+            var arr: [4]u8 = undefined;
+            std.mem.writeInt(u32, &arr, try bb.array(rs.items), .little);
+            try ps.append(aa, try bb.record(.properties, &refRecord(ty, arr)));
+            rs.clearRetainingCapacity();
+        }
+    }.f;
+    for (try sortedKeys(Key2, a, info.constructions.keys())) |k| {
+        const shapes = try rdatShapes(a, b, info.constructions.get(k).?);
+        try recs.append(a, try b.record(.constructions, &refRecord(shapes, .{ k[0], 0, 0, 0 })));
+    }
+    try flush(a, b, &props, &recs, 1);
+    for (try sortedKeys(Key3, a, info.matvec.keys())) |k| {
+        try recs.append(a, try b.record(.thread_matvec, &.{ k[0], k[1], k[2], info.matvec.get(k).? }));
+    }
+    try flush(a, b, &props, &recs, 2);
+    const mul_keys = try sortedKeys(Key4, a, info.multiplies.keys());
+    for ([_]u8{ 1, 2 }, [_]rdat.Ext{ .wave_multiplies, .group_multiplies }, [_]u32{ 3, 4 }) |scope, t, ty| {
+        for (mul_keys) |k| if (k[0] == scope) {
+            const shapes = try rdatShapes(a, b, info.multiplies.get(k).?);
+            try recs.append(a, try b.record(t, &refRecord(shapes, .{ k[1], k[2], k[3], 0 })));
+        };
+        try flush(a, b, &props, &recs, ty);
+    }
+    for (try sortedKeys(Key2, a, info.outer.keys())) |k| {
+        try recs.append(a, try b.record(.outer_products, &.{ k[0], k[1], 0, 0 }));
+    }
+    try flush(a, b, &props, &recs, 5);
+    for (try sortedKeys(u8, a, info.accumulate.keys())) |k| {
+        try recs.append(a, try b.record(.accumulate_stores, &.{ k, info.accumulate.get(k).?, 0, 0 }));
+    }
+    try flush(a, b, &props, &recs, 6);
+    if (props.items.len == 0) return rdat.null_ref;
+    return b.array(props.items);
 }
