@@ -526,6 +526,10 @@ pub const Module = struct {
     resource_structs: bool = false,
     /// -enable-16bit-types: half and 16-bit integers are native types.
     native_16bit: bool = false,
+    /// -Zpr: matrices that are structured buffer elements themselves
+    /// (not fields, which carry their own orientation) are row_major.
+    /// DXIL only: dxc's SPIR-V keeps those column_major.
+    row_major: bool = false,
     /// Root signatures: version 1.0 or 1.1 (-force-rootsig-ver), and
     /// -Qstrip_rootsignature.
     rootsig_version: enum { v1_0, v1_1 } = .v1_1,

@@ -1942,10 +1942,16 @@ const Lowerer = struct {
         return r;
     }
 
+    /// A parameter's (or the return value's) interpolation and matrix
+    /// orientation.
+    fn paramAttrs(l: *Lowerer, q: ast.Qualifiers, ty: *const ast.TypeRef) SigAttrs {
+        return .{ .interp = semamod.interpOf(q), .row_major = l.s.sig_row_major.get(ty) orelse q.row_major };
+    }
+
     /// A parameter's (or, with the function's attributes, the return
     /// value's) signature modifiers.
-    fn sigAttrs(l: *Lowerer, q: ast.Qualifiers, attrs: []const ast.Attribute) SigAttrs {
-        var a = paramAttrs(q);
+    fn sigAttrs(l: *Lowerer, q: ast.Qualifiers, attrs: []const ast.Attribute, ty: *const ast.TypeRef) SigAttrs {
+        var a = l.paramAttrs(q, ty);
         a.vk_location = l.s.vkAttrInt(attrs, "vk::location");
         a.vk_index = l.s.vkAttrInt(attrs, "vk::index");
         for (attrs) |at| if (std.mem.eql(u8, at.name, "vk::builtin") and at.args.len == 1 and at.args[0].kind == .string_lit) {
@@ -2244,7 +2250,7 @@ const Lowerer = struct {
         const points = try l.arena.alloc(Ref, patch.count);
         for (points, 0..) |*v, k| {
             var next = first;
-            v.* = try l.vertexIn(entry, patch.elem, semanticOf(pd.semantics), l.sigAttrs(pd.quals, pd.attrs), @intCast(k), register and k == 0, &next, null, pd.name_loc);
+            v.* = try l.vertexIn(entry, patch.elem, semanticOf(pd.semantics), l.sigAttrs(pd.quals, pd.attrs, pd.type), @intCast(k), register and k == 0, &next, null, pd.name_loc);
         }
         try l.b.store(local, try l.b.add(.{ .op = .{ .construct = points }, .ty = l.irType(pty) }));
     }
@@ -2316,16 +2322,16 @@ const Lowerer = struct {
                 args[i] = try l.b.load(locals[i]);
                 continue;
             }
-            if (p.dir != .out) try l.b.store(locals[i], try l.entryInput(entry, p.type, semanticOf(pd.semantics), l.sigAttrs(pd.quals, pd.attrs), pd.name_loc, pd.name));
+            if (p.dir != .out) try l.b.store(locals[i], try l.entryInput(entry, p.type, semanticOf(pd.semantics), l.sigAttrs(pd.quals, pd.attrs, pd.type), pd.name_loc, pd.name));
             args[i] = if (p.dir == .in) try l.b.load(locals[i]) else locals[i];
         }
         const ret = try l.b.add(.{ .op = .{ .call = .{ .func = pci, .args = args } }, .ty = pcf.ret });
         l.patch_io = true;
         defer l.patch_io = false;
-        if (pcf.ret != TypeTable.void_type) try l.entryOutput(entry, pcf.ret, semanticOf(pcf.decl.ret_semantics), paramAttrs(pcf.decl.quals), ret, pcf.loc, "return value");
+        if (pcf.ret != TypeTable.void_type) try l.entryOutput(entry, pcf.ret, semanticOf(pcf.decl.ret_semantics), l.paramAttrs(pcf.decl.quals, pcf.decl.ret), ret, pcf.loc, "return value");
         for (pcf.decl.params, pcf.params, 0..) |pd, p, i| {
             if (p.dir == .in) continue;
-            try l.entryOutput(entry, p.type, semanticOf(pd.semantics), l.sigAttrs(pd.quals, pd.attrs), try l.b.load(locals[i]), pd.name_loc, pd.name);
+            try l.entryOutput(entry, p.type, semanticOf(pd.semantics), l.sigAttrs(pd.quals, pd.attrs, pd.type), try l.b.load(locals[i]), pd.name_loc, pd.name);
         }
         l.b.terminate(.{ .ret = .none });
         entry.patch_wrapper = wrapper;
@@ -2384,12 +2390,12 @@ const Lowerer = struct {
                     .vertices => {
                         entry.mesh.max_vertices = arr.len;
                         var next: u32 = @intCast(entry.outputs.items.len);
-                        try l.streamOut(&entry.outputs, arr.elem, semanticOf(pd.semantics), l.sigAttrs(q, pd.attrs), null, &next, 0, null, pd.name_loc);
+                        try l.streamOut(&entry.outputs, arr.elem, semanticOf(pd.semantics), l.sigAttrs(q, pd.attrs, pd.type), null, &next, 0, null, pd.name_loc);
                     },
                     .primitives => {
                         entry.mesh.max_primitives = arr.len;
                         var next: u32 = @intCast(entry.patch_constants.items.len);
-                        try l.streamOut(&entry.patch_constants, arr.elem, semanticOf(pd.semantics), l.sigAttrs(q, pd.attrs), null, &next, 0, null, pd.name_loc);
+                        try l.streamOut(&entry.patch_constants, arr.elem, semanticOf(pd.semantics), l.sigAttrs(q, pd.attrs, pd.type), null, &next, 0, null, pd.name_loc);
                     },
                     .indices => {
                         entry.mesh.max_primitives = arr.len;
@@ -2419,7 +2425,7 @@ const Lowerer = struct {
                 // Everything else a domain shader reads is per patch.
                 l.patch_io = true;
                 defer l.patch_io = false;
-                try l.b.store(locals[i], try l.entryInput(&entry, p.type, semanticOf(pd.semantics), l.sigAttrs(pd.quals, pd.attrs), pd.name_loc, pd.name));
+                try l.b.store(locals[i], try l.entryInput(&entry, p.type, semanticOf(pd.semantics), l.sigAttrs(pd.quals, pd.attrs, pd.type), pd.name_loc, pd.name));
                 args[i] = if (p.dir == .in) try l.b.load(locals[i]) else locals[i];
                 continue;
             }
@@ -2432,7 +2438,7 @@ const Lowerer = struct {
                 const verts = try l.arena.alloc(Ref, arr.len);
                 for (verts, 0..) |*v, vx| {
                     var next = first;
-                    v.* = try l.vertexIn(&entry, arr.elem, semanticOf(pd.semantics), l.sigAttrs(pd.quals, pd.attrs), @intCast(vx), vx == 0, &next, null, pd.name_loc);
+                    v.* = try l.vertexIn(&entry, arr.elem, semanticOf(pd.semantics), l.sigAttrs(pd.quals, pd.attrs, pd.type), @intCast(vx), vx == 0, &next, null, pd.name_loc);
                 }
                 try l.b.store(locals[i], try l.b.add(.{ .op = .{ .construct = verts }, .ty = p.type }));
                 args[i] = try l.b.load(locals[i]);
@@ -2448,7 +2454,7 @@ const Lowerer = struct {
                 continue;
             }
             if (p.dir != .out) {
-                const v = try l.entryInput(&entry, p.type, semanticOf(pd.semantics), l.sigAttrs(pd.quals, pd.attrs), pd.name_loc, pd.name);
+                const v = try l.entryInput(&entry, p.type, semanticOf(pd.semantics), l.sigAttrs(pd.quals, pd.attrs, pd.type), pd.name_loc, pd.name);
                 try l.b.store(locals[i], v);
             }
             args[i] = if (p.dir == .in) try l.b.load(locals[i]) else locals[i];
@@ -2457,7 +2463,7 @@ const Lowerer = struct {
         for (f.params, 0..) |p, i| if (l.s.types.get(p.type) != .stream) try call_args.append(l.arena, args[i]);
         std.debug.assert(call_args.items.len == n_args);
         const ret = try l.b.add(.{ .op = .{ .call = .{ .func = main, .args = call_args.items } }, .ty = f.ret });
-        if (f.ret != TypeTable.void_type) try l.entryOutput(&entry, f.ret, semanticOf(f.decl.ret_semantics), l.sigAttrs(f.decl.quals, f.decl.attrs), ret, f.loc, "return value");
+        if (f.ret != TypeTable.void_type) try l.entryOutput(&entry, f.ret, semanticOf(f.decl.ret_semantics), l.sigAttrs(f.decl.quals, f.decl.attrs, f.decl.ret), ret, f.loc, "return value");
         for (f.decl.params, f.params, 0..) |pd, p, i| {
             if (p.dir == .in or l.s.types.get(p.type) == .stream) continue;
             if (l.b.f.inst(locals[i]).ptr == .mesh) continue;
@@ -2466,7 +2472,7 @@ const Lowerer = struct {
                 try l.b.store(ray_srcs[i], v);
                 continue;
             }
-            try l.entryOutput(&entry, p.type, semanticOf(pd.semantics), l.sigAttrs(pd.quals, pd.attrs), v, pd.name_loc, pd.name);
+            try l.entryOutput(&entry, p.type, semanticOf(pd.semantics), l.sigAttrs(pd.quals, pd.attrs, pd.type), v, pd.name_loc, pd.name);
         }
         l.b.terminate(.{ .ret = .none });
         entry.wrapper = wrapper;
@@ -2658,9 +2664,6 @@ pub fn isObject(t: *TypeTable, ty: TypeId) bool {
     };
 }
 
-fn paramAttrs(q: ast.Qualifiers) Lowerer.SigAttrs {
-    return .{ .interp = semamod.interpOf(q), .row_major = q.row_major };
-}
 
 fn semanticOf(sems: []const ast.Semantic) ?[]const u8 {
     for (sems) |sem| if (sem.kind == .semantic) return sem.values[0];

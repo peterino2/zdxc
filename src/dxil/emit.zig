@@ -1763,7 +1763,7 @@ const Emitter = struct {
                     if (rk == 13 or rk == 15) return e.cbufferAccess(frame, .{ .res = ri }, e.resources.items[ri].elem, a.indices);
                     if (rk >= 1 and rk <= 10) return .{ .texel = .{ .res = ri, .coords = try e.scalars(frame, a.indices[0]) } };
                     if (rk != 12) return e.unsupported("member access into this resource is not supported yet", .{});
-                    const start: @FieldType(Lowered, "buf") = .{ .res = ri, .index = (try e.scalars(frame, a.indices[0]))[0] };
+                    const start: @FieldType(Lowered, "buf") = .{ .res = ri, .index = (try e.scalars(frame, a.indices[0]))[0], .row_major = e.m.row_major };
                     return e.bufferAccess(frame, start, e.t.get(f.inst(a.base).ty).resource.elem, a.indices[1..]);
                 }
                 if (frame.vals[a.base.index()] == .buf) return e.bufferAccess(frame, frame.vals[a.base.index()].buf, f.inst(a.base).ty, a.indices);
@@ -3394,10 +3394,10 @@ const Emitter = struct {
             const fn_i = try e.dxOp("dx.op.bufferUpdateCounter", i32t, &.{ i32t, e.handle_ty, i8t }, .nounwind);
             const n = try e.callOp(fn_i, i32t, &.{ try e.i32Const(70), res.handle, try e.dm.constant(.{ .ty = i8t, .kind = .{ .int = if (inc) 1 else -1 } }) });
             if (eq(u8, name, "Append")) {
-                try e.structuredStore(res.*, n, 0, null, false, frame.f.inst(arg_refs[0]).ty, try e.scalars(frame, arg_refs[0]));
+                try e.structuredStore(res.*, n, 0, null, e.m.row_major, frame.f.inst(arg_refs[0]).ty, try e.scalars(frame, arg_refs[0]));
                 return .none;
             }
-            if (eq(u8, name, "Consume")) return .{ .scalars = try e.structuredLoad(res.*, n, 0, null, false, ty) };
+            if (eq(u8, name, "Consume")) return .{ .scalars = try e.structuredLoad(res.*, n, 0, null, e.m.row_major, ty) };
             // (BufferUpdateCounter returns the old value for increments and
             // the new one for decrements, matching HLSL.)
             return e.list(&.{n});
@@ -3868,7 +3868,7 @@ const Emitter = struct {
             return .{ .scalars = try e.textureLoad(res.*, mip, coords, null, ty) };
         }
         const idx = (try e.scalars(frame, index_ref))[0];
-        if (res.kind == 12) return .{ .scalars = try e.structuredLoad(res.*, idx, 0, null, false, ty) };
+        if (res.kind == 12) return .{ .scalars = try e.structuredLoad(res.*, idx, 0, null, e.m.row_major, ty) };
         if (res.kind == 11 and !try e.simpleRaw(ty)) return .{ .scalars = try e.rawLoad(res.*, idx, ty) };
         const n = try e.flatCount(ty);
         const c = try e.uniformScalar(ty);
@@ -4021,7 +4021,7 @@ const Emitter = struct {
         if (res.kind >= 1 and res.kind <= 9) return e.textureStore(res.*, try e.scalars(frame, index_ref), try e.scalars(frame, value_ref), frame.f.inst(value_ref).ty);
         const idx = (try e.scalars(frame, index_ref))[0];
         const vals = try e.scalars(frame, value_ref);
-        if (res.kind == 12) return e.structuredStore(res.*, idx, 0, null, false, frame.f.inst(value_ref).ty, vals);
+        if (res.kind == 12) return e.structuredStore(res.*, idx, 0, null, e.m.row_major, frame.f.inst(value_ref).ty, vals);
         if (res.kind == 11 and !try e.simpleRaw(frame.f.inst(value_ref).ty)) return e.rawStore(res.*, idx, frame.f.inst(value_ref).ty, vals);
         const vt = frame.f.inst(value_ref).ty;
         const c = try e.uniformScalar(vt);

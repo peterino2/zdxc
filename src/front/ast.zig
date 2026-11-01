@@ -48,6 +48,9 @@ pub const TypeRef = struct {
     /// Type attributes written on this reference, in order: `row_major`,
     /// `column_major`, `unorm`, `snorm` (template arguments, typedefs).
     attr_words: []const QualWord = &.{},
+    /// `#pragma pack_matrix` in effect where the type was written (true:
+    /// row_major): the orientation of a matrix declared without one.
+    pack_matrix: ?bool = null,
 };
 
 /// Storage classes, type qualifiers and parameter / interpolation

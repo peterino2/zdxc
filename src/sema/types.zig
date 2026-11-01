@@ -469,7 +469,9 @@ pub const Type = union(enum) {
     @"enum": *EnumInfo,
     /// `elem` is the template argument (or the void type when absent).
     /// `flags`: RayQuery's constant ray flags (template arguments).
-    resource: struct { kind: ResourceKind, elem: TypeId, name: []const u8, flags: u32 = 0, flags2: u32 = 0 },
+    /// `row_major`: a structured buffer's matrix elements are (as written,
+    /// by `#pragma pack_matrix` or -Zpr; dxc's SPIR-V honors it).
+    resource: struct { kind: ResourceKind, elem: TypeId, name: []const u8, flags: u32 = 0, flags2: u32 = 0, row_major: bool = false },
     sampler: struct { comparison: bool },
     string,
     /// PointStream / LineStream / TriangleStream<T>.
@@ -527,7 +529,7 @@ pub const TypeTable = struct {
             .array => |a| .{ .tag = 4, .a = a.elem, .b = a.len },
             .@"struct" => |s| .{ .tag = 5, .a = @intFromPtr(s), .b = 0 },
             .@"enum" => |e| .{ .tag = 6, .a = @intFromPtr(e), .b = 0 },
-            .resource => |r| .{ .tag = 7, .a = (@as(u64, @backingInt(r.kind)) << 32) | r.elem, .b = std.hash.Wyhash.hash(r.flags | (@as(u64, r.flags2) << 32), r.name) },
+            .resource => |r| .{ .tag = 7, .a = (@as(u64, @intFromBool(r.row_major)) << 48) | (@as(u64, @backingInt(r.kind)) << 32) | r.elem, .b = std.hash.Wyhash.hash(r.flags | (@as(u64, r.flags2) << 32), r.name) },
             .sampler => |s| .{ .tag = 8, .a = @intFromBool(s.comparison), .b = 0 },
             .string => .{ .tag = 9, .a = 0, .b = 0 },
             .stream => |s| .{ .tag = 10, .a = @backingInt(s.kind), .b = s.elem },

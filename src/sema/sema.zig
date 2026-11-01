@@ -31,11 +31,15 @@ pub const Options = struct {
     /// translation-unit checks; otherwise `root` (the entry point name).
     library: bool = true,
     root: ?[]const u8 = null,
+    /// `-Zpr`: matrices without an orientation (or `#pragma pack_matrix`)
+    /// are row_major.
+    row_major: bool = false,
 };
 
 /// Matrix orientation and float normalization written on a type: sugar
-/// that does not change type identity.
-pub const TypeAttrs = struct { orientation: ?[]const u8 = null, norm: ?[]const u8 = null };
+/// that does not change type identity. `pack` is the `#pragma
+/// pack_matrix` in effect where the type was written (true: row_major).
+pub const TypeAttrs = struct { orientation: ?[]const u8 = null, norm: ?[]const u8 = null, pack: ?bool = null };
 
 pub const Storage = enum { global_uniform, global_static, groupshared, cbuffer, local, local_static, param, constant };
 
@@ -184,6 +188,9 @@ pub const Sema = struct {
     all_functions: std.ArrayList(*Function) = .empty,
     /// Type attributes carried by typedef names (clang's attributed-type
     /// sugar: `typedef row_major float4x4 rm;`). Keyed by name.
+    /// Function parameters' and return types' matrix orientation (for
+    /// entry point signatures), keyed by the type as written.
+    sig_row_major: std.AutoHashMapUnmanaged(*const ast.TypeRef, bool) = .empty,
     typedef_attrs: std.StringHashMapUnmanaged(TypeAttrs) = .empty,
     /// Type attributes of the last resolveType result.
     last_attrs: TypeAttrs = .{},
@@ -1053,6 +1060,7 @@ pub const Sema = struct {
             }
         };
         for (t.attr_words) |w| s.applyTypeAttr(w, base, &attrs);
+        if (s.types.get(base) == .matrix) attrs.pack = t.pack_matrix;
         var ty = base;
         // Array dimensions on template arguments (`float[3]`).
         var i = t.array_dims.len;
@@ -1062,6 +1070,24 @@ pub const Sema = struct {
         }
         s.last_attrs = attrs;
         return ty;
+    }
+
+    /// Written orientation, else `#pragma pack_matrix`'s, else `-Zpr`'s.
+    pub fn isRowMajor(s: *const Sema, a: TypeAttrs) bool {
+        if (a.orientation) |o| return eql(o, "row_major");
+        return a.pack orelse s.opts.row_major;
+    }
+
+    /// A parameter's or return value's orientation in a signature: as
+    /// written on it or by `#pragma pack_matrix`. A typedef's orientation
+    /// is lost there in dxc (and blocks the pragma), leaving `-Zpr`'s.
+    fn sigRowMajor(s: *const Sema, words: []const ast.QualWord, type_attrs: TypeAttrs) bool {
+        for (words) |w| {
+            if (eql(w.word, "row_major")) return true;
+            if (eql(w.word, "column_major")) return false;
+        }
+        if (type_attrs.orientation != null) return s.opts.row_major;
+        return type_attrs.pack orelse s.opts.row_major;
     }
 
     /// Applies a type attribute (dxc's handleHLSLTypeAttr checks).
@@ -1156,8 +1182,11 @@ pub const Sema = struct {
                     return TypeTable.error_type;
                 }
                 var elem: TypeId = TypeTable.void_type;
+                var row_major = false;
                 if (args.len > 0) {
                     elem = try s.typeArg(args[0]) orelse TypeTable.error_type;
+                    const structured = kind == .structured_buffer or kind == .rw_structured_buffer or kind == .append_structured_buffer or kind == .consume_structured_buffer;
+                    if (structured and s.types.get(elem) == .matrix) row_major = s.isRowMajor(if (args[0] == .type) s.last_attrs else .{});
                 } else if (isTextureOrTypedBuffer(kind)) {
                     elem = try s.types.vector(.float, 4); // Texture2D == Texture2D<float4>
                 }
@@ -1175,7 +1204,7 @@ pub const Sema = struct {
                     }
                 }
                 if ((kind == .constant_buffer or kind == .texture_buffer) and args.len > 0) s.checkLongVectors(elem, templateArgLoc(args[0]), "ConstantBuffers or TextureBuffers");
-                return s.types.intern(.{ .resource = .{ .kind = kind, .elem = elem, .name = n } });
+                return s.types.intern(.{ .resource = .{ .kind = kind, .elem = elem, .name = n, .row_major = row_major } });
             }
             const streams = [_]struct { []const u8, @FieldType(@FieldType(types.Type, "stream"), "kind") }{ .{ "PointStream", .point }, .{ "LineStream", .line }, .{ "TriangleStream", .triangle } };
             for (streams) |st| if (std.mem.eql(u8, n, st[0])) {
@@ -1660,7 +1689,10 @@ pub const Sema = struct {
                 }
                 var base = try s.resolveType(td.type);
                 if (s.types.get(base) == .spirv and td.attrs.len > 0) base = try s.spirvTypeWithAttrs(base, td.attrs);
-                const attrs = s.checkModifiers(.typedef, td.qual_words, d.loc, base, s.last_attrs);
+                var attrs = s.checkModifiers(.typedef, td.qual_words, d.loc, base, s.last_attrs);
+                if (attrs.orientation == null) if (attrs.pack) |rm| {
+                    attrs.orientation = if (rm) "row_major" else "column_major";
+                };
                 const ty = try s.applyArrayDims(base, td.array_dims);
                 try s.declare(td.name, .{ .type = ty }, d.loc);
                 if (attrs.orientation != null or attrs.norm != null) try s.typedef_attrs.put(s.arena, td.name, attrs);
@@ -1852,7 +1884,7 @@ pub const Sema = struct {
                 if (s.opts.spirv) if (s.vkAttrInt(v.attrs, "vk::offset")) |vo| if (vo % 16 != 0 and s.types.get(ft) == .@"struct") {
                     s.warn(v.name_loc, null, "The offset provided in the attribute should be 16-byte aligned.", .{});
                 };
-                try info.fields.append(s.arena, .{ .name = v.name, .type = ft, .row_major = isRowMajor(fattrs), .semantic = fsem, .interp = interpOf(v.quals), .vk_location = s.vkAttrInt(v.attrs, "vk::location"), .vk_index = s.vkAttrInt(v.attrs, "vk::index"), .vk_offset = if (s.opts.spirv) s.vkAttrInt(v.attrs, "vk::offset") else null, .vk_builtin = vkAttrString(v.attrs, "vk::builtin"), .decorations = if (s.opts.spirv) try s.memberDecorations(v.attrs) else &.{} });
+                try info.fields.append(s.arena, .{ .name = v.name, .type = ft, .row_major = s.isRowMajor(fattrs), .semantic = fsem, .interp = interpOf(v.quals), .vk_location = s.vkAttrInt(v.attrs, "vk::location"), .vk_index = s.vkAttrInt(v.attrs, "vk::index"), .vk_offset = if (s.opts.spirv) s.vkAttrInt(v.attrs, "vk::offset") else null, .vk_builtin = vkAttrString(v.attrs, "vk::builtin"), .decorations = if (s.opts.spirv) try s.memberDecorations(v.attrs) else &.{} });
             },
             .func => {},
             else => try s.decl(m, .member),
@@ -2251,7 +2283,7 @@ pub const Sema = struct {
             .init = v.init,
             .init_scope = s.scope,
             .decl = v,
-            .row_major = isRowMajor(decl_attrs),
+            .row_major = s.isRowMajor(decl_attrs),
         };
         try s.declare(v.name, .{ .variable = variable }, v.name_loc);
         try s.decl_vars.put(s.arena, v, variable);
@@ -2335,11 +2367,15 @@ pub const Sema = struct {
         // `auto` return types are deduced in HLSL 202x; unconstrained here.
         const ret = if (f.ret.name.isSimple("auto")) TypeTable.error_type else try s.applyArrayDims(try s.resolveType(f.ret), f.ret_dims);
         const params = try s.arena.alloc(Param, f.params.len);
-        _ = s.checkModifiers(if (owner != null) .method else .function, f.qual_words, if (f.qual_words.len > 0) f.qual_words[0].loc else f.ret.loc, ret, s.last_attrs);
+        const ret_type_attrs = s.last_attrs;
+        _ = s.checkModifiers(if (owner != null) .method else .function, f.qual_words, if (f.qual_words.len > 0) f.qual_words[0].loc else f.ret.loc, ret, ret_type_attrs);
+        try s.sig_row_major.put(s.arena, f.ret, s.sigRowMajor(f.qual_words, ret_type_attrs));
         s.checkFunctionAttrs(f.attrs);
         for (f.params, params) |p, *out| {
             const pbase = try s.resolveType(p.type);
-            _ = s.checkModifiers(.parameter, p.qual_words, if (p.qual_words.len > 0) p.qual_words[0].loc else p.type.loc, pbase, s.last_attrs);
+            const ptype_attrs = s.last_attrs;
+            _ = s.checkModifiers(.parameter, p.qual_words, if (p.qual_words.len > 0) p.qual_words[0].loc else p.type.loc, pbase, ptype_attrs);
+            try s.sig_row_major.put(s.arena, p.type, s.sigRowMajor(p.qual_words, ptype_attrs));
             try s.checkArrayDims(p.name_loc, pbase, p.array_dims);
             const pt = try s.applyArrayDims(pbase, p.array_dims);
             s.checkSemantics(.parameter, p.semantics, pt, false);
@@ -4126,10 +4162,6 @@ fn templateArgLoc(arg: ast.TemplateArg) Loc {
 
 pub fn interpOf(q: ast.Qualifiers) types.Interp {
     return .{ .nointerpolation = q.nointerpolation, .linear = q.linear, .centroid = q.centroid, .sample = q.sample, .noperspective = q.noperspective };
-}
-
-fn isRowMajor(a: TypeAttrs) bool {
-    return if (a.orientation) |o| eql(o, "row_major") else false;
 }
 
 fn eql(a: []const u8, b: []const u8) bool {

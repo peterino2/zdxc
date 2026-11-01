@@ -49,18 +49,55 @@ pub const Parser = struct {
     /// The last parseName ended in `::template X`: X takes template
     /// arguments whatever it names.
     forced_template: bool = false,
+    /// `#pragma pack_matrix` lines: the position of the token after them,
+    /// and row_major.
+    pack_pragmas: []const PackPragma = &.{},
+
+    const PackPragma = struct { pos: usize, row_major: bool };
 
     /// Collect every token from `pp` and set up a parser over them.
     pub fn fromPreprocessor(arena: Allocator, diags: *Diagnostics, pp: *Preprocessor) !Parser {
         var toks: std.ArrayList(Token) = .empty;
+        var packs: std.ArrayList(PackPragma) = .empty;
         while (true) {
             // Preprocessor diagnostics are ordered by the token being produced.
             diags.position = toks.items.len;
             const t = try pp.next();
+            // `#pragma pack_matrix` may come between any two tokens (as in
+            // dxc): it is kept aside, not in the token stream.
+            if (t.kind == .pragma) if (packMatrix(t.text)) |rm| {
+                try packs.append(arena, .{ .pos = toks.items.len, .row_major = rm });
+                continue;
+            };
             try toks.append(arena, t);
             if (t.kind == .eof) break;
         }
-        return .{ .arena = arena, .diags = diags, .toks = toks.items };
+        return .{ .arena = arena, .diags = diags, .toks = toks.items, .pack_pragmas = packs.items };
+    }
+
+    /// `pack_matrix(row_major)` / `pack_matrix(column_major)`.
+    fn packMatrix(text: []const u8) ?bool {
+        var buf: [64]u8 = undefined;
+        var n: usize = 0;
+        for (text) |c| if (!std.ascii.isWhitespace(c)) {
+            if (n == buf.len) return null;
+            buf[n] = c;
+            n += 1;
+        };
+        const s = buf[0..n];
+        if (std.mem.eql(u8, s, "pack_matrix(row_major)")) return true;
+        if (std.mem.eql(u8, s, "pack_matrix(column_major)")) return false;
+        return null;
+    }
+
+    /// The `#pragma pack_matrix` in effect at token `pos`.
+    fn packMatrixAt(p: *const Parser, pos: usize) ?bool {
+        var r: ?bool = null;
+        for (p.pack_pragmas) |pp| {
+            if (pp.pos > pos) break;
+            r = pp.row_major;
+        }
+        return r;
     }
 
     pub fn parseTranslationUnit(p: *Parser) Allocator.Error!ast.TranslationUnit {
@@ -503,7 +540,9 @@ pub const Parser = struct {
             if (w.isIdent("unorm")) norm = .unorm;
             if (w.isIdent("snorm")) norm = .snorm;
         }
+        const type_pos = p.pos;
         const t = try p.parseTypeInner();
+        t.pack_matrix = p.packMatrixAt(type_pos);
         if (norm != .none) t.norm = norm;
         if (words.items.len > 0) t.attr_words = words.items;
         if (p.at(.l_square) and p.peek(1).kind == .l_square) t.attrs = try p.parseAttributes();

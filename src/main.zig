@@ -18,6 +18,8 @@ const Options = struct {
     preprocess: bool = false,
     pp_output: ?[]const u8 = null,
     enable_16bit: bool = false,
+    row_major: bool = false,
+    col_major: bool = false,
     /// -force-rootsig-ver, -Qstrip_rootsignature, -rootsig-define, -Frs.
     rootsig_ver: ?[]const u8 = null,
     strip_rootsig: bool = false,
@@ -132,6 +134,8 @@ fn parseArgs(cli: Cli, arena: std.mem.Allocator, argv: []const [:0]const u8, std
                     .spirv => opts.spirv = true,
                     .fspv_target_env_EQ => opts.target_env = v,
                     .enable_16bit_types => opts.enable_16bit = true,
+                    .Zpr => opts.row_major = true,
+                    .Zpc => opts.col_major = true,
                     .force_rootsig_ver, .force_rootsig_ver_ => opts.rootsig_ver = v,
                     .Qstrip_rootsignature => opts.strip_rootsig = true,
                     .rootsig_define => opts.rootsig_define = v,
@@ -226,6 +230,7 @@ fn parseArgs(cli: Cli, arena: std.mem.Allocator, argv: []const [:0]const u8, std
             },
         }
     }
+    if (opts.row_major and opts.col_major) return cli.fail("Cannot specify /Zpr and /Zpc together, use /? to get usage information", .{});
     // Like dxc, the last input wins (dxc reads getLastArgValue(OPT_INPUT)).
     if (parsed.inputs.len > 0) opts.input = parsed.inputs[parsed.inputs.len - 1];
 
@@ -324,6 +329,7 @@ fn run(cli: Cli, arena: std.mem.Allocator, args: []const [:0]const u8, stdout: *
                         .sm_minor = if (profile) |p| p.minor else 10,
                         .library = is_lib,
                         .root = opts.entry,
+                        .row_major = opts.row_major,
                     });
                     try sema.checkUnit(tu);
                     if (!opts.sema and !diags.hasErrors() and profile != null) {
@@ -344,6 +350,7 @@ fn run(cli: Cli, arena: std.mem.Allocator, args: []const [:0]const u8, stdout: *
                         };
                         if (module) |*mm| {
                             mm.native_16bit = opts.enable_16bit;
+                            mm.row_major = opts.row_major;
                             mm.vk = opts.vk;
                             mm.strip_rootsig = opts.strip_rootsig;
                             if (opts.rootsig_ver) |rv| {

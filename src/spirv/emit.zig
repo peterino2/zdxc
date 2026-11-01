@@ -2202,7 +2202,7 @@ const Emitter = struct {
                 }
                 e.ptr_layouts[ri] = switch (e.m.globals.items[g].space) {
                     .cbuffer => if (e.m.globals.items[g].tbuffer) .{ .rules = e.tbRules(), .row_major = false, .buffer = true } else .{ .rules = e.cbRules(), .row_major = false },
-                    .resource => .{ .rules = e.sbRules(), .row_major = false, .buffer = true },
+                    .resource => .{ .rules = e.sbRules(), .row_major = bufferRowMajor(e.t, e.m.globals.items[g].ty), .buffer = true },
                     else => null,
                 };
             },
@@ -2322,7 +2322,7 @@ const Emitter = struct {
                     .cbuffer, .resource => .uniform,
                     else => return e.unsupported("access into this storage is not supported yet", .{}),
                 };
-                var pl = if (shader_record) PtrLayout{ .rules = e.sbRules(), .row_major = false } else if (into_cb) PtrLayout{ .rules = e.cbRules(), .row_major = false } else if (into_tb) PtrLayout{ .rules = e.tbRules(), .row_major = false, .buffer = true } else if (into_buffer) PtrLayout{ .rules = e.sbRules(), .row_major = false, .buffer = true } else e.ptr_layouts[a.base.index()];
+                var pl = if (shader_record) PtrLayout{ .rules = e.sbRules(), .row_major = false } else if (into_cb) PtrLayout{ .rules = e.cbRules(), .row_major = false } else if (into_tb) PtrLayout{ .rules = e.tbRules(), .row_major = false, .buffer = true } else if (into_buffer) PtrLayout{ .rules = e.sbRules(), .row_major = bufferRowMajor(e.t, f.inst(a.base).ty), .buffer = true } else e.ptr_layouts[a.base.index()];
                 var ops: std.ArrayList(u32) = .empty;
                 try ops.appendSlice(e.arena, &.{ 0, 0, e.val(a.base) });
                 var cur = f.inst(a.base).ty;
@@ -2952,6 +2952,15 @@ const Emitter = struct {
     }
 
     /// The laid-out element type of a structured / byte-address buffer.
+    /// A structured buffer type's matrix elements are row_major.
+    fn bufferRowMajor(t: *TypeTable, ty: TypeId) bool {
+        return switch (t.get(ty)) {
+            .resource => |r| r.row_major,
+            .array => |a| bufferRowMajor(t, a.elem),
+            else => false,
+        };
+    }
+
     fn bufferElemType(e: *Emitter, ty: TypeId) Error!?Id {
         const r = switch (e.t.get(ty)) {
             .resource => |r| r,
@@ -2962,7 +2971,7 @@ const Emitter = struct {
             .structured_buffer, .rw_structured_buffer, .append_structured_buffer, .consume_structured_buffer => r.elem,
             else => return null,
         };
-        return try e.layoutTypeId(elem_ty, e.sbRules(), false);
+        return try e.layoutTypeId(elem_ty, e.sbRules(), r.row_major);
     }
 
     /// The BufferBlock struct of a buffer type (one per HLSL type, so
@@ -2972,7 +2981,7 @@ const Emitter = struct {
         const r = e.t.get(ty).resource;
         const elem_ty = if (r.kind == .byte_address_buffer or r.kind == .rw_byte_address_buffer) try e.t.scalar(.uint) else r.elem;
         const elem = (try e.bufferElemType(ty)).?;
-        const stride = layout.arrayStride(e.t, elem_ty, false, e.sbRules()) catch return e.unsupported("buffer element type '{s}'", .{try e.t.format(e.arena, elem_ty)});
+        const stride = layout.arrayStride(e.t, elem_ty, r.row_major, e.sbRules()) catch return e.unsupported("buffer element type '{s}'", .{try e.t.format(e.arena, elem_ty)});
         const rt = e.b.newId();
         try e.b.emit(.types_globals, .type_runtime_array, &.{ rt, elem });
         try e.b.emit(.annotations, .decorate, &.{ rt, 6, stride }); // ArrayStride
@@ -2980,10 +2989,10 @@ const Emitter = struct {
         try e.b.emit(.types_globals, .type_struct, &.{ st, rt });
         try e.b.emit(.annotations, .member_decorate, &.{ st, 0, 35, 0 }); // Offset 0
         if (e.isTrueMatrix(elem_ty) and storageScalar(e.t.get(elem_ty).matrix.elem).isFloat()) {
-            // Buffers of (column-major) matrices: HLSL rows are SPIR-V
-            // columns.
-            try e.b.emit(.annotations, .member_decorate, &.{ st, 0, 7, layout.matrixStride(e.t, elem_ty, false, e.sbRules()) }); // MatrixStride
-            try e.b.emit(.annotations, .member_decorate, &.{ st, 0, 4 }); // RowMajor
+            // Buffers of matrices: HLSL rows are SPIR-V columns, so
+            // column_major is RowMajor.
+            try e.b.emit(.annotations, .member_decorate, &.{ st, 0, 7, layout.matrixStride(e.t, elem_ty, r.row_major, e.sbRules()) }); // MatrixStride
+            try e.b.emit(.annotations, .member_decorate, &.{ st, 0, if (r.row_major) 5 else 4 }); // ColMajor / RowMajor
         }
         if (!r.kind.isWritable() and r.kind != .consume_structured_buffer) try e.b.emit(.annotations, .member_decorate, &.{ st, 0, 24 }); // NonWritable
         try e.b.emit(.annotations, .decorate, &.{ st, e.bufferBlockDecoration() });
