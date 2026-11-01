@@ -466,7 +466,7 @@ pub const SpirvInst = struct {
     opcode: u32,
     set: ?[]const u8 = null,
     /// Values, pointers (`[[vk::ext_reference]]`) or literal words.
-    operands: []const union(enum) { value: Ref, literal: u32 },
+    operands: []const union(enum) { value: Ref, literal: u32, type: TypeId },
     capabilities: []const u32 = &.{},
     extensions: []const []const u8 = &.{},
 };

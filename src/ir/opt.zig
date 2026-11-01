@@ -207,7 +207,7 @@ fn mapOp(a: Allocator, op: Op, ctx: anytype) Allocator.Error!Op {
             const ops = try a.dupe(@typeInfo(@TypeOf(x.operands)).pointer.child, x.operands);
             for (ops) |*o| switch (o.*) {
                 .value => |*v| v.* = ctx.map(v.*),
-                .literal => {},
+                .literal, .type => {},
             };
             const n = try a.create(ir.SpirvInst);
             n.* = x.*;

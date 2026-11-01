@@ -965,14 +965,14 @@ pub const Parser = struct {
             return p.mk(ast.Decl, .{ .loc = kw.loc, .kind = .{ .using_decl = n } });
         }
         const name = try p.expectIdent("alias name");
-        _ = try p.parseAttributes(); // e.g. [[vk::ext_capability(...)]]
+        const attrs = try p.parseAttributes(); // e.g. [[vk::ext_capability(...)]]
         _ = try p.expect(.equal, "'='");
         _ = p.parseQualifiers();
         const ty = try p.parseType();
         const dims = try p.parseArrayDims();
         _ = try p.expect(.semi, "';'");
         try p.declareNameOuter(name.text, if (template_params.len > 0) .template_type else .type, template_params.len > 0);
-        return p.mk(ast.Decl, .{ .loc = kw.loc, .kind = .{ .typedef = .{ .name = name.text, .type = ty, .array_dims = dims, .template_params = template_params } } });
+        return p.mk(ast.Decl, .{ .loc = kw.loc, .kind = .{ .typedef = .{ .name = name.text, .type = ty, .array_dims = dims, .template_params = template_params, .attrs = attrs } } });
     }
 
     fn parseNamespace(p: *Parser) Error!*ast.Decl {

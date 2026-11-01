@@ -107,6 +107,8 @@ pub const Function = struct {
     /// The parameters' variables, created when the body is checked
     /// (null for unnamed parameters).
     param_vars: []?*Variable = &.{},
+    /// A function template instance's arguments.
+    template_args: []const Bound = &.{},
 };
 
 /// A bound template argument.
@@ -616,8 +618,7 @@ pub const Sema = struct {
             at = s.types.withComponent(at, c.concrete()) catch at;
         };
         const n = pt.name;
-        if (n.parts.len != 1) return;
-        const name = n.parts[0];
+        const name = n.last();
         const bindName = struct {
             fn f(ps: []const ast.TemplateParam, o: []?Bound, nm: []const u8, v: Bound) void {
                 for (ps, 0..) |p, i| if (eql(p.name, nm) and o[i] == null and ((p.value_type == null) == (v == .type))) {
@@ -634,7 +635,7 @@ pub const Sema = struct {
             }
         }.f;
         if (pt.args.len == 0) {
-            bindName(params, out, name, .{ .type = at });
+            if (n.parts.len == 1) bindName(params, out, name, .{ .type = at });
             return;
         }
         // vector<T, N> / matrix<T, R, C>.
@@ -661,6 +662,26 @@ pub const Sema = struct {
         if (s.types.get(at) == .resource and pt.args.len == 1) {
             const r = s.types.get(at).resource;
             if (eql(r.name, name)) if (argName(pt.args[0])) |an| bindName(params, out, an, .{ .type = r.elem });
+            return;
+        }
+        // An alias of vk::SpirvOpaqueType / vk::SpirvType (such as
+        // vk::WorkgroupSpirvPointer<T>): type operands bind their alias
+        // parameters.
+        if (s.types.get(at) == .spirv) {
+            const x = s.types.get(at).spirv;
+            const sym = s.lookupName(pt.name) orelse return;
+            if (sym != .template or sym.template.decls.items.len == 0 or sym.template.decls.items[0].kind != .typedef) return;
+            const alias = sym.template.decls.items[0].kind.typedef;
+            const target = alias.type;
+            const fixed: usize = if (eql(target.name.last(), "SpirvType")) 3 else if (eql(target.name.last(), "SpirvOpaqueType")) 1 else return;
+            if (target.args.len != fixed + x.operands.len) return;
+            for (target.args[fixed..], x.operands) |ta, op| {
+                if (op != .type) continue;
+                const tn = argName(ta) orelse continue;
+                for (alias.template_params, 0..) |ap, pi| if (eql(ap.name, tn) and pi < pt.args.len) {
+                    if (argName(pt.args[pi])) |an| bindName(params, out, an, .{ .type = op.type });
+                };
+            }
             return;
         }
         // S<T, ...> against an instance of S.
@@ -774,6 +795,7 @@ pub const Sema = struct {
             s.current_struct = owner;
             try s.funcDeclMode(cd, &cd.kind.func, owner, .both);
             if (b.scope.syms.get(iname)) |sym| if (sym == .functions) {
+                for (sym.functions.funcs.items) |func| func.template_args = b.args;
                 try set.funcs.appendSlice(s.arena, sym.functions.funcs.items);
             };
             break :blk set;
@@ -1188,6 +1210,9 @@ pub const Sema = struct {
             };
             return s.types.intern(.{ .resource = .{ .kind = vn[1], .elem = elem, .name = n } });
         };
+        // vk::SpirvType<opcode, size, alignment, operands...> and
+        // vk::SpirvOpaqueType<opcode, operands...>.
+        if (s.opts.spirv and (eql(n, "SpirvType") or eql(n, "SpirvOpaqueType"))) return s.inlineSpirvType(t, eql(n, "SpirvType"));
         // Any other builtin object (RayQuery, node records, vk:: types...).
         // vk::ext_result_id<T>: a T (an inline instruction's result).
         if (eql(n, "ext_result_id") and args.len == 1) return try s.typeArg(args[0]) orelse TypeTable.error_type;
@@ -1207,6 +1232,104 @@ pub const Sema = struct {
         // parser cannot tell); other unknown names were reported there.
         if (t.name.parts.len > 1 and t.name.args.len > 0) s.err(t.loc, "no type named '{s}' in this template instance", .{n});
         return TypeTable.error_type;
+    }
+
+    fn inlineSpirvType(s: *Sema, t: *const ast.TypeRef, sized: bool) Allocator.Error!TypeId {
+        const args = t.args;
+        const fixed: usize = if (sized) 3 else 1;
+        if (args.len < fixed) {
+            s.err(t.loc, "too few template arguments for '{s}'", .{t.name.last()});
+            return TypeTable.error_type;
+        }
+        var head: [3]u32 = .{ 0, 0, 0 };
+        for (args[0..fixed], 0..) |a, k| {
+            const v = s.constArg(a) orelse {
+                s.err(templateArgLoc(a), "expression is not an integral constant expression", .{});
+                return TypeTable.error_type;
+            };
+            head[k] = @truncate(@as(u64, @bitCast(v)));
+        }
+        const ops = try s.arena.alloc(types.SpirvOperand, args.len - fixed);
+        for (args[fixed..], ops) |a, *op| op.* = (try s.spirvOperand(a)) orelse return TypeTable.error_type;
+        const info = try s.arena.create(types.SpirvTypeInfo);
+        info.* = .{ .opcode = head[0], .operands = ops, .size = head[1], .alignment = head[2] };
+        return s.types.intern(.{ .spirv = info });
+    }
+
+    /// `[[vk::ext_decorate(d, words...)]]` and
+    /// `[[vk::ext_decorate_string(d, strings...)]]` on a struct member.
+    fn memberDecorations(s: *Sema, attrs: []const ast.Attribute) Allocator.Error![]const types.MemberDecoration {
+        var out: std.ArrayList(types.MemberDecoration) = .empty;
+        for (attrs) |a| {
+            const string = eql(a.name, "vk::ext_decorate_string");
+            if (!(string or eql(a.name, "vk::ext_decorate")) or a.args.len == 0) continue;
+            const d: u32 = @intCast(s.evalInt(a.args[0]) orelse continue);
+            var ints: std.ArrayList(u32) = .empty;
+            var strs: std.ArrayList([]const u8) = .empty;
+            for (a.args[1..]) |x| {
+                if (string) {
+                    if (x.kind == .string_lit) try strs.append(s.arena, x.kind.string_lit[1 .. x.kind.string_lit.len - 1]);
+                } else if (s.evalInt(x)) |v| try ints.append(s.arena, @truncate(@as(u64, @bitCast(v))));
+            }
+            try out.append(s.arena, .{ .decoration = d, .ints = ints.items, .strings = strs.items });
+        }
+        return out.items;
+    }
+
+    /// Adds the capabilities and extensions an alias or field declares
+    /// to an inline SPIR-V type.
+    fn spirvTypeWithAttrs(s: *Sema, ty: TypeId, attrs: []const ast.Attribute) Allocator.Error!TypeId {
+        const old: *types.SpirvTypeInfo = @constCast(s.types.get(ty).spirv);
+        var caps: std.ArrayList(u32) = .empty;
+        var exts: std.ArrayList([]const u8) = .empty;
+        try caps.appendSlice(s.arena, old.capabilities);
+        try exts.appendSlice(s.arena, old.extensions);
+        for (attrs) |a| {
+            if (eql(a.name, "vk::ext_capability")) for (a.args) |x| {
+                if (s.evalInt(x)) |v| try caps.append(s.arena, @intCast(v));
+            };
+            if (eql(a.name, "vk::ext_extension")) for (a.args) |x| if (x.kind == .string_lit) {
+                try exts.append(s.arena, x.kind.string_lit[1 .. x.kind.string_lit.len - 1]);
+            };
+        }
+        old.capabilities = caps.items;
+        old.extensions = exts.items;
+        return ty;
+    }
+
+    /// A type operand, `vk::integral_constant<T, v>` (a constant) or
+    /// `vk::Literal<vk::integral_constant<T, v>>` (a literal word).
+    fn spirvOperand(s: *Sema, a: ast.TemplateArg) Allocator.Error!?types.SpirvOperand {
+        if (a == .type) {
+            const t = a.type;
+            if (eql(t.name.last(), "Literal") and t.args.len == 1) {
+                const inner = (try s.spirvOperand(t.args[0])) orelse return null;
+                if (inner != .constant) {
+                    s.err(t.loc, "The template argument to vk::Literal must be a vk::integral_constant", .{});
+                    return null;
+                }
+                return .{ .literal = inner.constant.value };
+            }
+            if (eql(t.name.last(), "integral_constant") and t.args.len == 2) {
+                const ty = (try s.typeArg(t.args[0])) orelse TypeTable.error_type;
+                const v = s.constArg(t.args[1]) orelse {
+                    s.err(templateArgLoc(t.args[1]), "expression is not an integral constant expression", .{});
+                    return null;
+                };
+                // (Enumerations are their underlying integers.)
+                const cty = switch (s.types.get(ty)) {
+                    .@"enum" => |en| try s.types.scalar(en.underlying),
+                    .scalar => ty,
+                    else => try s.types.scalar(.uint),
+                };
+                return .{ .constant = .{ .ty = cty, .value = v } };
+            }
+        }
+        const ty = (try s.typeArg(a)) orelse {
+            s.err(templateArgLoc(a), "operands of inline SPIR-V types must be types", .{});
+            return null;
+        };
+        return .{ .type = ty };
     }
 
     /// The string argument of attribute `name` (`[[vk::builtin("X")]]`).
@@ -1319,7 +1442,22 @@ pub const Sema = struct {
             .bool_lit => |b| .{ .bool = b },
             .is_same => .{ .bool = e.info != 0 },
             .call => |c| s.evalIntrinsic(c.callee, c.args),
+            // A static constant member through an object.
+            .member => if (s.resolution(e)) |r| switch (r) {
+                .variable => |v| if (v.quals.@"const" and v.init != null) s.evalVarConst(v) else null,
+                else => null,
+            } else null,
             .name => |n| blk: {
+                // What Sema resolved the name to (lowering evaluates
+                // outside the name's scope, e.g. in template instances).
+                if (s.resolution(e)) |r| switch (r) {
+                    .enumerator => |v| break :blk .{ .int = v },
+                    .variable => |v| {
+                        if (!v.quals.@"const" or v.init == null) break :blk null;
+                        break :blk s.evalVarConst(v);
+                    },
+                    else => {},
+                };
                 const sym = s.lookupName(n) orelse break :blk null;
                 switch (sym) {
                     .enumerator => |en| break :blk .{ .int = en.value },
@@ -1469,7 +1607,8 @@ pub const Sema = struct {
                     s.err(d.loc, "nested typedefs are not supported in HLSL", .{});
                     return;
                 }
-                const base = try s.resolveType(td.type);
+                var base = try s.resolveType(td.type);
+                if (s.types.get(base) == .spirv and td.attrs.len > 0) base = try s.spirvTypeWithAttrs(base, td.attrs);
                 const attrs = s.checkModifiers(.typedef, td.qual_words, d.loc, base, s.last_attrs);
                 const ty = try s.applyArrayDims(base, td.array_dims);
                 try s.declare(td.name, .{ .type = ty }, d.loc);
@@ -1637,7 +1776,9 @@ pub const Sema = struct {
                     continue;
                 }
                 const fattrs = s.checkModifiers(.field, v.qual_words, start, fbase, s.last_attrs);
-                const ft = try s.applyArrayDims(fbase, v.array_dims);
+                var ft = try s.applyArrayDims(fbase, v.array_dims);
+                // `[[vk::ext_capability(...)]] SpirvType field;`
+                if (s.types.get(ft) == .spirv and v.attrs.len > 0) ft = try s.spirvTypeWithAttrs(ft, v.attrs);
                 s.checkSemantics(.field, v.semantics, ft, false);
                 if (s.types.get(fbase) == .string) s.err(v.name_loc, "string declaration may only appear in global scope", .{});
                 s.checkDuplicateMember(info, base_fields, v.name, v.name_loc);
@@ -1648,7 +1789,7 @@ pub const Sema = struct {
                 if (s.opts.spirv) if (s.vkAttrInt(v.attrs, "vk::offset")) |vo| if (vo % 16 != 0 and s.types.get(ft) == .@"struct") {
                     s.warn(v.name_loc, null, "The offset provided in the attribute should be 16-byte aligned.", .{});
                 };
-                try info.fields.append(s.arena, .{ .name = v.name, .type = ft, .row_major = isRowMajor(fattrs), .semantic = fsem, .interp = interpOf(v.quals), .vk_location = s.vkAttrInt(v.attrs, "vk::location"), .vk_index = s.vkAttrInt(v.attrs, "vk::index"), .vk_offset = if (s.opts.spirv) s.vkAttrInt(v.attrs, "vk::offset") else null, .vk_builtin = vkAttrString(v.attrs, "vk::builtin") });
+                try info.fields.append(s.arena, .{ .name = v.name, .type = ft, .row_major = isRowMajor(fattrs), .semantic = fsem, .interp = interpOf(v.quals), .vk_location = s.vkAttrInt(v.attrs, "vk::location"), .vk_index = s.vkAttrInt(v.attrs, "vk::index"), .vk_offset = if (s.opts.spirv) s.vkAttrInt(v.attrs, "vk::offset") else null, .vk_builtin = vkAttrString(v.attrs, "vk::builtin"), .decorations = if (s.opts.spirv) try s.memberDecorations(v.attrs) else &.{} });
             },
             .func => {},
             else => try s.decl(m, .member),
@@ -2033,6 +2174,8 @@ pub const Sema = struct {
         };
         // Uniform globals and cbuffer members are read-only, as are consts.
         const read_only = q.@"const" or storage == .cbuffer or storage == .global_uniform;
+        // `[[vk::ext_capability(...)]] SpirvType x;`
+        if (s.types.get(ty) == .spirv and v.attrs.len > 0) _ = try s.spirvTypeWithAttrs(ty, v.attrs);
         // The variable is in scope in its own initializer (as in C++).
         const variable = try s.arena.create(Variable);
         variable.* = .{
@@ -2317,7 +2460,13 @@ pub const Sema = struct {
                 defer s.popScope();
                 for (list) |c| try s.stmt(c);
             },
-            .decl => |list| for (list) |d| try s.decl(d, .local),
+            .decl => |list| for (list) |d| {
+                try s.decl(d, .local);
+                // `[[vk::ext_capability(...)]] SpirvType x = ...;`
+                if (st.attrs.len > 0 and d.kind == .@"var") if (s.decl_vars.get(&d.kind.@"var")) |v| if (s.types.get(v.type) == .spirv) {
+                    _ = try s.spirvTypeWithAttrs(v.type, st.attrs);
+                };
+            },
             .expr => |e| _ = try s.expr(e),
             .empty => {},
             .@"if" => |x| {
@@ -3072,7 +3221,10 @@ pub const Sema = struct {
                     const ss: *StructSema = @ptrCast(@alignCast(p));
                     if (structMember(ss, name)) |sym| switch (sym) {
                         .functions => return .{ .ty = TypeTable.error_type, .callee = .{ .method = .{ .object = b.ty, .name = name, .object_lvalue = b.lvalue } } },
-                        .variable => |v| return .{ .ty = v.type, .lvalue = true, .read_only = v.read_only },
+                        .variable => |v| {
+                            s.record(e, .{ .variable = v });
+                            return .{ .ty = v.type, .lvalue = true, .read_only = v.read_only };
+                        },
                         .template => return .{ .ty = TypeTable.error_type, .callee = .{ .method = .{ .object = b.ty, .name = name, .object_lvalue = b.lvalue } } },
                         else => {},
                     };

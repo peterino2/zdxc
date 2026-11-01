@@ -285,7 +285,7 @@ pub const Decl = struct {
         func: FuncDecl,
         @"struct": StructDecl,
         cbuffer: CBufferDecl,
-        typedef: struct { name: []const u8, type: *TypeRef, array_dims: []const ?*Expr, template_params: []const TemplateParam = &.{}, qual_words: []const QualWord = &.{} },
+        typedef: struct { name: []const u8, type: *TypeRef, array_dims: []const ?*Expr, template_params: []const TemplateParam = &.{}, qual_words: []const QualWord = &.{}, attrs: []const Attribute = &.{} },
         @"enum": EnumDecl,
         namespace: struct { name: []const u8, decls: []const *Decl },
         /// `using namespace N;`

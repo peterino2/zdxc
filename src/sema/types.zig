@@ -349,7 +349,13 @@ pub const Field = struct {
     vk_index: ?u32 = null,
     vk_offset: ?u32 = null,
     vk_builtin: ?[]const u8 = null,
+    /// [[vk::ext_decorate(...)]] / [[vk::ext_decorate_string(...)]].
+    decorations: []const MemberDecoration = &.{},
 };
+
+/// A decoration inline SPIR-V puts on a struct member: literal words or
+/// strings.
+pub const MemberDecoration = struct { decoration: u32, ints: []const u32 = &.{}, strings: []const []const u8 = &.{} };
 
 /// A bitfield member: `width` bits at `offset` in storage field `storage`.
 pub const Bitfield = struct {
@@ -404,6 +410,30 @@ pub const StructInfo = struct {
     }
 };
 
+/// An operand of a `vk::SpirvType` / `vk::SpirvOpaqueType`: a type, a
+/// constant (`vk::integral_constant<T, v>`) or a literal word
+/// (`vk::Literal<vk::integral_constant<T, v>>`).
+pub const SpirvOperand = union(enum) {
+    type: TypeId,
+    constant: struct { ty: TypeId, value: i64 },
+    literal: i64,
+};
+
+/// `vk::SpirvType<opcode, size, alignment, operands...>` (sized) and
+/// `vk::SpirvOpaqueType<opcode, operands...>`: a SPIR-V type spelled out.
+pub const SpirvTypeInfo = struct {
+    opcode: u32,
+    operands: []const SpirvOperand,
+    /// Zero for opaque types (which cannot be in buffers).
+    size: u32 = 0,
+    alignment: u32 = 0,
+    /// `[[vk::ext_capability]]` / `[[vk::ext_extension]]` on an alias or
+    /// field of the type: declared wherever it is used (not part of its
+    /// identity).
+    capabilities: []const u32 = &.{},
+    extensions: []const []const u8 = &.{},
+};
+
 pub const EnumInfo = struct {
     name: []const u8,
     underlying: Scalar,
@@ -436,6 +466,7 @@ pub const Type = union(enum) {
     dynamic_resource,
     /// `tex.mips` / `tex.sample` and their slices (`tex.mips[level]`).
     texture_view: struct { texture: TypeId, kind: enum { mips, mips_slice, sample, sample_slice } },
+    spirv: *const SpirvTypeInfo,
 };
 
 /// Interns types. Ids 0 and 1 are `error` and `void`.
@@ -483,6 +514,7 @@ pub const TypeTable = struct {
             .descriptor_heap => |h| .{ .tag = 12, .a = @intFromBool(h.sampler), .b = 0 },
             .dynamic_resource => .{ .tag = 13, .a = 0, .b = 0 },
             .texture_view => |v| .{ .tag = 14, .a = v.texture, .b = @backingInt(v.kind) },
+            .spirv => |x| .{ .tag = 15, .a = (@as(u64, x.opcode) << 32) | x.size, .b = std.hash.Wyhash.hash(x.alignment, std.mem.sliceAsBytes(x.operands)) },
         };
     }
 
@@ -670,6 +702,7 @@ pub const TypeTable = struct {
                 .sample => "sample_type",
                 .sample_slice => "sample_slice_type",
             } }),
+            .spirv => |x| if (x.size == 0) "SpirvOpaqueType" else "SpirvType",
         };
     }
 };

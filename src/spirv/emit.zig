@@ -28,7 +28,7 @@ pub const Error = Allocator.Error || error{Unsupported};
 /// Marks a binding that is a recipe (see Emitter.resourceBinding).
 const recipe_tag: u32 = 0x8000_0000;
 
-const StorageClass = enum(u32) { uniform_constant = 0, input = 1, uniform = 2, output = 3, workgroup = 4, private = 6, function = 7, image = 11, storage_buffer = 12, task_payload_workgroup = 5402, callable_data_khr = 5328, incoming_callable_data_khr = 5329, ray_payload_khr = 5338, hit_attribute_khr = 5339, incoming_ray_payload_khr = 5342, shader_record_buffer_khr = 5343, push_constant = 9 };
+const StorageClass = enum(u32) { uniform_constant = 0, input = 1, uniform = 2, output = 3, workgroup = 4, private = 6, function = 7, image = 11, storage_buffer = 12, task_payload_workgroup = 5402, callable_data_khr = 5328, incoming_callable_data_khr = 5329, ray_payload_khr = 5338, hit_attribute_khr = 5339, incoming_ray_payload_khr = 5342, shader_record_buffer_khr = 5343, push_constant = 9, physical_storage_buffer = 5349 };
 
 const Capability = enum(u32) {
     shader = 1,
@@ -94,6 +94,7 @@ const Capability = enum(u32) {
     storage_buffer_array_non_uniform_indexing = 5308,
     storage_image_array_non_uniform_indexing = 5309,
     vulkan_memory_model = 5345,
+    variable_pointers = 4442,
     /// (Inline SPIR-V may use any value.)
     _,
 };
@@ -135,6 +136,9 @@ const Emitter = struct {
     universal: bool = false,
 
     value_types: std.AutoHashMapUnmanaged(TypeId, Id) = .empty,
+    /// Inline SPIR-V types by their instruction's operand words (equal
+    /// spellings are one type).
+    spirv_types: std.StringHashMapUnmanaged(Id) = .empty,
     /// Explicitly laid out variants of arrays and structs (buffers).
     layout_types: std.AutoHashMapUnmanaged(LayoutKey, Id) = .empty,
     /// Per instruction (current function): the buffer layout its pointer
@@ -281,6 +285,13 @@ const Emitter = struct {
         try e.capabilities.put(e.arena, c, {});
     }
 
+    /// A capability inline SPIR-V asks for, with the extension it needs
+    /// before it became core (as dxc adds it).
+    fn inlineCap(e: *Emitter, c: u32) Error!void {
+        try e.capabilities.put(e.arena, @enumFromInt(c), {});
+        if (op_caps.need(&op_caps.capabilities, c)) |n| if (n.core > 100 + @as(u32, e.spv_minor)) try e.extension(n.ext);
+    }
+
     // ------------------------------------------------------------------
     // Types and constants
 
@@ -375,11 +386,71 @@ const Emitter = struct {
                 try e.b.emit(.types_globals, .type_struct, ops.items);
                 try e.b.emitWithString(.debug_names, .name, &.{id}, try std.fmt.allocPrint(e.arena, "struct.{s}", .{st.name}), &.{});
                 for (st.fields.items, 0..) |fld, k| try e.b.emitWithString(.debug_names, .member_name, &.{ id, @intCast(k) }, fld.name, &.{});
+                try e.memberDecorations(id, st, false);
                 break :blk id;
             },
+            .spirv => |x| try e.inlineType(x),
+            .@"enum" => |en| try e.scalarType(en.underlying),
             else => return e.unsupported("type '{s}' is not supported yet", .{try e.t.format(e.arena, ty)}),
         };
         try e.value_types.put(e.arena, ty, id);
+        return id;
+    }
+
+    /// `vk::SpirvType` / `vk::SpirvOpaqueType`. Integers, floats and
+    /// pointers are the types zdxc declares itself (SPIR-V allows one of
+    /// each); anything else is declared as spelled.
+    fn inlineType(e: *Emitter, x: *const types.SpirvTypeInfo) Error!Id {
+        const lit = struct {
+            fn f(o: types.SpirvOperand) ?u32 {
+                return if (o == .literal) @truncate(@as(u64, @bitCast(o.literal))) else null;
+            }
+        }.f;
+        const ops = x.operands;
+        for (x.capabilities) |c| try e.inlineCap(c);
+        for (x.extensions) |ext| try e.extension(ext);
+        switch (x.opcode) {
+            21 => if (ops.len == 2) if (lit(ops[0])) |w| if (lit(ops[1])) |signed| {
+                const sc: ?Scalar = switch (w) {
+                    16 => if (signed != 0) .int16 else .uint16,
+                    32 => if (signed != 0) .int else .uint,
+                    64 => if (signed != 0) .int64 else .uint64,
+                    else => null,
+                };
+                if (sc) |c| return e.scalarType(c);
+            },
+            22 => if (ops.len == 1) if (lit(ops[0])) |w| {
+                const sc: ?Scalar = switch (w) {
+                    16 => .float16,
+                    32 => .float,
+                    64 => .double,
+                    else => null,
+                };
+                if (sc) |c| return e.scalarType(c);
+            },
+            32 => if (ops.len == 2 and ops[1] == .type) if (lit(ops[0])) |c| if (std.enums.fromInt(StorageClass, c)) |sc| {
+                return e.pointerType(sc, try e.typeId(ops[1].type));
+            },
+            else => {},
+        }
+        var words: std.ArrayList(u32) = .empty;
+        for (ops) |o| try words.append(e.arena, switch (o) {
+            .type => |t| switch (e.t.get(t)) {
+                .resource, .sampler => (try e.resourcePointee(t)).ty,
+                else => try e.typeId(t),
+            },
+            .constant => |c| try e.constant(c.ty, .{ .int = c.value }),
+            .literal => lit(o).?,
+        });
+        var key: std.ArrayList(u8) = .empty;
+        try key.print(e.arena, "{d}:", .{x.opcode});
+        try key.appendSlice(e.arena, std.mem.sliceAsBytes(words.items));
+        if (e.spirv_types.get(key.items)) |id| return id;
+        const id = e.b.newId();
+        try words.insert(e.arena, 0, id);
+        try e.b.emit(.types_globals, @enumFromInt(x.opcode), words.items);
+        try e.b.emitWithString(.debug_names, .name, &.{id}, "spirvIntrinsicType", &.{});
+        try e.spirv_types.put(e.arena, key.items, id);
         return id;
     }
 
@@ -460,8 +531,26 @@ const Emitter = struct {
                     try e.b.emitWithString(.debug_names, .member_name, &.{ id, mk }, fld.name, &.{});
                 }
                 try e.b.emitWithString(.debug_names, .name, &.{id}, name, &.{});
+                try e.memberDecorations(id, st, true);
             }
         }
+    }
+
+    /// Members' inline SPIR-V decorations (not Offset in buffer layouts,
+    /// which place members themselves).
+    fn memberDecorations(e: *Emitter, id: Id, st: *const types.StructInfo, laid_out: bool) Error!void {
+        for (st.fields.items, 0..) |fld, k| for (fld.decorations) |d| {
+            if (laid_out and d.decoration == 35) continue;
+            try e.requireNeed(op_caps.need(&op_caps.decorations, d.decoration));
+            if (d.strings.len > 0) {
+                for (d.strings) |str| try e.b.emitWithString(.annotations, @enumFromInt(5633), &.{ id, @intCast(k), d.decoration }, str, &.{}); // OpMemberDecorateString
+            } else {
+                var words: std.ArrayList(u32) = .empty;
+                try words.appendSlice(e.arena, &.{ id, @intCast(k), d.decoration });
+                try words.appendSlice(e.arena, d.ints);
+                try e.b.emit(.annotations, .member_decorate, words.items);
+            }
+        };
     }
 
     /// The block of TextureBuffer<S>: S's members, std430, read-only.
@@ -628,7 +717,7 @@ const Emitter = struct {
     /// Inline SPIR-V decorations, capabilities and extensions of a
     /// declaration (decorations on `v` when non-zero).
     fn applyExt(e: *Emitter, v: Id, x: ir.SpirvExt) Error!void {
-        for (x.capabilities) |c| try e.capabilities.put(e.arena, @enumFromInt(c), {});
+        for (x.capabilities) |c| try e.inlineCap(c);
         for (x.extensions) |name| try e.extension(name);
         if (v != 0) try e.extDecorate(v, x.decorations);
     }
@@ -640,7 +729,7 @@ const Emitter = struct {
             // (Not kernel capabilities: Addresses, Linkage, Kernel,
             // SubgroupDispatch.)
             0, 4, 5, 6, 58 => {},
-            else => try e.capabilities.put(e.arena, @enumFromInt(x.cap), {}),
+            else => try e.inlineCap(x.cap),
         }
         if (x.ext.len > 0 and x.core > 100 + @as(u32, e.spv_minor)) try e.extension(x.ext);
     }
@@ -669,13 +758,14 @@ const Emitter = struct {
     /// Inline SPIR-V: the instruction with its operands (OpExtInst for an
     /// instruction set).
     fn spirvInst(e: *Emitter, x: *const ir.SpirvInst, ty: TypeId) Error!Id {
-        for (x.capabilities) |c| try e.capabilities.put(e.arena, @enumFromInt(c), {});
+        for (x.capabilities) |c| try e.inlineCap(c);
         for (x.extensions) |name| try e.extension(name);
         // The capability the grammar gives the instruction (not ones for
         // kernels).
         if (x.set == null) if (op_caps.get(x.opcode)) |c| switch (c) {
-            4, 5, 6 => {},
-            else => try e.capabilities.put(e.arena, @enumFromInt(c), {}),
+            // (Matrix comes with Shader.)
+            0, 4, 5, 6 => {},
+            else => try e.inlineCap(c),
         };
         var words: std.ArrayList(u32) = .empty;
         const has_result = ty != TypeTable.void_type or x.set != null;
@@ -685,6 +775,7 @@ const Emitter = struct {
         for (x.operands) |o| try words.append(e.arena, switch (o) {
             .value => |r| e.val(r),
             .literal => |w| w,
+            .type => |t| try e.typeId(t),
         });
         const op: Op = if (x.set != null) .ext_inst else @enumFromInt(@as(u16, @intCast(x.opcode)));
         try e.b.emit(.functions, op, words.items);
@@ -826,7 +917,9 @@ const Emitter = struct {
         }
         for (e.capabilities.keys()) |c| try e.b.emit(.capabilities, .capability, &.{@backingInt(c)});
         if (e.glsl != 0) try e.b.emitWithString(.ext_inst_imports, .ext_inst_import, &.{e.glsl}, "GLSL.std.450", &.{});
-        try e.b.emit(.memory_model, .memory_model, &.{ 0, if (vulkan_mm) 3 else 1 }); // Logical Vulkan / GLSL450
+        // (PhysicalStorageBuffer64 addressing with physical pointers.)
+        const addressing: u32 = if (e.capabilities.contains(@enumFromInt(5347))) 5348 else 0;
+        try e.b.emit(.memory_model, .memory_model, &.{ addressing, if (vulkan_mm) 3 else 1 }); // Logical / PhysicalStorageBuffer64, Vulkan / GLSL450
         for (m.entries.items, 0..) |*entry, k| {
             e.setEntry(@intCast(k));
             try e.entryPoint(entry);
@@ -1843,6 +1936,12 @@ const Emitter = struct {
                 continue;
             }
             const t = try e.typeId(p.ty);
+            // An inline SPIR-V pointer passed to a function: dxc inlines
+            // the call; zdxc keeps it and needs variable pointers.
+            if (e.t.get(p.ty) == .spirv and e.t.get(p.ty).spirv.opcode == 32) {
+                try e.cap(.variable_pointers);
+                if (e.spv_minor < 3) try e.extension("SPV_KHR_variable_pointers");
+            }
             try params.append(e.arena, if (p.by_ref) try e.pointerType(.function, t) else t);
         }
         const fn_ty = try e.functionType(ret, params.items);

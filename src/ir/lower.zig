@@ -99,6 +99,10 @@ const Lowerer = struct {
     // Per function.
     b: ir.Builder = undefined,
     vars: std.AutoHashMapUnmanaged(*const Variable, Ref) = .empty,
+    /// Variables bound to values instead of storage: inline SPIR-V
+    /// pointers (`vk::WorkgroupSpirvPointer`), which Vulkan does not let
+    /// variables hold.
+    value_vars: std.AutoHashMapUnmanaged(*const Variable, Ref) = .empty,
     loops: std.ArrayList(struct { brk: BlockId, cont: BlockId }) = .empty,
     /// Geometry shaders: output elements registered before lowering (by
     /// stream parameter), and each stream's element layout.
@@ -403,6 +407,10 @@ const Lowerer = struct {
             const space: ir.Space = if (mq.vertices or mq.indices or mq.primitives) .mesh else if (p.dir != .in) .function else .none;
             const pv = try l.b.add(.{ .op = .{ .param = ir_index }, .ty = pty, .ptr = space });
             ir_index += 1;
+            if (p.dir == .in and isSpirvPointer(&l.s.types, p.type)) {
+                if (i < f.param_vars.len) if (f.param_vars[i]) |v| try l.value_vars.put(l.arena, v, pv);
+                continue;
+            }
             const storage = if (p.dir != .in) pv else blk: {
                 const local = try l.b.add(.{ .op = .local_var, .ty = pty, .ptr = .function });
                 try l.b.store(local, pv);
@@ -666,6 +674,14 @@ const Lowerer = struct {
                     l.unsupported(d.loc, "uninitialized local resource '{s}' is not supported yet", .{variable.name});
                     return error.Unsupported;
                 }
+                if (isSpirvPointer(&l.s.types, variable.type)) {
+                    const init_e = v.init orelse {
+                        l.unsupported(d.loc, "uninitialized inline SPIR-V pointer '{s}' is not supported", .{variable.name});
+                        return error.Unsupported;
+                    };
+                    try l.value_vars.put(l.arena, variable, try l.converted(init_e, variable.type));
+                    return;
+                }
                 const local = try l.b.add(.{ .op = .local_var, .ty = variable.type, .ptr = .function });
                 try l.vars.put(l.arena, variable, local);
                 if (v.init) |init_e| {
@@ -923,6 +939,7 @@ const Lowerer = struct {
                         return l.bitRead(try l.b.load(try l.bitStorage(l.this_ptr, bf)), bf);
                     },
                     .variable => |v| {
+                        if (l.value_vars.get(v)) |val| return val;
                         if (l.isSpecConstant(v)) return l.specConstant(v);
                         // Integer `static const` scalars are constants.
                         if (v.storage == .constant and v.init != null and l.s.types.get(v.type) == .scalar and !l.s.types.get(v.type).scalar.isFloat()) {
@@ -1194,6 +1211,14 @@ const Lowerer = struct {
             },
             .@"struct" => |info| {
                 const r = l.s.resolution(e) orelse return l.fail(e, "this member");
+                // A static member through an object.
+                if (r == .variable) {
+                    const v = r.variable;
+                    if (v.storage == .constant and v.init != null and l.s.types.get(v.type) == .scalar and !l.s.types.get(v.type).scalar.isFloat()) {
+                        if (l.s.evalVarInt(v)) |val| return l.b.constInt(try l.concrete(e.ty), val);
+                    }
+                    return l.b.load(try l.variableLvalue(e, v));
+                }
                 if (r == .bitfield) {
                     const bf = r.bitfield;
                     const storage = if (isAddressable(l.s, base))
@@ -1244,7 +1269,15 @@ const Lowerer = struct {
         }
         const Operand = @typeInfo(@TypeOf(inst.operands)).pointer.child;
         var ops: std.ArrayList(Operand) = .empty;
-        for (args, 0..) |a, i| {
+        // Missing trailing arguments take the parameters' defaults.
+        var full = args;
+        if (args.len < f.decl.params.len) {
+            const all = try l.arena.alloc(*ast.Expr, f.decl.params.len);
+            @memcpy(all[0..args.len], args);
+            for (all[args.len..], f.decl.params[args.len..]) |*x, pd| x.* = pd.init orelse return l.fail(e, "this call");
+            full = all;
+        }
+        for (full, 0..) |a, i| {
             const pd = if (i < f.decl.params.len) f.decl.params[i] else null;
             const pattrs: []const ast.Attribute = if (pd) |x| x.attrs else &.{};
             if (hasAttr(pattrs, "vk::ext_literal")) {
@@ -1271,6 +1304,14 @@ const Lowerer = struct {
         switch (r) {
             .function => |f| {
                 if (!f.defined and hasAttr(f.decl.attrs, "vk::ext_instruction")) return l.spirvInstCall(e, f, args, ret_ty);
+                // OpCooperativeMatrixLengthKHR of the template argument.
+                if (!f.defined and std.mem.startsWith(u8, f.name, "__builtin_spv_CooperativeMatrixLengthKHR") and f.template_args.len == 1 and f.template_args[0] == .type and l.s.opts.spirv) {
+                    const p = try l.arena.create(ir.SpirvInst);
+                    const ops = try l.arena.alloc(@typeInfo(@TypeOf(p.operands)).pointer.child, 1);
+                    ops[0] = .{ .type = f.template_args[0].type };
+                    p.* = .{ .opcode = 4460, .operands = ops };
+                    return l.b.add(.{ .op = .{ .spirv_inst = p }, .ty = ret_ty });
+                }
                 const fi = try l.functionIndex(f);
                 // Missing trailing arguments take the parameters' defaults.
                 var full = args;
@@ -1466,6 +1507,40 @@ const Lowerer = struct {
     }
 
     /// Pointer to the storage `e` designates.
+    /// Storage of a variable that is not a local (locals are in `vars`).
+    fn variableLvalue(l: *Lowerer, e: *ast.Expr, v: *const Variable) Error!Ref {
+        const t = l.types();
+        if (l.vars.get(v)) |p| return p;
+        switch (v.storage) {
+            .local, .param, .local_static => return l.fail(e, "this variable"),
+            .global_uniform, .cbuffer => {
+                if (isObject(&l.s.types, v.type)) {
+                    l.unsupported(e.loc, "resource '{s}' declared as a uniform is not supported yet", .{v.name});
+                    return error.Unsupported;
+                }
+                if (l.isPushConstantStruct(v)) {
+                    // A buffer of its own (SPIR-V push constants).
+                    const g = l.globals.get(v) orelse blk: {
+                        try l.m.globals.append(l.arena, .{ .name = v.name, .ty = v.type, .space = .cbuffer, .push_constant = true });
+                        const gi: u32 = @intCast(l.m.globals.items.len - 1);
+                        try l.globals.put(l.arena, v, gi);
+                        break :blk gi;
+                    };
+                    return l.b.add(.{ .op = .{ .global = g }, .ty = v.type, .ptr = .cbuffer });
+                }
+                const cm = try l.cbufferMember(v);
+                const glob = l.m.globals.items[cm.global];
+                const base = try l.b.add(.{ .op = .{ .global = cm.global }, .ty = glob.ty, .ptr = .cbuffer });
+                const idx = try l.b.constInt(try t.scalar(.uint), cm.field);
+                return l.b.add(.{ .op = .{ .access = .{ .base = base, .indices = try l.arena.dupe(Ref, &.{idx}) } }, .ty = v.type, .ptr = .cbuffer });
+            },
+            else => {},
+        }
+        const g = try l.globalIndex(v);
+        const glob = l.m.globals.items[g];
+        return l.b.add(.{ .op = .{ .global = g }, .ty = glob.ty, .ptr = glob.space });
+    }
+
     fn lvalue(l: *Lowerer, e: *ast.Expr) Error!Ref {
         const t = l.types();
         switch (e.kind) {
@@ -1481,39 +1556,12 @@ const Lowerer = struct {
                     return l.b.add(.{ .op = .{ .access = .{ .base = l.this_ptr, .indices = try l.arena.dupe(Ref, &.{idx}) } }, .ty = e.ty, .ptr = l.b.f.inst(l.this_ptr).ptr });
                 }
                 if (r != .variable) return l.fail(e, "this name");
-                const v = r.variable;
-                if (l.vars.get(v)) |p| return p;
-                switch (v.storage) {
-                    .local, .param, .local_static => return l.fail(e, "this variable"),
-                    .global_uniform, .cbuffer => {
-                        if (isObject(&l.s.types, v.type)) {
-                            l.unsupported(e.loc, "resource '{s}' declared as a uniform is not supported yet", .{v.name});
-                            return error.Unsupported;
-                        }
-                        if (l.isPushConstantStruct(v)) {
-                            // A buffer of its own (SPIR-V push constants).
-                            const g = l.globals.get(v) orelse blk: {
-                                try l.m.globals.append(l.arena, .{ .name = v.name, .ty = v.type, .space = .cbuffer, .push_constant = true });
-                                const gi: u32 = @intCast(l.m.globals.items.len - 1);
-                                try l.globals.put(l.arena, v, gi);
-                                break :blk gi;
-                            };
-                            return l.b.add(.{ .op = .{ .global = g }, .ty = v.type, .ptr = .cbuffer });
-                        }
-                        const cm = try l.cbufferMember(v);
-                        const glob = l.m.globals.items[cm.global];
-                        const base = try l.b.add(.{ .op = .{ .global = cm.global }, .ty = glob.ty, .ptr = .cbuffer });
-                        const idx = try l.b.constInt(try t.scalar(.uint), cm.field);
-                        return l.b.add(.{ .op = .{ .access = .{ .base = base, .indices = try l.arena.dupe(Ref, &.{idx}) } }, .ty = v.type, .ptr = .cbuffer });
-                    },
-                    else => {},
-                }
-                const g = try l.globalIndex(v);
-                const glob = l.m.globals.items[g];
-                return l.b.add(.{ .op = .{ .global = g }, .ty = glob.ty, .ptr = glob.space });
+                return l.variableLvalue(e, r.variable);
             },
             .member => |m| {
                 const r = l.s.resolution(e) orelse return l.fail(e, "this member");
+                // A static member through an object.
+                if (r == .variable) return l.variableLvalue(e, r.variable);
                 if (r != .field) return l.fail(e, "this member");
                 const idx = try l.b.constInt(try t.scalar(.uint), r.field);
                 if (t.get(m.base.ty) == .resource) {
@@ -2266,6 +2314,11 @@ pub fn saturatingInt(f: f64) i64 {
 
 /// Non-static member functions take their object as a hidden first
 /// parameter.
+/// `vk::SpirvOpaqueType<OpTypePointer, ...>` (WorkgroupSpirvPointer).
+fn isSpirvPointer(t: *const TypeTable, ty: TypeId) bool {
+    return t.get(ty) == .spirv and t.get(ty).spirv.opcode == 32;
+}
+
 fn isMethod(f: *const semamod.Function) bool {
     return f.owner != null and !f.decl.quals.static;
 }
