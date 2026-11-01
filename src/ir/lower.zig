@@ -436,7 +436,7 @@ const Lowerer = struct {
         };
         const shader_record = if (v.decl) |d| isShaderRecord(d.attrs) else false;
         const push_constant = if (v.decl) |d| hasAttr(d.attrs, "vk::push_constant") else false;
-        try l.m.globals.append(l.arena, .{ .name = v.name, .ty = v.type, .space = space, .binding = binding, .shader_record = shader_record, .push_constant = push_constant, .input_attachment = if (v.decl) |d| l.s.vkAttrInt(d.attrs, "vk::input_attachment_index") else null, .image_format = if (v.decl) |d| imageFormatNamed(semamod.Sema.vkAttrString(d.attrs, "vk::image_format")) else null, .ext = if (v.decl) |d| try l.spirvExt(d.attrs) else .{} });
+        try l.m.globals.append(l.arena, .{ .name = v.name, .ty = v.type, .space = space, .binding = binding, .shader_record = shader_record, .push_constant = push_constant, .input_attachment = if (v.decl) |d| l.s.vkAttrInt(d.attrs, "vk::input_attachment_index") else null, .image_format = if (v.decl) |d| imageFormatNamed(semamod.Sema.vkAttrString(d.attrs, "vk::image_format")) else null, .globally_coherent = if (v.decl) |d| d.quals.globallycoherent else false, .ext = if (v.decl) |d| try l.spirvExt(d.attrs) else .{} });
         const i: u32 = @intCast(l.m.globals.items.len - 1);
         try l.globals.put(l.arena, v, i);
         return i;

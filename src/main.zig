@@ -164,6 +164,10 @@ fn parseArgs(cli: Cli, arena: std.mem.Allocator, argv: []const [:0]const u8, std
                     .auto_binding_space => opts.vk.auto_binding_space = std.fmt.parseInt(u32, v, 10) catch return cli.fail("invalid -auto-binding-space '{s}'", .{v}),
                     .fvk_auto_shift_bindings => opts.vk.auto_shift = true,
                     .fspv_flatten_resource_arrays => opts.vk.flatten_arrays = true,
+                    .fspv_use_legacy_buffer_matrix_order => opts.vk.legacy_matrix_order = true,
+                    .fspv_use_vulkan_memory_model => opts.vk.vulkan_memory_model = true,
+                    // (zdxc never removes interface variables.)
+                    .fspv_preserve_interface => {},
                     .fvk_invert_y => opts.vk.invert_y = true,
                     .fvk_use_gl_layout => opts.vk.layout = .gl,
                     .fvk_use_dx_layout => opts.vk.layout = .dx,

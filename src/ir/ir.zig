@@ -258,6 +258,11 @@ pub const VkOptions = struct {
     /// -fspv-flatten-resource-arrays: one variable (and binding) per
     /// element of an array of resources.
     flatten_arrays: bool = false,
+    /// -fspv-use-legacy-buffer-matrix-order: byte-address buffer matrices
+    /// are row major (dxc's old, incorrect assumption).
+    legacy_matrix_order: bool = false,
+    /// -fspv-use-vulkan-memory-model.
+    vulkan_memory_model: bool = false,
     /// -fvk-bind-register: every resource's (set, binding) by register.
     bind_register: std.ArrayList(struct { class: u8, index: u32, space: u32, binding: u32, set: u32 }) = .empty,
 
@@ -318,6 +323,8 @@ pub const Global = struct {
     input_attachment: ?u32 = null,
     /// [[vk::image_format("...")]]: the SPIR-V ImageFormat.
     image_format: ?u32 = null,
+    /// `globallycoherent` resources.
+    globally_coherent: bool = false,
     ext: SpirvExt = .{},
 };
 

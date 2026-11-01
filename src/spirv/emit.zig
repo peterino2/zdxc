@@ -9,6 +9,7 @@ const ir = @import("../ir/ir.zig");
 const types = @import("../sema/types.zig");
 const texture = @import("../ir/texture.zig");
 const op_caps = @import("op_caps.zig");
+const memory_model = @import("memory_model.zig");
 const builder = @import("builder.zig");
 const diag = @import("../diag.zig");
 const layout = @import("../ir/layout.zig");
@@ -92,6 +93,7 @@ const Capability = enum(u32) {
     sampled_image_array_non_uniform_indexing = 5307,
     storage_buffer_array_non_uniform_indexing = 5308,
     storage_image_array_non_uniform_indexing = 5309,
+    vulkan_memory_model = 5345,
     /// (Inline SPIR-V may use any value.)
     _,
 };
@@ -242,6 +244,9 @@ const Emitter = struct {
         iface: std.ArrayList(Id) = .empty,
         /// Compute derivatives' execution mode (0: none).
         derivative_mode: u32 = 0,
+        /// Rasterizer-ordered views: the fragment interlock execution
+        /// mode (0: none).
+        interlock_mode: u32 = 0,
         /// vk::ext_execution_mode(...): mode and operands (ids for
         /// ext_execution_mode_id).
         ext_modes: std.ArrayList(struct { words: []const u32, id: bool }) = .empty,
@@ -577,7 +582,7 @@ const Emitter = struct {
         return id;
     }
 
-    fn constUint(e: *Emitter, v: u64) Error!Id {
+    pub fn constUint(e: *Emitter, v: u64) Error!Id {
         return e.constBits(try e.scalarType(.uint), v, 1);
     }
 
@@ -806,9 +811,22 @@ const Emitter = struct {
             try e.emitFunction(m.functions.items[v.fi], v.id, v.bindings);
         }
 
+        // The Vulkan memory model, when asked for or needed (as dxc).
+        const vulkan_mm = e.vk.vulkan_memory_model or e.capabilities.contains(.vulkan_memory_model);
+        if (vulkan_mm) {
+            var tess_control = false;
+            for (m.entries.items) |en| tess_control = tess_control or en.stage == .hull;
+            try memory_model.upgrade(e, tess_control);
+            try e.cap(.vulkan_memory_model);
+            if (e.spv_minor < 5) {
+                // (The option implies the extension is allowed.)
+                if (e.vk.vulkan_memory_model) try e.vk.extensions.append(e.arena, "SPV_KHR_vulkan_memory_model");
+                try e.extension("SPV_KHR_vulkan_memory_model");
+            }
+        }
         for (e.capabilities.keys()) |c| try e.b.emit(.capabilities, .capability, &.{@backingInt(c)});
         if (e.glsl != 0) try e.b.emitWithString(.ext_inst_imports, .ext_inst_import, &.{e.glsl}, "GLSL.std.450", &.{});
-        try e.b.emit(.memory_model, .memory_model, &.{ 0, 1 }); // Logical GLSL450
+        try e.b.emit(.memory_model, .memory_model, &.{ 0, if (vulkan_mm) 3 else 1 }); // Logical Vulkan / GLSL450
         for (m.entries.items, 0..) |*entry, k| {
             e.setEntry(@intCast(k));
             try e.entryPoint(entry);
@@ -816,6 +834,36 @@ const Emitter = struct {
         for (m.functions.items, e.func_ids) |f, id| {
             if (!e.hasResourceParams(f)) try e.b.emitWithString(.debug_names, .name, &.{id}, f.name, &.{});
         }
+    }
+
+    fn usesRov(e: *Emitter) bool {
+        for (e.m.globals.items) |g| {
+            var t = g.ty;
+            while (e.t.get(t) == .array) t = e.t.get(t).array.elem;
+            if (e.t.get(t) == .resource and std.mem.startsWith(u8, e.t.get(t).resource.name, "RasterizerOrdered")) return true;
+        }
+        return false;
+    }
+
+    /// OpBeginInvocationInterlockEXT, ordered per sample when the shader
+    /// reads SV_SampleIndex, per shading rate region with SV_ShadingRate
+    /// (the last of them declared), else per pixel.
+    fn beginInterlock(e: *Emitter) Error!void {
+        var mode: u32 = 5366; // PixelInterlockOrderedEXT
+        var capability: u32 = 5378; // FragmentShaderPixelInterlockEXT
+        for (e.entry.inputs.items) |el| {
+            if (std.ascii.eqlIgnoreCase(el.semantic, "SV_SampleIndex")) {
+                mode = 5368; // SampleInterlockOrderedEXT
+                capability = 5363; // FragmentShaderSampleInterlockEXT
+            } else if (std.ascii.eqlIgnoreCase(el.semantic, "SV_ShadingRate")) {
+                mode = 5370; // ShadingRateInterlockOrderedEXT
+                capability = 5372; // FragmentShaderShadingRateInterlockEXT
+            }
+        }
+        e.st.interlock_mode = mode;
+        try e.cap(@enumFromInt(capability));
+        try e.extension("SPV_EXT_fragment_shader_interlock");
+        try e.b.emit(.functions, .begin_invocation_interlock_ext, &.{});
     }
 
     fn recordCall(e: *Emitter, callee: Id) Error!void {
@@ -948,6 +996,7 @@ const Emitter = struct {
             else => {},
         }
         if (e.st.derivative_mode != 0) try e.b.emit(.execution_modes, .execution_mode, &.{ wrapper, e.st.derivative_mode });
+        if (e.st.interlock_mode != 0) try e.b.emit(.execution_modes, .execution_mode, &.{ wrapper, e.st.interlock_mode });
         // vk::ext_execution_mode(...) / ext_execution_mode_id(...).
         for (e.st.ext_modes.items) |em| {
             var words: std.ArrayList(u32) = .empty;
@@ -1005,6 +1054,7 @@ const Emitter = struct {
                             try e.b.emit(.types_globals, .variable, &.{ try e.pointerType(p.sc, p.ty), id.*, @backingInt(p.sc) });
                             try e.b.emit(.annotations, .decorate, &.{ id.*, 34, slot.set }); // DescriptorSet
                             try e.b.emit(.annotations, .decorate, &.{ id.*, 33, slot.binding + @as(u32, @intCast(k)) }); // Binding
+                            if (g.globally_coherent) try e.b.emit(.annotations, .decorate, &.{ id.*, 23 }); // Coherent
                             try e.b.emitWithString(.debug_names, .name, &.{id.*}, try std.fmt.allocPrint(e.arena, "{s}[{d}]", .{ g.name, k }), &.{});
                             if (e.spv_minor >= 4) try e.flat_iface.append(e.arena, id.*);
                         }
@@ -1019,6 +1069,7 @@ const Emitter = struct {
                     const slot = try e.slotOf(@intCast(gi), false);
                     try e.b.emit(.annotations, .decorate, &.{ var_id, 34, slot.set }); // DescriptorSet
                     try e.b.emit(.annotations, .decorate, &.{ var_id, 33, slot.binding }); // Binding
+                    if (g.globally_coherent) try e.b.emit(.annotations, .decorate, &.{ var_id, 23 }); // Coherent
                     try e.b.emitWithString(.debug_names, .name, &.{var_id}, g.name, &.{});
                     try e.userType(var_id, g.ty, g);
                     if (g.input_attachment) |ia| try e.b.emit(.annotations, .decorate, &.{ var_id, 43, ia }); // InputAttachmentIndex
@@ -2384,7 +2435,13 @@ const Emitter = struct {
                     if (e.mesh_params.contains(.{ callee, @intCast(k) })) continue;
                     try ops.append(e.arena, e.val(a));
                 }
+                // Rasterizer-ordered views: the whole pixel shader is the
+                // critical section (entered exactly once, as Vulkan
+                // requires; dxc's optimizer narrows it to the accesses).
+                const interlock = e.entry.stage == .pixel and c.func == e.entry.func and e.cur_fn == e.func_ids[e.entry.wrapper] and e.usesRov();
+                if (interlock) try e.beginInterlock();
                 e.vals[ri] = try e.op1(.function_call, i.ty, ops.items);
+                if (interlock) try e.b.emit(.functions, .end_invocation_interlock_ext, &.{});
             },
             .intrinsic => |c| {
                 if (std.mem.eql(u8, c.name, "SetMeshOutputCounts")) {
@@ -3631,7 +3688,7 @@ const Emitter = struct {
     /// The scalar type and byte offset of flattened component `k` of a
     /// value of `ty` in a byte-address buffer (natural alignment).
     fn rawComponent(e: *Emitter, ty: TypeId, k: u32) Error!struct { TypeId, u32 } {
-        const off = layout.componentOffset(e.arena, e.t, ty, false, k, .dx_packed) catch return e.unsupported("byte-address buffer accesses of type '{s}' are not supported yet", .{try e.t.format(e.arena, ty)});
+        const off = layout.componentOffset(e.arena, e.t, ty, e.vk.legacy_matrix_order, k, .dx_packed) catch return e.unsupported("byte-address buffer accesses of type '{s}' are not supported yet", .{try e.t.format(e.arena, ty)});
         var cur = ty;
         var kk = k;
         while (true) switch (e.t.get(cur)) {
@@ -3990,7 +4047,12 @@ const Emitter = struct {
             5326 => e.entry.stage == .intersection,
             else => false,
         };
-        if (changing and e.spv_minor >= 6) try e.b.emit(.annotations, .decorate, &.{ v, 21 }); // Volatile
+        if (changing) {
+            try e.b.emit(.annotations, .decorate, &.{ v, 21 }); // Volatile
+            // Before Vulkan 1.3 Volatile needs the Vulkan memory model
+            // (which turns the decoration into Volatile loads).
+            if (e.spv_minor < 6) try e.cap(.vulkan_memory_model);
+        }
         try e.useVar(v);
         try e.builtin_inputs.put(e.arena, builtin, v);
         return v;

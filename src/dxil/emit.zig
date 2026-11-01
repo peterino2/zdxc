@@ -110,6 +110,9 @@ const Resource = struct {
     comparison: bool = false,
     /// Structured UAV with a hidden counter (IncrementCounter, Append...).
     has_counter: bool = false,
+    /// `globallycoherent` UAVs and rasterizer-ordered views.
+    coherent: bool = false,
+    rov: bool = false,
     /// Registers in the range (arrays of resources); maxInt for unsized.
     count: u32 = 1,
     /// An array element's handle made at its use: a copy of the array's
@@ -424,7 +427,7 @@ const Emitter = struct {
             else => return e.unsupported("resource type '{s}' is not supported yet", .{r.name}),
         };
         const class: Resource.Class = if (kind == 13) .cbuffer else if (r.kind.isWritable() or r.kind == .consume_structured_buffer) .uav else .srv;
-        return .{ .global = 0, .class = class, .kind = kind, .elem = r.elem, .rty = ty, .has_counter = r.kind == .append_structured_buffer or r.kind == .consume_structured_buffer };
+        return .{ .global = 0, .class = class, .kind = kind, .elem = r.elem, .rty = ty, .has_counter = r.kind == .append_structured_buffer or r.kind == .consume_structured_buffer, .rov = std.mem.startsWith(u8, r.name, "RasterizerOrdered") };
     }
 
     // ------------------------------------------------------------------
@@ -905,6 +908,7 @@ const Emitter = struct {
             }
             if (e.t.get(gty) != .resource) return e.unsupported("global '{s}' is not supported yet", .{g.name});
             var res = try e.resourceFor(gty);
+            res.coherent = g.globally_coherent and res.class == .uav;
             const class = res.class;
             const want: u8 = switch (class) {
                 .uav => 'u',
@@ -1064,6 +1068,8 @@ const Emitter = struct {
     fn resourceProperties(e: *Emitter, res: Resource) Error![2]i64 {
         var basic: i64 = res.kind;
         if (res.class == .uav) basic |= 0x1000;
+        if (res.rov) basic |= 0x2000;
+        if (res.coherent) basic |= 0x4000;
         if (res.comparison or res.has_counter) basic |= 0x8000;
         const extra: i64 = switch (res.kind) {
             13 => try e.cbufferSize(res),
@@ -4253,12 +4259,15 @@ const Emitter = struct {
         if (e.uses_int64) flags |= 1 << 20;
         if (e.uses_min_precision) flags |= 1 << 5;
         var uavs: u32 = 0;
+        var rov = false;
         for (e.resources.items) |r| {
             if (r.view) continue;
             if (r.kind == 11 or r.kind == 12) flags |= 1 << 4;
             if (r.class == .uav) uavs += @min(r.count, 9);
+            if (r.rov) rov = true;
         }
         if (uavs > 8) flags |= 1 << 15;
+        if (rov) flags |= 1 << 18;
         if (e.uses_typed_uav_load) flags |= 1 << 13;
         // Resources may not alias (DXIL 1.7+, when UAVs are used).
         if (uavs > 0 and e.profile.minor >= 7) flags |= 1 << 33;
@@ -4367,7 +4376,7 @@ const Emitter = struct {
             try fields.appendSlice(e.arena, &head);
             try fields.append(e.arena, try mdI32(dm, r.kind));
             if (r.class == .uav) {
-                try fields.appendSlice(e.arena, &.{ try mdBool(dm, i1t, false), try mdBool(dm, i1t, r.has_counter), try mdBool(dm, i1t, false) });
+                try fields.appendSlice(e.arena, &.{ try mdBool(dm, i1t, r.coherent), try mdBool(dm, i1t, r.has_counter), try mdBool(dm, i1t, r.rov) });
             } else try fields.append(e.arena, try mdI32(dm, 0)); // sample count
             const extra: ?module.MdId = switch (r.kind) {
                 12 => try dm.mdNode(&.{ try mdI32(dm, 1), try mdI32(dm, try e.stride(r.elem)) }),
@@ -4395,10 +4404,12 @@ const Emitter = struct {
         const globals = try e.arena.alloc(?libinfo.GlobalRes, e.dm.globals.items.len);
         @memset(globals, null);
         var uavs: u32 = 0;
+        var rov = false;
         var raw = false;
         for (e.resources.items) |r| {
             if (r.view) continue;
             if (r.class == .uav) uavs += @min(r.count, 9);
+            if (r.rov) rov = true;
             if ((r.class == .uav or r.class == .srv) and (r.kind == 11 or r.kind == 12)) raw = true;
             const lg = r.lib_global orelse continue;
             globals[lg] = .{ .uav = r.class == .uav, .typed_multi = r.kind >= 1 and r.kind <= 10 and try e.flatCount(r.elem) > 1 };
@@ -4413,6 +4424,7 @@ const Emitter = struct {
         flags &= ~@as(u64, libinfo.bit.local);
         if (raw) flags |= libinfo.bit.raw_structured;
         if (uavs > 8) flags |= 1 << 15;
+        if (rov) flags |= 1 << 18;
         return .{ .infos = infos, .flags = flags };
     }
 
@@ -4517,7 +4529,7 @@ const Emitter = struct {
                 .cbuffer => 2,
                 .sampler => 3,
             };
-            try b.addResource(.{ .class = rdat_class, .kind = r.kind, .id = r.id, .space = bd.space, .lower = bd.index, .upper = upper, .name = try b.string(e.m.globals.items[r.global].name), .flags = if (r.class == .uav and r.has_counter) 2 else 0 });
+            try b.addResource(.{ .class = rdat_class, .kind = r.kind, .id = r.id, .space = bd.space, .lower = bd.index, .upper = upper, .name = try b.string(e.m.globals.items[r.global].name), .flags = if (r.class == .uav) @as(u32, @intFromBool(r.coherent)) | @as(u32, @intFromBool(r.has_counter)) << 1 | @as(u32, @intFromBool(r.rov)) << 2 else 0 });
             if (r.lib_global) |lg| try res_index.put(e.arena, lg, count);
             count += 1;
         };
