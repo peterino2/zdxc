@@ -31,6 +31,10 @@ pub const Parser = struct {
     names: std.StringHashMapUnmanaged(std.ArrayList(NameKind)) = .empty,
     /// Names declared in each open scope, to undo on exit.
     scopes: std.ArrayList(std.ArrayList([]const u8)) = .empty,
+    /// Types declared in any struct (template ones included, whose scope
+    /// ends with the template): types as the last part of a qualified
+    /// name (`S<T>::Inner`).
+    member_types: std.StringHashMapUnmanaged(void) = .empty,
     anon_count: u32 = 0,
     /// Name of the struct most recently parsed by parseStructDeclInto
     /// (synthesized for anonymous structs), for `typedef struct ...`.
@@ -281,6 +285,11 @@ pub const Parser = struct {
         return isBuiltinType(name);
     }
 
+    /// The last part of a qualified name: also a struct's member type.
+    fn isMemberTypeName(p: *const Parser, name: []const u8) bool {
+        return p.isTypeName(name) or p.member_types.contains(name);
+    }
+
     fn isTemplateName(p: *const Parser, name: []const u8) bool {
         if (p.lookupName(name)) |k| {
             if (k == .template_type or k == .template_func) return true;
@@ -306,6 +315,7 @@ pub const Parser = struct {
             return p.skipTypeAttrs(p.skipParens(i + 1) orelse return null);
         }
         if (p.toks[i].kind == .colon_colon) i += 1;
+        var qualified = false;
         while (true) {
             const t = p.toks[i];
             if (t.kind != .identifier or isReserved(t.text)) return null;
@@ -316,9 +326,10 @@ pub const Parser = struct {
             }
             if (p.toks[after].kind == .colon_colon and p.toks[after + 1].kind == .identifier) {
                 i = after + 1;
+                qualified = true;
                 continue;
             }
-            if (!p.isTypeName(t.text)) return null;
+            if (!(if (qualified) p.isMemberTypeName(t.text) else p.isTypeName(t.text))) return null;
             return p.skipTypeAttrs(after);
         }
     }
@@ -524,7 +535,7 @@ pub const Parser = struct {
             return p.mk(ast.TypeRef, .{ .loc = start.loc, .name = try p.simpleName(start.loc, name), .unsigned_spec = !signed });
         }
         const name = try p.parseName();
-        if (!p.isTypeName(name.last())) {
+        if (!(if (name.parts.len > 1) p.isMemberTypeName(name.last()) else p.isTypeName(name.last()))) {
             p.diags.position = p.pos;
             _ = p.diags.report(.{ .severity = .@"error", .loc = start.loc, .len = @intCast(start.text.len) }, "unknown type name '{s}'", .{name.last()});
             return error.Syntax;
@@ -849,7 +860,10 @@ pub const Parser = struct {
             // that `S::Inner` resolves; the name table is flat by last name.
             var nested: std.ArrayList(struct { []const u8, NameKind }) = .empty;
             for (p.scopes.items[p.scopes.items.len - 1].items) |n| {
-                if (p.lookupName(n)) |k| if (k == .type or k == .template_type) try nested.append(p.arena, .{ n, k });
+                if (p.lookupName(n)) |k| if (k == .type or k == .template_type) {
+                    try nested.append(p.arena, .{ n, k });
+                    if (k == .type) try p.member_types.put(p.arena, n, {});
+                };
             }
             p.popScope();
             for (nested.items) |n| try p.declareName(n[0], n[1]);
@@ -972,7 +986,7 @@ pub const Parser = struct {
         const dims = try p.parseArrayDims();
         _ = try p.expect(.semi, "';'");
         try p.declareNameOuter(name.text, if (template_params.len > 0) .template_type else .type, template_params.len > 0);
-        return p.mk(ast.Decl, .{ .loc = kw.loc, .kind = .{ .typedef = .{ .name = name.text, .type = ty, .array_dims = dims, .template_params = template_params, .attrs = attrs } } });
+        return p.mk(ast.Decl, .{ .loc = kw.loc, .kind = .{ .typedef = .{ .name = name.text, .type = ty, .array_dims = dims, .template_params = template_params, .attrs = attrs, .alias = true } } });
     }
 
     fn parseNamespace(p: *Parser) Error!*ast.Decl {

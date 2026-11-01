@@ -233,6 +233,9 @@ const Emitter = struct {
     /// Libraries: `[noinline]` functions kept as functions of their own
     /// (IR function -> module function).
     lib_calls: std.AutoHashMapUnmanaged(u32, u32) = .empty,
+    /// Each HLSL struct's module type (struct types are named, and two
+    /// structs may share a name: `A<int>::In`, `A<float>::In`).
+    struct_types: std.AutoHashMapUnmanaged(TypeId, DType) = .empty,
     /// Prologue instructions dropped again if unused (resource handles).
     lib_removable: std.AutoHashMapUnmanaged(u32, void) = .empty,
 
@@ -4635,9 +4638,19 @@ const Emitter = struct {
             .matrix => |m| e.dm.getType(.{ .array = .{ .len = m.rows, .elem = try e.dm.getType(.{ .array = .{ .len = m.cols, .elem = try e.scalarTy(memScalar(e.compOf(ty))) } }) } }),
             .array => |a| e.dm.getType(.{ .array = .{ .len = a.len, .elem = try e.memoryType(a.elem) } }),
             .@"struct" => |st| blk: {
+                if (e.struct_types.get(ty)) |d| break :blk d;
                 const elems = try e.arena.alloc(DType, st.fields.items.len);
                 for (elems, st.fields.items) |*x, fld| x.* = try e.memoryType(fld.type);
-                break :blk e.dm.getType(.{ .@"struct" = .{ .name = try std.fmt.allocPrint(e.arena, "struct.{s}", .{st.name}), .elems = elems } });
+                // A name another struct has taken gets a suffix, as LLVM's.
+                const base = try std.fmt.allocPrint(e.arena, "struct.{s}", .{st.name});
+                var name = base;
+                var n: u32 = 0;
+                while (for (e.dm.types.items) |x| {
+                    if (x == .@"struct" and std.mem.eql(u8, x.@"struct".name, name)) break true;
+                } else false) : (n += 1) name = try std.fmt.allocPrint(e.arena, "{s}.{d}", .{ base, n });
+                const d = try e.dm.getType(.{ .@"struct" = .{ .name = name, .elems = elems } });
+                try e.struct_types.put(e.arena, ty, d);
+                break :blk d;
             },
             else => e.unsupported("payloads of type '{s}' are not supported yet", .{try e.t.format(e.arena, ty)}),
         };

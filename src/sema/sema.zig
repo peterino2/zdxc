@@ -295,6 +295,10 @@ pub const Sema = struct {
     /// Adds a template (or a specialization) to the name's set here.
     fn addTemplate(s: *Sema, name: []const u8, d: *const ast.Decl, spec: bool) !void {
         try s.template_scopes.put(s.arena, d, s.scope);
+        // dxc rejects `typedef` members even in templates never used.
+        if (d.kind == .@"struct" and s.instance_depth == 0) if (d.kind.@"struct".members) |ms| for (ms) |m| {
+            if (m.kind == .typedef and !m.kind.typedef.alias and m.kind.typedef.template_params.len == 0) s.err(m.loc, "nested typedefs are not supported in HLSL", .{});
+        };
         const set = blk: {
             if (s.scope.syms.get(name)) |sym| switch (sym) {
                 .template => |t| break :blk t,
@@ -1648,7 +1652,9 @@ pub const Sema = struct {
             },
             .typedef => |td| {
                 if (td.template_params.len > 0) return s.declareTemplate(td.name, d);
-                if (ctx == .member and s.instance_depth == 0) {
+                // (Alias declarations are allowed; template members are
+                // reported at the template's definition.)
+                if (ctx == .member and !td.alias and s.instance_depth == 0) {
                     s.err(d.loc, "nested typedefs are not supported in HLSL", .{});
                     return;
                 }
@@ -4336,5 +4342,21 @@ test "recursion is reported from exported functions" {
         \\export void entry(inout float4 f) { recurse(f); }
     , .{}, &.{
         "1: error: recursive functions are not allowed: function 'entry' calls recursive function 'recurse'",
+    });
+}
+
+test "nested types and typedefs" {
+    // `typedef` members are errors, templates included (even unused);
+    // alias declarations are not, and nested types of template instances
+    // resolve.
+    try expectDiags(
+        \\struct A { typedef float F; float x; };
+        \\template <typename T> struct B { typedef T F; T x; };
+        \\struct C { using F = float; F x; };
+        \\template <typename T> struct D { struct In { T t; }; using E = T; };
+        \\void f() { C::F c = 1; D<float>::In i; i.t = c; D<int>::E e = 2; }
+    , .{}, &.{
+        "1: error: nested typedefs are not supported in HLSL",
+        "2: error: nested typedefs are not supported in HLSL",
     });
 }
