@@ -276,6 +276,10 @@ const Encoder = struct {
     m: *Module,
     w: bitstream.Writer,
     ops: std.ArrayList(u64) = .empty,
+    /// The function being written, and each of its instructions' value
+    /// ID offset (non-void instructions before it).
+    numbered: ?*const Function = null,
+    inst_ids: std.ArrayList(u32) = .empty,
 
     fn gpa(e: *Encoder) Allocator {
         return e.w.gpa;
@@ -305,12 +309,9 @@ const Encoder = struct {
             .arg => |a| e.moduleValueCount() + a,
             .inst => |i| blk: {
                 const func = f.?;
+                std.debug.assert(e.numbered == func);
                 const nargs: u32 = @intCast(e.m.types.items[func.ty].function.params.len);
-                var n: u32 = 0;
-                for (func.insts.items[0..i]) |prev| {
-                    if (e.m.types.items[prev.ty] != .void) n += 1;
-                }
-                break :blk e.moduleValueCount() + nargs + n;
+                break :blk e.moduleValueCount() + nargs + e.inst_ids.items[i];
             },
         };
     }
@@ -337,6 +338,7 @@ const Encoder = struct {
 
     fn write(e: *Encoder) ![]u8 {
         defer e.ops.deinit(e.gpa());
+        defer e.inst_ids.deinit(e.gpa());
         const w = &e.w;
         try w.emit('B', 8);
         try w.emit('C', 8);
@@ -534,6 +536,13 @@ const Encoder = struct {
 
     fn writeFunction(e: *Encoder, f: *const Function) !void {
         const w = &e.w;
+        e.inst_ids.clearRetainingCapacity();
+        var n: u32 = 0;
+        for (f.insts.items) |inst| {
+            try e.inst_ids.append(e.gpa(), n);
+            if (e.m.types.items[inst.ty] != .void) n += 1;
+        }
+        e.numbered = f;
         try w.enterBlock(block_function, 4);
         try e.push(f.num_blocks);
         try e.rec(1); // DECLAREBLOCKS
