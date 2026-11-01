@@ -7,6 +7,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const ast = @import("../front/ast.zig");
 const ir = @import("ir.zig");
+const layout = @import("layout.zig");
 const semamod = @import("../sema/sema.zig");
 const types = @import("../sema/types.zig");
 const Bitfield = types.Bitfield;
@@ -91,6 +92,9 @@ const Lowerer = struct {
     funcs: std.AutoHashMapUnmanaged(*const semamod.Function, u32) = .empty,
     pending: std.ArrayList(*const semamod.Function) = .empty,
     globals: std.AutoHashMapUnmanaged(*const Variable, u32) = .empty,
+    /// Resources inside global structs (`g.tex`): a global each, by
+    /// variable and member path.
+    leaf_globals: std.StringHashMapUnmanaged(u32) = .empty,
     /// cbuffer globals by declaration (0: `$Globals`), and where each
     /// member variable lives.
     cbuffers: std.AutoHashMapUnmanaged(usize, u32) = .empty,
@@ -230,6 +234,32 @@ const Lowerer = struct {
         var globals_done = false;
         for (l.s.global_order.items) |gd| switch (gd) {
             .variable => |v| {
+                // A struct of resources: a binding per resource (used or
+                // not), the first taking the struct's register.
+                if (v.storage == .global_uniform and holdsResources(&l.s.types, v.type)) {
+                    l.m.resource_structs = true;
+                    if (l.s.opts.spirv) {
+                        if (structHoldsBuffer(&l.s.types, v.type)) {
+                            l.unsupported(v.loc, "global structures containing buffers are not supported", .{});
+                            return error.Unsupported;
+                        }
+                        if (layout.flatCount(&l.s.types, v.type) catch 0 > 0) {
+                            l.unsupported(v.loc, "global structures containing both resources and non-resources are not supported", .{});
+                            return error.Unsupported;
+                        }
+                    }
+                    var leaves: std.ArrayList(LeafPath) = .empty;
+                    try l.resourceLeaves(v.type, &.{}, &leaves);
+                    for (leaves.items, 0..) |leaf, k| {
+                        const name = try l.leafName(v, leaf.path);
+                        var bd: ir.BindingDecl = .{ .global = l.leaf_globals.get(name) };
+                        if (k == 0) if (v.decl) |d| {
+                            bd = try l.bindingDecl(d.semantics, d.attrs, bd.global);
+                        };
+                        try l.m.binding_decls.append(l.arena, bd);
+                    }
+                    if (layout.flatCount(&l.s.types, v.type) catch 0 == 0) continue;
+                }
                 if (!isObject(&l.s.types, v.type)) {
                     if (v.storage != .global_uniform or globals_done or l.isPushConstantStruct(v) or l.isSpecConstant(v)) continue;
                     globals_done = true;
@@ -854,7 +884,8 @@ const Lowerer = struct {
         const t = l.types();
         const ty = l.b.f.inst(v).ty;
         switch (t.get(ty)) {
-            .scalar, .@"enum" => try out.append(l.arena, v),
+            // (Resources in structs are leaves of their own.)
+            .scalar, .@"enum", .resource, .sampler => try out.append(l.arena, v),
             .vector, .matrix => for (0..t.componentCount(ty).?) |k| try out.append(l.arena, try l.component(v, @intCast(k))),
             .array => |a| for (0..a.len) |i| try l.flatten(try l.b.add(.{ .op = .{ .extract = .{ .agg = v, .index = @intCast(i) } }, .ty = a.elem }), out),
             .@"struct" => |st| for (st.fields.items, 0..) |f, i| {
@@ -874,6 +905,10 @@ const Lowerer = struct {
     fn fromFlat(l: *Lowerer, ty: TypeId, comps: []const Ref, next: *usize) Error!Ref {
         const t = l.types();
         switch (t.get(ty)) {
+            .resource, .sampler => {
+                defer next.* += 1;
+                return comps[next.*];
+            },
             .scalar, .@"enum" => {
                 defer next.* += 1;
                 return l.convert(comps[next.*], ty);
@@ -940,6 +975,7 @@ const Lowerer = struct {
                     },
                     .variable => |v| {
                         if (l.value_vars.get(v)) |val| return val;
+                        if (v.storage == .global_uniform and holdsResources(&l.s.types, v.type)) return l.uniformValue(v, &.{}, v.type);
                         if (l.isSpecConstant(v)) return l.specConstant(v);
                         // Integer `static const` scalars are constants.
                         if (v.storage == .constant and v.init != null and isIntConstantType(&l.s.types, v.type)) {
@@ -1180,7 +1216,7 @@ const Lowerer = struct {
         try flattenList(l.arena, e, &flat);
         var comps: std.ArrayList(Ref) = .empty;
         for (flat.items) |x| try l.flatten(try l.rvalue(x), &comps);
-        const need = l.types().componentCount(ty) orelse return l.fail(e, "this initializer list");
+        const need = flatLength(l.types(), ty) orelse return l.fail(e, "this initializer list");
         if (comps.items.len < need) return l.fail(e, "this initializer list");
         var next: usize = 0;
         return l.fromFlat(ty, comps.items, &next);
@@ -1210,6 +1246,7 @@ const Lowerer = struct {
                 return l.b.add(.{ .op = .{ .construct = parts }, .ty = try l.concrete(e.ty) });
             },
             .@"struct" => |info| {
+                if (l.uniformPath(e)) |up| return l.uniformValue(up.v, up.path, e.ty);
                 const r = l.s.resolution(e) orelse return l.fail(e, "this member");
                 // A static member through an object.
                 if (r == .variable) {
@@ -1527,6 +1564,91 @@ const Lowerer = struct {
     }
 
     /// Pointer to the storage `e` designates.
+    /// `g.a.b`, rooted at a global uniform struct holding resources: the
+    /// variable and the member indices.
+    fn uniformPath(l: *Lowerer, e: *ast.Expr) ?struct { v: *const Variable, path: []const u32 } {
+        switch (e.kind) {
+            .name => {
+                const r = l.s.resolution(e) orelse return null;
+                if (r != .variable) return null;
+                const v = r.variable;
+                if (v.storage != .global_uniform or !holdsResources(&l.s.types, v.type)) return null;
+                return .{ .v = v, .path = &.{} };
+            },
+            .member => |m| {
+                if (l.s.types.get(m.base.ty) != .@"struct") return null;
+                const base = l.uniformPath(m.base) orelse return null;
+                const r = l.s.resolution(e) orelse return null;
+                if (r != .field) return null;
+                const path = std.mem.concat(l.arena, u32, &.{ base.path, &.{r.field} }) catch return null;
+                return .{ .v = base.v, .path = path };
+            },
+            else => return null,
+        }
+    }
+
+    const LeafPath = struct { path: []const u32, ty: TypeId };
+
+    /// The resources of a struct type, in member order.
+    fn resourceLeaves(l: *Lowerer, ty: TypeId, prefix: []const u32, out: *std.ArrayList(LeafPath)) Error!void {
+        const t = l.types();
+        if (isResourceLike(t, ty)) return out.append(l.arena, .{ .path = prefix, .ty = ty });
+        if (t.get(ty) != .@"struct") return;
+        for (t.get(ty).@"struct".fields.items, 0..) |f, k| {
+            if (!isResourceLike(t, f.type) and !holdsResources(t, f.type)) continue;
+            try l.resourceLeaves(f.type, try std.mem.concat(l.arena, u32, &.{ prefix, &.{@intCast(k)} }), out);
+        }
+    }
+
+    /// `g.inner.tex`.
+    fn leafName(l: *Lowerer, v: *const Variable, path: []const u32) Error![]const u8 {
+        var name: std.ArrayList(u8) = .empty;
+        try name.appendSlice(l.arena, v.name);
+        var cur = v.type;
+        for (path) |k| {
+            const f = l.s.types.get(cur).@"struct".fields.items[k];
+            try name.print(l.arena, ".{s}", .{f.name});
+            cur = f.type;
+        }
+        return name.items;
+    }
+
+    /// The global of a resource inside a global struct, named by its path
+    /// (`g.tex`) and bound like any other unbound resource.
+    fn leafGlobal(l: *Lowerer, v: *const Variable, path: []const u32, ty: TypeId) Error!Ref {
+        const name = try l.leafName(v, path);
+        const gop = try l.leaf_globals.getOrPut(l.arena, name);
+        if (!gop.found_existing) {
+            try l.m.globals.append(l.arena, .{ .name = name, .ty = ty, .space = .resource });
+            gop.value_ptr.* = @intCast(l.m.globals.items.len - 1);
+        }
+        return l.b.add(.{ .op = .{ .global = gop.value_ptr.* }, .ty = ty, .ptr = .resource });
+    }
+
+    /// The value at `path` in a global struct holding resources: its
+    /// resources from their globals, its data from $Globals.
+    fn uniformValue(l: *Lowerer, v: *const Variable, path: []const u32, ty: TypeId) Error!Ref {
+        const t = l.types();
+        if (isResourceLike(t, ty)) return l.b.load(try l.leafGlobal(v, path, ty));
+        if (holdsResources(t, ty)) {
+            if (t.get(ty) != .@"struct") {
+                l.unsupported(v.loc, "arrays of structs holding resources in global '{s}' are not supported yet", .{v.name});
+                return error.Unsupported;
+            }
+            const st = t.get(ty).@"struct";
+            const parts = try l.arena.alloc(Ref, st.fields.items.len);
+            for (parts, st.fields.items, 0..) |*p, f, k| p.* = try l.uniformValue(v, try std.mem.concat(l.arena, u32, &.{ path, &.{@intCast(k)} }), f.type);
+            return l.b.add(.{ .op = .{ .construct = parts }, .ty = ty });
+        }
+        const cm = try l.cbufferMember(v);
+        const glob = l.m.globals.items[cm.global];
+        const base = try l.b.add(.{ .op = .{ .global = cm.global }, .ty = glob.ty, .ptr = .cbuffer });
+        const idx = try l.arena.alloc(Ref, path.len + 1);
+        idx[0] = try l.b.constInt(try t.scalar(.uint), cm.field);
+        for (path, idx[1..]) |k, *x| x.* = try l.b.constInt(try t.scalar(.uint), k);
+        return l.b.load(try l.b.add(.{ .op = .{ .access = .{ .base = base, .indices = idx } }, .ty = ty, .ptr = .cbuffer }));
+    }
+
     /// Storage of a variable that is not a local (locals are in `vars`).
     fn variableLvalue(l: *Lowerer, e: *ast.Expr, v: *const Variable) Error!Ref {
         const t = l.types();
@@ -1563,6 +1685,8 @@ const Lowerer = struct {
 
     fn lvalue(l: *Lowerer, e: *ast.Expr) Error!Ref {
         const t = l.types();
+        // A resource inside a global struct: its own global.
+        if (e.kind == .member) if (l.uniformPath(e)) |up| if (isResourceLike(t, e.ty)) return l.leafGlobal(up.v, up.path, e.ty);
         switch (e.kind) {
             .this => {
                 if (l.this_ptr == .none) return l.fail(e, "this expression");
@@ -2334,6 +2458,58 @@ pub fn saturatingInt(f: f64) i64 {
 
 /// Non-static member functions take their object as a hidden first
 /// parameter.
+/// (dxc's SPIR-V supports textures and samplers in global structs, not
+/// buffers.)
+fn structHoldsBuffer(t: *const TypeTable, ty: TypeId) bool {
+    return switch (t.get(ty)) {
+        .resource => |r| switch (r.kind) {
+            .buffer, .rw_buffer, .byte_address_buffer, .rw_byte_address_buffer, .structured_buffer, .rw_structured_buffer, .append_structured_buffer, .consume_structured_buffer, .constant_buffer, .texture_buffer => true,
+            else => false,
+        },
+        .array => |a| structHoldsBuffer(t, a.elem),
+        .@"struct" => |st| for (st.fields.items) |f| {
+            if (structHoldsBuffer(t, f.type)) break true;
+        } else false,
+        else => false,
+    };
+}
+
+fn isResourceLike(t: *const TypeTable, ty: TypeId) bool {
+    return switch (t.get(ty)) {
+        .resource, .sampler => true,
+        else => false,
+    };
+}
+
+/// A struct or array with a resource in it.
+fn holdsResources(t: *const TypeTable, ty: TypeId) bool {
+    return switch (t.get(ty)) {
+        .array => |a| isResourceLike(t, a.elem) or holdsResources(t, a.elem),
+        .@"struct" => |st| for (st.fields.items) |f| {
+            if (isResourceLike(t, f.type) or holdsResources(t, f.type)) break true;
+        } else false,
+        else => false,
+    };
+}
+
+/// Leaves of an initializer list for `ty` (components, and resources).
+fn flatLength(t: *const TypeTable, ty: TypeId) ?u32 {
+    return switch (t.get(ty)) {
+        .resource, .sampler => 1,
+        .array => |a| if (flatLength(t, a.elem)) |n| n * a.len else null,
+        .@"struct" => |st| blk: {
+            var n: u32 = 0;
+            for (st.fields.items, 0..) |f, i| {
+                if (f.bits) {
+                    n += @intCast(st.bitfieldsIn(@intCast(i)).len);
+                } else n += flatLength(t, f.type) orelse break :blk null;
+            }
+            break :blk n;
+        },
+        else => t.componentCount(ty),
+    };
+}
+
 /// Integer (and enum) `static const` values are folded to constants.
 fn isIntConstantType(t: *const TypeTable, ty: TypeId) bool {
     return switch (t.get(ty)) {

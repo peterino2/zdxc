@@ -46,6 +46,13 @@ const Lowered = union(enum) {
     none,
     /// Flattened scalar components.
     scalars: []const Value,
+    /// A struct or array value holding resources: its data components
+    /// (flattened, resources counting none) and its resources, in order.
+    agg: struct { vals: []const Value, res: []const Lowered },
+    /// A local holding resources: its data storage (.ptr or .typed; null
+    /// when it has no data) and one resource slot (Emitter.res_locals)
+    /// per resource, each an alias of what is stored into it.
+    agg_ptr: struct { data: ?*const Lowered, slots: []const u32, ty: TypeId },
     ptr: Ptr,
     /// A resource handle (index into Emitter.resources).
     handle: u32,
@@ -136,6 +143,8 @@ const Frame = struct {
     /// For inlined calls: where `ret` goes and the incoming return values.
     cont: ?u32 = null,
     rets: std.ArrayList(struct { block: u32, vals: []const Value }) = .empty,
+    /// The resources a function returns (every return the same ones).
+    ret_res: ?[]const Lowered = null,
 };
 
 const PInst = struct { inst: module.Inst, id: u32 };
@@ -187,6 +196,8 @@ const Emitter = struct {
     /// SM 6.10 matrix types used (`!dx.targetTypes`), in first-use order.
     linalg_types: std.ArrayList(struct { ty: TypeId, dty: DType }) = .empty,
     uses_linalg: bool = false,
+    /// The resources the last inlined call returned.
+    last_ret_res: ?[]const Lowered = null,
     /// RayQuery locals: the query handle (allocated in the prologue on
     /// first use, or a copy of another query) and the query type.
     rq_locals: std.ArrayList(struct { h: ?Value, ty: TypeId }) = .empty,
@@ -304,8 +315,10 @@ const Emitter = struct {
     /// Number of flattened scalar components of `ty`.
     fn flatCount(e: *Emitter, ty: TypeId) Error!u32 {
         return switch (e.t.get(ty)) {
-            // (A matrix handle is one opaque component.)
+            // (A matrix handle is one opaque component; resources are not
+            // data.)
             .scalar, .@"enum", .linalg => 1,
+            .resource, .sampler => 0,
             .vector => |v| v.len,
             .matrix => |m| @as(u32, m.rows) * m.cols,
             .array => |a| a.len * try e.flatCount(a.elem),
@@ -326,6 +339,7 @@ const Emitter = struct {
             .@"struct" => |s| blk: {
                 var first: ?Scalar = null;
                 for (s.fields.items) |f| {
+                    if (try e.flatCount(f.type) == 0) continue;
                     const c = try e.uniformScalar(f.type);
                     if (first != null and first.? != c) return e.unsupported("structs with mixed component types are not supported yet", .{});
                     first = c;
@@ -1270,6 +1284,7 @@ const Emitter = struct {
             e.cur = try e.blockFor(&frame, @intCast(bi));
             try e.emitBlock(&frame, @intCast(bi));
         }
+        e.last_ret_res = frame.ret_res;
         if (frame.cont) |cont| {
             e.cur = cont;
             if (f.ret == TypeTable.void_type or frame.rets.items.len == 0) return &.{};
@@ -1316,7 +1331,18 @@ const Emitter = struct {
         switch (blk.term) {
             .ret => |v| {
                 if (frame.cont) |cont| {
-                    if (v != .none) try frame.rets.append(e.arena, .{ .block = e.cur, .vals = try e.scalars(frame, v) });
+                    if (v != .none) {
+                        const rty = frame.f.inst(v).ty;
+                        if ((isResourceType(e.t, rty) and !isRayQuery(e.t, rty)) or e.holdsResources(rty)) {
+                            const parts = try e.aggParts(frame.vals[v.index()], rty);
+                            if (frame.ret_res) |old| {
+                                if (old.len != parts.res.len) return e.unsupported("returning different resources from one function is not supported yet", .{});
+                                for (old, parts.res) |a, b| if (!std.meta.eql(a, b)) return e.unsupported("returning different resources from one function is not supported yet", .{});
+                            }
+                            frame.ret_res = parts.res;
+                            try frame.rets.append(e.arena, .{ .block = e.cur, .vals = parts.vals });
+                        } else try frame.rets.append(e.arena, .{ .block = e.cur, .vals = try e.scalars(frame, v) });
+                    }
                     _ = try e.add(void_ty, .{ .br = .{ .then = cont } });
                 } else _ = try e.add(void_ty, .{ .ret = null });
             },
@@ -1484,6 +1510,7 @@ const Emitter = struct {
                     try e.res_locals.append(e.arena, null);
                     return .{ .res_local = @intCast(e.res_locals.items.len - 1) };
                 }
+                if (e.holdsResources(i.ty)) return e.aggLocal(i.ty);
                 if (try e.mixedSizes(i.ty) or e.containsLinAlg(i.ty)) {
                     // Components of several sizes (or matrix handles): a
                     // struct-typed alloca.
@@ -1495,6 +1522,16 @@ const Emitter = struct {
             },
             .load => |p| switch (frame.vals[p.index()]) {
                 .handle => |h| return .{ .handle = h },
+                .agg_ptr => |ap| {
+                    const vals: []const Value = if (ap.data) |d| switch (d.*) {
+                        .ptr => |ptr| (try e.loadPtr(ptr, ap.ty)).scalars,
+                        .typed => |tp| (try e.typedLoad(tp, ap.ty)).scalars,
+                        else => unreachable,
+                    } else &.{};
+                    const res = try e.arena.alloc(Lowered, ap.slots.len);
+                    for (res, ap.slots) |*o, sl| o.* = e.res_locals.items[sl] orelse return e.unsupported("a resource in a local read before it is assigned", .{});
+                    return .{ .agg = .{ .vals = vals, .res = res } };
+                },
                 .rq_local => |k| return .{ .ray_query = try e.rqHandle(k) },
                 .res_local => |k| return e.res_locals.items[k] orelse return e.unsupported("a resource local read before it is assigned", .{}),
                 .res_array => |ra| return .{ .res_array = ra },
@@ -1553,6 +1590,10 @@ const Emitter = struct {
                     slot.* = h;
                     return .none;
                 }
+                if (frame.vals[s.ptr.index()] == .agg_ptr) {
+                    try e.aggStore(frame.vals[s.ptr.index()].agg_ptr, frame.vals[s.value.index()]);
+                    return .none;
+                }
                 if (frame.vals[s.ptr.index()] == .mesh) {
                     try e.meshStore(frame.vals[s.ptr.index()].mesh, try e.scalars(frame, s.value), f.inst(s.value).ty);
                     return .none;
@@ -1593,6 +1634,7 @@ const Emitter = struct {
                     tp.path = path.items;
                     return .{ .typed = tp };
                 }
+                if (frame.vals[a.base.index()] == .agg_ptr) return e.aggAccess(frame, frame.vals[a.base.index()].agg_ptr, a.indices);
                 if (frame.vals[a.base.index()] == .res_array) return e.arrayElement(frame, frame.vals[a.base.index()].res_array, a.indices);
                 if (frame.vals[a.base.index()] == .cbuf) return e.cbufferAccess(frame, frame.vals[a.base.index()].cbuf, f.inst(a.base).ty, a.indices);
                 if (frame.vals[a.base.index()] == .handle) {
@@ -1706,12 +1748,24 @@ const Emitter = struct {
                 return .{ .scalars = out };
             },
             .extract => |x| {
+                if (frame.vals[x.agg.index()] == .agg) return e.aggExtract(frame.vals[x.agg.index()].agg, f.inst(x.agg).ty, x.index);
                 const v = try e.scalars(frame, x.agg);
                 const at = f.inst(x.agg).ty;
                 const range = try e.componentRange(at, x.index);
                 return e.list(v[range[0]..range[1]]);
             },
             .insert => |x| {
+                if (e.holdsResources(i.ty)) {
+                    const whole = try e.aggParts(frame.vals[x.agg.index()], i.ty);
+                    const part = try e.aggParts(frame.vals[x.value.index()], f.inst(x.value).ty);
+                    const vals = try e.arena.dupe(Value, whole.vals);
+                    const res = try e.arena.dupe(Lowered, whole.res);
+                    const dr = try e.componentRange(i.ty, x.index);
+                    const rr = try e.resRange(i.ty, x.index);
+                    @memcpy(vals[dr[0]..dr[1]], part.vals);
+                    @memcpy(res[rr[0]..rr[1]], part.res);
+                    return .{ .agg = .{ .vals = vals, .res = res } };
+                }
                 const v = try e.scalars(frame, x.agg);
                 const out = try e.arena.dupe(Value, v);
                 const range = try e.componentRange(i.ty, x.index);
@@ -1720,6 +1774,16 @@ const Emitter = struct {
                 return .{ .scalars = out };
             },
             .construct => |xs| {
+                if (e.holdsResources(i.ty)) {
+                    var vals: std.ArrayList(Value) = .empty;
+                    var res: std.ArrayList(Lowered) = .empty;
+                    for (xs) |x| {
+                        const part = try e.aggParts(frame.vals[x.index()], f.inst(x).ty);
+                        try vals.appendSlice(e.arena, part.vals);
+                        try res.appendSlice(e.arena, part.res);
+                    }
+                    return .{ .agg = .{ .vals = vals.items, .res = res.items } };
+                }
                 var out: std.ArrayList(Value) = .empty;
                 for (xs) |x| try out.appendSlice(e.arena, try e.scalars(frame, x));
                 return .{ .scalars = out.items };
@@ -1743,6 +1807,12 @@ const Emitter = struct {
                 const args = try e.arena.alloc(Lowered, c.args.len);
                 for (c.args, args) |a, *o| o.* = frame.vals[a.index()];
                 const res = try e.inlineCall(c.func, args);
+                // Functions returning resources (or structs of them).
+                if (isResourceType(e.t, i.ty) and !isRayQuery(e.t, i.ty)) {
+                    const rr = e.last_ret_res orelse return e.unsupported("a function returning a resource with no return value", .{});
+                    return rr[0];
+                }
+                if (e.holdsResources(i.ty)) return .{ .agg = .{ .vals = res, .res = e.last_ret_res orelse return e.unsupported("a function returning resources with no return value", .{}) } };
                 return if (res.len == 0) .none else .{ .scalars = res };
             },
             .intrinsic => |c| return e.intrinsic(frame, c.name, i.ty, c.args),
@@ -1775,6 +1845,168 @@ const Emitter = struct {
     }
 
     /// Components [start, end) of member / element / component `index`.
+    // ------------------------------------------------------------------
+    // Structs and arrays holding resources
+
+    /// Resources in a value of `ty`, in flattened order.
+    fn resCount(e: *Emitter, ty: TypeId) u32 {
+        return switch (e.t.get(ty)) {
+            .resource, .sampler => if (isRayQuery(e.t, ty)) 0 else 1,
+            .array => |a| a.len * e.resCount(a.elem),
+            .@"struct" => |st| blk: {
+                var n: u32 = 0;
+                for (st.fields.items) |f| n += e.resCount(f.type);
+                break :blk n;
+            },
+            else => 0,
+        };
+    }
+
+    /// A struct or array with resources in it.
+    fn holdsResources(e: *Emitter, ty: TypeId) bool {
+        return switch (e.t.get(ty)) {
+            .array, .@"struct" => e.resCount(ty) > 0,
+            else => false,
+        };
+    }
+
+    /// Where element / member `index`'s resources are among a value's.
+    fn resRange(e: *Emitter, ty: TypeId, index: u32) Error![2]u32 {
+        switch (e.t.get(ty)) {
+            .array => |a| {
+                const n = e.resCount(a.elem);
+                return .{ index * n, (index + 1) * n };
+            },
+            .@"struct" => |st| {
+                var start: u32 = 0;
+                for (st.fields.items[0..index]) |fld| start += e.resCount(fld.type);
+                return .{ start, start + e.resCount(st.fields.items[index].type) };
+            },
+            else => return .{ 0, 0 },
+        }
+    }
+
+    /// The data and resources of a value of `ty`.
+    fn aggParts(e: *Emitter, v: Lowered, ty: TypeId) Error!@FieldType(Lowered, "agg") {
+        return switch (v) {
+            .agg => |a| a,
+            .scalars => |vals| if (e.resCount(ty) == 0) .{ .vals = vals, .res = &.{} } else e.unsupported("this value with resources is not supported yet", .{}),
+            .handle, .res_array => .{ .vals = &.{}, .res = try e.arena.dupe(Lowered, &.{v}) },
+            .none => .{ .vals = &.{}, .res = &.{} },
+            else => e.unsupported("this value with resources is not supported yet", .{}),
+        };
+    }
+
+    fn aggLocal(e: *Emitter, ty: TypeId) Error!Lowered {
+        const slots = try e.arena.alloc(u32, e.resCount(ty));
+        for (slots) |*sl| {
+            sl.* = @intCast(e.res_locals.items.len);
+            try e.res_locals.append(e.arena, null);
+        }
+        var data: ?*const Lowered = null;
+        if (try e.flatCount(ty) > 0) {
+            const d = try e.arena.create(Lowered);
+            if (try e.mixedSizes(ty)) {
+                const dty = try e.memoryType(ty);
+                const base = try e.addPrologue(try e.dm.ptrType(dty), .{ .alloca = .{ .elem = dty, .size = try e.i32Const(1) } });
+                d.* = .{ .typed = .{ .base = base, .dty = dty, .addr_space = 0, .ty = ty } };
+            } else d.* = .{ .ptr = try e.alloca(ty) };
+            data = d;
+        }
+        return .{ .agg_ptr = .{ .data = data, .slots = slots, .ty = ty } };
+    }
+
+    /// A member or element of a local holding resources.
+    fn aggAccess(e: *Emitter, frame: *Frame, start: @FieldType(Lowered, "agg_ptr"), indices: []const Ref) Error!Lowered {
+        var cur = start.ty;
+        var slot: u32 = 0;
+        var data: ?Lowered = if (start.data) |d| d.* else null;
+        var path: std.ArrayList(Value) = .empty;
+        if (data) |d| if (d == .typed) try path.appendSlice(e.arena, d.typed.path);
+        for (indices) |x| {
+            const xi = frame.f.inst(x);
+            const konst: ?u32 = if (xi.op == .constant) @intCast(xi.op.constant.int) else null;
+            var data_off: u32 = 0;
+            var data_dyn: ?Value = null;
+            switch (e.t.get(cur)) {
+                .@"struct" => |st| {
+                    const k = konst.?;
+                    for (st.fields.items[0..k]) |fld| {
+                        slot += e.resCount(fld.type);
+                        data_off += try e.flatCount(fld.type);
+                    }
+                    cur = st.fields.items[k].type;
+                },
+                .array => |arr| {
+                    if (e.resCount(arr.elem) > 0) {
+                        const k = konst orelse return e.unsupported("dynamically indexing an array holding resources in a local is not supported yet", .{});
+                        slot += k * e.resCount(arr.elem);
+                        data_off = k * try e.flatCount(arr.elem);
+                    } else if (konst) |k| {
+                        data_off = k * try e.flatCount(arr.elem);
+                    } else {
+                        const idx = (try e.scalars(frame, x))[0];
+                        const n = try e.flatCount(arr.elem);
+                        data_dyn = if (n == 1) idx else try e.add(try e.dm.intType(32), .{ .binop = .{ .op = .mul, .lhs = idx, .rhs = try e.i32Const(n) } });
+                    }
+                    cur = arr.elem;
+                },
+                else => return e.unsupported("indexing this type is not supported yet", .{}),
+            }
+            if (data) |*d| switch (d.*) {
+                .ptr => |*ptr| {
+                    ptr.offset_const += data_off;
+                    if (data_dyn) |dd| ptr.offset_dyn = if (ptr.offset_dyn) |old| try e.add(try e.dm.intType(32), .{ .binop = .{ .op = .add, .lhs = old, .rhs = dd } }) else dd;
+                },
+                .typed => try path.append(e.arena, (try e.scalars(frame, x))[0]),
+                else => {},
+            };
+        }
+        if (isResourceType(e.t, cur)) return .{ .res_local = start.slots[slot] };
+        if (data) |*d| if (d.* == .typed) {
+            d.typed.path = path.items;
+            d.typed.ty = cur;
+        };
+        if (e.holdsResources(cur)) {
+            var sub: ?*const Lowered = null;
+            if (data != null and try e.flatCount(cur) > 0) {
+                const p = try e.arena.create(Lowered);
+                p.* = data.?;
+                sub = p;
+            }
+            return .{ .agg_ptr = .{ .data = sub, .slots = start.slots[slot..][0..e.resCount(cur)], .ty = cur } };
+        }
+        return data orelse e.unsupported("this member of a local holding resources", .{});
+    }
+
+    fn aggStore(e: *Emitter, ap: @FieldType(Lowered, "agg_ptr"), v: Lowered) Error!void {
+        const parts = try e.aggParts(v, ap.ty);
+        if (ap.data) |d| switch (d.*) {
+            .ptr => |ptr| try e.storePtr(ptr, parts.vals, ap.ty),
+            .typed => |tp| try e.typedStore(tp, parts.vals, ap.ty),
+            else => unreachable,
+        };
+        if (parts.res.len != ap.slots.len) return e.unsupported("this assignment of resources is not supported yet", .{});
+        for (ap.slots, parts.res) |sl, r| {
+            const slot = &e.res_locals.items[sl];
+            if (slot.*) |old| if (!std.meta.eql(old, r)) return e.unsupported("assigning different resources to one variable is not supported yet", .{});
+            slot.* = r;
+        }
+    }
+
+    fn aggExtract(e: *Emitter, a: @FieldType(Lowered, "agg"), ty: TypeId, index: u32) Error!Lowered {
+        const field: TypeId = switch (e.t.get(ty)) {
+            .array => |arr| arr.elem,
+            .@"struct" => |st| st.fields.items[index].type,
+            else => return e.unsupported("extracting from this type is not supported yet", .{}),
+        };
+        const dr = try e.componentRange(ty, index);
+        const rr = try e.resRange(ty, index);
+        if (isResourceType(e.t, field)) return a.res[rr[0]];
+        if (e.holdsResources(field)) return .{ .agg = .{ .vals = a.vals[dr[0]..dr[1]], .res = a.res[rr[0]..rr[1]] } };
+        return e.list(a.vals[dr[0]..dr[1]]);
+    }
+
     fn componentRange(e: *Emitter, ty: TypeId, index: u32) Error![2]u32 {
         switch (e.t.get(ty)) {
             .vector, .scalar => return .{ index, index + 1 },
@@ -4080,7 +4312,7 @@ const Emitter = struct {
     fn linAlgSuffix(e: *Emitter, ty: TypeId) Error![]const u8 {
         return switch (e.t.get(ty)) {
             .linalg => |la| std.fmt.allocPrint(e.arena, "mC{d}M{d}N{d}U{d}S{d}", .{ la.comp, la.m, la.n, la.use, la.scope }),
-            .vector => |v| if (v.len == 1) e.overloadName(try e.scalarTy(e.compOf(ty))) else std.fmt.allocPrint(e.arena, "v{d}{s}", .{ v.len, e.overloadName(try e.scalarTy(e.compOf(ty))) }),
+            .vector => |v| std.fmt.allocPrint(e.arena, "v{d}{s}", .{ v.len, e.overloadName(try e.scalarTy(e.compOf(ty))) }),
             else => e.overloadName(try e.scalarTy(e.compOf(ty))),
         };
     }
@@ -4091,7 +4323,12 @@ const Emitter = struct {
         const ty = frame.f.inst(r).ty;
         const vals = try e.scalars(frame, r);
         if (e.t.get(ty) == .linalg) return .{ vals[0], try e.matrixType(ty) };
-        if (e.t.get(ty) == .vector and vals.len > 1) return .{ try e.libJoin(vals, ty), try e.libValueType(ty) };
+        if (e.t.get(ty) == .vector) {
+            const vt = try e.linAlgVectorType(ty);
+            var v = try e.dm.constant(.{ .ty = vt, .kind = .undef });
+            for (vals, 0..) |c, k| v = try e.add(vt, .{ .insertelement = .{ .vec = v, .val = c, .index = try e.dm.constInt(64, @intCast(k)) } });
+            return .{ v, vt };
+        }
         return .{ vals[0], try e.valueType(vals[0]) };
     }
 
@@ -4099,7 +4336,7 @@ const Emitter = struct {
     /// argument's storage.
     fn linAlgStore(e: *Emitter, frame: *Frame, dst: Ref, v: Value) Error!void {
         const ty = frame.f.inst(dst).ty;
-        const vals = if (e.t.get(ty) == .vector and e.t.get(ty).vector.len > 1) try e.libSplit(v, ty) else try e.arena.dupe(Value, &.{v});
+        const vals = if (e.t.get(ty) == .vector) try e.linAlgSplit(v, ty) else try e.arena.dupe(Value, &.{v});
         switch (frame.vals[dst.index()]) {
             .typed => |tp| try e.typedStore(tp, vals, ty),
             .ptr => |p| try e.storePtr(p, vals, ty),
@@ -4174,10 +4411,10 @@ const Emitter = struct {
             if (out_first) {
                 const dst_ty = frame.f.inst(args[0]).ty;
                 try suffix.print(e.arena, ".{s}", .{try e.linAlgSuffix(dst_ty)});
-                break :blk if (e.t.get(dst_ty) == .linalg) try e.matrixType(dst_ty) else if (e.t.get(dst_ty) == .vector and e.t.get(dst_ty).vector.len > 1) try e.libValueType(dst_ty) else try e.scalarTy(e.compOf(dst_ty));
+                break :blk if (e.t.get(dst_ty) == .linalg) try e.matrixType(dst_ty) else if (e.t.get(dst_ty) == .vector) try e.linAlgVectorType(dst_ty) else try e.scalarTy(e.compOf(dst_ty));
             }
             if (ty == TypeTable.void_type) break :blk try e.voidTy();
-            break :blk if (e.t.get(ty) == .vector) try e.libValueType(ty) else try e.scalarTy(e.compOf(ty));
+            break :blk if (e.t.get(ty) == .vector) try e.linAlgVectorType(ty) else try e.scalarTy(e.compOf(ty));
         };
         for (args[@intFromBool(out_first)..], @intFromBool(out_first)..) |a, k| {
             const aty = frame.f.inst(a).ty;
@@ -4198,7 +4435,7 @@ const Emitter = struct {
             const v = try e.linAlgValue(frame, a);
             try vals.append(e.arena, v[0]);
             try params.append(e.arena, v[1]);
-            const overloaded = e.t.get(aty) == .linalg or (e.t.get(aty) == .vector and e.t.get(aty).vector.len > 1) or
+            const overloaded = e.t.get(aty) == .linalg or e.t.get(aty) == .vector or
                 // The filled / set value.
                 (op.code == 323 and k == 2) or (op.code == 330 and k == 3);
             if (overloaded) try suffix.print(e.arena, ".{s}", .{try e.linAlgSuffix(aty)});
@@ -4216,8 +4453,22 @@ const Emitter = struct {
             return .none;
         }
         if (ty == TypeTable.void_type) return .none;
-        if (e.t.get(ty) == .vector) return .{ .scalars = try e.libSplit(r, ty) };
+        if (e.t.get(ty) == .vector) return .{ .scalars = try e.linAlgSplit(r, ty) };
         return .{ .scalars = try e.arena.dupe(Value, &.{r}) };
+    }
+
+    /// LinAlg vectors are native vectors, even of one element.
+    fn linAlgVectorType(e: *Emitter, ty: TypeId) Error!DType {
+        const v = e.t.get(ty).vector;
+        return e.dm.getType(.{ .vector = .{ .len = v.len, .elem = try e.scalarTy(e.compOf(ty)) } });
+    }
+
+    fn linAlgSplit(e: *Emitter, v: Value, ty: TypeId) Error![]const Value {
+        const n = e.t.get(ty).vector.len;
+        const et = try e.scalarTy(e.compOf(ty));
+        const out = try e.arena.alloc(Value, n);
+        for (out, 0..) |*o, k| o.* = try e.add(et, .{ .extractelement = .{ .vec = v, .index = try e.i32Const(@intCast(k)) } });
+        return out;
     }
 
     /// What the module does with matrices (PSV0), when it has any.
@@ -4247,6 +4498,8 @@ const Emitter = struct {
     fn memoryType(e: *Emitter, ty: TypeId) Error!DType {
         return switch (e.t.get(ty)) {
             .linalg => e.matrixType(ty),
+            // (A resource member's place in a struct-typed local.)
+            .resource, .sampler => e.dm.intType(32),
             .scalar, .@"enum" => e.scalarTy(memScalar(e.compOf(ty))),
             .vector => |v| e.dm.getType(.{ .array = .{ .len = v.len, .elem = try e.scalarTy(memScalar(e.compOf(ty))) } }),
             .matrix => |m| e.dm.getType(.{ .array = .{ .len = m.rows, .elem = try e.dm.getType(.{ .array = .{ .len = m.cols, .elem = try e.scalarTy(memScalar(e.compOf(ty))) } }) } }),
@@ -4269,6 +4522,7 @@ const Emitter = struct {
     fn memLayout(e: *Emitter, ty: TypeId) Error![2]u32 {
         switch (e.t.get(ty)) {
             .linalg => return .{ 8, 8 },
+            .resource, .sampler => return .{ 4, 4 },
             .scalar, .@"enum", .vector, .matrix => {
                 const sz = memScalar(e.compOf(ty)).size();
                 return .{ sz * (e.t.componentCount(ty) orelse 1), sz };
@@ -4303,6 +4557,7 @@ const Emitter = struct {
         }.f;
         switch (e.t.get(ty)) {
             .scalar, .@"enum", .linalg => try out.append(e.arena, prefix),
+            .resource, .sampler => {},
             .vector => |v| for (0..v.len) |k| try out.append(e.arena, try sub(e, prefix, @intCast(k))),
             .matrix => |m| for (0..m.rows) |r| {
                 const rp = try sub(e, prefix, @intCast(r));

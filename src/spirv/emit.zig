@@ -378,15 +378,15 @@ const Emitter = struct {
                 break :blk id;
             },
             .@"struct" => |st| blk: {
-                const members = try e.arena.alloc(u32, st.fields.items.len);
-                for (st.fields.items, members) |fld, *mid| mid.* = try e.typeId(fld.type);
+                var members: std.ArrayList(u32) = .empty;
+                for (st.fields.items) |fld| if (!layout.isOpaque(e.t, fld.type)) try members.append(e.arena, try e.typeId(fld.type));
                 const id = e.b.newId();
                 var ops: std.ArrayList(u32) = .empty;
                 try ops.append(e.arena, id);
-                try ops.appendSlice(e.arena, members);
+                try ops.appendSlice(e.arena, members.items);
                 try e.b.emit(.types_globals, .type_struct, ops.items);
                 try e.b.emitWithString(.debug_names, .name, &.{id}, try std.fmt.allocPrint(e.arena, "struct.{s}", .{st.name}), &.{});
-                for (st.fields.items, 0..) |fld, k| try e.b.emitWithString(.debug_names, .member_name, &.{ id, @intCast(k) }, fld.name, &.{});
+                for (st.fields.items, 0..) |fld, k| if (!layout.isOpaque(e.t, fld.type)) try e.b.emitWithString(.debug_names, .member_name, &.{ id, dataIndex(e.t, st, @intCast(k)) }, fld.name, &.{});
                 try e.memberDecorations(id, st, false);
                 break :blk id;
             },
@@ -506,7 +506,9 @@ const Emitter = struct {
             {
                 var ops: std.ArrayList(u32) = .empty;
                 try ops.append(e.arena, id);
-                for (st.fields.items) |fld| try ops.append(e.arena, try e.layoutTypeId(fld.type, rules, fld.row_major));
+                // (Resources in structs are not members of the SPIR-V
+                // struct: they are their own variables.)
+                for (st.fields.items) |fld| if (!layout.isOpaque(e.t, fld.type)) try ops.append(e.arena, try e.layoutTypeId(fld.type, rules, fld.row_major));
                 try e.b.emit(.types_globals, .type_struct, ops.items);
                 const offs = layout.fieldOffsets(e.arena, e.t, st, rules) catch return e.unsupported("buffer member type '{s}'", .{st.name});
                 // An explicit [[vk::offset]] still has to respect the rules.
@@ -519,7 +521,8 @@ const Emitter = struct {
                     if (o % need != 0) return e.unsupported("[[vk::offset({d})]] on '{s}' is not aligned to {d} bytes for this buffer layout", .{ o, fld.name, need });
                 };
                 for (st.fields.items, offs, 0..) |fld, o, k| {
-                    const mk: u32 = @intCast(k);
+                    if (layout.isOpaque(e.t, fld.type)) continue;
+                    const mk: u32 = dataIndex(e.t, st, @intCast(k));
                     try e.b.emit(.annotations, .member_decorate, &.{ id, mk, 35, o }); // Offset
                     // Float matrices (possibly in arrays): HLSL rows are
                     // SPIR-V columns, so column_major is RowMajor.
@@ -540,7 +543,9 @@ const Emitter = struct {
     /// Members' inline SPIR-V decorations (not Offset in buffer layouts,
     /// which place members themselves).
     fn memberDecorations(e: *Emitter, id: Id, st: *const types.StructInfo, laid_out: bool) Error!void {
-        for (st.fields.items, 0..) |fld, k| for (fld.decorations) |d| {
+        for (st.fields.items, 0..) |fld, kk| for (fld.decorations) |d| {
+            if (layout.isOpaque(e.t, fld.type)) continue;
+            const k = dataIndex(e.t, st, @intCast(kk));
             if (laid_out and d.decoration == 35) continue;
             try e.requireNeed(op_caps.need(&op_caps.decorations, d.decoration));
             if (d.strings.len > 0) {
@@ -1134,7 +1139,7 @@ const Emitter = struct {
             }
             switch (g.space) {
                 .resource => {
-                    if (e.vk.flatten_arrays and e.t.get(g.ty) == .array and e.constantlyIndexed(@intCast(gi))) {
+                    if ((e.vk.flatten_arrays or e.m.resource_structs) and e.t.get(g.ty) == .array and e.constantlyIndexed(@intCast(gi))) {
                         // One variable per element, on consecutive bindings.
                         var et = g.ty;
                         var n: u32 = 1;
@@ -1354,7 +1359,7 @@ const Emitter = struct {
                 record(e, v, .{ .set = set, .binding = b });
             } else if (v.bd.vk_binding) |b| {
                 const set = v.bd.vk_set orelse default_set;
-                try e.useBindings(set, b, v.n(e.vk.flatten_arrays));
+                try e.useBindings(set, b, v.n((e.vk.flatten_arrays or e.m.resource_structs)));
                 record(e, v, .{ .set = set, .binding = b });
             }
         }
@@ -1364,7 +1369,7 @@ const Emitter = struct {
             const set = if (v.bd.reg.space_given) v.bd.reg.space else default_set;
             const class: u8 = if (v.bd.reg.class == 's' and v.bd.combined) 't' else v.bd.reg.class;
             const b = v.bd.reg.index + e.vk.shift(class, set);
-            try e.useBindings(set, b, v.n(e.vk.flatten_arrays));
+            try e.useBindings(set, b, v.n((e.vk.flatten_arrays or e.m.resource_structs)));
             record(e, v, .{ .set = set, .binding = b });
         }
         // The rest, in order.
@@ -1381,7 +1386,7 @@ const Emitter = struct {
                 }
                 const set = if (v.bd.space_only and v.bd.reg.space_given) v.bd.reg.space else default_set;
                 const shift = if (e.vk.auto_shift) e.vk.shift(e.implicitClass(v.bd), set) else 0;
-                record(e, v, .{ .set = set, .binding = try e.nextBindings(set, shift, v.n(e.vk.flatten_arrays)) });
+                record(e, v, .{ .set = set, .binding = try e.nextBindings(set, shift, v.n((e.vk.flatten_arrays or e.m.resource_structs))) });
             }
         }
     }
@@ -2325,8 +2330,16 @@ const Emitter = struct {
                         .@"struct" => |st| blk: {
                             const k = f.inst(x);
                             if (k.op != .constant) break :blk cur;
-                            const fld = st.fields.items[@intCast(k.op.constant.int)];
+                            const fi: u32 = @intCast(k.op.constant.int);
+                            const fld = st.fields.items[fi];
                             if (pl) |*p| p.row_major = fld.row_major;
+                            // (Resource members are not in the SPIR-V
+                            // struct: later members move up.)
+                            if (dataIndex(e.t, st, fi) != fi) {
+                                try ops.append(e.arena, try e.constUint(dataIndex(e.t, st, fi)));
+                                cur = fld.type;
+                                continue;
+                            }
                             break :blk fld.type;
                         },
                         else => cur,
@@ -4693,6 +4706,15 @@ fn isRayQuery(t: *TypeTable, ty: TypeId) bool {
 
 /// Resources and samplers (not RayQuery objects, which are function
 /// storage passed by pointer).
+/// Member `k`'s index in the SPIR-V struct (resource members dropped).
+fn dataIndex(t: *const TypeTable, st: *const types.StructInfo, k: u32) u32 {
+    var n: u32 = 0;
+    for (st.fields.items[0..k]) |f| {
+        if (!layout.isOpaque(t, f.type)) n += 1;
+    }
+    return n;
+}
+
 fn isResourceType(t: *TypeTable, ty: TypeId) bool {
     return switch (t.get(ty)) {
         .resource => !isRayQuery(t, ty),

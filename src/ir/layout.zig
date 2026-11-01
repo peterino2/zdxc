@@ -160,7 +160,9 @@ fn structAlign(t: *const TypeTable, info: *const types.StructInfo, rules: Rules)
         .dx_legacy => return 16,
         else => {
             var al: u32 = if (rules == .vk_relaxed or rules == .gl_std140) 16 else 1;
-            for (info.fields.items) |f| al = @max(al, try alignOf(t, f.type, f.row_major, rules));
+            for (info.fields.items) |f| if (!isOpaque(t, f.type)) {
+                al = @max(al, try alignOf(t, f.type, f.row_major, rules));
+            };
             return al;
         },
     }
@@ -200,6 +202,11 @@ fn layoutFields(t: *const TypeTable, info: *const types.StructInfo, rules: Rules
     if (packed_end) |pe| off = @max(off, pe);
     var end: u32 = off;
     for (info.fields.items[first..], out[first..]) |f, *o| {
+        // (Resources in structs take no space in buffers.)
+        if (isOpaque(t, f.type)) {
+            o.* = off;
+            continue;
+        }
         if (f.pack_offset) |po| {
             o.* = po;
             continue;
@@ -250,9 +257,19 @@ pub fn componentOffset(a: Allocator, t: *const TypeTable, ty: TypeId, row_major:
     }
 }
 
+/// Resources (and arrays of them): no data.
+pub fn isOpaque(t: *const TypeTable, ty: TypeId) bool {
+    return switch (t.get(ty)) {
+        .resource, .sampler => true,
+        .array => |a| isOpaque(t, a.elem),
+        else => false,
+    };
+}
+
 pub fn flatCount(t: *const TypeTable, ty: TypeId) Error!u32 {
     return switch (t.get(ty)) {
         .scalar, .@"enum" => 1,
+        .resource, .sampler => 0,
         .vector => |v| v.len,
         .matrix => |m| @as(u32, m.rows) * m.cols,
         .array => |a| a.len * try flatCount(t, a.elem),

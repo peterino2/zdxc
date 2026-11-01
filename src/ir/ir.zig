@@ -515,6 +515,9 @@ pub const Module = struct {
     /// Descriptor declarations in declaration order.
     binding_decls: std.ArrayList(BindingDecl) = .empty,
     vk: VkOptions = .{},
+    /// A global struct holds resources (dxc's SPIR-V then numbers array
+    /// elements' bindings separately, as with -fspv-flatten-resource-arrays).
+    resource_structs: bool = false,
     /// -enable-16bit-types: half and 16-bit integers are native types.
     native_16bit: bool = false,
     /// Root signatures: version 1.0 or 1.1 (-force-rootsig-ver), and
