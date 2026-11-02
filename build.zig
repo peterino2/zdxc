@@ -75,6 +75,30 @@ pub fn build(b: *std.Build) void {
     lib.installHeader(b.path("include/zdxc.h"), "zdxc.h");
     b.installArtifact(lib);
 
+    // The DXC drop-in: a `dxc` command line and a dxcompiler library with
+    // DXC's COM entry points (src/dxcapi.zig), for programs that load
+    // libdxcompiler / dxcompiler.dll themselves.
+    const dropin_step = b.step("dropin", "Build the DXC drop-in: bin/dxc and the dxcompiler library");
+    const dxc_name = if (target.result.os.tag == .windows) "dxc.exe" else "dxc";
+    dropin_step.dependOn(&b.addInstallArtifact(exe, .{ .dest_sub_path = dxc_name }).step);
+    const dxcompiler = b.addLibrary(.{
+        .name = "dxcompiler",
+        .linkage = .dynamic,
+        .root_module = b.addModule("dxcapi", .{
+            .root_source_file = b.path("src/dxcapi.zig"),
+            .target = target,
+            .optimize = optimize,
+            // It is loaded into C programs, so it names the libc it uses
+            // (for TLS, among others) instead of leaving it implied.
+            .link_libc = target.result.os.tag != .windows,
+            .imports = &.{.{ .name = "zdxc", .module = mod }},
+        }),
+    });
+    dropin_step.dependOn(&b.addInstallArtifact(dxcompiler, .{}).step);
+    // (Not installed by default, so a dependent finds it by this name
+    // rather than with artifact().)
+    b.addNamedLazyPath("dxcompiler", dxcompiler.getEmittedBin());
+
     const run_step = b.step("run", "Run zdxc");
     const run_cmd = b.addRunArtifact(exe);
     run_step.dependOn(&run_cmd.step);
@@ -86,4 +110,6 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&b.addRunArtifact(mod_tests).step);
     const exe_tests = b.addTest(.{ .root_module = exe.root_module });
     test_step.dependOn(&b.addRunArtifact(exe_tests).step);
+    const dxcapi_tests = b.addTest(.{ .root_module = dxcompiler.root_module });
+    test_step.dependOn(&b.addRunArtifact(dxcapi_tests).step);
 }

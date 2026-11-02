@@ -31,6 +31,10 @@ pub const Request = struct {
     /// Fail without -Fo, as the command line does (a library caller takes
     /// the object from the result instead).
     require_output: bool = false,
+    /// Note options that are accepted but have no effect yet. (The DXC
+    /// drop-in leaves them out: its clients read any diagnostic text as a
+    /// warning.)
+    compat_notes: bool = true,
 };
 
 pub const Status = enum(u8) {
@@ -345,7 +349,7 @@ fn parseArgs(ctx: *Ctx, arena: std.mem.Allocator, args: []const []const u8) !?Op
     // Like dxc, the last input wins (dxc reads getLastArgValue(OPT_INPUT)).
     if (parsed.inputs.len > 0) opts.input = parsed.inputs[parsed.inputs.len - 1];
 
-    if (opts.ignored.items.len > 0 and !opts.no_warnings) {
+    if (opts.ignored.items.len > 0 and !opts.no_warnings and ctx.req.compat_notes) {
         try ctx.stderr.writeAll("zdxc: note: accepted for compatibility, no effect yet:");
         for (opts.ignored.items) |sp| try ctx.stderr.print(" {s}", .{sp});
         try ctx.stderr.writeByte('\n');
