@@ -585,6 +585,15 @@ pub fn run(a: Allocator, m: *module.Module, func: u32, dyn: *const std.AutoHashM
         }
     }
 
+    // Peepholes on what promotion exposes, in instruction order so they
+    // cascade: bitcast round trips (locals mixing ints and floats store
+    // i32s), constant integer arithmetic and comparisons, identities, and
+    // selects on a constant.
+    for (insts, 0..) |inst, i| {
+        if (repl[i] != null) continue;
+        repl[i] = try simplify(m, f, repl, n, phi_var.items, var_ty, inst);
+    }
+
     // The instructions that go: promoted allocas, their getelementptrs,
     // loads and stores.
     const removed = try a.alloc(bool, n);
@@ -684,10 +693,161 @@ pub fn run(a: Allocator, m: *module.Module, func: u32, dyn: *const std.AutoHashM
         while (i < block_start[b + 1]) : (i += 1) if (live[i]) {
             var inst = insts[i];
             try operands(true, ma, &inst, &map);
+            if (inst.op == .gep) try clampIndex(m, &inst.op.gep);
             out.appendAssumeCapacity(inst);
         };
     }
     f.insts = out;
+}
+
+/// An index into an array that folding made a constant out of range (on
+/// a path that cannot run: the access would be undefined) becomes 0, as
+/// the validator rejects constant out-of-bounds accesses.
+fn clampIndex(m: *module.Module, g: *@FieldType(@FieldType(Inst, "op"), "gep")) Allocator.Error!void {
+    if (g.indices.len != 2) return;
+    const len = switch (m.types.items[g.elem]) {
+        .array => |arr| arr.len,
+        else => return,
+    };
+    const k = constInt(m, g.indices[1]) orelse return;
+    if (k >= 0 and k < len) return;
+    const ix = try m.allocator().dupe(Value, g.indices);
+    ix[1] = try m.constant(.{ .ty = m.constants.items[g.indices[1].constant].ty, .kind = .{ .int = 0 } });
+    g.indices = ix;
+}
+
+/// A simpler value for `inst`, or null.
+fn simplify(m: *module.Module, f: *const module.Function, repl: []const ?Value, n: u32, phi_var: []const u32, var_ty: []const TypeId, inst: Inst) Allocator.Error!?Value {
+    const S = struct {
+        fn ty(mm: *const module.Module, ff: *const module.Function, nn: u32, pv: []const u32, vt: []const TypeId, v: Value) TypeId {
+            if (v == .inst and v.inst >= nn) return vt[pv[v.inst - nn]];
+            return typeOf(mm, ff, v);
+        }
+        fn intWidth(mm: *const module.Module, t: TypeId) ?u32 {
+            return switch (mm.types.items[t]) {
+                .int => |w| w,
+                else => null,
+            };
+        }
+        /// `v` as a `w`-bit pattern.
+        fn bits(v: i64, w: u32) u64 {
+            const u: u64 = @bitCast(v);
+            return if (w >= 64) u else u & ((@as(u64, 1) << @intCast(w)) - 1);
+        }
+        /// A `w`-bit pattern as stored: 0 / 1 for i1, sign-extended above.
+        fn stored(p: u64, w: u32) i64 {
+            if (w == 1) return @intCast(p & 1);
+            if (w >= 64) return @bitCast(p);
+            const sh: u6 = @intCast(64 - w);
+            return @as(i64, @bitCast(p << sh)) >> sh;
+        }
+    };
+    switch (inst.op) {
+        .cast => |c| {
+            if (c.op != .bitcast) return null;
+            const x = resolve(repl, c.val);
+            if (x == .inst and x.inst < n) {
+                const inner = f.insts.items[x.inst].op;
+                if (inner == .cast and inner.cast.op == .bitcast) {
+                    const src = resolve(repl, inner.cast.val);
+                    if (S.ty(m, f, n, phi_var, var_ty, src) == inst.ty) return src;
+                }
+            }
+            if (x == .constant) {
+                const k = m.constants.items[x.constant].kind;
+                const w: u32 = switch (m.types.items[inst.ty]) {
+                    .int => |iw| iw,
+                    .half => 16,
+                    .float => 32,
+                    .double => 64,
+                    else => return null,
+                };
+                const p: u64 = switch (k) {
+                    .int => |v| S.bits(v, w),
+                    .float_bits => |b| b,
+                    else => return null,
+                };
+                return try m.constant(.{ .ty = inst.ty, .kind = switch (m.types.items[inst.ty]) {
+                    .int => .{ .int = S.stored(p, w) },
+                    else => .{ .float_bits = p },
+                } });
+            }
+            return null;
+        },
+        .binop => |b| {
+            const w = S.intWidth(m, inst.ty) orelse return null;
+            const l = resolve(repl, b.lhs);
+            const r = resolve(repl, b.rhs);
+            const lc = constInt(m, l);
+            const rc = constInt(m, r);
+            if (lc != null and rc != null) {
+                const x = S.bits(lc.?, w);
+                const y = S.bits(rc.?, w);
+                const sx = S.stored(x, w);
+                const sy = S.stored(y, w);
+                const p: u64 = switch (b.op) {
+                    .add => x +% y,
+                    .sub => x -% y,
+                    .mul => x *% y,
+                    .@"and" => x & y,
+                    .@"or" => x | y,
+                    .xor => x ^ y,
+                    .shl => if (y < w) x << @intCast(y) else return null,
+                    .lshr => if (y < w) x >> @intCast(y) else return null,
+                    .ashr => if (y < w) @bitCast(sx >> @intCast(y)) else return null,
+                    .udiv => if (y != 0) x / y else return null,
+                    .urem => if (y != 0) x % y else return null,
+                    .sdiv => if (sy != 0 and !(sy == -1 and sx == std.math.minInt(i64))) @bitCast(@divTrunc(sx, sy)) else return null,
+                    .srem => if (sy != 0 and sy != -1) @bitCast(@rem(sx, sy)) else return null,
+                };
+                return try m.constant(.{ .ty = inst.ty, .kind = .{ .int = S.stored(S.bits(@bitCast(p), w), w) } });
+            }
+            if (rc) |y| switch (b.op) {
+                .add, .sub, .@"or", .xor, .shl, .lshr, .ashr => if (y == 0) return l,
+                .mul, .udiv, .sdiv => if (S.bits(y, w) == 1) return l,
+                .@"and" => if (S.bits(y, w) == S.bits(-1, w)) return l,
+                else => {},
+            };
+            if (lc) |x| switch (b.op) {
+                .add, .@"or", .xor => if (x == 0) return r,
+                .mul => if (S.bits(x, w) == 1) return r,
+                .@"and" => if (S.bits(x, w) == S.bits(-1, w)) return r,
+                else => {},
+            };
+            return null;
+        },
+        .cmp => |c| {
+            if (c.pred < 32 or c.pred > 41) return null; // integer predicates only
+            const l = resolve(repl, c.lhs);
+            const r = resolve(repl, c.rhs);
+            const w = S.intWidth(m, S.ty(m, f, n, phi_var, var_ty, l)) orelse return null;
+            const x = S.bits(constInt(m, l) orelse return null, w);
+            const y = S.bits(constInt(m, r) orelse return null, w);
+            const sx = S.stored(x, w);
+            const sy = S.stored(y, w);
+            const t = switch (c.pred) {
+                32 => x == y,
+                33 => x != y,
+                34 => x > y,
+                35 => x >= y,
+                36 => x < y,
+                37 => x <= y,
+                38 => sx > sy,
+                39 => sx >= sy,
+                40 => sx < sy,
+                else => sx <= sy,
+            };
+            return try m.constant(.{ .ty = inst.ty, .kind = .{ .int = @intFromBool(t) } });
+        },
+        .select => |sl| {
+            const t = resolve(repl, sl.t);
+            const fv = resolve(repl, sl.f);
+            if (std.meta.eql(t, fv)) return t;
+            const c = constInt(m, resolve(repl, sl.cond)) orelse return null;
+            return if (c != 0) t else fv;
+        },
+        else => return null,
+    }
 }
 
 /// Instructions that must stay even when nothing reads their result.

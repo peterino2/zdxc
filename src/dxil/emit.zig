@@ -34,10 +34,13 @@ const Value = module.Value;
 
 pub const Error = Allocator.Error || error{Unsupported};
 
-pub fn emit(gpa: Allocator, m: *const ir.Module, profile: shader.Profile, diags: *diag.Diagnostics) Error![]u8 {
+/// `optimize` (off for -Od and -zdxc-no-opt) promotes locals to SSA values,
+/// passes arrays to callees that only read them in place and reuses
+/// inlined callees' arrays.
+pub fn emit(gpa: Allocator, m: *const ir.Module, profile: shader.Profile, diags: *diag.Diagnostics, optimize: bool) Error![]u8 {
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
-    var e: Emitter = .{ .arena = arena_state.allocator(), .dm = .init(gpa), .m = m, .t = m.types, .profile = profile, .diags = diags };
+    var e: Emitter = .{ .arena = arena_state.allocator(), .dm = .init(gpa), .m = m, .t = m.types, .profile = profile, .diags = diags, .optimize = optimize };
     defer e.dm.deinit();
     // Native 16-bit types are laid out at their own size.
     if (m.native_16bit) e.dm.datalayout = "e-m:e-p:32:32-i1:32-i8:8-i16:16-i32:32-i64:64-f16:16-f32:32-f64:64-n8:16:32:64";
@@ -155,13 +158,16 @@ const Frame = struct {
     rets: std.ArrayList(struct { block: u32, vals: []const Value }) = .empty,
     /// The resources a function returns (every return the same ones).
     ret_res: ?[]const Lowered = null,
-    /// Loads of locals: where from, and the block and write count when
-    /// read, so a call right after can pass the local itself.
-    load_srcs: std.AutoHashMapUnmanaged(u32, struct { ptr: Ptr, block: u32, writes: u32 }) = .empty,
-    /// By-value parameters passed as the caller's storage (see paramCopies).
-    param_ptrs: []const ?Ptr = &.{},
+    /// Loads of locals and constant buffers: the place (a `.ptr` or
+    /// `.cbuf`), and the block and write count when read, so a call right
+    /// after can pass the place itself.
+    load_srcs: std.AutoHashMapUnmanaged(u32, struct { src: Lowered, block: u32, writes: u32 }) = .empty,
+    /// By-value parameters passed as the caller's place (see paramCopies).
+    param_srcs: []const ?Lowered = &.{},
     /// paramCopies of the function, when some parameter is aliased.
     param_copies: []const u32 = &.{},
+    /// Array locals of an inlined callee, back to the pool on return.
+    arrays: std.ArrayList(struct { ty: TypeId, ptr: Ptr }) = .empty,
 };
 
 const PInst = struct { inst: module.Inst, id: u32 };
@@ -230,6 +236,11 @@ const Emitter = struct {
     /// Dynamically indexed getelementptrs into locals (by id) and the
     /// components they can reach, for promote.run.
     dyn_ranges: std.AutoHashMapUnmanaged(u32, [2]u32) = .empty,
+    /// See `emit`.
+    optimize: bool = true,
+    /// Arrays of inlined callees that have returned, by type, for later
+    /// callees' locals of that type (per function).
+    array_pool: std.AutoHashMapUnmanaged(TypeId, std.ArrayList(Ptr)) = .empty,
     /// Instructions emitted so far that may write memory.
     writes: u32 = 0,
     /// paramCopies per IR function.
@@ -1255,7 +1266,8 @@ const Emitter = struct {
         var it = e.dyn_ranges.iterator();
         while (it.next()) |kv| try ranges.put(e.arena, map[kv.key_ptr.*], kv.value_ptr.*);
         e.dyn_ranges.clearRetainingCapacity();
-        try promote.run(e.arena, &e.dm, func, &ranges);
+        e.array_pool.clearRetainingCapacity();
+        if (e.optimize) try promote.run(e.arena, &e.dm, func, &ranges);
     }
 
     /// Drops removable prologue instructions nothing uses (repeatedly: a
@@ -1370,9 +1382,10 @@ const Emitter = struct {
         return e.inlineCallAliased(fi, args, &.{});
     }
 
-    /// `aliases[k]`, when set, is caller storage holding by-value argument
-    /// `k`, which the callee may read in place of a copy (see argAliases).
-    fn inlineCallAliased(e: *Emitter, fi: u32, args: []const Lowered, aliases: []const ?Ptr) Error![]const Value {
+    /// `aliases[k]`, when set, is the caller's place holding by-value
+    /// argument `k`, which the callee may read in place of a copy (see
+    /// argAliases).
+    fn inlineCallAliased(e: *Emitter, fi: u32, args: []const Lowered, aliases: []const ?Lowered) Error![]const Value {
         const f = e.m.functions.items[fi];
         var frame: Frame = .{
             .f = f,
@@ -1381,7 +1394,7 @@ const Emitter = struct {
             .blocks = try e.arena.alloc(?u32, f.blocks.items.len),
         };
         for (aliases) |al| if (al != null) {
-            frame.param_ptrs = aliases;
+            frame.param_srcs = aliases;
             frame.param_copies = try e.paramCopies(fi);
             break;
         };
@@ -1398,6 +1411,14 @@ const Emitter = struct {
             try e.emitBlock(&frame, @intCast(bi));
         }
         e.last_ret_res = frame.ret_res;
+        // The callee's arrays are dead now: later callees can have them
+        // (with no values forwarded from what they held).
+        if (frame.arrays.items.len > 0) e.forwarded.clearRetainingCapacity();
+        for (frame.arrays.items) |x| {
+            const gop = try e.array_pool.getOrPut(e.arena, x.ty);
+            if (!gop.found_existing) gop.value_ptr.* = .empty;
+            try gop.value_ptr.append(e.arena, x.ptr);
+        }
         if (frame.cont) |cont| {
             e.cur = cont;
             if (f.ret == TypeTable.void_type or frame.rets.items.len == 0) return &.{};
@@ -1414,19 +1435,33 @@ const Emitter = struct {
         return &.{};
     }
 
-    /// Caller storage the by-value arguments of a call to `fi` can be read
-    /// from: an argument loaded from a local in the same block, with no
-    /// write since. Calls with out / inout arguments get none (the callee
-    /// could write the local through one while reading it through another).
-    fn argAliases(e: *Emitter, frame: *const Frame, fi: u32, refs: []const Ref) Error![]const ?Ptr {
+    /// Places the by-value array and struct arguments of a call to `fi` can
+    /// be read from: a constant buffer they were loaded from (none with
+    /// matrices, whose constant buffer access is narrower than a local's),
+    /// or a local loaded in the same block with no write since. Calls with
+    /// out / inout arguments get no locals (the callee could write one
+    /// through them while reading it through another).
+    fn argAliases(e: *Emitter, frame: *const Frame, fi: u32, refs: []const Ref) Error![]const ?Lowered {
         const params = e.m.functions.items[fi].params;
-        for (params) |p| if (p.by_ref) return &.{};
-        const out = try e.arena.alloc(?Ptr, refs.len);
+        var by_ref = false;
+        for (params) |p| by_ref = by_ref or p.by_ref;
+        const out = try e.arena.alloc(?Lowered, refs.len);
         for (refs, params, out) |r, p, *o| {
             o.* = null;
-            if (e.t.get(p.ty) != .array) continue;
+            if (p.by_ref) continue;
+            switch (e.t.get(p.ty)) {
+                .array, .@"struct" => if (e.holdsResources(p.ty)) continue,
+                else => continue,
+            }
             const src = frame.load_srcs.get(r.index()) orelse continue;
-            if (src.block == e.cur and src.writes == e.writes) o.* = src.ptr;
+            switch (src.src) {
+                .cbuf => if (!e.containsMatrix(p.ty)) {
+                    o.* = src.src;
+                },
+                else => if (!by_ref and src.block == e.cur and src.writes == e.writes) {
+                    o.* = src.src;
+                },
+            }
         }
         return out;
     }
@@ -1741,6 +1776,12 @@ const Emitter = struct {
                 return .{ .handle = ri };
             },
             .local_var => {
+                // (First: the store of the parameter is skipped whenever
+                // there is an alias.)
+                if (frame.param_copies.len > 0) {
+                    const k = frame.param_copies[r.index()];
+                    if (k != std.math.maxInt(u32)) if (frame.param_srcs[k]) |alias| return alias;
+                }
                 if (e.payload_local) |pl| if (pl.func == f and pl.inst == r.index()) {
                     const dty = try e.memoryType(i.ty);
                     const base = try e.addPrologue(try e.dm.ptrType(dty), .{ .alloca = .{ .elem = dty, .size = try e.i32Const(1) } });
@@ -1767,9 +1808,11 @@ const Emitter = struct {
                     const base = try e.addPrologue(try e.dm.ptrType(dty), .{ .alloca = .{ .elem = dty, .size = try e.i32Const(1) } });
                     return .{ .typed = .{ .base = base, .dty = dty, .addr_space = 0, .ty = i.ty } };
                 }
-                if (frame.param_copies.len > 0) {
-                    const k = frame.param_copies[r.index()];
-                    if (k != std.math.maxInt(u32)) if (frame.param_ptrs[k]) |alias| return .{ .ptr = alias };
+                if (e.optimize and frame.cont != null and e.t.get(i.ty) == .array) {
+                    const pooled = if (e.array_pool.getPtr(i.ty)) |l| l.pop() else null;
+                    const ptr = pooled orelse try e.alloca(i.ty);
+                    try frame.arrays.append(e.arena, .{ .ty = i.ty, .ptr = ptr });
+                    return .{ .ptr = ptr };
                 }
                 return .{ .ptr = try e.alloca(i.ty) };
             },
@@ -1801,6 +1844,7 @@ const Emitter = struct {
                     return .{ .scalars = try e.textureLoad(res, mip, tx.coords, null, i.ty) };
                 },
                 .cbuf => |c| {
+                    if (c.dyn_comp == null) try frame.load_srcs.put(e.arena, r.index(), .{ .src = .{ .cbuf = c }, .block = e.cur, .writes = e.writes });
                     const dc = c.dyn_comp orelse return e.cbufferLoad(c.res, c.offset, c.dyn_regs, c.row_major, i.ty);
                     const whole = (try e.cbufferLoad(c.res, c.offset, c.dyn_regs, c.row_major, c.vec)).scalars;
                     return .{ .scalars = try e.arena.dupe(Value, &.{try e.pickComponent(whole, dc, i.ty)}) };
@@ -1831,7 +1875,7 @@ const Emitter = struct {
                     return .{ .scalars = out };
                 },
                 .ptr => |ptr| {
-                    if (ptr.addr_space == 0 and localRoot(f, p)) try frame.load_srcs.put(e.arena, r.index(), .{ .ptr = ptr, .block = e.cur, .writes = e.writes });
+                    if (ptr.addr_space == 0 and localRoot(f, p)) try frame.load_srcs.put(e.arena, r.index(), .{ .src = .{ .ptr = ptr }, .block = e.cur, .writes = e.writes });
                     return e.loadPtr(ptr, i.ty);
                 },
                 .typed => |tp| return e.typedLoad(tp, i.ty),
@@ -1841,7 +1885,7 @@ const Emitter = struct {
             .store => |s| {
                 if (frame.param_copies.len > 0) if (f.inst(s.value).op == .param) {
                     const k = f.inst(s.value).op.param;
-                    if (frame.param_copies[s.ptr.index()] == k and frame.param_ptrs[k] != null) return .none;
+                    if (frame.param_copies[s.ptr.index()] == k and frame.param_srcs[k] != null) return .none;
                 };
                 if (frame.vals[s.ptr.index()] == .rq_local) {
                     // A copy of a query is the same query.
@@ -2103,7 +2147,7 @@ const Emitter = struct {
                 if (e.lib_calls.get(c.func)) |func| return e.libCall(frame, c.func, func, c.args);
                 const args = try e.arena.alloc(Lowered, c.args.len);
                 for (c.args, args) |a, *o| o.* = frame.vals[a.index()];
-                const res = try e.inlineCallAliased(c.func, args, try e.argAliases(frame, c.func, c.args));
+                const res = try e.inlineCallAliased(c.func, args, if (e.optimize) try e.argAliases(frame, c.func, c.args) else &.{});
                 // Functions returning resources (or structs of them).
                 if (isResourceType(e.t, i.ty) and !isRayQuery(e.t, i.ty)) {
                     const rr = e.last_ret_res orelse return e.unsupported("a function returning a resource with no return value", .{});
@@ -4732,6 +4776,17 @@ const Emitter = struct {
         const dty = try e.dm.getType(.{ .@"struct" = .{ .name = name, .elems = &.{try e.dm.ptrType(try e.dm.intType(8))} } });
         try e.linalg_types.append(e.arena, .{ .ty = ty, .dty = dty });
         return dty;
+    }
+
+    fn containsMatrix(e: *Emitter, ty: TypeId) bool {
+        return switch (e.t.get(ty)) {
+            .matrix => true,
+            .array => |a| e.containsMatrix(a.elem),
+            .@"struct" => |st| for (st.fields.items) |fld| {
+                if (e.containsMatrix(fld.type)) break true;
+            } else false,
+            else => false,
+        };
     }
 
     fn containsLinAlg(e: *Emitter, ty: TypeId) bool {
