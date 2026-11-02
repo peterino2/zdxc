@@ -734,7 +734,7 @@ fn unrollOne(a: Allocator, t: *TypeTable, f: *ir.Function, h: u32, set: []const 
                 .selection => |b| .{ .selection = mapBlock(&bmap, b) },
                 .loop => |l| .{ .loop = .{ .merge = mapBlock(&bmap, l.merge), .@"continue" = mapBlock(&bmap, l.@"continue"), .unroll = l.unroll } },
             };
-            f.blocks.items[nb] = .{ .insts = insts, .term = term, .merge = mg };
+            f.blocks.items[nb] = .{ .insts = insts, .term = term, .merge = mg, .selection_control = src.selection_control };
         }
         entries[iter] = bmap.get(body).?;
         conts[iter] = bmap.get(cont).?;

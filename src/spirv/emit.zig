@@ -2199,7 +2199,13 @@ const Emitter = struct {
             for (blk.insts.items) |r| try e.emitInst(r);
             switch (blk.merge) {
                 .none => {},
-                .selection => |mb| try e.b.emit(.functions, .selection_merge, &.{ labels[mb.index()], 0 }),
+                // [flatten] / [branch]: SelectionControl Flatten /
+                // DontFlatten, as in dxc.
+                .selection => |mb| try e.b.emit(.functions, .selection_merge, &.{ labels[mb.index()], switch (blk.selection_control) {
+                    .none => 0,
+                    .flatten => 1,
+                    .dont_flatten => 2,
+                } }),
                 // [unroll] / [loop] the IR could not act on are the
                 // driver's to honor (LoopControl Unroll / DontUnroll), as
                 // in dxc.

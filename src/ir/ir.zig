@@ -180,7 +180,11 @@ pub const Block = struct {
     insts: std.ArrayList(Ref) = .empty,
     term: Terminator = .none,
     merge: Merge = .none,
+    /// `[flatten]` / `[branch]` on the selection this block heads.
+    selection_control: SelectionControl = .none,
 };
+
+pub const SelectionControl = enum { none, flatten, dont_flatten };
 
 pub const Param = struct {
     name: []const u8,

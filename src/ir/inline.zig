@@ -283,8 +283,10 @@ fn inlineOne(a: Allocator, f: *ir.Function, bi: u32, pos: usize, args: []const R
         try f.blocks.items[cont].insts.appendSlice(a, blk.insts.items[pos + 1 ..]);
         f.blocks.items[cont].term = blk.term;
         f.blocks.items[cont].merge = blk.merge;
+        f.blocks.items[cont].selection_control = blk.selection_control;
         blk.insts.shrinkRetainingCapacity(pos);
         blk.merge = .none;
+        blk.selection_control = .none;
     }
 
     // Copies of the callee's blocks and instructions (parameters become
@@ -387,7 +389,7 @@ fn inlineOne(a: Allocator, f: *ir.Function, bi: u32, pos: usize, args: []const R
             .selection => |mb| .{ .selection = B.map(bmap, mb) },
             .loop => |l| .{ .loop = .{ .merge = B.map(bmap, l.merge), .@"continue" = B.map(bmap, l.@"continue"), .unroll = l.unroll } },
         };
-        f.blocks.items[bmap[k]] = .{ .insts = insts, .term = term, .merge = merge };
+        f.blocks.items[bmap[k]] = .{ .insts = insts, .term = term, .merge = merge, .selection_control = src.selection_control };
     }
     f.blocks.items[bi].term = .{ .br = @fromBackingInt(@intCast(entry_target)) };
     return result;
