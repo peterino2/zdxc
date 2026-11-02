@@ -21,6 +21,7 @@ const mangle = @import("mangle.zig");
 const rdat = @import("rdat.zig");
 const linalg_info = @import("linalg_info.zig");
 const libinfo = @import("libinfo.zig");
+const reflect = @import("reflect.zig");
 const rootsig = @import("rootsig.zig");
 const promote = @import("promote.zig");
 const opt = @import("../ir/opt.zig");
@@ -38,13 +39,25 @@ pub const Error = Allocator.Error || error{Unsupported};
 /// passes arrays to callees that only read them in place and reuses
 /// inlined callees' arrays.
 pub fn emit(gpa: Allocator, m: *const ir.Module, profile: shader.Profile, diags: *diag.Diagnostics, optimize: bool) Error![]u8 {
+    const out = try emitWithReflection(gpa, m, profile, diags, optimize);
+    gpa.free(out.reflection);
+    return out.object;
+}
+
+/// The DXIL container and its reflection (reflect.zig), both owned by the
+/// caller.
+pub const Output = struct { object: []u8, reflection: []u8 };
+
+pub fn emitWithReflection(gpa: Allocator, m: *const ir.Module, profile: shader.Profile, diags: *diag.Diagnostics, optimize: bool) Error!Output {
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
     var e: Emitter = .{ .arena = arena_state.allocator(), .dm = .init(gpa), .m = m, .t = m.types, .profile = profile, .diags = diags, .optimize = optimize };
     defer e.dm.deinit();
     // Native 16-bit types are laid out at their own size.
     if (m.native_16bit) e.dm.datalayout = "e-m:e-p:32:32-i1:32-i8:8-i16:16-i32:32-i64:64-f16:16-f32:32-f64:64-n8:16:32:64";
-    return e.run(gpa);
+    const object = try e.run(gpa);
+    errdefer gpa.free(object);
+    return .{ .object = object, .reflection = e.reflection orelse return error.OutOfMemory };
 }
 
 /// A lowered IR value.
@@ -249,6 +262,9 @@ const Emitter = struct {
     param_copies: std.AutoHashMapUnmanaged(u32, []const u32) = .empty,
     uses_barycentrics: bool = false,
     uses_sampler_heap: bool = false,
+    /// The shader's reflection (reflect.zig), made with the object; owned
+    /// by the caller of `emit`.
+    reflection: ?[]u8 = null,
 
     sig_in: []signature.Element = &.{},
     sig_out: []signature.Element = &.{},
@@ -473,9 +489,35 @@ const Emitter = struct {
             try e.finish(e.pc_fn.?);
         }
 
+        if (e.optimize) e.inputUsage();
         const bitcode = try e.writeModule(entry);
         defer gpa.free(bitcode);
         return e.assemble(gpa, entry, bitcode);
+    }
+
+    /// The input components read, from the optimized code (lowering marks
+    /// every read, including ones optimized away), as DXC reports them in
+    /// the signature and its reflection.
+    fn inputUsage(e: *Emitter) void {
+        const readers = [_][]const u8{ "dx.op.loadInput.", "dx.op.attributeAtVertex.", "dx.op.evalSnapped.", "dx.op.evalSampleIndex.", "dx.op.evalCentroid." };
+        var usage: [64]u8 = @splat(0);
+        if (e.sig_in.len > usage.len) return;
+        for (e.dm.functions.items) |f| for (f.insts.items) |inst| {
+            const c = switch (inst.op) {
+                .call => |c| c,
+                else => continue,
+            };
+            const name = e.dm.functions.items[c.callee].name;
+            for (readers) |r| {
+                if (!std.mem.startsWith(u8, name, r)) continue;
+                const id = e.constInt(c.args[1]) orelse return;
+                const col = e.constInt(c.args[3]) orelse return;
+                for (e.sig_in, 0..) |el, k| if (el.id == id) {
+                    usage[k] |= @as(u8, 1) << @intCast(col);
+                };
+            }
+        };
+        for (e.sig_in, usage[0..e.sig_in.len]) |*el, u| el.usage = u;
     }
 
     /// The resource entry for a value of resource type `ty` (global,
@@ -5509,12 +5551,404 @@ const Emitter = struct {
         return dm.writeBitcode(dm.arena.child_allocator);
     }
 
+    // ---- Reflection (reflect.zig) -----------------------------------------
+
+    /// The bytes of a constant buffer (or tbuffer) the shader reads.
+    const BufferUse = struct {
+        /// Read at a dynamic register: all of it counts as read.
+        all: bool = false,
+        bytes: std.ArrayList(bool) = .empty,
+
+        fn reads(u: BufferUse, offset: u32, size: u32) bool {
+            if (u.all) return true;
+            const end = @min(offset + @max(size, 1), u.bytes.items.len);
+            if (offset >= end) return false;
+            return std.mem.indexOfScalar(bool, u.bytes.items[offset..end], true) != null;
+        }
+    };
+
+    fn constInt(e: *Emitter, v: Value) ?i64 {
+        return switch (v) {
+            .constant => |c| switch (e.dm.constants.items[c].kind) {
+                .int => |i| i,
+                else => null,
+            },
+            else => null,
+        };
+    }
+
+    /// The resource (index into `resources`) a handle in `f` stands for,
+    /// when the handle's creation says.
+    fn handleResource(e: *Emitter, f: *const module.Function, handle: Value) ?u32 {
+        var cur = handle;
+        for (0..8) |_| {
+            const i = switch (cur) {
+                .inst => |i| i,
+                else => return null,
+            };
+            const c = switch (f.insts.items[i].op) {
+                .call => |c| c,
+                else => return null,
+            };
+            const name = e.dm.functions.items[c.callee].name;
+            if (std.mem.eql(u8, name, "dx.op.annotateHandle")) {
+                cur = c.args[1];
+                continue;
+            }
+            if (std.mem.eql(u8, name, "dx.op.createHandle")) {
+                const class = e.constInt(c.args[1]) orelse return null;
+                const id = e.constInt(c.args[2]) orelse return null;
+                for (e.resources.items, 0..) |r, ri| {
+                    if (!r.view and @backingInt(r.class) == class and r.id == id) return @intCast(ri);
+                }
+                return null;
+            }
+            if (std.mem.eql(u8, name, "dx.op.createHandleFromBinding")) {
+                const k = switch (c.args[1]) {
+                    .constant => |k| k,
+                    else => return null,
+                };
+                const fields = switch (e.dm.constants.items[k].kind) {
+                    .aggregate => |p| p,
+                    else => return null,
+                };
+                const lower = e.constInt(.{ .constant = fields[0] }) orelse return null;
+                const space = e.constInt(.{ .constant = fields[2] }) orelse return null;
+                const class = e.constInt(.{ .constant = fields[3] }) orelse return null;
+                for (e.resources.items, 0..) |r, ri| {
+                    const b = e.binding(r);
+                    if (!r.view and @backingInt(r.class) == class and b.space == space and b.index == lower) return @intCast(ri);
+                }
+                return null;
+            }
+            if (std.mem.startsWith(u8, name, "dx.op.createHandleForLib.")) {
+                var p = c.args[1];
+                while (p == .inst) p = switch (f.insts.items[p.inst].op) {
+                    .load => |x| x.ptr,
+                    .gep => |x| x.ptr,
+                    else => return null,
+                };
+                if (p != .global) return null;
+                for (e.resources.items, 0..) |r, ri| {
+                    if (!r.view and r.lib_global == p.global) return @intCast(ri);
+                }
+                return null;
+            }
+            return null;
+        }
+        return null;
+    }
+
+    /// What each constant buffer and tbuffer (by resource index) is read
+    /// for, from the final module's loads, at the precision DXC's
+    /// reflection marks variables used: the components extracted.
+    fn bufferUses(e: *Emitter) Error![]BufferUse {
+        const uses = try e.arena.alloc(BufferUse, e.resources.items.len);
+        @memset(uses, .{});
+        for (e.dm.functions.items) |*f| {
+            if (f.insts.items.len == 0) continue;
+            // The elements each instruction's extractvalue users take.
+            var elems: std.AutoHashMapUnmanaged(u32, std.ArrayList(u32)) = .empty;
+            for (f.insts.items) |inst| switch (inst.op) {
+                .extractvalue => |x| if (x.agg == .inst) {
+                    const gop = try elems.getOrPut(e.arena, x.agg.inst);
+                    if (!gop.found_existing) gop.value_ptr.* = .empty;
+                    try gop.value_ptr.append(e.arena, x.index);
+                },
+                else => {},
+            };
+            for (f.insts.items, 0..) |inst, i| {
+                const c = switch (inst.op) {
+                    .call => |c| c,
+                    else => continue,
+                };
+                const name = e.dm.functions.items[c.callee].name;
+                const legacy = std.mem.startsWith(u8, name, "dx.op.cbufferLoadLegacy.");
+                if (!legacy and !std.mem.startsWith(u8, name, "dx.op.bufferLoad.")) continue;
+                const ri = e.handleResource(f, c.args[1]) orelse continue;
+                const r = e.resources.items[ri];
+                if (r.class != .cbuffer and r.kind != 15) continue;
+                const u = &uses[ri];
+                if (u.all) continue;
+                const row = e.constInt(c.args[2]) orelse {
+                    u.all = true;
+                    continue;
+                };
+                // A register's elements: 4 32-bit, 2 64-bit or 8 16-bit.
+                const size: usize = if (!legacy) 4 else if (std.mem.endsWith(u8, name, "16")) 2 else if (std.mem.endsWith(u8, name, "64")) 8 else 4;
+                const base: usize = @intCast(row * 16);
+                if (u.bytes.items.len < base + 16) try u.bytes.appendNTimes(e.arena, false, base + 16 - u.bytes.items.len);
+                if (elems.get(@intCast(i))) |taken| {
+                    for (taken.items) |k| @memset(u.bytes.items[base + k * size ..][0..size], true);
+                } else @memset(u.bytes.items[base..][0..16], true);
+            }
+        }
+        return uses;
+    }
+
+    /// D3D_SHADER_VARIABLE_TYPE.
+    fn svType(e: *Emitter, s: Scalar) u32 {
+        return switch (s) {
+            .bool => 1,
+            .int, .literal_int => 2,
+            .uint, .int8_4packed, .uint8_4packed => 19,
+            .float, .literal_float => 3,
+            .half => if (e.m.native_16bit) 58 else 3,
+            .double => 39,
+            .min16float => 52,
+            .min10float => 51,
+            .min16int => 54,
+            .min12int => 53,
+            .min16uint => 55,
+            .int16 => 56,
+            .uint16 => 57,
+            .float16 => 58,
+            .int64 => 59,
+            .uint64 => 60,
+        };
+    }
+
+    /// Adds the type description of `ty` (and of its members) to `types`;
+    /// returns its index.
+    fn reflectType(e: *Emitter, tys: *std.ArrayList(reflect.Type), ty: TypeId, row_major: bool, offset: u32) Error!u32 {
+        var t = ty;
+        var elements: u32 = 0;
+        while (e.t.get(t) == .array) {
+            const a = e.t.get(t).array;
+            elements = if (elements == 0) a.len else elements * a.len;
+            t = a.elem;
+        }
+        var d: reflect.Type = .{ .class = reflect.svc.object, .kind = 0, .elements = elements, .offset = offset };
+        switch (e.t.get(t)) {
+            .scalar => |s| {
+                d.class = reflect.svc.scalar;
+                d.kind = e.svType(s);
+                d.rows = 1;
+                d.cols = 1;
+                // D3D's name for uint.
+                d.name = if (s == .uint) "dword" else s.name();
+            },
+            .@"enum" => {
+                d.class = reflect.svc.scalar;
+                d.kind = 2;
+                d.rows = 1;
+                d.cols = 1;
+                d.name = "int";
+            },
+            .vector => |v| {
+                d.class = reflect.svc.vector;
+                d.kind = e.svType(v.elem);
+                d.rows = 1;
+                d.cols = v.len;
+                d.name = try std.fmt.allocPrint(e.arena, "{s}{d}", .{ v.elem.name(), v.len });
+            },
+            .matrix => |m| {
+                d.class = if (row_major) reflect.svc.matrix_rows else reflect.svc.matrix_columns;
+                d.kind = e.svType(m.elem);
+                d.rows = m.rows;
+                d.cols = m.cols;
+                d.name = try std.fmt.allocPrint(e.arena, "{s}{d}x{d}", .{ m.elem.name(), m.rows, m.cols });
+            },
+            .@"struct" => |s| {
+                d.class = reflect.svc.@"struct";
+                d.rows = 1;
+                d.cols = layout.flatCount(e.t, t) catch 0;
+                d.name = s.name;
+                const offs = layout.fieldOffsets(e.arena, e.t, s, .dx_legacy) catch return e.unsupported("reflection of '{s}'", .{s.name});
+                var members: std.ArrayList(reflect.Member) = .empty;
+                for (s.fields.items, offs) |fld, off| {
+                    if (fld.bits or layout.isOpaque(e.t, fld.type)) continue;
+                    try members.append(e.arena, .{ .name = fld.name, .ty = try e.reflectType(tys, fld.type, fld.row_major, off) });
+                }
+                d.members = members.items;
+            },
+            else => {},
+        }
+        try tys.append(e.arena, d);
+        return @intCast(tys.items.len - 1);
+    }
+
+    /// The scalar and component count of a texture or typed buffer element.
+    fn elemShape(e: *Emitter, elem: TypeId) ?struct { scalar: Scalar, comps: u32 } {
+        return switch (e.t.get(elem)) {
+            .scalar => |s| .{ .scalar = s, .comps = 1 },
+            .vector => |v| .{ .scalar = v.elem, .comps = v.len },
+            else => null,
+        };
+    }
+
+    const ReflectedResources = struct {
+        binds: []const reflect.Bind,
+        cbuffers: []const reflect.CBuffer,
+        types: []const reflect.Type,
+        /// Bind index -> cbuffer index (constant buffers and tbuffers).
+        cbuffer_of: []const ?u32,
+    };
+
+    /// The bound resources (CBVs, samplers, SRVs, UAVs, as PSV and RDAT
+    /// list them) and the constant buffers' variables.
+    fn reflectResources(e: *Emitter) Error!ReflectedResources {
+        const uses = try e.bufferUses();
+        var binds: std.ArrayList(reflect.Bind) = .empty;
+        var cbuffers: std.ArrayList(reflect.CBuffer) = .empty;
+        var tys: std.ArrayList(reflect.Type) = .empty;
+        var cbuffer_of: std.ArrayList(?u32) = .empty;
+        for ([_]Resource.Class{ .cbuffer, .sampler, .srv, .uav }) |cls| for (e.resources.items, 0..) |r, ri| if (r.class == cls and !r.view) {
+            const g = e.m.globals.items[r.global];
+            const b = e.binding(r);
+            var bd: reflect.Bind = .{
+                .name = g.name,
+                .type = 0,
+                .bind_point = b.index,
+                .bind_count = if (r.count == std.math.maxInt(u32)) 0 else r.count,
+                .space = b.space,
+                .id = r.id,
+            };
+            const shape = e.elemShape(r.elem);
+            const dims = [_]u32{ 0, 2, 4, 6, 8, 9, 3, 5, 7, 10, 1, 1, 1 };
+            const dim: u32 = if (r.kind < dims.len) dims[r.kind] else if (r.kind == 17) 4 else if (r.kind == 18) 5 else 0;
+            const typed_ret: u32 = if (shape) |sh| switch (sh.scalar) {
+                .int, .int16, .int64, .min16int, .min12int => reflect.ret.sint,
+                .uint, .uint16, .uint64, .min16uint, .bool => reflect.ret.uint,
+                .double => reflect.ret.double,
+                else => reflect.ret.float,
+            } else reflect.ret.float;
+            const comps_flags: u32 = if (shape) |sh| ((sh.comps - 1) & 3) << 2 else 0;
+            const rkind: ?types.ResourceKind = if (r.rty != 0 and e.t.get(r.rty) == .resource) e.t.get(r.rty).resource.kind else null;
+            var cbuffer_index: ?u32 = null;
+            switch (r.class) {
+                .cbuffer => {
+                    bd.type = reflect.sit.cbuffer;
+                    bd.flags = reflect.sif_userpacked;
+                    cbuffer_index = try e.reflectCBuffer(&cbuffers, &tys, r, uses[ri], reflect.ct_cbuffer);
+                },
+                .sampler => {
+                    bd.type = reflect.sit.sampler;
+                    if (r.comparison) bd.flags |= reflect.sif_comparison_sampler;
+                },
+                .srv => switch (r.kind) {
+                    12 => {
+                        bd.type = reflect.sit.structured;
+                        bd.return_type = reflect.ret.mixed;
+                        bd.dimension = 1;
+                        bd.num_samples = layout.sizeOf(e.t, r.elem, false, .dx_packed) catch 0;
+                        cbuffer_index = try e.reflectElementBuffer(&cbuffers, &tys, try e.elementBufferName(g.name, r.count), r.elem, bd.num_samples);
+                    },
+                    11 => {
+                        bd.type = reflect.sit.byteaddress;
+                        bd.return_type = reflect.ret.mixed;
+                        bd.dimension = 1;
+                    },
+                    15 => {
+                        bd.type = reflect.sit.tbuffer;
+                        bd.flags = reflect.sif_userpacked;
+                        cbuffer_index = try e.reflectCBuffer(&cbuffers, &tys, r, uses[ri], reflect.ct_tbuffer);
+                    },
+                    16 => {
+                        bd.type = reflect.sit.rtaccelerationstructure;
+                        bd.return_type = reflect.ret.sint;
+                        bd.num_samples = std.math.maxInt(u32);
+                    },
+                    else => {
+                        bd.type = reflect.sit.texture;
+                        bd.dimension = dim;
+                        bd.return_type = typed_ret;
+                        bd.flags |= comps_flags;
+                        if (r.kind != 3 and r.kind != 8) bd.num_samples = std.math.maxInt(u32);
+                    },
+                },
+                .uav => switch (r.kind) {
+                    12 => {
+                        // Append and consume buffers too, as DXC reports them.
+                        bd.type = if (r.has_counter or rkind == .append_structured_buffer or rkind == .consume_structured_buffer)
+                            reflect.sit.uav_rwstructured_with_counter
+                        else
+                            reflect.sit.uav_rwstructured;
+                        bd.return_type = reflect.ret.mixed;
+                        bd.dimension = 1;
+                        bd.num_samples = layout.sizeOf(e.t, r.elem, false, .dx_packed) catch 0;
+                        cbuffer_index = try e.reflectElementBuffer(&cbuffers, &tys, try e.elementBufferName(g.name, r.count), r.elem, bd.num_samples);
+                    },
+                    11 => {
+                        bd.type = reflect.sit.uav_rwbyteaddress;
+                        bd.return_type = reflect.ret.mixed;
+                        bd.dimension = 1;
+                    },
+                    17, 18 => {
+                        bd.type = reflect.sit.uav_feedbacktexture;
+                        bd.dimension = dim;
+                    },
+                    else => {
+                        bd.type = reflect.sit.uav_rwtyped;
+                        bd.dimension = dim;
+                        bd.return_type = typed_ret;
+                        bd.flags |= comps_flags;
+                        if (r.kind != 3 and r.kind != 8) bd.num_samples = std.math.maxInt(u32);
+                    },
+                },
+            }
+            try binds.append(e.arena, bd);
+            try cbuffer_of.append(e.arena, cbuffer_index);
+        };
+        return .{ .binds = binds.items, .cbuffers = cbuffers.items, .types = tys.items, .cbuffer_of = cbuffer_of.items };
+    }
+
+    /// An array's resource-bind-info buffer is named for its first element.
+    fn elementBufferName(e: *Emitter, name: []const u8, count: u32) Error![]const u8 {
+        return if (count == 1) name else std.fmt.allocPrint(e.arena, "{s}[0]", .{name});
+    }
+
+    /// Adds a structured buffer's resource-bind-info buffer, as DXC lists
+    /// them: one variable, `$Element`, of the element type.
+    fn reflectElementBuffer(e: *Emitter, cbuffers: *std.ArrayList(reflect.CBuffer), tys: *std.ArrayList(reflect.Type), name: []const u8, elem: TypeId, elem_size: u32) Error!u32 {
+        const vars = try e.arena.alloc(reflect.Variable, 1);
+        vars[0] = .{ .name = "$Element", .offset = 0, .size = elem_size, .flags = reflect.svf_used, .ty = try e.reflectType(tys, elem, false, 0) };
+        try cbuffers.append(e.arena, .{ .name = name, .kind = reflect.ct_resource_bind_info, .size = elem_size, .vars = vars });
+        return @intCast(cbuffers.items.len - 1);
+    }
+
+    /// Adds the constant buffer (or tbuffer) `r`'s description; returns
+    /// its index.
+    fn reflectCBuffer(e: *Emitter, cbuffers: *std.ArrayList(reflect.CBuffer), tys: *std.ArrayList(reflect.Type), r: Resource, use: BufferUse, kind: u32) Error!u32 {
+        const g = e.m.globals.items[r.global];
+        var vars: std.ArrayList(reflect.Variable) = .empty;
+        var size: u32 = 0;
+        if (g.space == .cbuffer and e.t.get(g.ty) == .@"struct") {
+            // A cbuffer block: its members are the variables.
+            const s = e.t.get(g.ty).@"struct";
+            const offs = layout.fieldOffsets(e.arena, e.t, s, .dx_legacy) catch return e.unsupported("reflection of constant buffer '{s}'", .{g.name});
+            for (s.fields.items, offs) |fld, off| {
+                if (fld.bits) continue;
+                const fsize = layout.sizeOf(e.t, fld.type, fld.row_major, .dx_legacy) catch 0;
+                var flags: u32 = if (fld.pack_offset != null) reflect.svf_userpacked else 0;
+                if (use.reads(off, fsize)) flags |= reflect.svf_used;
+                try vars.append(e.arena, .{ .name = fld.name, .offset = off, .size = fsize, .flags = flags, .ty = try e.reflectType(tys, fld.type, fld.row_major, 0) });
+            }
+            size = layout.sizeOf(e.t, g.ty, false, .dx_legacy) catch 0;
+        } else if (r.count == 1 and e.t.get(r.elem) == .@"struct") {
+            // ConstantBuffer<T> / TextureBuffer<T>: one variable, the block.
+            size = layout.sizeOf(e.t, r.elem, false, .dx_legacy) catch 0;
+            const flags: u32 = if (use.reads(0, size)) reflect.svf_used else 0;
+            try vars.append(e.arena, .{ .name = g.name, .offset = 0, .size = size, .flags = flags, .ty = try e.reflectType(tys, r.elem, false, 0) });
+        }
+        try cbuffers.append(e.arena, .{ .name = g.name, .kind = kind, .size = std.mem.alignForward(u32, size, 16), .vars = vars.items });
+        return @intCast(cbuffers.items.len - 1);
+    }
+
+    fn instructionCount(e: *Emitter) u32 {
+        var n: usize = 0;
+        for (e.dm.functions.items) |f| n += f.insts.items.len;
+        return @intCast(n);
+    }
+
     /// The library container: feature info, runtime data (RDAT) and the
     /// program.
     fn assembleLibrary(e: *Emitter, gpa: Allocator, funcs: []const LibFunc, bitcode: []const u8) Error![]u8 {
         const dxil_part = try shader.programPart(gpa, e.profile, bitcode);
         defer gpa.free(dxil_part);
         const analysis = try e.libAnalysis(funcs);
+        const refl = try e.reflectResources();
+        var refl_funcs: std.ArrayList(reflect.Function) = .empty;
         var b = try rdat.Builder.init(gpa);
         defer b.deinit();
         // Resources: CBVs, samplers, SRVs, UAVs.
@@ -5553,6 +5987,16 @@ const Emitter = struct {
                 }
             }
             std.mem.sort(u32, used.items, {}, std.sort.asc(u32));
+            // Reflection lists resources in the same order as RDAT.
+            var func_cbuffers: std.ArrayList(u32) = .empty;
+            for (used.items) |ri| if (refl.cbuffer_of[ri]) |ci| try func_cbuffers.append(e.arena, ci);
+            try refl_funcs.append(e.arena, .{
+                .name = lf.name,
+                .version = reflect.version(reflect.programType(@tagName(lf.stage)), e.profile.major, e.profile.minor),
+                .requires = libinfo.featureInfo(info.flags) & reflect.required_features,
+                .binds = try e.arena.dupe(u32, used.items),
+                .cbuffers = func_cbuffers.items,
+            });
             const resources = if (used.items.len > 0) try b.array(used.items) else rdat.null_ref;
             const props = if (e.uses_linalg) try linalg_info.rdatProperties(e.arena, &b, &try linalg_info.functionInfo(e.arena, &e.dm, mats, lf.func)) else rdat.null_ref;
             const kind = shaderKind(lf.stage);
@@ -5597,6 +6041,24 @@ const Emitter = struct {
         defer gpa.free(rdat_part);
         var sfi0: [8]u8 = @splat(0);
         std.mem.writeInt(u64, &sfi0, libinfo.featureInfo(analysis.flags), .little);
+        e.reflection = try reflect.encode(gpa, .{
+            .version = reflect.version(reflect.programType("library"), e.profile.major, e.profile.minor),
+            .requires = libinfo.featureInfo(analysis.flags) & reflect.required_features,
+            .instructions = e.instructionCount(),
+            .binds = refl.binds,
+            .cbuffers = refl.cbuffers,
+            .types = refl.types,
+            .functions = sorted: {
+                // By name, as DXC lists them.
+                std.mem.sort(reflect.Function, refl_funcs.items, {}, struct {
+                    fn lt(_: void, x: reflect.Function, y: reflect.Function) bool {
+                        return std.mem.lessThan(u8, x.name, y.name);
+                    }
+                }.lt);
+                break :sorted refl_funcs.items;
+            },
+        }, &.{.{ .fourcc = container.fourcc("SFI0"), .data = &sfi0 }});
+        errdefer if (e.reflection) |r| gpa.free(r);
         return container.assemble(gpa, &.{
             .{ .fourcc = container.fourcc("SFI0"), .data = &sfi0 },
             .{ .fourcc = container.fourcc("RDAT"), .data = rdat_part },
@@ -5844,6 +6306,38 @@ const Emitter = struct {
         defer gpa.free(psg1);
         var sfi0: [8]u8 = @splat(0);
         std.mem.writeInt(u64, &sfi0, libinfo.featureInfo(e.shaderFlags()), .little);
+        const refl = try e.reflectResources();
+        const refl_in = try signature.declarationOrderSignature(gpa, e.sig_in, true, domain);
+        defer gpa.free(refl_in);
+        const refl_out = try signature.declarationOrderSignature(gpa, e.sig_out, false, domain);
+        defer gpa.free(refl_out);
+        const refl_pc = try signature.declarationOrderSignature(gpa, e.sig_pc, entry.stage == .domain, domain);
+        defer gpa.free(refl_pc);
+        const gs = entry.stage == .geometry;
+        const tess = entry.stage == .hull or entry.stage == .domain;
+        e.reflection = try reflect.encode(gpa, .{
+            .version = reflect.version(reflect.programType(@tagName(entry.stage)), e.profile.major, e.profile.minor),
+            .requires = libinfo.featureInfo(e.shaderFlags()) & reflect.required_features,
+            .instructions = e.instructionCount(),
+            .thread_group = if (threaded) entry.num_threads else .{ 0, 0, 0 },
+            .binds = refl.binds,
+            .cbuffers = refl.cbuffers,
+            .types = refl.types,
+            // Hull shaders: the input patch (D3D_PRIMITIVE_1_CONTROL_POINT_PATCH is 8).
+            .input_primitive = if (gs) @intFromEnum(entry.geometry.input) else if (entry.stage == .hull) 7 + entry.tess.input_control_points else 0,
+            .gs_output_topology = if (gs) gsTopology(entry.geometry) else 0,
+            .gs_max_vertices = if (gs) entry.geometry.max_vertex_count else 0,
+            .gs_instances = if (gs) entry.geometry.instance_count else 0,
+            .control_points = if (entry.stage == .hull) entry.tess.output_control_points else if (entry.stage == .domain) entry.tess.input_control_points else 0,
+            .hs_output_primitive = if (entry.stage == .hull) @intFromEnum(entry.tess.output_topology) else 0,
+            .hs_partitioning = if (entry.stage == .hull) @intFromEnum(entry.tess.partitioning) else 0,
+            .tess_domain = if (tess) @intFromEnum(entry.tess.domain) else 0,
+        }, &.{
+            .{ .fourcc = container.fourcc("SFI0"), .data = &sfi0 },
+            .{ .fourcc = reflect.input_part, .data = refl_in },
+            .{ .fourcc = reflect.output_part, .data = refl_out },
+            .{ .fourcc = reflect.patch_part, .data = refl_pc },
+        });
         var parts: std.ArrayList(container.Part) = .empty;
         try parts.appendSlice(e.arena, &.{
             .{ .fourcc = container.fourcc("SFI0"), .data = &sfi0 },
