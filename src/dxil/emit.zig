@@ -192,6 +192,8 @@ const Emitter = struct {
     blocks: std.ArrayList(std.ArrayList(PInst)) = .empty,
     prologue: std.ArrayList(PInst) = .empty,
     next_id: u32 = 0,
+    /// Each instruction's type, by id.
+    inst_types: std.ArrayList(DType) = .empty,
     cur: u32 = 0,
 
     resources: std.ArrayList(Resource) = .empty,
@@ -293,6 +295,7 @@ const Emitter = struct {
     fn add(e: *Emitter, ty: DType, op: @FieldType(module.Inst, "op")) Error!Value {
         const id = e.next_id;
         e.next_id += 1;
+        try e.inst_types.append(e.arena, ty);
         switch (op) {
             .store, .atomicrmw, .cmpxchg => e.writes += 1,
             .call => |c| if (!std.mem.startsWith(u8, e.dm.functions.items[c.callee].name, "dx.op.")) {
@@ -307,6 +310,7 @@ const Emitter = struct {
     fn addPrologue(e: *Emitter, ty: DType, op: @FieldType(module.Inst, "op")) Error!Value {
         const id = e.next_id;
         e.next_id += 1;
+        try e.inst_types.append(e.arena, ty);
         try e.prologue.append(e.arena, .{ .inst = .{ .ty = ty, .op = op }, .id = id });
         return .{ .inst = id };
     }
@@ -457,6 +461,7 @@ const Emitter = struct {
             e.blocks = .empty;
             e.prologue = .empty;
             e.next_id = 0;
+            e.inst_types = .empty;
             e.private_globals = .empty;
             e.private_typed = .empty;
             e.nonuniform = .empty;
@@ -614,6 +619,7 @@ const Emitter = struct {
             e.blocks = .empty;
             e.prologue = .empty;
             e.next_id = 0;
+            e.inst_types = .empty;
             e.private_globals = .empty;
             e.private_typed = .empty;
             e.nonuniform = .empty;
@@ -645,6 +651,7 @@ const Emitter = struct {
                 e.blocks = .empty;
                 e.prologue = .empty;
                 e.next_id = 0;
+                e.inst_types = .empty;
                 e.private_globals = .empty;
                 e.private_typed = .empty;
                 e.nonuniform = .empty;
@@ -810,6 +817,7 @@ const Emitter = struct {
         e.blocks = .empty;
         e.prologue = .empty;
         e.next_id = 0;
+        e.inst_types = .empty;
         e.private_globals = .empty;
         e.private_typed = .empty;
         e.nonuniform = .empty;
@@ -1591,11 +1599,7 @@ const Emitter = struct {
     fn valueType(e: *Emitter, v: Value) Error!DType {
         return switch (v) {
             .constant => |c| e.dm.constants.items[c].ty,
-            .inst => |id| blk: {
-                for (e.prologue.items) |pi| if (pi.id == id) break :blk pi.inst.ty;
-                for (e.blocks.items) |b| for (b.items) |pi| if (pi.id == id) break :blk pi.inst.ty;
-                unreachable;
-            },
+            .inst => |id| e.inst_types.items[id],
             else => e.unsupported("value kind", .{}),
         };
     }
