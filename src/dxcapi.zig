@@ -665,7 +665,7 @@ fn makeResult(c: compile.Result) !*Result {
     try addOutput(r, .remarks, try Blob.utf8(""), null);
     std.mem.sortUnstable(Output, r.outputs.items, {}, struct {
         fn lt(_: void, x: Output, y: Output) bool {
-            return @intFromEnum(x.kind) < @intFromEnum(y.kind);
+            return @backingInt(x.kind) < @backingInt(y.kind);
         }
     }.lt);
     return r;
@@ -826,9 +826,17 @@ const Compiler = struct {
     }
 };
 
+/// Each thread's compile arena, kept between calls. Freeing it per call
+/// gives its blocks back to the OS (smp_allocator maps 64 KiB and up
+/// directly), and faulting fresh pages in again costs more than the compile
+/// on many threads. What a thread keeps is capped at `retain_limit`.
+threadlocal var thread_arena: ?std.heap.ArenaAllocator = null;
+const retain_limit = 64 << 20;
+
 fn run(source: *const Buffer, wargs: []const ?[*:0]const WCHAR, include: ?*anyopaque) error{ OutOfMemory, InvalidArgument }!*Result {
-    var arena: std.heap.ArenaAllocator = .init(gpa);
-    defer arena.deinit();
+    if (thread_arena == null) thread_arena = .init(gpa);
+    const arena = &thread_arena.?;
+    defer _ = arena.reset(.{ .retain_with_limit = retain_limit });
     const a = arena.allocator();
     const args = try a.alloc([]const u8, wargs.len);
     for (args, wargs) |*d, w| d.* = try fromWide(a, w orelse return error.InvalidArgument);
