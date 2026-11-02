@@ -1237,7 +1237,7 @@ const Emitter = struct {
 
     fn markUses(a: Allocator, inst: module.Inst, used: []bool) void {
         const M = struct {
-            var u: []bool = &.{};
+            threadlocal var u: []bool = &.{};
             fn v(_: []const u32, x: Value) Value {
                 if (x == .inst) u[x.inst] = true;
                 return x;
