@@ -2000,6 +2000,9 @@ const object_types = [_][]const u8{
     "__builtin_LinAlgMatrix",             "BuiltInTrianglePositions",
 };
 
+/// The builtin pseudo-enum typedefs of uint (`const RAY_FLAG f = ...`).
+const enum_typedefs = [_][]const u8{ "RAY_FLAG", "RAYQUERY_FLAG", "COMMITTED_STATUS", "CANDIDATE_TYPE", "MEMORY_TYPE_FLAG", "BARRIER_SEMANTIC_FLAG" };
+
 /// Templates among the builtin object types.
 const template_types = [_][]const u8{
     "vector",                          "matrix",                            "Buffer",
@@ -2051,7 +2054,7 @@ fn inList(list: []const []const u8, w: []const u8) bool {
 /// replaces linear scans of the lists above (a third of parse time).
 const word_map = blk: {
     @setEvalBranchQuota(1_000_000);
-    var words: []const []const u8 = &(reserved_words ++ contextual_words ++ scalar_types ++ object_types ++ template_types ++ template_funcs);
+    var words: []const []const u8 = &(reserved_words ++ contextual_words ++ scalar_types ++ object_types ++ enum_typedefs ++ template_types ++ template_funcs);
     for (qualifier_words) |q| words = words ++ &[_][]const u8{q[0]};
     var kvs: [words.len]struct { []const u8, WordInfo } = undefined;
     var n: usize = 0;
@@ -2062,7 +2065,7 @@ const word_map = blk: {
             .contextual = inList(&contextual_words, w),
             .scalar = inList(&scalar_types, w),
             .numeric_scalar = inList(&scalar_types, w) and !std.mem.endsWith(u8, w, "_packed"),
-            .object = inList(&object_types, w),
+            .object = inList(&object_types, w) or inList(&enum_typedefs, w),
             .template = inList(&template_types, w) or inList(&template_funcs, w),
         };
         for (qualifier_words) |q| {
