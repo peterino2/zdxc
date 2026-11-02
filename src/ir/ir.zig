@@ -141,6 +141,9 @@ pub const Op = union(enum) {
     emit: u32,
     cut: u32,
     phi: []const struct { value: Ref, block: BlockId },
+    /// An undefined value of the result type (a read before any write,
+    /// after promotion to SSA values).
+    undef,
 };
 
 pub const Inst = struct {
@@ -705,6 +708,7 @@ fn dumpInst(m: *const Module, f: *const Function, r: Ref, w: *std.Io.Writer) !vo
         },
         .input => |i| try w.print("input {d}", .{i}),
         .output => |o| try w.print("output {d}, %{d}", .{ o.element, o.value.index() }),
+        .undef => try w.writeAll("undef"),
         .phi => |ins| {
             try w.writeAll("phi");
             for (ins, 0..) |in, i| try w.print("{s} [%{d}, b{d}]", .{ if (i > 0) "," else "", in.value.index(), in.block.index() });

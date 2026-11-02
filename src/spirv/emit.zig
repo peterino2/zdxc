@@ -226,6 +226,13 @@ const Emitter = struct {
     /// through them).
     nonuniform_ids: std.AutoHashMapUnmanaged(Id, void) = .empty,
     variants: std.ArrayList(struct { fi: u32, bindings: []const Id, id: Id }) = .empty,
+    /// The current function's block labels, and phi operands (word
+    /// positions in the functions section) naming values emitted after the
+    /// phi, patched when the function is done.
+    labels: []const Id = &.{},
+    phi_patches: std.ArrayList(struct { pos: usize, ref: Ref }) = .empty,
+    /// OpUndef by type.
+    undef_ids: std.AutoHashMapUnmanaged(TypeId, Id) = .empty,
     /// The bindings of the function being emitted (a specialization).
     cur_bindings: []const Id = &.{},
     /// Per instruction (current function): resource locals assigned
@@ -2131,10 +2138,13 @@ const Emitter = struct {
         const order = try blockOrder(e.arena, f);
         const labels = try e.arena.alloc(Id, f.blocks.items.len);
         for (labels) |*l| l.* = e.b.newId();
+        e.labels = labels;
+        e.phi_patches = .empty;
 
         // Constants and parameters first (they may be used in any block).
         for (f.insts.items, 0..) |inst, i| switch (inst.op) {
             .constant => |c| e.vals[i] = try e.constant(inst.ty, c),
+            .undef => e.vals[i] = try e.undefOf(inst.ty),
             .param => |p| {
                 e.vals[i] = param_ids[p];
                 if (e.mesh_params.get(.{ f, p })) |kind| try e.mesh_places.put(e.arena, @intCast(i), .{ .kind = kind, .ty = inst.ty });
@@ -2231,7 +2241,20 @@ const Emitter = struct {
                 .discard => try e.b.emit(.functions, .kill, &.{}),
             }
         }
+        const words = e.b.sections.getPtr(.functions).items;
+        for (e.phi_patches.items) |p| {
+            words[p.pos] = e.val(p.ref);
+            if (words[p.pos] == 0) return e.unsupported("internal: a phi names a value that is never emitted", .{});
+        }
         try e.b.emit(.functions, .function_end, &.{});
+    }
+
+    fn undefOf(e: *Emitter, ty: TypeId) Error!Id {
+        if (e.undef_ids.get(ty)) |id| return id;
+        const id = e.b.newId();
+        try e.b.emit(.types_globals, .undef, &.{ try e.typeId(ty), id });
+        try e.undef_ids.put(e.arena, ty, id);
+        return id;
     }
 
     /// For the hull shader's entry wrapper: the patch constant wrapper it
@@ -2918,7 +2941,22 @@ const Emitter = struct {
                     try e.b.emit(.functions, .store, &.{ ptr, v });
                 } else try e.b.emit(.functions, .store, &.{ iface.var_id, v });
             },
-            .phi => return e.unsupported("phi", .{}),
+            .undef => {},
+            .phi => |ins| {
+                // Values from back edges are emitted later: patched at the
+                // end of the function.
+                const id = e.b.newId();
+                var ops: std.ArrayList(u32) = .empty;
+                try ops.appendSlice(e.arena, &.{ try e.typeId(i.ty), id });
+                const base = e.b.sections.getPtr(.functions).items.len + 1;
+                for (ins) |in| {
+                    const v = e.val(in.value);
+                    if (v == 0) try e.phi_patches.append(e.arena, .{ .pos = base + ops.items.len, .ref = in.value });
+                    try ops.appendSlice(e.arena, &.{ v, e.labels[in.block.index()] });
+                }
+                try e.b.emit(.functions, .phi, ops.items);
+                e.vals[ri] = id;
+            },
         }
     }
 

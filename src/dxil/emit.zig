@@ -1965,6 +1965,7 @@ const Emitter = struct {
             },
             .output_vertex => |x| return e.outputControlPoint(x.element, i.ty, x.vertex),
             .phi => return e.unsupported("phi", .{}),
+            .undef => return e.unsupported("undef", .{}),
         }
     }
 

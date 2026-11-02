@@ -508,6 +508,7 @@ fn run(ctx: *Ctx, arena: std.mem.Allocator) !void {
                 // optimizer (skipped for -Od).
                 if (!opts.no_opt and opts.opt_level != .od) {
                     try zdxc.ir.inline_calls.run(m);
+                    try zdxc.ir.ssa.run(m);
                 }
             }
             if (opts.dump_ir) {

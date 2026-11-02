@@ -2,7 +2,8 @@
 //! dxc's legalization does, so drivers get one function per entry point
 //! (and later passes see across call boundaries).
 //!
-//! Callees are inlined bottom-up. The calling block is split at the call:
+//! Calls are inlined top-down from the entry points. The calling block is
+//! split at the call:
 //! it branches to the copy of the callee's entry, and the rest of the block
 //! (with its terminator and merge) moves to a continuation block. A callee
 //! with one return outside every construct branches from it to the
@@ -30,7 +31,7 @@ pub const Error = Allocator.Error;
 /// points only (the emitter treats hull, mesh, geometry and ray tracing
 /// functions specially), and no rasterizer-ordered views (the pixel
 /// shader's call of its entry function is the interlocked region).
-fn eligible(m: *const ir.Module) bool {
+pub fn eligible(m: *const ir.Module) bool {
     if (m.entries.items.len == 0) return false;
     for (m.entries.items) |e| switch (e.stage) {
         .vertex, .pixel, .compute => {},
@@ -48,27 +49,28 @@ pub fn run(m: *ir.Module) Error!void {
     if (!eligible(m)) return;
     const a = m.arena;
     const n = m.functions.items.len;
-    // Callees first: post-order over the call graph from every function.
-    const state = try a.alloc(u8, n); // 0 new, 1 in progress, 2 done
-    @memset(state, 0);
-    var order: std.ArrayList(u32) = .empty;
-    for (0..n) |fi| try postOrder(a, m, @intCast(fi), state, &order);
+    // Shapes from the original bodies (inlining a function's callees does
+    // not change how it returns).
     const shapes = try a.alloc(?Shape, n);
-    @memset(shapes, null);
-    for (order.items) |fi| {
-        try inlineCalls(m, m.functions.items[fi], shapes);
-        shapes[fi] = try shapeOf(a, m, m.functions.items[fi]);
+    for (m.functions.items, shapes) |f, *sh| sh.* = try shapeOf(a, m, f);
+    // Top-down from the roots: each call is replaced by a copy of the
+    // callee's own body, whose calls are inlined in turn as the scan
+    // reaches the copied blocks; a function only gets expanded where it
+    // ends up. Callees that stay functions are expanded as roots.
+    const done = try a.alloc(bool, n);
+    @memset(done, false);
+    var work: std.ArrayList(u32) = .empty;
+    for (m.entries.items) |e| {
+        try work.append(a, e.wrapper);
+        if (e.patch_wrapper) |pw| try work.append(a, pw);
+    }
+    try work.appendSlice(a, m.exports.items);
+    while (work.pop()) |fi| {
+        if (done[fi]) continue;
+        done[fi] = true;
+        try inlineCalls(m, m.functions.items[fi], shapes, &work);
     }
     try markDead(m);
-}
-
-fn postOrder(a: Allocator, m: *const ir.Module, fi: u32, state: []u8, out: *std.ArrayList(u32)) Error!void {
-    if (state[fi] != 0) return;
-    state[fi] = 1;
-    const f = m.functions.items[fi];
-    for (f.insts.items) |inst| if (inst.op == .call) try postOrder(a, m, inst.op.call.func, state, out);
-    state[fi] = 2;
-    try out.append(a, fi);
 }
 
 /// How a function returns, for inlining it.
@@ -203,8 +205,9 @@ fn newInst(a: Allocator, f: *ir.Function, inst: ir.Inst) Error!Ref {
     return @fromBackingInt(@intCast(f.insts.items.len - 1));
 }
 
-/// Inlines every call in `f` whose callee has an inlinable shape.
-fn inlineCalls(m: *ir.Module, f: *ir.Function, shapes: []const ?Shape) Error!void {
+/// Inlines every call in `f` whose callee has an inlinable shape (calls
+/// in the copies included); callees of calls that stay go to `work`.
+fn inlineCalls(m: *ir.Module, f: *ir.Function, shapes: []const ?Shape, work: *std.ArrayList(u32)) Error!void {
     const a = m.arena;
     // Call results, replaced by the callees' return values at the end.
     var results: std.AutoHashMapUnmanaged(u32, Ref) = .empty;
@@ -217,10 +220,12 @@ fn inlineCalls(m: *ir.Module, f: *ir.Function, shapes: []const ?Shape) Error!voi
                 .call => |c| c,
                 else => continue,
             };
-            const shape = shapes[call.func] orelse continue;
-            if (shape == .keep) continue;
+            const shape = shapes[call.func] orelse .keep;
             // A loop header keeps its instructions (its back edges target it).
-            if (f.blocks.items[bi].merge == .loop) continue;
+            if (shape == .keep or f.blocks.items[bi].merge == .loop) {
+                try work.append(a, call.func);
+                continue;
+            }
             const callee = m.functions.items[call.func];
             const value = try inlineOne(a, f, @intCast(bi), pos, call.args, callee, shape);
             try results.put(a, r.index(), value);
@@ -241,8 +246,19 @@ fn inlineCalls(m: *ir.Module, f: *ir.Function, shapes: []const ?Shape) Error!voi
         }
     };
     const mp = Map{ .res = &results };
+    const Hit = struct {
+        res: *const std.AutoHashMapUnmanaged(u32, Ref),
+        hit: *bool,
+        pub fn use(c: @This(), x: Ref) void {
+            if (x != .none and c.res.contains(x.index())) c.hit.* = true;
+        }
+    };
     for (f.blocks.items) |*blk| {
-        for (blk.insts.items) |r| f.insts.items[r.index()].op = try opt.mapOp(a, f.inst(r).op, mp);
+        for (blk.insts.items) |r| {
+            var hit = false;
+            opt.eachOperand(f.inst(r).op, Hit{ .res = &results, .hit = &hit });
+            if (hit) f.insts.items[r.index()].op = try opt.mapOp(a, f.inst(r).op, mp);
+        }
         blk.term = mapTerm(blk.term, mp);
     }
 }
@@ -272,27 +288,45 @@ fn inlineOne(a: Allocator, f: *ir.Function, bi: u32, pos: usize, args: []const R
     }
 
     // Copies of the callee's blocks and instructions (parameters become
-    // the arguments).
+    // the arguments). Only instructions in its blocks are copied up front;
+    // others it refers to (locals live in no block) are copied on first
+    // use: the callee's array also holds what earlier inlining left behind.
     const bmap = try a.alloc(u32, callee.blocks.items.len);
     for (bmap) |*b| b.* = try newBlock(a, f, .{});
     const imap = try a.alloc(Ref, callee.insts.items.len);
-    for (callee.insts.items, imap) |inst, *x| {
-        x.* = switch (inst.op) {
+    @memset(imap, .none);
+    for (callee.blocks.items) |blk| for (blk.insts.items) |r| {
+        const inst = callee.inst(r);
+        imap[r.index()] = switch (inst.op) {
             .param => |p| args[p],
             else => try newInst(a, f, inst),
         };
-    }
+    };
     const Map = struct {
-        imap: []const Ref,
-        pub fn map(c: @This(), x: Ref) Ref {
-            return if (x == .none) x else c.imap[x.index()];
+        imap: []Ref,
+        f: *ir.Function,
+        callee: *const ir.Function,
+        args: []const Ref,
+        al: Allocator,
+        pub fn map(c: *const @This(), x: Ref) Ref {
+            if (x == .none) return x;
+            if (c.imap[x.index()] != .none) return c.imap[x.index()];
+            const inst = c.callee.inst(x);
+            const y = switch (inst.op) {
+                .param => |p| c.args[p],
+                else => newInst(c.al, c.f, inst) catch return x,
+            };
+            c.imap[x.index()] = y;
+            if (inst.op != .param) c.f.insts.items[y.index()].op = opt.mapOp(c.al, inst.op, c) catch inst.op;
+            return y;
         }
     };
-    const mp = Map{ .imap = imap };
-    for (callee.insts.items, 0..) |inst, k| {
+    const mp = &Map{ .imap = imap, .f = f, .callee = callee, .args = args, .al = a };
+    for (callee.blocks.items) |blk| for (blk.insts.items) |r| {
+        const inst = callee.inst(r);
         if (inst.op == .param) continue;
-        f.insts.items[imap[k].index()].op = try opt.mapOp(a, inst.op, mp);
-    }
+        f.insts.items[imap[r.index()].index()].op = try opt.mapOp(a, inst.op, mp);
+    };
     const B = struct {
         fn map(bm: []const u32, b: BlockId) BlockId {
             return if (b == .none) b else @fromBackingInt(@intCast(bm[b.index()]));
@@ -324,7 +358,7 @@ fn inlineOne(a: Allocator, f: *ir.Function, bi: u32, pos: usize, args: []const R
         var insts: std.ArrayList(Ref) = .empty;
         for (src.insts.items) |r| {
             if (callee.inst(r).op == .param) continue;
-            try insts.append(a, imap[r.index()]);
+            try insts.append(a, mp.map(r));
         }
         var term: ir.Terminator = switch (src.term) {
             .ret => |v| blk: {
