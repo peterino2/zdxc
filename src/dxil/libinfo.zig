@@ -306,6 +306,11 @@ fn handleRes(m: *const module.Module, f: *const module.Function, o: Options, h: 
             },
             .load => |l| {
                 if (l.ptr == .global) return o.globals[l.ptr.global];
+                // An element of a resource array global.
+                if (l.ptr == .inst) switch (f.insts.items[l.ptr.inst].op) {
+                    .gep => |g| if (g.ptr == .global) return o.globals[g.ptr.global],
+                    else => {},
+                };
                 return null;
             },
             else => return null,

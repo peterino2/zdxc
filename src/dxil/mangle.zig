@@ -69,7 +69,11 @@ pub fn global(a: Allocator, t: *TypeTable, name: []const u8, ty: TypeId) Allocat
     var names: Names = .{};
     try names.add(a, name);
     try out.print(a, "\x01?{s}@@3", .{name});
-    try typeCode(a, t, ty, &out, &names);
+    // An array global: a pointer to its element.
+    if (t.get(ty) == .array) {
+        try out.appendSlice(a, "PA");
+        try typeCode(a, t, t.get(ty).array.elem, &out, &names);
+    } else try typeCode(a, t, ty, &out, &names);
     try out.append(a, 'A');
     return out.items;
 }
@@ -137,7 +141,7 @@ fn typeCode(a: Allocator, t: *TypeTable, ty: TypeId, out: *std.ArrayList(u8), na
             var et = ty;
             while (t.get(et) == .array) : (et = t.get(et).array.elem) try dims.append(a, t.get(et).array.len);
             try out.append(a, 'Y');
-            try number(a, dims.items.len - 1, out);
+            try number(a, dims.items.len, out);
             for (dims.items) |d| try number(a, d, out);
             try typeCode(a, t, et, out, names);
         },

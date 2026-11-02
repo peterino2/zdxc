@@ -106,6 +106,9 @@ pub const Inst = struct {
         extractelement: struct { vec: Value, index: Value },
         insertelement: struct { vec: Value, val: Value, index: Value },
     },
+    /// An attached metadata node (`kind` from Module.mdKind), as
+    /// `!dx.nonuniform` on a resource array's getelementptr.
+    md: ?struct { kind: u32, node: MdId } = null,
 };
 
 pub const Function = struct {
@@ -136,6 +139,8 @@ pub const Module = struct {
     globals: std.ArrayList(GlobalVar) = .empty,
     metadata: std.ArrayList(Metadata) = .empty,
     named_metadata: std.ArrayList(struct { name: []const u8, nodes: []const MdId }) = .empty,
+    /// Instruction metadata kinds, by id.
+    md_kinds: std.ArrayList([]const u8) = .empty,
 
     pub fn init(gpa: Allocator) Module {
         return .{ .arena = .init(gpa) };
@@ -250,6 +255,13 @@ pub const Module = struct {
         return @intCast(m.metadata.items.len - 1);
     }
 
+    /// The id of an instruction metadata kind.
+    pub fn mdKind(m: *Module, name: []const u8) !u32 {
+        for (m.md_kinds.items, 0..) |k, i| if (std.mem.eql(u8, k, name)) return @intCast(i);
+        try m.md_kinds.append(m.allocator(), try m.allocator().dupe(u8, name));
+        return @intCast(m.md_kinds.items.len - 1);
+    }
+
     pub fn addNamedMetadata(m: *Module, name: []const u8, nodes: []const MdId) !void {
         const a = m.allocator();
         try m.named_metadata.append(a, .{ .name = try a.dupe(u8, name), .nodes = try a.dupe(MdId, nodes) });
@@ -270,6 +282,7 @@ const block_constants = 11;
 const block_function = 12;
 const block_value_symtab = 14;
 const block_metadata = 15;
+const block_metadata_attachment = 16;
 const block_type = 17;
 
 const Encoder = struct {
@@ -371,6 +384,12 @@ const Encoder = struct {
         }
         try e.writeConstants();
         try e.writeMetadata();
+        if (e.m.md_kinds.items.len != 0) {
+            // METADATA_KIND: [id, name...]
+            try w.enterBlock(block_metadata, 3);
+            for (e.m.md_kinds.items, 0..) |k, id| try w.recordString(6, &.{id}, k);
+            try w.endBlock();
+        }
         try e.writeSymtab();
         for (e.m.functions.items) |*f| {
             if (f.num_blocks != 0) try e.writeFunction(f);
@@ -680,6 +699,17 @@ const Encoder = struct {
                 },
             }
             if (e.m.types.items[inst.ty] != .void) inst_id += 1;
+        }
+        // METADATA_ATTACHMENT: [instruction index, (kind, node)...]
+        var any_md = false;
+        for (f.insts.items) |inst| any_md = any_md or inst.md != null;
+        if (any_md) {
+            try w.enterBlock(block_metadata_attachment, 3);
+            for (f.insts.items, 0..) |inst, k| if (inst.md) |md| {
+                try e.ops.appendSlice(e.gpa(), &.{ k, md.kind, md.node });
+                try e.rec(11);
+            };
+            try w.endBlock();
         }
         try w.endBlock();
     }

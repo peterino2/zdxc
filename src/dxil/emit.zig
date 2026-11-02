@@ -59,6 +59,9 @@ const Lowered = union(enum) {
     /// A local holding a resource (index into Emitter.res_locals): an
     /// alias of the one resource stored into it.
     res_local: u32,
+    /// A local assigned different elements of one resource array (index
+    /// into Emitter.res_index_locals): it holds the element's index.
+    res_index_local: u32,
     /// A RayQuery local (index into Emitter.rq_locals) and a query handle.
     rq_local: u32,
     ray_query: Value,
@@ -68,8 +71,9 @@ const Lowered = union(enum) {
     /// far.
     res_array: struct { res: u32, index: ?Value = null, ty: TypeId },
     /// A place in a constant buffer: byte offset plus a dynamic register
-    /// offset.
-    cbuf: struct { res: u32, offset: u32 = 0, dyn_regs: ?Value = null, row_major: bool = false },
+    /// offset; with `dyn_comp`, the component of the `vec` vector at
+    /// `offset` that index picks at run time.
+    cbuf: struct { res: u32, offset: u32 = 0, dyn_regs: ?Value = null, row_major: bool = false, dyn_comp: ?Value = null, vec: TypeId = 0 },
     /// A place in a mesh shader output array: the vertex / primitive index
     /// and a flattened component offset within it.
     mesh: struct { kind: ir.MeshOutput, index: ?Value = null, offset: u32 = 0, ty: TypeId },
@@ -201,6 +205,9 @@ const Emitter = struct {
     /// RayQuery locals: the query handle (allocated in the prologue on
     /// first use, or a copy of another query) and the query type.
     rq_locals: std.ArrayList(struct { h: ?Value, ty: TypeId }) = .empty,
+    /// Resource locals holding an element index of resource array `res`:
+    /// the index's storage, and whether any index stored is NonUniform.
+    res_index_locals: std.ArrayList(struct { ptr: Ptr, res: u32, nonuniform: bool = false }) = .empty,
     /// The ResRet of the last texture operation (for status arguments).
     last_resret: Value = undefined,
     /// Status values, forwarded through locals within a block: the
@@ -510,8 +517,8 @@ const Emitter = struct {
         // A global per resource, named as dxc mangles it.
         for (e.resources.items) |*r| {
             if (r.view) continue;
-            if (r.count != 1) return e.unsupported("resource arrays in libraries are not supported yet", .{});
             const g = m.globals.items[r.global];
+            // (Arrays: of the class, all dimensions flattened.)
             const ty = try e.classType(r.*);
             const name = if (g.space == .resource) try mangle.global(e.arena, e.t, g.name, g.ty) else g.name;
             const v = try e.dm.addGlobal(name, ty, 0);
@@ -574,6 +581,7 @@ const Emitter = struct {
             e.nonuniform = .empty;
             e.res_locals = .empty;
             e.rq_locals = .empty;
+            e.res_index_locals = .empty;
             e.forwarded = .empty;
             e.status_vals = .empty;
             e.payload_global = null;
@@ -766,6 +774,7 @@ const Emitter = struct {
         e.nonuniform = .empty;
         e.res_locals = .empty;
         e.rq_locals = .empty;
+        e.res_index_locals = .empty;
         e.forwarded = .empty;
         e.status_vals = .empty;
         e.lib_args = &.{};
@@ -828,6 +837,8 @@ const Emitter = struct {
         const i32t = try e.dm.intType(32);
         for (e.resources.items) |*res| {
             const lg = res.lib_global orelse continue;
+            // (Arrays: a handle per element access, in arrayElement.)
+            if (res.count != 1) continue;
             const gty = e.dm.globals.items[lg].ty;
             const loaded = try e.addPrologue(gty, .{ .load = .{ .ptr = .{ .global = lg }, .@"align" = 4 } });
             try e.lib_removable.put(e.arena, loaded.inst, {});
@@ -1612,6 +1623,10 @@ const Emitter = struct {
                     try e.rq_locals.append(e.arena, .{ .h = null, .ty = i.ty });
                     return .{ .rq_local = @intCast(e.rq_locals.items.len - 1) };
                 }
+                if (isResourceType(e.t, i.ty) and e.t.get(i.ty) != .array) if (e.indexedLocal(f, r)) |ri| {
+                    try e.res_index_locals.append(e.arena, .{ .ptr = try e.alloca(try e.t.scalar(.uint)), .res = ri });
+                    return .{ .res_index_local = @intCast(e.res_index_locals.items.len - 1) };
+                };
                 // (An array of resources is one alias too: of an array.)
                 if (isResourceType(e.t, i.ty) or e.isResourceArray(i.ty)) {
                     try e.res_locals.append(e.arena, null);
@@ -1641,6 +1656,12 @@ const Emitter = struct {
                 },
                 .rq_local => |k| return .{ .ray_query = try e.rqHandle(k) },
                 .res_local => |k| return e.res_locals.items[k] orelse return e.unsupported("a resource local read before it is assigned", .{}),
+                .res_index_local => |k| {
+                    const il = e.res_index_locals.items[k];
+                    const idx = (try e.loadPtr(il.ptr, try e.t.scalar(.uint))).scalars[0];
+                    if (il.nonuniform) try e.nonuniform.put(e.arena, idx, {});
+                    return e.elementHandle(il.res, idx, il.nonuniform);
+                },
                 .res_array => |ra| return .{ .res_array = ra },
                 .texel => |tx| {
                     const res = e.resources.items[tx.res];
@@ -1648,7 +1669,11 @@ const Emitter = struct {
                     if (res.kind == 10) return .{ .scalars = try e.typedBufferLoad(res, tx.coords[0], i.ty) };
                     return .{ .scalars = try e.textureLoad(res, mip, tx.coords, null, i.ty) };
                 },
-                .cbuf => |c| return e.cbufferLoad(c.res, c.offset, c.dyn_regs, c.row_major, i.ty),
+                .cbuf => |c| {
+                    const dc = c.dyn_comp orelse return e.cbufferLoad(c.res, c.offset, c.dyn_regs, c.row_major, i.ty);
+                    const whole = (try e.cbufferLoad(c.res, c.offset, c.dyn_regs, c.row_major, c.vec)).scalars;
+                    return .{ .scalars = try e.arena.dupe(Value, &.{try e.pickComponent(whole, dc, i.ty)}) };
+                },
                 .buf => |b| {
                     const mat = b.mat orelse return .{ .scalars = try e.structuredLoad(e.resources.items[b.res], b.index, b.offset, b.dyn, b.row_major, i.ty) };
                     const m = e.t.get(mat.ty).matrix;
@@ -1685,6 +1710,15 @@ const Emitter = struct {
                     const v = frame.vals[s.value.index()];
                     if (v != .ray_query) return e.unsupported("this RayQuery assignment is not supported yet", .{});
                     e.rq_locals.items[frame.vals[s.ptr.index()].rq_local].h = v.ray_query;
+                    return .none;
+                }
+                if (frame.vals[s.ptr.index()] == .res_index_local) {
+                    const il = &e.res_index_locals.items[frame.vals[s.ptr.index()].res_index_local];
+                    const acc = resourceElement(f, s.value).?;
+                    const g = f.inst(acc.base).op.global;
+                    const elem = try e.arrayIndex(frame, .{ .res = il.res, .ty = e.m.globals.items[g].ty }, acc.indices);
+                    if (elem.nonuniform) il.nonuniform = true;
+                    try e.storePtr(il.ptr, &.{elem.ra.index orelse try e.i32Const(0)}, try e.t.scalar(.uint));
                     return .none;
                 }
                 if (frame.vals[s.ptr.index()] == .res_local) {
@@ -3116,9 +3150,13 @@ const Emitter = struct {
                     cur = arr.elem;
                 },
                 .vector => |v| {
-                    if (xi.op != .constant) return e.unsupported("dynamic indexing of constant buffer vectors", .{});
-                    c.offset += @as(u32, @intCast(xi.op.constant.int)) * storageScalar(v.elem).size();
                     cur = try e.t.scalar(v.elem);
+                    if (xi.op != .constant) {
+                        c.dyn_comp = (try e.scalars(frame, x))[0];
+                        c.vec = try e.t.vector(v.elem, v.len);
+                        continue;
+                    }
+                    c.offset += @as(u32, @intCast(xi.op.constant.int)) * storageScalar(v.elem).size();
                 },
                 .matrix => |mt| {
                     if (xi.op != .constant) return e.unsupported("dynamic indexing of constant buffer matrices", .{});
@@ -3193,6 +3231,18 @@ const Emitter = struct {
         return .{ .scalars = out };
     }
 
+    /// Component `idx` (a dynamic index) of `vals`: a chain of selects.
+    fn pickComponent(e: *Emitter, vals: []const Value, idx: Value, ty: TypeId) Error!Value {
+        const i1t = try e.dm.intType(1);
+        const dty = try e.scalarTy(e.compOf(ty));
+        var acc = vals[0];
+        for (vals[1..], 1..) |v, k| {
+            const is_k = try e.add(i1t, .{ .cmp = .{ .pred = 32, .lhs = idx, .rhs = try e.i32Const(@intCast(k)) } });
+            acc = try e.select(is_k, v, acc, dty);
+        }
+        return acc;
+    }
+
     /// The scalar type of flattened component `k` of `ty`.
     fn componentType(e: *Emitter, ty: TypeId, k: u32) Error!TypeId {
         switch (e.t.get(ty)) {
@@ -3218,6 +3268,59 @@ const Emitter = struct {
     /// `array[i]...` on a resource array: a sub-array, or the element's
     /// handle (created here, at register lower bound + flattened index).
     fn arrayElement(e: *Emitter, frame: *Frame, start: @FieldType(Lowered, "res_array"), indices: []const Ref) Error!Lowered {
+        const elem = try e.arrayIndex(frame, start, indices);
+        if (e.t.get(elem.ra.ty) == .array) return .{ .res_array = elem.ra };
+        return e.elementHandle(elem.ra.res, elem.ra.index orelse try e.i32Const(0), elem.nonuniform);
+    }
+
+    /// The resource array global behind `v`, an element of it (possibly
+    /// loaded), and the indices; null for anything else.
+    fn resourceElement(f: *const ir.Function, v: Ref) ?@FieldType(ir.Op, "access") {
+        var x = v;
+        while (f.inst(x).op == .load) x = f.inst(x).op.load;
+        if (f.inst(x).op != .access) return null;
+        const acc = f.inst(x).op.access;
+        var base = acc.base;
+        while (f.inst(base).op == .load) base = f.inst(base).op.load;
+        if (f.inst(base).op != .global) return null;
+        return .{ .base = base, .indices = acc.indices };
+    }
+
+    /// For a resource local of `f`, the resource array whose elements are
+    /// all that is stored into it, when they are different ones (as in a
+    /// switch picking a texture): such a local holds the element's index.
+    fn indexedLocal(e: *Emitter, f: *const ir.Function, local: Ref) ?u32 {
+        var first: ?@FieldType(ir.Op, "access") = null;
+        var first_value: Ref = .none;
+        var distinct = false;
+        for (f.insts.items) |st| {
+            if (st.op != .store or st.op.store.ptr != local) continue;
+            const acc = resourceElement(f, st.op.store.value) orelse return null;
+            if (first) |fa| {
+                if (st.op.store.value != first_value) distinct = true;
+                if (f.inst(fa.base).op.global != f.inst(acc.base).op.global or fa.indices.len != acc.indices.len) return null;
+            } else {
+                first = acc;
+                first_value = st.op.store.value;
+            }
+        }
+        const fa = first orelse return null;
+        if (!distinct) return null;
+        const g = f.inst(fa.base).op.global;
+        const ri = e.resource_of_global.get(g) orelse return null;
+        if (e.resources.items[ri].count == 1) return null;
+        // Indexed down to single resources.
+        var ty = e.m.globals.items[g].ty;
+        for (fa.indices) |_| {
+            if (e.t.get(ty) != .array) return null;
+            ty = e.t.get(ty).array.elem;
+        }
+        if (e.t.get(ty) == .array) return null;
+        return ri;
+    }
+
+    /// The flattened index of an element of a resource array.
+    fn arrayIndex(e: *Emitter, frame: *Frame, start: @FieldType(Lowered, "res_array"), indices: []const Ref) Error!struct { ra: @FieldType(Lowered, "res_array"), nonuniform: bool } {
         var ra = start;
         const i32t = try e.dm.intType(32);
         var nonuniform = false;
@@ -3236,15 +3339,47 @@ const Emitter = struct {
             ra.ty = arr.elem;
         }
         _ = i32t;
-        if (e.t.get(ra.ty) == .array) return .{ .res_array = ra };
-        const res = e.resources.items[ra.res];
+        return .{ .ra = ra, .nonuniform = nonuniform };
+    }
+
+    /// A handle for element `index` (flattened) of resource array `ri`.
+    fn elementHandle(e: *Emitter, ri: u32, index: Value, nonuniform: bool) Error!Lowered {
+        const res = e.resources.items[ri];
+        if (res.lib_global) |lg| {
+            var view = res;
+            view.view = true;
+            view.handle = try e.libArrayHandle(res, lg, index, nonuniform);
+            try e.resources.append(e.arena, view);
+            return .{ .handle = @intCast(e.resources.items.len - 1) };
+        }
         const lb = e.binding(res).index;
-        const idx = try e.intArith(.add, ra.index orelse try e.i32Const(0), try e.i32Const(lb));
+        const idx = try e.intArith(.add, index, try e.i32Const(lb));
         var view = res;
         view.view = true;
         view.handle = try e.makeHandle(res, idx, nonuniform, false);
         try e.resources.append(e.arena, view);
         return .{ .handle = @intCast(e.resources.items.len - 1) };
+    }
+
+    /// A library's handle for element `index` of a resource array: of the
+    /// element loaded from the array's global.
+    fn libArrayHandle(e: *Emitter, res: Resource, lg: u32, index: Value, nonuniform: bool) Error!Value {
+        const i32t = try e.dm.intType(32);
+        const arr_ty = e.dm.globals.items[lg].ty;
+        const class_ty = e.dm.types.items[arr_ty].array.elem;
+        const ptr = try e.add(try e.dm.ptrType(class_ty), .{ .gep = .{ .elem = arr_ty, .ptr = .{ .global = lg }, .indices = try e.arena.dupe(Value, &.{ try e.i32Const(0), index }) } });
+        if (nonuniform) {
+            const blk = e.blocks.items[e.cur].items;
+            blk[blk.len - 1].inst.md = .{ .kind = try e.dm.mdKind("dx.nonuniform"), .node = try e.dm.mdNode(&.{try e.dm.mdI32(1)}) };
+        }
+        const loaded = try e.add(class_ty, .{ .load = .{ .ptr = ptr, .@"align" = 4 } });
+        const struct_name = e.dm.types.items[class_ty].@"struct".name;
+        const create = try e.dxOp(try std.fmt.allocPrint(e.arena, "dx.op.createHandleForLib.{s}", .{struct_name}), e.handle_ty, &.{ i32t, class_ty }, .nounwind_readonly);
+        const h = try e.callOp(create, e.handle_ty, &.{ try e.i32Const(160), loaded });
+        if (!e.self_sm66()) return h;
+        const props_ty = try e.dm.getType(.{ .@"struct" = .{ .name = "dx.types.ResourceProperties", .elems = &.{ i32t, i32t } } });
+        const annotate = try e.dxOp("dx.op.annotateHandle", e.handle_ty, &.{ i32t, e.handle_ty, props_ty }, .nounwind_readnone);
+        return e.callOp(annotate, e.handle_ty, &.{ try e.i32Const(216), h, try e.propertiesConst(res) });
     }
 
     fn constIntOf(e: *Emitter, v: Value) ?i64 {
@@ -5197,13 +5332,20 @@ const Emitter = struct {
             const f = &e.dm.functions.items[lf.func];
             const name = try b.string(lf.name);
             const unmangled = try b.string(lf.unmangled);
-            // Resources whose globals the function loads, in table order.
+            // Resources whose globals the function loads (or indexes, for
+            // arrays), in table order.
             var used: std.ArrayList(u32) = .empty;
-            for (f.insts.items) |inst| if (inst.op == .load and inst.op.load.ptr == .global) {
-                if (res_index.get(inst.op.load.ptr.global)) |ri| {
+            for (f.insts.items) |inst| {
+                const ptr = switch (inst.op) {
+                    .load => |l| l.ptr,
+                    .gep => |g| g.ptr,
+                    else => continue,
+                };
+                if (ptr != .global) continue;
+                if (res_index.get(ptr.global)) |ri| {
                     if (std.mem.indexOfScalar(u32, used.items, ri) == null) try used.append(e.arena, ri);
                 }
-            };
+            }
             std.mem.sort(u32, used.items, {}, std.sort.asc(u32));
             const resources = if (used.items.len > 0) try b.array(used.items) else rdat.null_ref;
             const props = if (e.uses_linalg) try linalg_info.rdatProperties(e.arena, &b, &try linalg_info.functionInfo(e.arena, &e.dm, mats, lf.func)) else rdat.null_ref;
