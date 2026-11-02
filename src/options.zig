@@ -168,10 +168,14 @@ fn parseOne(arena: Allocator, argv: []const []const u8, index: *usize, failure: 
                 return .{ .which = c.which, .spelling = spelling, .values = vals.items };
             },
             .separate, .joined_or_separate => {
-                if (rest.len != 0) {
-                    if (c.kind == .separate) continue;
+                // dxc also takes "-opt value" passed as one argument: spaces
+                // after the name are skipped, and all-space rest means the
+                // value is the next argument.
+                const value = std.mem.trimStart(u8, rest, " ");
+                if (value.len != 0) {
+                    if (c.kind == .separate and value.len == rest.len) continue;
                     index.* += 1;
-                    return .{ .which = c.which, .spelling = spelling, .values = try dupeOne(arena, rest) };
+                    return .{ .which = c.which, .spelling = spelling, .values = try dupeOne(arena, value) };
                 }
                 if (index.* + 1 >= argv.len) {
                     failure.arg = spelling;
