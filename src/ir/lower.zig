@@ -1693,7 +1693,10 @@ const Lowerer = struct {
         const t = l.types();
         if (l.vars.get(v)) |p| return p;
         switch (v.storage) {
-            .local, .param, .local_static => return l.fail(e, "this variable"),
+            .local, .param => return l.fail(e, "this variable"),
+            // Not yet in `vars` only inside another static's initializer:
+            // its global, as for a file-scope static.
+            .local_static => {},
             .global_uniform, .cbuffer => {
                 if (isObject(&l.s.types, v.type)) {
                     l.unsupported(e.loc, "resource '{s}' declared as a uniform is not supported yet", .{v.name});
