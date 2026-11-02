@@ -28,6 +28,31 @@ pub const Error = Allocator.Error || error{Unsupported};
 /// Marks a binding that is a recipe (see Emitter.resourceBinding).
 const recipe_tag: u32 = 0x8000_0000;
 
+const Recipe = struct {
+    var_id: Id,
+    ptr_ty: Id,
+    indices: []const Id,
+    dyn_types: []const Id = &.{},
+    /// The element is selected non-uniformly (NonUniformResourceIndex).
+    nonuniform: bool = false,
+    res_ty: TypeId = 0,
+};
+
+/// A resource local assigned different elements of one resource array
+/// (`tex = textures[i]` in several branches): a variable per index.
+const IndexedLocal = struct {
+    global: Ref,
+    index_types: []const TypeId,
+    vars: []Id = &.{},
+    nonuniform: bool = false,
+};
+
+const IndexedLoad = struct { global: Ref, indices: []const Id, types: []const TypeId, nonuniform: bool };
+
+/// A resource argument: what the callee's parameter is bound to, and the
+/// values of its recipe's dynamic indices (passed as extra arguments).
+const Binding = struct { id: Id, dyn: []const Id = &.{} };
+
 const StorageClass = enum(u32) { uniform_constant = 0, input = 1, uniform = 2, output = 3, workgroup = 4, private = 6, function = 7, image = 11, storage_buffer = 12, task_payload_workgroup = 5402, callable_data_khr = 5328, incoming_callable_data_khr = 5329, ray_payload_khr = 5338, hit_attribute_khr = 5339, incoming_ray_payload_khr = 5342, shader_record_buffer_khr = 5343, push_constant = 9, physical_storage_buffer = 5349 };
 
 const Capability = enum(u32) {
@@ -203,8 +228,19 @@ const Emitter = struct {
     variants: std.ArrayList(struct { fi: u32, bindings: []const Id, id: Id }) = .empty,
     /// The bindings of the function being emitted (a specialization).
     cur_bindings: []const Id = &.{},
-    /// Resource array elements bound to specialized parameters.
-    recipes: std.ArrayList(struct { var_id: Id, ptr_ty: Id, indices: []const Id }) = .empty,
+    /// Per instruction (current function): resource locals assigned
+    /// elements of one resource array, kept as their indices.
+    indexed_locals: std.AutoHashMapUnmanaged(u32, IndexedLocal) = .empty,
+    /// Per instruction (current function): reads of those locals, with the
+    /// loaded indices.
+    indexed_loads: std.AutoHashMapUnmanaged(u32, IndexedLoad) = .empty,
+    /// The extra parameters of the function being emitted that carry the
+    /// dynamic indices of its recipe bindings, per parameter.
+    cur_dyn: []const []const Id = &.{},
+    /// Resource array elements bound to specialized parameters. A dynamic
+    /// index is 0 in `indices`; the specialization takes it as an extra
+    /// parameter of the type in `dyn_types`.
+    recipes: std.ArrayList(Recipe) = .empty,
     payload_global: ?u32 = null,
     /// Per instruction (current function): places in mesh output arrays.
     mesh_places: std.AutoHashMapUnmanaged(u32, MeshPlace) = .empty,
@@ -1889,49 +1925,126 @@ const Emitter = struct {
     /// What a resource argument binds a specialized callee's parameter
     /// to: a module variable, or (an element of a resource array) a
     /// recipe the callee re-creates: `recipe_tag | index` into `recipes`.
-    fn resourceBinding(e: *Emitter, a: Ref) Error!Id {
+    fn resourceBinding(e: *Emitter, a: Ref) Error!Binding {
         const f = e.f;
         var x = a;
         while (true) switch (f.inst(x).op) {
-            .load => |p| x = p,
+            .load => |p| {
+                // A read of an indexed local: its element, all indices dynamic.
+                if (e.indexed_loads.get(x.index())) |il| {
+                    const idx = try e.arena.alloc(Id, il.indices.len);
+                    @memset(idx, 0);
+                    const dyn_types = try e.arena.alloc(Id, il.types.len);
+                    for (dyn_types, il.types) |*d, ty| d.* = try e.typeId(ty);
+                    const p_ = try e.resourcePointee(f.inst(x).ty);
+                    const id = try e.addRecipe(.{ .var_id = e.val(il.global), .ptr_ty = try e.pointerType(p_.sc, p_.ty), .indices = idx, .dyn_types = dyn_types, .nonuniform = il.nonuniform, .res_ty = f.inst(x).ty });
+                    return .{ .id = id, .dyn = il.indices };
+                }
+                x = p;
+            },
             // A resource local: what was stored into it.
             .local_var => x = for (f.insts.items) |inst| {
                 if (inst.op == .store and inst.op.store.ptr == x) break inst.op.store.value;
-            } else return e.val(x),
+            } else return .{ .id = e.val(x) },
             else => break,
         };
         switch (f.inst(x).op) {
-            .global => return e.val(x),
+            .global => return .{ .id = e.val(x) },
             .heap_resource => |h| {
                 // A heap element at a constant index.
                 if (f.inst(h.index).op != .constant) return e.unsupported("passing a resource from a descriptor heap at a dynamic index to a function is not supported yet", .{});
                 const p = try e.resourcePointee(f.inst(x).ty);
                 const hv = e.heap_vars.get(.{ h.sampler, p.ty }) orelse return e.unsupported("internal: heap variable missing", .{});
-                return e.addRecipe(hv, try e.pointerType(p.sc, p.ty), try e.arena.dupe(Id, &.{e.val(h.index)}));
+                return .{ .id = try e.addRecipe(.{ .var_id = hv, .ptr_ty = try e.pointerType(p.sc, p.ty), .indices = try e.arena.dupe(Id, &.{e.val(h.index)}) }) };
             },
-            // A specialized parameter passes on what it is bound to.
-            .param => |pi| return if (pi < e.cur_bindings.len and e.cur_bindings[pi] != 0) e.cur_bindings[pi] else e.val(x),
+            // A specialized parameter passes on what it is bound to (and
+            // the dynamic indices it received).
+            .param => |pi| {
+                if (pi >= e.cur_bindings.len or e.cur_bindings[pi] == 0) return .{ .id = e.val(x) };
+                return .{ .id = e.cur_bindings[pi], .dyn = if (pi < e.cur_dyn.len) e.cur_dyn[pi] else &.{} };
+            },
             .access => |acc| {
                 var base = acc.base;
                 while (f.inst(base).op == .load) base = f.inst(base).op.load;
                 if (f.inst(base).op != .global) return e.unsupported("passing this resource to a function is not supported yet", .{});
+                if (e.flat_vars.contains(f.inst(base).op.global)) {
+                    for (acc.indices) |r| if (f.inst(r).op != .constant) return e.unsupported("passing a dynamically selected resource to a function is not supported yet", .{});
+                }
+                // Constant indices are part of the recipe; dynamic ones are
+                // passed along to the specialization.
                 const idx = try e.arena.alloc(Id, acc.indices.len);
+                var dyn_types: std.ArrayList(Id) = .empty;
+                var dyn: std.ArrayList(Id) = .empty;
+                var nonuniform = false;
                 for (idx, acc.indices) |*d, r| {
-                    if (f.inst(r).op != .constant) return e.unsupported("passing a dynamically selected resource to a function is not supported yet", .{});
-                    d.* = e.val(r);
+                    if (f.inst(r).op == .constant) {
+                        d.* = e.val(r);
+                        continue;
+                    }
+                    d.* = 0;
+                    try dyn_types.append(e.arena, try e.typeId(f.inst(r).ty));
+                    try dyn.append(e.arena, e.val(r));
+                    if (e.nonuniform_ids.contains(e.val(r))) nonuniform = true;
                 }
                 const p = try e.resourcePointee(f.inst(x).ty);
-                return e.addRecipe(e.val(base), try e.pointerType(p.sc, p.ty), idx);
+                const id = try e.addRecipe(.{ .var_id = e.val(base), .ptr_ty = try e.pointerType(p.sc, p.ty), .indices = idx, .dyn_types = dyn_types.items, .nonuniform = nonuniform, .res_ty = f.inst(x).ty });
+                return .{ .id = id, .dyn = dyn.items };
             },
-            else => return e.val(x),
+            else => return .{ .id = e.val(x) },
         }
     }
 
-    fn addRecipe(e: *Emitter, var_id: Id, ptr_ty: Id, idx: []const Id) Error!Id {
-        for (e.recipes.items, 0..) |rc, k| {
-            if (rc.var_id == var_id and rc.ptr_ty == ptr_ty and std.mem.eql(Id, rc.indices, idx)) return recipe_tag | @as(Id, @intCast(k));
+    /// The element access a resource value is (through loads), when it is
+    /// an element of a module-level resource array.
+    fn resourceElement(e: *Emitter, v: Ref) ?@FieldType(ir.Op, "access") {
+        const f = e.f;
+        var x = v;
+        while (f.inst(x).op == .load) x = f.inst(x).op.load;
+        if (f.inst(x).op != .access) return null;
+        const acc = f.inst(x).op.access;
+        var base = acc.base;
+        while (f.inst(base).op == .load) base = f.inst(base).op.load;
+        if (f.inst(base).op != .global) return null;
+        return .{ .base = base, .indices = acc.indices };
+    }
+
+    /// Finds the resource locals of `f` assigned different elements of
+    /// one resource array, which keep their indices instead of aliasing
+    /// one resource.
+    fn findIndexedLocals(e: *Emitter, f: *const ir.Function) Error!void {
+        for (f.insts.items, 0..) |inst, li| {
+            if (inst.op != .local_var or !isResourceType(e.t, inst.ty) or e.t.get(inst.ty) == .array) continue;
+            const local: Ref = @enumFromInt(li);
+            var first: ?@FieldType(ir.Op, "access") = null;
+            var first_value: Ref = .none;
+            var distinct = false;
+            const ok = scan: for (f.insts.items) |st| {
+                if (st.op != .store or st.op.store.ptr != local) continue;
+                const acc = e.resourceElement(st.op.store.value) orelse break :scan false;
+                if (first) |fa| {
+                    if (st.op.store.value != first_value) distinct = true;
+                    if (f.inst(fa.base).op.global != f.inst(acc.base).op.global or fa.indices.len != acc.indices.len) break :scan false;
+                    for (fa.indices, acc.indices) |p, q| if (f.inst(p).ty != f.inst(q).ty) break :scan false;
+                } else {
+                    first = acc;
+                    first_value = st.op.store.value;
+                }
+            } else true;
+            if (!ok or !distinct) continue;
+            const fa = first.?;
+            if (e.flat_vars.contains(f.inst(fa.base).op.global)) continue;
+            const tys = try e.arena.alloc(TypeId, fa.indices.len);
+            for (tys, fa.indices) |*t, x| t.* = f.inst(x).ty;
+            try e.indexed_locals.put(e.arena, @intCast(li), .{ .global = fa.base, .index_types = tys });
         }
-        try e.recipes.append(e.arena, .{ .var_id = var_id, .ptr_ty = ptr_ty, .indices = idx });
+    }
+
+    fn addRecipe(e: *Emitter, r: Recipe) Error!Id {
+        for (e.recipes.items, 0..) |rc, k| {
+            if (rc.var_id == r.var_id and rc.ptr_ty == r.ptr_ty and std.mem.eql(Id, rc.indices, r.indices) and
+                std.mem.eql(Id, rc.dyn_types, r.dyn_types) and rc.nonuniform == r.nonuniform) return recipe_tag | @as(Id, @intCast(k));
+        }
+        try e.recipes.append(e.arena, r);
         return recipe_tag | @as(Id, @intCast(e.recipes.items.len - 1));
     }
 
@@ -1950,6 +2063,9 @@ const Emitter = struct {
         e.cur_bindings = bindings;
         e.texel_places = .empty;
         e.mesh_places = .empty;
+        e.indexed_locals = .empty;
+        e.indexed_loads = .empty;
+        try e.findIndexedLocals(f);
         e.vals = try e.arena.alloc(Id, f.insts.items.len);
         @memset(e.vals, 0);
         e.ptr_layouts = try e.arena.alloc(?PtrLayout, f.insts.items.len);
@@ -1972,6 +2088,9 @@ const Emitter = struct {
             }
             try params.append(e.arena, if (p.by_ref) try e.pointerType(if (p.groupshared) .workgroup else .function, t) else t);
         }
+        // The dynamic indices of recipe bindings: extra parameters, last.
+        const n_plain = params.items.len;
+        for (bindings) |bd| if (bd & recipe_tag != 0) try params.appendSlice(e.arena, e.recipes.items[bd & ~recipe_tag].dyn_types);
         const fn_ty = try e.functionType(ret, params.items);
         try e.b.emit(.functions, .function, &.{ ret, fn_id, 0, fn_ty });
         const param_ids = try e.arena.alloc(Id, f.params.len);
@@ -1991,6 +2110,22 @@ const Emitter = struct {
             next += 1;
             try e.b.emitWithString(.debug_names, .name, &.{id.*}, p.name, &.{});
         }
+        const cur_dyn = try e.arena.alloc([]const Id, bindings.len);
+        next = n_plain;
+        for (bindings, cur_dyn) |bd, *ids| {
+            ids.* = &.{};
+            if (bd & recipe_tag == 0) continue;
+            const rc = e.recipes.items[bd & ~recipe_tag];
+            const dyn_ids = try e.arena.alloc(Id, rc.dyn_types.len);
+            for (dyn_ids) |*id| {
+                id.* = e.b.newId();
+                try e.b.emit(.functions, .function_parameter, &.{ params.items[next], id.* });
+                next += 1;
+                if (rc.nonuniform) try e.nonuniform_ids.put(e.arena, id.*, {});
+            }
+            ids.* = dyn_ids;
+        }
+        e.cur_dyn = cur_dyn;
 
         const order = try blockOrder(e.arena, f);
         const labels = try e.arena.alloc(Id, f.blocks.items.len);
@@ -2024,12 +2159,29 @@ const Emitter = struct {
                     e.vals[i] = e.b.newId();
                     try e.b.emit(.functions, .variable, &.{ ptr, e.vals[i], @backingInt(StorageClass.function) });
                 };
+                var il_it = e.indexed_locals.valueIterator();
+                while (il_it.next()) |il| {
+                    il.vars = try e.arena.alloc(Id, il.index_types.len);
+                    for (il.vars, il.index_types) |*v, ty| {
+                        v.* = e.b.newId();
+                        try e.b.emit(.functions, .variable, &.{ try e.pointerType(.function, try e.typeId(ty)), v.*, @backingInt(StorageClass.function) });
+                    }
+                }
                 for (bindings, 0..) |bd, k| if (bd & recipe_tag != 0) {
                     const rc = e.recipes.items[bd & ~recipe_tag];
                     var ops: std.ArrayList(u32) = .empty;
                     try ops.appendSlice(e.arena, &.{ rc.ptr_ty, param_ids[k], rc.var_id });
-                    try ops.appendSlice(e.arena, rc.indices);
+                    var d: usize = 0;
+                    for (rc.indices) |x| {
+                        if (x != 0) {
+                            try ops.append(e.arena, x);
+                            continue;
+                        }
+                        try ops.append(e.arena, cur_dyn[k][d]);
+                        d += 1;
+                    }
                     try e.b.emit(.functions, .access_chain, ops.items);
+                    if (rc.nonuniform) try e.markNonUniform(param_ids[k], rc.res_ty);
                 };
             }
             const blk = f.blocks.items[bi];
@@ -2230,6 +2382,22 @@ const Emitter = struct {
                 }
                 // Resources stay as their variables (accessed by chains).
                 if (i.ptr == .none and (e.t.get(i.ty) == .resource or e.t.get(i.ty) == .sampler or (e.t.get(i.ty) == .array and isResourceType(e.t, i.ty)))) {
+                    if (e.indexed_locals.get(p.index())) |il| {
+                        const idx = try e.arena.alloc(Id, il.vars.len);
+                        for (idx, il.vars, il.index_types) |*d, v, ty| d.* = try e.op1(.load, ty, &.{v});
+                        e.format_override = e.formatFor(il.global);
+                        const pt = try e.resourcePointee(i.ty);
+                        e.format_override = null;
+                        var ops: std.ArrayList(u32) = .empty;
+                        const id = e.b.newId();
+                        try ops.appendSlice(e.arena, &.{ try e.pointerType(pt.sc, pt.ty), id, e.val(il.global) });
+                        try ops.appendSlice(e.arena, idx);
+                        try e.b.emit(.functions, .access_chain, ops.items);
+                        if (il.nonuniform) try e.markNonUniform(id, i.ty);
+                        e.vals[ri] = id;
+                        try e.indexed_loads.put(e.arena, @intCast(ri), .{ .global = il.global, .indices = idx, .types = il.index_types, .nonuniform = il.nonuniform });
+                        return;
+                    }
                     if (e.val(p) == 0 and f.inst(p).op == .local_var) return e.unsupported("a resource local read before it is assigned", .{});
                     e.vals[ri] = e.val(p);
                     return;
@@ -2258,6 +2426,14 @@ const Emitter = struct {
                 if (target.op != .local_var and isResourceType(e.t, target.ty) and target.ptr == .resource) {
                     if (e.val(s.value) == e.val(s.ptr)) return;
                     return e.unsupported("assigning another resource to a global resource", .{});
+                }
+                if (e.indexed_locals.getPtr(s.ptr.index())) |il| {
+                    const acc = e.resourceElement(s.value).?;
+                    for (il.vars, acc.indices) |v, x| {
+                        if (e.nonuniform_ids.contains(e.val(x))) il.nonuniform = true;
+                        try e.b.emit(.functions, .store, &.{ v, e.val(x) });
+                    }
+                    return;
                 }
                 if (target.op == .local_var and isResourceType(e.t, target.ty)) {
                     const old = e.vals[s.ptr.index()];
@@ -2575,11 +2751,23 @@ const Emitter = struct {
                 const callee = e.m.functions.items[c.func];
                 if (e.hasResourceParams(callee)) {
                     const bindings = try e.arena.alloc(Id, c.args.len);
-                    for (callee.params, c.args, bindings) |p, a, *bd| bd.* = if (isResourceType(e.t, p.ty)) try e.resourceBinding(a) else 0;
+                    var dyn: std.ArrayList(Id) = .empty;
+                    for (callee.params, c.args, bindings) |p, a, *bd| {
+                        if (!isResourceType(e.t, p.ty)) {
+                            bd.* = 0;
+                            continue;
+                        }
+                        const b = try e.resourceBinding(a);
+                        bd.* = b.id;
+                        try dyn.appendSlice(e.arena, b.dyn);
+                    }
                     const vid = try e.variantFor(c.func, bindings);
                     try e.recordCall(vid);
                     try ops.append(e.arena, vid);
                     for (callee.params, c.args) |p, a| if (!isResourceType(e.t, p.ty)) try ops.append(e.arena, e.val(a));
+                    // The dynamic indices of recipe bindings, after the
+                    // other arguments.
+                    try ops.appendSlice(e.arena, dyn.items);
                     e.vals[ri] = try e.op1(.function_call, i.ty, ops.items);
                     return;
                 }
