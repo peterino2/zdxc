@@ -453,6 +453,9 @@ fn run(ctx: *Ctx, arena: std.mem.Allocator) !void {
                         .root = opts.entry,
                         .row_major = opts.row_major,
                     });
+                    // About one resolution per expression: reserve rather
+                    // than grow, which leaves every old buffer in the arena.
+                    try sema.resolutions.ensureTotalCapacity(arena, parser.toks.len);
                     try sema.checkUnit(tu);
                     if (!opts.sema and !diags.hasErrors() and profile != null) {
                         const stage: zdxc.ir.ir.Stage = switch (profile.?.kind) {

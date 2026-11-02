@@ -58,6 +58,11 @@ pub const Parser = struct {
     /// Collect every token from `pp` and set up a parser over them.
     pub fn fromPreprocessor(arena: Allocator, diags: *Diagnostics, pp: *Preprocessor) !Parser {
         var toks: std.ArrayList(Token) = .empty;
+        // Growing a large list in an arena leaves every old buffer behind:
+        // reserve about one token per 5 bytes of the files loaded so far.
+        var loaded: usize = 0;
+        for (pp.sm.files.items) |f| loaded += f.text.len;
+        try toks.ensureTotalCapacity(arena, loaded / 5 + 64);
         var packs: std.ArrayList(PackPragma) = .empty;
         while (true) {
             // Preprocessor diagnostics are ordered by the token being produced.
@@ -600,17 +605,22 @@ pub const Parser = struct {
 
     fn parseName(p: *Parser) Error!ast.Name {
         const loc = p.tok().loc;
-        var parts: std.ArrayList([]const u8) = .empty;
-        var args: std.ArrayList([]const ast.TemplateArg) = .empty;
+        // Names are parsed very often and nearly all have one part: collect
+        // them on the stack and copy them to the arena once.
+        var parts_buf: [32][]const u8 = undefined;
+        var args_buf: [32][]const ast.TemplateArg = undefined;
+        var parts: std.ArrayList([]const u8) = .initBuffer(&parts_buf);
+        var args: std.ArrayList([]const ast.TemplateArg) = .initBuffer(&args_buf);
         var any_args = false;
         p.forced_template = false;
         if (p.eat(.colon_colon)) {
-            try parts.append(p.arena, "");
-            try args.append(p.arena, &.{});
+            parts.appendAssumeCapacity("");
+            args.appendAssumeCapacity(&.{});
         }
         while (true) {
             const id = try p.expectIdent("identifier");
-            try parts.append(p.arena, id.text);
+            if (parts.items.len == parts_buf.len) return p.fail("name has too many parts", .{});
+            parts.appendAssumeCapacity(id.text);
             var part_args: []const ast.TemplateArg = &.{};
             // `S<T>::member`: arguments followed by `::` belong to this part.
             if (p.at(.less) and p.isTemplateName(id.text)) {
@@ -621,7 +631,7 @@ pub const Parser = struct {
                     }
                 }
             }
-            try args.append(p.arena, part_args);
+            args.appendAssumeCapacity(part_args);
             if (!(p.at(.colon_colon) and p.peek(1).kind == .identifier and !p.peek(1).isIdent("operator"))) break;
             _ = p.advance();
             // `X<T>::template Y<U>`: the disambiguator.
@@ -630,7 +640,11 @@ pub const Parser = struct {
                 p.forced_template = true;
             }
         }
-        return .{ .loc = loc, .parts = parts.items, .args = if (any_args) args.items else &.{} };
+        return .{
+            .loc = loc,
+            .parts = try p.arena.dupe([]const u8, parts.items),
+            .args = if (any_args) try p.arena.dupe([]const ast.TemplateArg, args.items) else &.{},
+        };
     }
 
     fn parseTemplateArgs(p: *Parser) Error![]const ast.TemplateArg {

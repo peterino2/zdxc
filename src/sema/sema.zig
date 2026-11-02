@@ -208,7 +208,7 @@ pub const Sema = struct {
     current_block: ?*const ast.Decl = null,
     loop_depth: u32 = 0,
     switch_depth: u32 = 0,
-    intrinsic_db: intrinsics.Db,
+    intrinsic_db: *const intrinsics.Db,
     enum_scopes: std.AutoHashMapUnmanaged(*types.EnumInfo, *Scope) = .empty,
     /// Where each template was declared (its names resolve from there).
     template_scopes: std.AutoHashMapUnmanaged(*const ast.Decl, *Scope) = .empty,
@@ -232,7 +232,7 @@ pub const Sema = struct {
             .opts = opts,
             .global = global,
             .scope = global,
-            .intrinsic_db = try intrinsics.Db.init(arena),
+            .intrinsic_db = try intrinsics.Db.shared(),
         };
         try s.declareBuiltins();
         return s;

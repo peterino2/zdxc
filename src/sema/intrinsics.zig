@@ -48,6 +48,28 @@ pub const Db = struct {
         return db;
     }
 
+    var shared_db: Db = .{};
+    /// 0: not built, 1: being built, 2: built.
+    var shared_state: std.atomic.Value(u8) = .init(0);
+
+    /// The Db, built once per process and then shared read-only: it
+    /// depends only on the generated table, and building it costs thousands
+    /// of allocations per compile.
+    pub fn shared() Allocator.Error!*const Db {
+        while (true) switch (shared_state.load(.acquire)) {
+            2 => return &shared_db,
+            0 => if (shared_state.cmpxchgStrong(0, 1, .acquire, .monotonic) == null) {
+                shared_db = init(std.heap.smp_allocator) catch |e| {
+                    shared_state.store(0, .release);
+                    return e;
+                };
+                shared_state.store(2, .release);
+                return &shared_db;
+            },
+            else => std.atomic.spinLoopHint(),
+        };
+    }
+
     /// `ns` (e.g. `Texture2DMethods`) declares a method `name`.
     pub fn hasMethod(db: *const Db, ns: []const u8, name: []const u8) bool {
         var buf: [256]u8 = undefined;

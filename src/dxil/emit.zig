@@ -1267,6 +1267,7 @@ const Emitter = struct {
                 return out;
             }
         };
+        try f.insts.ensureUnusedCapacity(e.dm.allocator(), n);
         const all = [_][]const PInst{e.prologue.items};
         for (all) |items| for (items) |pi| try f.insts.append(e.dm.allocator(), try remapInst(e.arena, map, pi.inst, remap));
         for (e.blocks.items) |blk| for (blk.items) |pi| try f.insts.append(e.dm.allocator(), try remapInst(e.arena, map, pi.inst, remap));
