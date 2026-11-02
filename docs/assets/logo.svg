@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 232 72" fill="none">
+  <title>zdxc — tiny directx shader compiler</title>
+  <style>
+    .wordmark { stroke: #111110; }
+    @media (prefers-color-scheme: dark) { .wordmark { stroke: #f4f4ee; } }
+  </style>
+  <rect x="4" y="4" width="64" height="64" rx="12" fill="#111110"/>
+  <path d="M20 20h32v8L32 44h20v8H20v-8l20-16H20Z" fill="#f4f4ee"/>
+  <path class="wordmark" d="M90 30h24L90 54h24M146 18v36h-22V30h22M158 30l24 24m0-24-24 24M214 30h-20v24h20" stroke-width="5" stroke-linecap="square" stroke-linejoin="miter"/>
+</svg>
