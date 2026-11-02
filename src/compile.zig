@@ -53,6 +53,9 @@ pub const Result = struct {
     /// The root signature container (-Frs) and its name.
     root_signature: ?[]const u8 = null,
     root_signature_name: ?[]const u8 = null,
+    /// DXIL: the shader's reflection (dxil/reflect.zig), for the DXC
+    /// drop-in's DXC_OUT_REFLECTION.
+    reflection: ?[]const u8 = null,
     /// Preprocessed source (-P) and its -Fi name.
     preprocessed: ?[]const u8 = null,
     preprocessed_name: ?[]const u8 = null,
@@ -105,6 +108,7 @@ pub fn compile(arena: std.mem.Allocator, req: Request) error{OutOfMemory}!Result
     };
     if (result.status != .ok) {
         result.object = null;
+        result.reflection = null;
         result.root_signature = null;
         result.preprocessed = null;
     }
@@ -534,7 +538,7 @@ fn run(ctx: *Ctx, arena: std.mem.Allocator) !void {
             if (opts.rootsig_define) |macro| if (m.entries.items.len == 1) {
                 m.entries.items[0].root_signature = try rootSignatureMacroText(ctx, arena, opts, input, macro) orelse return error.CompileFailed;
             };
-            const bytes = zdxc.dxil.emit.emit(arena, m, profile.?, &diags, !opts.no_opt and opts.opt_level != .od) catch |err| switch (err) {
+            const dxil_out = zdxc.dxil.emit.emitWithReflection(arena, m, profile.?, &diags, !opts.no_opt and opts.opt_level != .od) catch |err| switch (err) {
                 error.Unsupported => {
                     try diags.render(&sm, ctx.stderr, .{ .format = opts.diag_format, .color = false });
                     return error.CompileFailed;
@@ -542,7 +546,8 @@ fn run(ctx: *Ctx, arena: std.mem.Allocator) !void {
                 else => |x| return x,
             };
             try ctx.needOutput(opts);
-            ctx.result.object = bytes;
+            ctx.result.object = dxil_out.object;
+            ctx.result.reflection = dxil_out.reflection;
             if (opts.rootsig_output != null) {
                 const text = (if (m.entries.items.len == 1) m.entries.items[0].root_signature else null) orelse return ctx.fail("-Frs: the shader has no root signature", .{});
                 var d: zdxc.dxil.rootsig.Diagnostic = .{};

@@ -26,6 +26,7 @@ pub const dxil = struct {
     pub const signature = @import("dxil/signature.zig");
     pub const emit = @import("dxil/emit.zig");
     pub const rootsig = @import("dxil/rootsig.zig");
+    pub const reflect = @import("dxil/reflect.zig");
 };
 
 pub const ir = struct {

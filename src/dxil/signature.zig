@@ -44,14 +44,14 @@ pub const SemanticKind = enum(u8) {
 };
 
 const sv_names = [_][]const u8{
-    "",                          "SV_VertexID",             "SV_InstanceID",        "SV_Position",
-    "SV_RenderTargetArrayIndex", "SV_ViewportArrayIndex",   "SV_ClipDistance",      "SV_CullDistance",
-    "SV_OutputControlPointID",   "SV_DomainLocation",       "SV_PrimitiveID",       "SV_GSInstanceID",
-    "SV_SampleIndex",            "SV_IsFrontFace",          "SV_Coverage",          "SV_InnerCoverage",
-    "SV_Target",                 "SV_Depth",                "SV_DepthLessEqual",    "SV_DepthGreaterEqual",
-    "SV_StencilRef",             "SV_DispatchThreadID",     "SV_GroupID",           "SV_GroupIndex",
-    "SV_GroupThreadID",          "SV_TessFactor",           "SV_InsideTessFactor",  "SV_ViewID",
-    "SV_Barycentrics",           "SV_ShadingRate",          "SV_CullPrimitive",     "SV_StartVertexLocation",
+    "",                          "SV_VertexID",           "SV_InstanceID",       "SV_Position",
+    "SV_RenderTargetArrayIndex", "SV_ViewportArrayIndex", "SV_ClipDistance",     "SV_CullDistance",
+    "SV_OutputControlPointID",   "SV_DomainLocation",     "SV_PrimitiveID",      "SV_GSInstanceID",
+    "SV_SampleIndex",            "SV_IsFrontFace",        "SV_Coverage",         "SV_InnerCoverage",
+    "SV_Target",                 "SV_Depth",              "SV_DepthLessEqual",   "SV_DepthGreaterEqual",
+    "SV_StencilRef",             "SV_DispatchThreadID",   "SV_GroupID",          "SV_GroupIndex",
+    "SV_GroupThreadID",          "SV_TessFactor",         "SV_InsideTessFactor", "SV_ViewID",
+    "SV_Barycentrics",           "SV_ShadingRate",        "SV_CullPrimitive",    "SV_StartVertexLocation",
     "SV_StartInstanceLocation",
 };
 
@@ -60,14 +60,14 @@ const sv_names = [_][]const u8{
 pub fn kindByName(name: []const u8) SemanticKind {
     if (!std.ascii.startsWithIgnoreCase(name, "SV_")) return .arbitrary;
     for (sv_names[1..], 1..) |n, i| {
-        if (std.ascii.eqlIgnoreCase(name, n)) return @enumFromInt(i);
+        if (std.ascii.eqlIgnoreCase(name, n)) return @fromBackingInt(@intCast(i));
     }
     return .invalid;
 }
 
 /// The canonical spelling of a system-value semantic.
 pub fn canonicalName(kind: SemanticKind) []const u8 {
-    return sv_names[@intFromEnum(kind)];
+    return sv_names[@backingInt(kind)];
 }
 
 pub const Interpretation = enum(u8) { na, sv, sgv, arb, not_in_sig, not_packed, target, tess_factor, shadow, clip_cull };
@@ -150,7 +150,7 @@ pub fn interpretation(kind: SemanticKind, sp: SigPoint, minor: u8) Interpretatio
         .start_vertex_location, .start_instance_location => if (minor >= 8) .{ nis, na, na, na, na, na, na, na, na, na, na, na, na, na, na, na, na, na, na, na } else @splat(na),
         else => @splat(na),
     };
-    return row[@intFromEnum(sp)];
+    return row[@backingInt(sp)];
 }
 
 pub fn shouldBeAllocated(i: Interpretation) bool {
@@ -553,6 +553,15 @@ fn systemValue(kind: SemanticKind, domain: Domain) u32 {
 /// A DxilProgramSignature part (ISG1 or OSG1) for elements in the
 /// signature (not NotInSig ones).
 pub fn programSignature(gpa: Allocator, elements: []const Element, is_input: bool, domain: Domain) Allocator.Error![]u8 {
+    return signaturePart(gpa, elements, is_input, domain, true);
+}
+
+/// The same records in declaration order, as reflection lists parameters.
+pub fn declarationOrderSignature(gpa: Allocator, elements: []const Element, is_input: bool, domain: Domain) Allocator.Error![]u8 {
+    return signaturePart(gpa, elements, is_input, domain, false);
+}
+
+fn signaturePart(gpa: Allocator, elements: []const Element, is_input: bool, domain: Domain, sorted: bool) Allocator.Error![]u8 {
     const Rec = struct { stream: u32, name: u32, index: u32, sv: u32, comp: u32, reg: u32, mask: u8, rw: u8, min_prec: u32 };
     var recs: std.ArrayList(Rec) = .empty;
     defer recs.deinit(gpa);
@@ -584,7 +593,7 @@ pub fn programSignature(gpa: Allocator, elements: []const Element, is_input: boo
             if (sv == 16) sv = 15; // isoline: density, then detail
         }
     }
-    std.sort.insertion(Rec, recs.items, {}, struct {
+    if (sorted) std.sort.insertion(Rec, recs.items, {}, struct {
         fn lt(_: void, a: Rec, b: Rec) bool {
             if (a.stream != b.stream) return a.stream < b.stream;
             if (a.reg != b.reg) return a.reg < b.reg;

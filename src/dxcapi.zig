@@ -55,6 +55,7 @@ const OutKind = enum(u32) {
     shader_hash = 4,
     hlsl = 6,
     text = 7,
+    reflection = 8,
     root_signature = 9,
     remarks = 11,
     _,
@@ -94,6 +95,13 @@ const GUID = extern struct {
 
 const CLSID_DxcCompiler = GUID.parse("73e22d93-e6ce-47f3-b5bf-f0664f39c1b0");
 const CLSID_DxcUtils = GUID.parse("6245d6af-66e0-48fd-80b4-4d271796748c"); // == CLSID_DxcLibrary
+const CLSID_DxcContainerReflection = GUID.parse("b9f54489-55b8-400c-ba3a-1675e4728b91");
+const CLSID_DxcContainerBuilder = GUID.parse("94134294-411f-4574-b4d0-8741e25240d2");
+const IID_IDxcLibrary = GUID.parse("e5204dc7-d18c-4c3c-bdfb-851673980fe7");
+const IID_IDxcContainerReflection = GUID.parse("d2c21b26-8350-4bdc-976a-331ce6f4c54c");
+const IID_IDxcContainerBuilder = GUID.parse("334b1f50-2292-4b35-99a1-25588d8c17fe");
+const IID_ID3D12ShaderReflection = GUID.parse("5a58797d-a72c-478d-8ba2-efc6b0efe88e");
+const IID_ID3D12LibraryReflection = GUID.parse("8e349d19-54db-4a56-9dc9-119d87bdb804");
 const IID_IUnknown = GUID.parse("00000000-0000-0000-c000-000000000046");
 const IID_IDxcBlob = GUID.parse("8ba5fb08-5195-40e2-ac58-0d989c3a0102");
 const IID_IDxcBlobEncoding = GUID.parse("7241d424-2646-4191-97c0-98e96e42fc68");
@@ -655,6 +663,7 @@ fn makeResult(c: compile.Result) !*Result {
         } else if (c.object) |obj| {
             try addOutput(r, .object, try Blob.copy(.binary, obj, CP_ACP), c.object_name);
             if (shaderHash(obj)) |h| try addOutput(r, .shader_hash, try Blob.copy(.binary, &h, CP_ACP), null);
+            if (c.reflection) |refl| try addOutput(r, .reflection, try Blob.copy(.binary, refl, CP_ACP), null);
         } else {
             r.primary = .text;
         },
@@ -892,9 +901,55 @@ const MallocVtbl = extern struct {
     Free: *const fn (This, ?*anyopaque) callconv(cc) void,
 };
 
+/// IDxcLibrary: the older blob helpers on the same object.
+const LibraryVtbl = extern struct {
+    unknown: UnknownVtbl,
+    SetMalloc: *const fn (This, ?*anyopaque) callconv(cc) HRESULT,
+    CreateBlobFromBlob: *const fn (This, ?*anyopaque, u32, u32, ?Out) callconv(cc) HRESULT,
+    CreateBlobFromFile: *const fn (This, ?[*:0]const WCHAR, ?*u32, ?Out) callconv(cc) HRESULT,
+    CreateBlobWithEncodingFromPinned: *const fn (This, ?[*]const u8, u32, u32, ?Out) callconv(cc) HRESULT,
+    CreateBlobWithEncodingOnHeapCopy: *const fn (This, ?[*]const u8, u32, u32, ?Out) callconv(cc) HRESULT,
+    CreateBlobWithEncodingOnMalloc: *const fn (This, ?[*]const u8, ?*anyopaque, u32, u32, ?Out) callconv(cc) HRESULT,
+    CreateIncludeHandler: *const fn (This, ?Out) callconv(cc) HRESULT,
+    CreateStreamFromBlobReadOnly: *const fn (This, ?*anyopaque, ?Out) callconv(cc) HRESULT,
+    GetBlobAsUtf8: *const fn (This, ?*anyopaque, ?Out) callconv(cc) HRESULT,
+    GetBlobAsUtf16: *const fn (This, ?*anyopaque, ?Out) callconv(cc) HRESULT,
+};
+
 const Utils = struct {
     iface: Iface(UtilsVtbl) = .{ .vtbl = &vtbl },
+    library: Iface(LibraryVtbl) = .{ .vtbl = &library_vtbl },
     rc: RefCount = .{},
+
+    const library_vtbl: LibraryVtbl = .{
+        .unknown = .{ .QueryInterface = libraryQueryInterface, .AddRef = libraryAddRef, .Release = libraryRelease },
+        .SetMalloc = setMalloc,
+        .CreateBlobFromBlob = createBlobFromBlob,
+        .CreateBlobFromFile = loadFile,
+        .CreateBlobWithEncodingFromPinned = createBlobFromPinned,
+        .CreateBlobWithEncodingOnHeapCopy = createBlob,
+        .CreateBlobWithEncodingOnMalloc = moveToBlob,
+        .CreateIncludeHandler = createDefaultIncludeHandler,
+        .CreateStreamFromBlobReadOnly = notImplemented2,
+        .GetBlobAsUtf8 = getBlobAsUtf8,
+        .GetBlobAsUtf16 = getBlobAsWide,
+    };
+
+    fn libraryOf(this: This) *Utils {
+        return parent(Utils, "library", this);
+    }
+    fn libraryQueryInterface(this: This, iid: *const GUID, out: ?Out) callconv(cc) HRESULT {
+        return queryInterface(&libraryOf(this).iface, iid, out);
+    }
+    fn libraryAddRef(this: This) callconv(cc) ULONG {
+        return libraryOf(this).rc.addRef();
+    }
+    fn libraryRelease(this: This) callconv(cc) ULONG {
+        return release(&libraryOf(this).iface);
+    }
+    fn setMalloc(_: This, _: ?*anyopaque) callconv(cc) HRESULT {
+        return S_OK;
+    }
 
     const vtbl: UtilsVtbl = .{
         .unknown = .{ .QueryInterface = queryInterface, .AddRef = addRef, .Release = release },
@@ -918,12 +973,17 @@ const Utils = struct {
     }
 
     fn queryInterface(this: This, iid: *const GUID, out: ?Out) callconv(cc) HRESULT {
-        if (!iid.eql(IID_IUnknown) and !iid.eql(IID_IDxcUtils)) {
+        const u = of(this);
+        const p: *anyopaque = if (iid.eql(IID_IUnknown) or iid.eql(IID_IDxcUtils))
+            &u.iface
+        else if (iid.eql(IID_IDxcLibrary))
+            &u.library
+        else {
             _ = put(out, null);
             return E_NOINTERFACE;
-        }
-        _ = of(this).rc.addRef();
-        return put(out, this);
+        };
+        _ = u.rc.addRef();
+        return put(out, p);
     }
     fn addRef(this: This) callconv(cc) ULONG {
         return of(this).rc.addRef();
@@ -1033,9 +1093,19 @@ const Utils = struct {
         return S_OK;
     }
 
-    fn createReflection(_: This, _: ?*const Buffer, _: *const GUID, out: ?Out) callconv(cc) HRESULT {
-        _ = put(out, null);
-        return E_NOTIMPL;
+    /// ID3D12ShaderReflection / ID3D12LibraryReflection over a
+    /// DXC_OUT_REFLECTION blob of ours.
+    fn createReflection(_: This, data: ?*const Buffer, iid: *const GUID, out: ?Out) callconv(cc) HRESULT {
+        const o = out orelse return E_POINTER;
+        o.* = null;
+        const buf = data orelse return E_INVALIDARG;
+        const bytes = (buf.ptr orelse return E_INVALIDARG)[0..buf.size];
+        const r = ShaderReflection.create(bytes) catch |e| return switch (e) {
+            error.OutOfMemory => E_OUTOFMEMORY,
+            else => E_INVALIDARG,
+        };
+        defer _ = ShaderReflection.release(&r.shader);
+        return r.query(iid, o);
     }
 
     fn getPdbContents(_: This, _: ?*anyopaque, hash: ?Out, container: ?Out) callconv(cc) HRESULT {
@@ -1051,6 +1121,893 @@ const Utils = struct {
     fn notImplemented2(_: This, _: ?*anyopaque, out: ?Out) callconv(cc) HRESULT {
         _ = put(out, null);
         return E_NOTIMPL;
+    }
+};
+
+// ---- Shader reflection ----------------------------------------------------
+//
+// ID3D12ShaderReflection and ID3D12LibraryReflection (d3d12shader.h) over
+// the reflection blob zdxc returns as DXC_OUT_REFLECTION (dxil/reflect.zig).
+// Their constant buffer, variable, type and function objects are not
+// IUnknowns: they live as long as the reflection object. A lookup that
+// finds nothing returns an object whose GetDesc fails, as D3D's do.
+
+const reflect = zdxc.dxil.reflect;
+const LPCSTR = ?[*:0]const u8;
+
+const ShaderDesc = extern struct {
+    Version: u32 = 0,
+    Creator: LPCSTR = null,
+    Flags: u32 = 0,
+    ConstantBuffers: u32 = 0,
+    BoundResources: u32 = 0,
+    InputParameters: u32 = 0,
+    OutputParameters: u32 = 0,
+    InstructionCount: u32 = 0,
+    TempRegisterCount: u32 = 0,
+    TempArrayCount: u32 = 0,
+    DefCount: u32 = 0,
+    DclCount: u32 = 0,
+    TextureNormalInstructions: u32 = 0,
+    TextureLoadInstructions: u32 = 0,
+    TextureCompInstructions: u32 = 0,
+    TextureBiasInstructions: u32 = 0,
+    TextureGradientInstructions: u32 = 0,
+    FloatInstructionCount: u32 = 0,
+    IntInstructionCount: u32 = 0,
+    UintInstructionCount: u32 = 0,
+    StaticFlowControlCount: u32 = 0,
+    DynamicFlowControlCount: u32 = 0,
+    MacroInstructionCount: u32 = 0,
+    ArrayInstructionCount: u32 = 0,
+    CutInstructionCount: u32 = 0,
+    EmitInstructionCount: u32 = 0,
+    GSOutputTopology: u32 = 0,
+    GSMaxOutputVertexCount: u32 = 0,
+    InputPrimitive: u32 = 0,
+    PatchConstantParameters: u32 = 0,
+    cGSInstanceCount: u32 = 0,
+    cControlPoints: u32 = 0,
+    HSOutputPrimitive: u32 = 0,
+    HSPartitioning: u32 = 0,
+    TessellatorDomain: u32 = 0,
+    cBarrierInstructions: u32 = 0,
+    cInterlockedInstructions: u32 = 0,
+    cTextureStoreInstructions: u32 = 0,
+};
+
+const BufferDesc = extern struct { Name: LPCSTR = null, Type: u32 = 0, Variables: u32 = 0, Size: u32 = 0, uFlags: u32 = 0 };
+
+const VariableDesc = extern struct {
+    Name: LPCSTR = null,
+    StartOffset: u32 = 0,
+    Size: u32 = 0,
+    uFlags: u32 = 0,
+    DefaultValue: ?*anyopaque = null,
+    StartTexture: u32 = 0xFFFFFFFF,
+    TextureSize: u32 = 0,
+    StartSampler: u32 = 0xFFFFFFFF,
+    SamplerSize: u32 = 0,
+};
+
+const TypeDesc = extern struct { Class: u32 = 0, Type: u32 = 0, Rows: u32 = 0, Columns: u32 = 0, Elements: u32 = 0, Members: u32 = 0, Offset: u32 = 0, Name: LPCSTR = null };
+
+const BindDesc = extern struct { Name: LPCSTR = null, Type: u32 = 0, BindPoint: u32 = 0, BindCount: u32 = 0, uFlags: u32 = 0, ReturnType: u32 = 0, Dimension: u32 = 0, NumSamples: u32 = 0, Space: u32 = 0, uID: u32 = 0 };
+
+const SignatureParamDesc = extern struct { SemanticName: LPCSTR = null, SemanticIndex: u32 = 0, Register: u32 = 0, SystemValueType: u32 = 0, ComponentType: u32 = 0, Mask: u8 = 0, ReadWriteMask: u8 = 0, Stream: u32 = 0, MinPrecision: u32 = 0 };
+
+const LibraryDesc = extern struct { Creator: LPCSTR = null, Flags: u32 = 0, FunctionCount: u32 = 0 };
+
+const FunctionDesc = extern struct {
+    Version: u32 = 0,
+    Creator: LPCSTR = null,
+    Flags: u32 = 0,
+    ConstantBuffers: u32 = 0,
+    BoundResources: u32 = 0,
+    InstructionCount: u32 = 0,
+    TempRegisterCount: u32 = 0,
+    TempArrayCount: u32 = 0,
+    DefCount: u32 = 0,
+    DclCount: u32 = 0,
+    TextureNormalInstructions: u32 = 0,
+    TextureLoadInstructions: u32 = 0,
+    TextureCompInstructions: u32 = 0,
+    TextureBiasInstructions: u32 = 0,
+    TextureGradientInstructions: u32 = 0,
+    FloatInstructionCount: u32 = 0,
+    IntInstructionCount: u32 = 0,
+    UintInstructionCount: u32 = 0,
+    StaticFlowControlCount: u32 = 0,
+    DynamicFlowControlCount: u32 = 0,
+    MacroInstructionCount: u32 = 0,
+    ArrayInstructionCount: u32 = 0,
+    MovInstructionCount: u32 = 0,
+    MovcInstructionCount: u32 = 0,
+    ConversionInstructionCount: u32 = 0,
+    BitwiseInstructionCount: u32 = 0,
+    MinFeatureLevel: u32 = 0,
+    RequiredFeatureFlags: u64 = 0,
+    Name: LPCSTR = null,
+    FunctionParameterCount: i32 = 0,
+    HasReturn: i32 = 0,
+    Has10Level9VertexShader: i32 = 0,
+    Has10Level9PixelShader: i32 = 0,
+};
+
+const creator: [*:0]const u8 = "zdxc";
+/// D3D_FEATURE_LEVEL_12_0.
+const feature_level_12_0 = 0xc000;
+
+const CBufferVtbl = extern struct {
+    GetDesc: *const fn (This, ?*BufferDesc) callconv(cc) HRESULT,
+    GetVariableByIndex: *const fn (This, u32) callconv(cc) *anyopaque,
+    GetVariableByName: *const fn (This, LPCSTR) callconv(cc) *anyopaque,
+};
+
+const VariableVtbl = extern struct {
+    GetDesc: *const fn (This, ?*VariableDesc) callconv(cc) HRESULT,
+    GetType: *const fn (This) callconv(cc) *anyopaque,
+    GetBuffer: *const fn (This) callconv(cc) *anyopaque,
+    GetInterfaceSlot: *const fn (This, u32) callconv(cc) u32,
+};
+
+const TypeVtbl = extern struct {
+    GetDesc: *const fn (This, ?*TypeDesc) callconv(cc) HRESULT,
+    GetMemberTypeByIndex: *const fn (This, u32) callconv(cc) *anyopaque,
+    GetMemberTypeByName: *const fn (This, LPCSTR) callconv(cc) *anyopaque,
+    GetMemberTypeName: *const fn (This, u32) callconv(cc) LPCSTR,
+    IsEqual: *const fn (This, ?*anyopaque) callconv(cc) HRESULT,
+    GetSubType: *const fn (This) callconv(cc) ?*anyopaque,
+    GetBaseClass: *const fn (This) callconv(cc) ?*anyopaque,
+    GetNumInterfaces: *const fn (This) callconv(cc) u32,
+    GetInterfaceByIndex: *const fn (This, u32) callconv(cc) ?*anyopaque,
+    IsOfType: *const fn (This, ?*anyopaque) callconv(cc) HRESULT,
+    ImplementsInterface: *const fn (This, ?*anyopaque) callconv(cc) HRESULT,
+};
+
+const ShaderReflectionVtbl = extern struct {
+    unknown: UnknownVtbl,
+    GetDesc: *const fn (This, ?*ShaderDesc) callconv(cc) HRESULT,
+    GetConstantBufferByIndex: *const fn (This, u32) callconv(cc) *anyopaque,
+    GetConstantBufferByName: *const fn (This, LPCSTR) callconv(cc) *anyopaque,
+    GetResourceBindingDesc: *const fn (This, u32, ?*BindDesc) callconv(cc) HRESULT,
+    GetInputParameterDesc: *const fn (This, u32, ?*SignatureParamDesc) callconv(cc) HRESULT,
+    GetOutputParameterDesc: *const fn (This, u32, ?*SignatureParamDesc) callconv(cc) HRESULT,
+    GetPatchConstantParameterDesc: *const fn (This, u32, ?*SignatureParamDesc) callconv(cc) HRESULT,
+    GetVariableByName: *const fn (This, LPCSTR) callconv(cc) *anyopaque,
+    GetResourceBindingDescByName: *const fn (This, LPCSTR, ?*BindDesc) callconv(cc) HRESULT,
+    GetMovInstructionCount: *const fn (This) callconv(cc) u32,
+    GetMovcInstructionCount: *const fn (This) callconv(cc) u32,
+    GetConversionInstructionCount: *const fn (This) callconv(cc) u32,
+    GetBitwiseInstructionCount: *const fn (This) callconv(cc) u32,
+    GetGSInputPrimitive: *const fn (This) callconv(cc) u32,
+    IsSampleFrequencyShader: *const fn (This) callconv(cc) BOOL,
+    GetNumInterfaceSlots: *const fn (This) callconv(cc) u32,
+    GetMinFeatureLevel: *const fn (This, ?*u32) callconv(cc) HRESULT,
+    GetThreadGroupSize: *const fn (This, ?*u32, ?*u32, ?*u32) callconv(cc) u32,
+    GetRequiresFlags: *const fn (This) callconv(cc) u64,
+};
+
+const LibraryReflectionVtbl = extern struct {
+    unknown: UnknownVtbl,
+    GetDesc: *const fn (This, ?*LibraryDesc) callconv(cc) HRESULT,
+    GetFunctionByIndex: *const fn (This, i32) callconv(cc) *anyopaque,
+};
+
+const FunctionVtbl = extern struct {
+    GetDesc: *const fn (This, ?*FunctionDesc) callconv(cc) HRESULT,
+    GetConstantBufferByIndex: *const fn (This, u32) callconv(cc) *anyopaque,
+    GetConstantBufferByName: *const fn (This, LPCSTR) callconv(cc) *anyopaque,
+    GetResourceBindingDesc: *const fn (This, u32, ?*BindDesc) callconv(cc) HRESULT,
+    GetVariableByName: *const fn (This, LPCSTR) callconv(cc) *anyopaque,
+    GetResourceBindingDescByName: *const fn (This, LPCSTR, ?*BindDesc) callconv(cc) HRESULT,
+    GetFunctionParameter: *const fn (This, i32) callconv(cc) *anyopaque,
+};
+
+const ParameterVtbl = extern struct {
+    GetDesc: *const fn (This, ?*anyopaque) callconv(cc) HRESULT,
+};
+
+fn eqlZ(a: LPCSTR, b: [*:0]const u8) bool {
+    return std.mem.eql(u8, std.mem.span(a orelse return false), std.mem.span(b));
+}
+
+/// A constant buffer of a reflection.
+const CBufferObj = struct {
+    iface: Iface(CBufferVtbl) = .{ .vtbl = &vtbl },
+    desc: BufferDesc,
+    vars: []VariableObj,
+
+    const vtbl: CBufferVtbl = .{ .GetDesc = getDesc, .GetVariableByIndex = getVariableByIndex, .GetVariableByName = getVariableByName };
+    fn of(this: This) *CBufferObj {
+        return parent(CBufferObj, "iface", this);
+    }
+    fn getDesc(this: This, d: ?*BufferDesc) callconv(cc) HRESULT {
+        const c = of(this);
+        if (c == &invalid_cbuffer) return E_FAIL;
+        (d orelse return E_INVALIDARG).* = c.desc;
+        return S_OK;
+    }
+    fn getVariableByIndex(this: This, i: u32) callconv(cc) *anyopaque {
+        const c = of(this);
+        return if (i < c.vars.len) &c.vars[i].iface else &invalid_variable.iface;
+    }
+    fn getVariableByName(this: This, name: LPCSTR) callconv(cc) *anyopaque {
+        for (of(this).vars) |*v| if (eqlZ(name, v.desc.Name.?)) return &v.iface;
+        return &invalid_variable.iface;
+    }
+};
+
+const VariableObj = struct {
+    iface: Iface(VariableVtbl) = .{ .vtbl = &vtbl },
+    desc: VariableDesc,
+    ty: *TypeObj,
+    buffer: *CBufferObj,
+
+    const vtbl: VariableVtbl = .{ .GetDesc = getDesc, .GetType = getType, .GetBuffer = getBuffer, .GetInterfaceSlot = getInterfaceSlot };
+    fn of(this: This) *VariableObj {
+        return parent(VariableObj, "iface", this);
+    }
+    fn getDesc(this: This, d: ?*VariableDesc) callconv(cc) HRESULT {
+        const v = of(this);
+        if (v == &invalid_variable) return E_FAIL;
+        (d orelse return E_INVALIDARG).* = v.desc;
+        return S_OK;
+    }
+    fn getType(this: This) callconv(cc) *anyopaque {
+        return &of(this).ty.iface;
+    }
+    fn getBuffer(this: This) callconv(cc) *anyopaque {
+        return &of(this).buffer.iface;
+    }
+    fn getInterfaceSlot(_: This, _: u32) callconv(cc) u32 {
+        return 0xFFFFFFFF;
+    }
+};
+
+const TypeObj = struct {
+    iface: Iface(TypeVtbl) = .{ .vtbl = &vtbl },
+    desc: TypeDesc,
+    members: []const *TypeObj = &.{},
+    member_names: []const [*:0]const u8 = &.{},
+
+    const vtbl: TypeVtbl = .{
+        .GetDesc = getDesc,
+        .GetMemberTypeByIndex = getMemberTypeByIndex,
+        .GetMemberTypeByName = getMemberTypeByName,
+        .GetMemberTypeName = getMemberTypeName,
+        .IsEqual = isEqual,
+        .GetSubType = getNull,
+        .GetBaseClass = getNull,
+        .GetNumInterfaces = getZero,
+        .GetInterfaceByIndex = getNullIndex,
+        .IsOfType = isEqual,
+        .ImplementsInterface = notImplementedObj,
+    };
+    fn of(this: This) *TypeObj {
+        return parent(TypeObj, "iface", this);
+    }
+    fn getDesc(this: This, d: ?*TypeDesc) callconv(cc) HRESULT {
+        const t = of(this);
+        if (t == &invalid_type) return E_FAIL;
+        (d orelse return E_INVALIDARG).* = t.desc;
+        return S_OK;
+    }
+    fn getMemberTypeByIndex(this: This, i: u32) callconv(cc) *anyopaque {
+        const t = of(this);
+        return if (i < t.members.len) &t.members[i].iface else &invalid_type.iface;
+    }
+    fn getMemberTypeByName(this: This, name: LPCSTR) callconv(cc) *anyopaque {
+        const t = of(this);
+        for (t.member_names, t.members) |n, m| if (eqlZ(name, n)) return &m.iface;
+        return &invalid_type.iface;
+    }
+    fn getMemberTypeName(this: This, i: u32) callconv(cc) LPCSTR {
+        const t = of(this);
+        return if (i < t.member_names.len) t.member_names[i] else null;
+    }
+    fn isEqual(this: This, other: ?*anyopaque) callconv(cc) HRESULT {
+        // S_FALSE when they differ.
+        return if (other == this) S_OK else 1;
+    }
+    fn getNull(_: This) callconv(cc) ?*anyopaque {
+        return null;
+    }
+    fn getNullIndex(_: This, _: u32) callconv(cc) ?*anyopaque {
+        return null;
+    }
+    fn getZero(_: This) callconv(cc) u32 {
+        return 0;
+    }
+    fn notImplementedObj(_: This, _: ?*anyopaque) callconv(cc) HRESULT {
+        return E_NOTIMPL;
+    }
+};
+
+var invalid_type: TypeObj = .{ .desc = .{} };
+var invalid_cbuffer: CBufferObj = .{ .desc = .{}, .vars = &.{} };
+var invalid_variable: VariableObj = .{ .desc = .{}, .ty = &invalid_type, .buffer = &invalid_cbuffer };
+
+/// A library function: its own resources and constant buffers.
+const FunctionObj = struct {
+    iface: Iface(FunctionVtbl) = .{ .vtbl = &vtbl },
+    desc: FunctionDesc,
+    binds: []const *const BindDesc,
+    cbuffers: []const *CBufferObj,
+
+    const vtbl: FunctionVtbl = .{
+        .GetDesc = getDesc,
+        .GetConstantBufferByIndex = getConstantBufferByIndex,
+        .GetConstantBufferByName = getConstantBufferByName,
+        .GetResourceBindingDesc = getResourceBindingDesc,
+        .GetVariableByName = getVariableByName,
+        .GetResourceBindingDescByName = getResourceBindingDescByName,
+        .GetFunctionParameter = getFunctionParameter,
+    };
+    fn of(this: This) *FunctionObj {
+        return parent(FunctionObj, "iface", this);
+    }
+    fn getDesc(this: This, d: ?*FunctionDesc) callconv(cc) HRESULT {
+        const f = of(this);
+        if (f == &invalid_function) return E_FAIL;
+        (d orelse return E_INVALIDARG).* = f.desc;
+        return S_OK;
+    }
+    fn getConstantBufferByIndex(this: This, i: u32) callconv(cc) *anyopaque {
+        const f = of(this);
+        return if (i < f.cbuffers.len) &f.cbuffers[i].iface else &invalid_cbuffer.iface;
+    }
+    fn getConstantBufferByName(this: This, name: LPCSTR) callconv(cc) *anyopaque {
+        for (of(this).cbuffers) |c| if (eqlZ(name, c.desc.Name.?)) return &c.iface;
+        return &invalid_cbuffer.iface;
+    }
+    fn getResourceBindingDesc(this: This, i: u32, d: ?*BindDesc) callconv(cc) HRESULT {
+        const f = of(this);
+        const out = d orelse return E_INVALIDARG;
+        if (i >= f.binds.len) return E_INVALIDARG;
+        out.* = f.binds[i].*;
+        return S_OK;
+    }
+    fn getVariableByName(this: This, name: LPCSTR) callconv(cc) *anyopaque {
+        for (of(this).cbuffers) |c| for (c.vars) |*v| if (eqlZ(name, v.desc.Name.?)) return &v.iface;
+        return &invalid_variable.iface;
+    }
+    fn getResourceBindingDescByName(this: This, name: LPCSTR, d: ?*BindDesc) callconv(cc) HRESULT {
+        const out = d orelse return E_INVALIDARG;
+        for (of(this).binds) |b| if (eqlZ(name, b.Name.?)) {
+            out.* = b.*;
+            return S_OK;
+        };
+        return E_INVALIDARG;
+    }
+    fn getFunctionParameter(_: This, _: i32) callconv(cc) *anyopaque {
+        return &invalid_parameter;
+    }
+};
+
+var invalid_function: FunctionObj = .{ .desc = .{}, .binds = &.{}, .cbuffers = &.{} };
+const invalid_parameter_vtbl: ParameterVtbl = .{ .GetDesc = struct {
+    fn f(_: This, _: ?*anyopaque) callconv(cc) HRESULT {
+        return E_FAIL;
+    }
+}.f };
+var invalid_parameter: Iface(ParameterVtbl) = .{ .vtbl = &invalid_parameter_vtbl };
+
+/// ID3D12ShaderReflection and ID3D12LibraryReflection: one object, with
+/// everything decoded up front into its arena.
+const ShaderReflection = struct {
+    shader: Iface(ShaderReflectionVtbl) = .{ .vtbl = &shader_vtbl },
+    library: Iface(LibraryReflectionVtbl) = .{ .vtbl = &library_vtbl },
+    rc: RefCount = .{},
+    arena: std.heap.ArenaAllocator,
+    r: reflect.Reflection,
+    desc: ShaderDesc,
+    binds: []BindDesc,
+    cbuffers: []CBufferObj,
+    inputs: []SignatureParamDesc,
+    outputs: []SignatureParamDesc,
+    patch: []SignatureParamDesc,
+    functions: []FunctionObj,
+
+    const shader_vtbl: ShaderReflectionVtbl = .{
+        .unknown = .{ .QueryInterface = queryInterface, .AddRef = addRef, .Release = release },
+        .GetDesc = getDesc,
+        .GetConstantBufferByIndex = getConstantBufferByIndex,
+        .GetConstantBufferByName = getConstantBufferByName,
+        .GetResourceBindingDesc = getResourceBindingDesc,
+        .GetInputParameterDesc = getInputParameterDesc,
+        .GetOutputParameterDesc = getOutputParameterDesc,
+        .GetPatchConstantParameterDesc = getPatchConstantParameterDesc,
+        .GetVariableByName = getVariableByName,
+        .GetResourceBindingDescByName = getResourceBindingDescByName,
+        .GetMovInstructionCount = zero,
+        .GetMovcInstructionCount = zero,
+        .GetConversionInstructionCount = zero,
+        .GetBitwiseInstructionCount = zero,
+        .GetGSInputPrimitive = getGSInputPrimitive,
+        .IsSampleFrequencyShader = isSampleFrequencyShader,
+        .GetNumInterfaceSlots = zero,
+        .GetMinFeatureLevel = getMinFeatureLevel,
+        .GetThreadGroupSize = getThreadGroupSize,
+        .GetRequiresFlags = getRequiresFlags,
+    };
+    const library_vtbl: LibraryReflectionVtbl = .{
+        .unknown = .{ .QueryInterface = libraryQueryInterface, .AddRef = libraryAddRef, .Release = libraryRelease },
+        .GetDesc = getLibraryDesc,
+        .GetFunctionByIndex = getFunctionByIndex,
+    };
+
+    fn of(this: This) *ShaderReflection {
+        return parent(ShaderReflection, "shader", this);
+    }
+    fn libraryOf(this: This) *ShaderReflection {
+        return parent(ShaderReflection, "library", this);
+    }
+
+    fn create(blob: []const u8) !*ShaderReflection {
+        const s = try gpa.create(ShaderReflection);
+        errdefer gpa.destroy(s);
+        s.* = .{ .arena = .init(gpa), .r = undefined, .desc = .{}, .binds = &.{}, .cbuffers = &.{}, .inputs = &.{}, .outputs = &.{}, .patch = &.{}, .functions = &.{} };
+        errdefer s.arena.deinit();
+        try s.load(blob);
+        return s;
+    }
+
+    fn load(s: *ShaderReflection, blob: []const u8) !void {
+        const a = s.arena.allocator();
+        const bytes = try a.dupe(u8, blob);
+        const json = containerPart(bytes, reflect.part) orelse return error.InvalidArgument;
+        const r = try reflect.decode(a, json);
+        s.r = r;
+
+        const types = try a.alloc(TypeObj, r.types.len);
+        for (types, r.types) |*t, rt| {
+            const members = try a.alloc(*TypeObj, rt.members.len);
+            const names = try a.alloc([*:0]const u8, rt.members.len);
+            for (members, names, rt.members) |*m, *n, rm| {
+                m.* = if (rm.ty < types.len) &types[rm.ty] else &invalid_type;
+                n.* = try a.dupeSentinel(u8, rm.name, 0);
+            }
+            t.* = .{
+                .desc = .{ .Class = rt.class, .Type = rt.kind, .Rows = rt.rows, .Columns = rt.cols, .Elements = rt.elements, .Members = @intCast(rt.members.len), .Offset = rt.offset, .Name = try a.dupeSentinel(u8, rt.name, 0) },
+                .members = members,
+                .member_names = names,
+            };
+        }
+        s.cbuffers = try a.alloc(CBufferObj, r.cbuffers.len);
+        for (s.cbuffers, r.cbuffers) |*c, rc| {
+            const vars = try a.alloc(VariableObj, rc.vars.len);
+            c.* = .{ .desc = .{ .Name = try a.dupeSentinel(u8, rc.name, 0), .Type = rc.kind, .Variables = @intCast(rc.vars.len), .Size = rc.size, .uFlags = rc.flags }, .vars = vars };
+            for (vars, rc.vars) |*v, rv| v.* = .{
+                .desc = .{ .Name = try a.dupeSentinel(u8, rv.name, 0), .StartOffset = rv.offset, .Size = rv.size, .uFlags = rv.flags },
+                .ty = if (rv.ty < types.len) &types[rv.ty] else &invalid_type,
+                .buffer = c,
+            };
+        }
+        s.binds = try a.alloc(BindDesc, r.binds.len);
+        for (s.binds, r.binds) |*b, rb| b.* = .{
+            .Name = try a.dupeSentinel(u8, rb.name, 0),
+            .Type = rb.type,
+            .BindPoint = rb.bind_point,
+            .BindCount = rb.bind_count,
+            .uFlags = rb.flags,
+            .ReturnType = rb.return_type,
+            .Dimension = rb.dimension,
+            .NumSamples = rb.num_samples,
+            .Space = rb.space,
+            .uID = rb.id,
+        };
+        s.inputs = try signatureParams(a, containerPart(bytes, reflect.input_part));
+        s.outputs = try signatureParams(a, containerPart(bytes, reflect.output_part));
+        s.patch = try signatureParams(a, containerPart(bytes, reflect.patch_part));
+        s.desc = .{
+            .Version = r.version,
+            .Creator = creator,
+            .ConstantBuffers = @intCast(r.cbuffers.len),
+            .BoundResources = @intCast(r.binds.len),
+            .InputParameters = @intCast(s.inputs.len),
+            .OutputParameters = @intCast(s.outputs.len),
+            .InstructionCount = r.instructions,
+            .GSOutputTopology = r.gs_output_topology,
+            .GSMaxOutputVertexCount = r.gs_max_vertices,
+            .InputPrimitive = r.input_primitive,
+            .PatchConstantParameters = @intCast(s.patch.len),
+            .cGSInstanceCount = r.gs_instances,
+            .cControlPoints = r.control_points,
+            .HSOutputPrimitive = r.hs_output_primitive,
+            .HSPartitioning = r.hs_partitioning,
+            .TessellatorDomain = r.tess_domain,
+        };
+        s.functions = try a.alloc(FunctionObj, r.functions.len);
+        for (s.functions, r.functions) |*f, rf| {
+            const binds = try a.alloc(*const BindDesc, rf.binds.len);
+            for (binds, rf.binds) |*b, i| b.* = if (i < s.binds.len) &s.binds[i] else &.{};
+            const cbs = try a.alloc(*CBufferObj, rf.cbuffers.len);
+            for (cbs, rf.cbuffers) |*c, i| c.* = if (i < s.cbuffers.len) &s.cbuffers[i] else &invalid_cbuffer;
+            f.* = .{
+                .desc = .{
+                    .Version = rf.version,
+                    .Creator = creator,
+                    .ConstantBuffers = @intCast(cbs.len),
+                    .BoundResources = @intCast(binds.len),
+                    .MinFeatureLevel = feature_level_12_0,
+                    .RequiredFeatureFlags = rf.requires,
+                    .Name = try a.dupeSentinel(u8, rf.name, 0),
+                },
+                .binds = binds,
+                .cbuffers = cbs,
+            };
+        }
+    }
+
+    /// The parameters of a DxilProgramSignature part (ISG1, OSG1, PSG1),
+    /// which are D3D12_SIGNATURE_PARAMETER_DESC's fields.
+    fn signatureParams(a: std.mem.Allocator, part: ?[]const u8) ![]SignatureParamDesc {
+        const p = part orelse return &.{};
+        if (p.len < 8) return &.{};
+        const count = std.mem.readInt(u32, p[0..4], .little);
+        const first = std.mem.readInt(u32, p[4..8], .little);
+        if (first > p.len or count > (p.len - first) / 32) return error.InvalidArgument;
+        const out = try a.alloc(SignatureParamDesc, count);
+        for (out, 0..) |*d, i| {
+            const rec = p[first + 32 * i ..][0..32];
+            const word = struct {
+                fn f(b: []const u8, k: usize) u32 {
+                    return std.mem.readInt(u32, b[4 * k ..][0..4], .little);
+                }
+            }.f;
+            const name_off = word(rec, 1);
+            const name: LPCSTR = if (name_off < p.len) blk: {
+                const end = std.mem.indexOfScalarPos(u8, p, name_off, 0) orelse return error.InvalidArgument;
+                const n = try a.dupeSentinel(u8, p[name_off..end], 0);
+                // System values read back uppercase, as D3D reports them.
+                if (word(rec, 3) != 0) _ = std.ascii.upperString(n, n);
+                break :blk n.ptr;
+            } else null;
+            // Minimum-precision values are reported as their 32-bit types
+            // (UINT16/SINT16/FLOAT16 -> UINT32/SINT32/FLOAT32).
+            const comp = word(rec, 4);
+            d.* = .{
+                .SemanticName = name,
+                .SemanticIndex = word(rec, 2),
+                .Register = word(rec, 5),
+                .SystemValueType = word(rec, 3),
+                .ComponentType = if (word(rec, 7) != 0 and comp >= 4 and comp <= 6) comp - 3 else comp,
+                .Mask = rec[24],
+                .ReadWriteMask = rec[25],
+                .Stream = word(rec, 0),
+                .MinPrecision = word(rec, 7),
+            };
+        }
+        return out;
+    }
+
+    fn query(s: *ShaderReflection, iid: *const GUID, out: Out) HRESULT {
+        const p: *anyopaque = if (iid.eql(IID_IUnknown) or iid.eql(IID_ID3D12ShaderReflection))
+            &s.shader
+        else if (iid.eql(IID_ID3D12LibraryReflection))
+            &s.library
+        else {
+            out.* = null;
+            return E_NOINTERFACE;
+        };
+        _ = s.rc.addRef();
+        out.* = p;
+        return S_OK;
+    }
+
+    fn queryInterface(this: This, iid: *const GUID, out: ?Out) callconv(cc) HRESULT {
+        return of(this).query(iid, out orelse return E_POINTER);
+    }
+    fn addRef(this: This) callconv(cc) ULONG {
+        return of(this).rc.addRef();
+    }
+    fn release(this: This) callconv(cc) ULONG {
+        const s = of(this);
+        const n = s.rc.release();
+        if (n == 0) {
+            s.arena.deinit();
+            gpa.destroy(s);
+        }
+        return n;
+    }
+    fn libraryQueryInterface(this: This, iid: *const GUID, out: ?Out) callconv(cc) HRESULT {
+        return libraryOf(this).query(iid, out orelse return E_POINTER);
+    }
+    fn libraryAddRef(this: This) callconv(cc) ULONG {
+        return libraryOf(this).rc.addRef();
+    }
+    fn libraryRelease(this: This) callconv(cc) ULONG {
+        return release(&libraryOf(this).shader);
+    }
+
+    fn getDesc(this: This, d: ?*ShaderDesc) callconv(cc) HRESULT {
+        (d orelse return E_INVALIDARG).* = of(this).desc;
+        return S_OK;
+    }
+    fn getConstantBufferByIndex(this: This, i: u32) callconv(cc) *anyopaque {
+        const s = of(this);
+        return if (i < s.cbuffers.len) &s.cbuffers[i].iface else &invalid_cbuffer.iface;
+    }
+    fn getConstantBufferByName(this: This, name: LPCSTR) callconv(cc) *anyopaque {
+        for (of(this).cbuffers) |*c| if (eqlZ(name, c.desc.Name.?)) return &c.iface;
+        return &invalid_cbuffer.iface;
+    }
+    fn getResourceBindingDesc(this: This, i: u32, d: ?*BindDesc) callconv(cc) HRESULT {
+        const s = of(this);
+        const out = d orelse return E_INVALIDARG;
+        if (i >= s.binds.len) return E_INVALIDARG;
+        out.* = s.binds[i];
+        return S_OK;
+    }
+    fn paramDesc(params: []const SignatureParamDesc, i: u32, d: ?*SignatureParamDesc) HRESULT {
+        const out = d orelse return E_INVALIDARG;
+        if (i >= params.len) return E_INVALIDARG;
+        out.* = params[i];
+        return S_OK;
+    }
+    fn getInputParameterDesc(this: This, i: u32, d: ?*SignatureParamDesc) callconv(cc) HRESULT {
+        return paramDesc(of(this).inputs, i, d);
+    }
+    fn getOutputParameterDesc(this: This, i: u32, d: ?*SignatureParamDesc) callconv(cc) HRESULT {
+        return paramDesc(of(this).outputs, i, d);
+    }
+    fn getPatchConstantParameterDesc(this: This, i: u32, d: ?*SignatureParamDesc) callconv(cc) HRESULT {
+        return paramDesc(of(this).patch, i, d);
+    }
+    fn getVariableByName(this: This, name: LPCSTR) callconv(cc) *anyopaque {
+        for (of(this).cbuffers) |*c| for (c.vars) |*v| if (eqlZ(name, v.desc.Name.?)) return &v.iface;
+        return &invalid_variable.iface;
+    }
+    fn getResourceBindingDescByName(this: This, name: LPCSTR, d: ?*BindDesc) callconv(cc) HRESULT {
+        const out = d orelse return E_INVALIDARG;
+        for (of(this).binds) |b| if (eqlZ(name, b.Name.?)) {
+            out.* = b;
+            return S_OK;
+        };
+        return E_INVALIDARG;
+    }
+    fn zero(_: This) callconv(cc) u32 {
+        return 0;
+    }
+    fn getGSInputPrimitive(this: This) callconv(cc) u32 {
+        return of(this).r.input_primitive;
+    }
+    /// DXC's reflection answers false.
+    fn isSampleFrequencyShader(_: This) callconv(cc) BOOL {
+        return if (windows) 0 else false;
+    }
+    fn getMinFeatureLevel(_: This, level: ?*u32) callconv(cc) HRESULT {
+        (level orelse return E_INVALIDARG).* = feature_level_12_0;
+        return S_OK;
+    }
+    fn getThreadGroupSize(this: This, x: ?*u32, y: ?*u32, z: ?*u32) callconv(cc) u32 {
+        const t = of(this).r.thread_group;
+        if (x) |p| p.* = t[0];
+        if (y) |p| p.* = t[1];
+        if (z) |p| p.* = t[2];
+        return t[0] * t[1] * t[2];
+    }
+    fn getRequiresFlags(this: This) callconv(cc) u64 {
+        return of(this).r.requires;
+    }
+    fn getLibraryDesc(this: This, d: ?*LibraryDesc) callconv(cc) HRESULT {
+        (d orelse return E_INVALIDARG).* = .{ .Creator = creator, .FunctionCount = @intCast(libraryOf(this).functions.len) };
+        return S_OK;
+    }
+    fn getFunctionByIndex(this: This, i: i32) callconv(cc) *anyopaque {
+        const s = libraryOf(this);
+        return if (i >= 0 and i < s.functions.len) &s.functions[@intCast(i)].iface else &invalid_function.iface;
+    }
+};
+
+// ---- Containers -------------------------------------------------------------
+
+/// The parts of a DXIL container, as (fourcc, bytes) slices into it.
+fn containerParts(a: std.mem.Allocator, obj: []const u8) !std.ArrayList(zdxc.dxil.container.Part) {
+    const view = zdxc.dxil.container.parse(a, obj) catch return error.InvalidArgument;
+    return view.parts;
+}
+
+const ContainerReflectionVtbl = extern struct {
+    unknown: UnknownVtbl,
+    Load: *const fn (This, ?*anyopaque) callconv(cc) HRESULT,
+    GetPartCount: *const fn (This, ?*u32) callconv(cc) HRESULT,
+    GetPartKind: *const fn (This, u32, ?*u32) callconv(cc) HRESULT,
+    GetPartContent: *const fn (This, u32, ?Out) callconv(cc) HRESULT,
+    FindFirstPartKind: *const fn (This, u32, ?*u32) callconv(cc) HRESULT,
+    GetPartReflection: *const fn (This, u32, *const GUID, ?Out) callconv(cc) HRESULT,
+};
+
+/// IDxcContainerReflection: the parts of a loaded container.
+const ContainerReflection = struct {
+    iface: Iface(ContainerReflectionVtbl) = .{ .vtbl = &vtbl },
+    rc: RefCount = .{},
+    bytes: []u8 = &.{},
+    parts: std.ArrayList(zdxc.dxil.container.Part) = .empty,
+
+    const vtbl: ContainerReflectionVtbl = .{
+        .unknown = .{ .QueryInterface = queryInterface, .AddRef = addRef, .Release = release },
+        .Load = load,
+        .GetPartCount = getPartCount,
+        .GetPartKind = getPartKind,
+        .GetPartContent = getPartContent,
+        .FindFirstPartKind = findFirstPartKind,
+        .GetPartReflection = getPartReflection,
+    };
+
+    fn of(this: This) *ContainerReflection {
+        return parent(ContainerReflection, "iface", this);
+    }
+    fn clear(c: *ContainerReflection) void {
+        c.parts.deinit(gpa);
+        c.parts = .empty;
+        gpa.free(c.bytes);
+        c.bytes = &.{};
+    }
+    fn queryInterface(this: This, iid: *const GUID, out: ?Out) callconv(cc) HRESULT {
+        if (!iid.eql(IID_IUnknown) and !iid.eql(IID_IDxcContainerReflection)) {
+            _ = put(out, null);
+            return E_NOINTERFACE;
+        }
+        _ = of(this).rc.addRef();
+        return put(out, this);
+    }
+    fn addRef(this: This) callconv(cc) ULONG {
+        return of(this).rc.addRef();
+    }
+    fn release(this: This) callconv(cc) ULONG {
+        const c = of(this);
+        const n = c.rc.release();
+        if (n == 0) {
+            c.clear();
+            gpa.destroy(c);
+        }
+        return n;
+    }
+    fn load(this: This, blob: ?*anyopaque) callconv(cc) HRESULT {
+        const c = of(this);
+        c.clear();
+        const b = blob orelse return E_INVALIDARG;
+        c.bytes = gpa.dupe(u8, blobBytes(b)) catch return E_OUTOFMEMORY;
+        c.parts = containerParts(gpa, c.bytes) catch |e| {
+            c.clear();
+            return if (e == error.OutOfMemory) E_OUTOFMEMORY else E_INVALIDARG;
+        };
+        return S_OK;
+    }
+    fn getPartCount(this: This, count: ?*u32) callconv(cc) HRESULT {
+        (count orelse return E_INVALIDARG).* = @intCast(of(this).parts.items.len);
+        return S_OK;
+    }
+    fn getPartKind(this: This, i: u32, kind: ?*u32) callconv(cc) HRESULT {
+        const c = of(this);
+        const k = kind orelse return E_INVALIDARG;
+        if (i >= c.parts.items.len) return E_INVALIDARG;
+        k.* = c.parts.items[i].fourcc;
+        return S_OK;
+    }
+    fn getPartContent(this: This, i: u32, out: ?Out) callconv(cc) HRESULT {
+        const c = of(this);
+        const o = out orelse return E_INVALIDARG;
+        o.* = null;
+        if (i >= c.parts.items.len) return E_INVALIDARG;
+        const b = Blob.copy(.binary, c.parts.items[i].data, CP_ACP) catch return E_OUTOFMEMORY;
+        o.* = b.ptr();
+        return S_OK;
+    }
+    fn findFirstPartKind(this: This, kind: u32, index: ?*u32) callconv(cc) HRESULT {
+        const c = of(this);
+        const out = index orelse return E_INVALIDARG;
+        for (c.parts.items, 0..) |p, i| if (p.fourcc == kind) {
+            out.* = @intCast(i);
+            return S_OK;
+        };
+        return code(0x80AA0013); // DXC_E_MISSING_PART
+    }
+    /// Reflection of one of our reflection blobs' parts is the blob's.
+    fn getPartReflection(this: This, _: u32, iid: *const GUID, out: ?Out) callconv(cc) HRESULT {
+        const c = of(this);
+        const o = out orelse return E_INVALIDARG;
+        o.* = null;
+        const r = ShaderReflection.create(c.bytes) catch |e| return if (e == error.OutOfMemory) E_OUTOFMEMORY else E_NOTIMPL;
+        defer _ = ShaderReflection.release(&r.shader);
+        return r.query(iid, o);
+    }
+};
+
+const ContainerBuilderVtbl = extern struct {
+    unknown: UnknownVtbl,
+    Load: *const fn (This, ?*anyopaque) callconv(cc) HRESULT,
+    AddPart: *const fn (This, u32, ?*anyopaque) callconv(cc) HRESULT,
+    RemovePart: *const fn (This, u32) callconv(cc) HRESULT,
+    SerializeContainer: *const fn (This, ?Out) callconv(cc) HRESULT,
+};
+
+/// IDxcContainerBuilder: adds and removes parts, then writes the container
+/// again (signed, as the validator signs).
+const ContainerBuilder = struct {
+    iface: Iface(ContainerBuilderVtbl) = .{ .vtbl = &vtbl },
+    rc: RefCount = .{},
+    arena: std.heap.ArenaAllocator = .init(gpa),
+    parts: std.ArrayList(zdxc.dxil.container.Part) = .empty,
+
+    const vtbl: ContainerBuilderVtbl = .{
+        .unknown = .{ .QueryInterface = queryInterface, .AddRef = addRef, .Release = release },
+        .Load = load,
+        .AddPart = addPart,
+        .RemovePart = removePart,
+        .SerializeContainer = serializeContainer,
+    };
+
+    fn of(this: This) *ContainerBuilder {
+        return parent(ContainerBuilder, "iface", this);
+    }
+    fn queryInterface(this: This, iid: *const GUID, out: ?Out) callconv(cc) HRESULT {
+        if (!iid.eql(IID_IUnknown) and !iid.eql(IID_IDxcContainerBuilder)) {
+            _ = put(out, null);
+            return E_NOINTERFACE;
+        }
+        _ = of(this).rc.addRef();
+        return put(out, this);
+    }
+    fn addRef(this: This) callconv(cc) ULONG {
+        return of(this).rc.addRef();
+    }
+    fn release(this: This) callconv(cc) ULONG {
+        const c = of(this);
+        const n = c.rc.release();
+        if (n == 0) {
+            c.arena.deinit();
+            gpa.destroy(c);
+        }
+        return n;
+    }
+    fn load(this: This, blob: ?*anyopaque) callconv(cc) HRESULT {
+        const c = of(this);
+        const a = c.arena.allocator();
+        const b = blob orelse return E_INVALIDARG;
+        const bytes = a.dupe(u8, blobBytes(b)) catch return E_OUTOFMEMORY;
+        c.parts = containerParts(a, bytes) catch |e| return if (e == error.OutOfMemory) E_OUTOFMEMORY else E_INVALIDARG;
+        return S_OK;
+    }
+    fn addPart(this: This, fourcc: u32, blob: ?*anyopaque) callconv(cc) HRESULT {
+        const c = of(this);
+        const a = c.arena.allocator();
+        const b = blob orelse return E_INVALIDARG;
+        for (c.parts.items) |p| if (p.fourcc == fourcc) return code(0x80AA0014); // DXC_E_DUPLICATE_PART
+        const data = a.dupe(u8, blobBytes(b)) catch return E_OUTOFMEMORY;
+        c.parts.append(a, .{ .fourcc = fourcc, .data = data }) catch return E_OUTOFMEMORY;
+        return S_OK;
+    }
+    /// Removing a part the container does not have succeeds: zdxc's
+    /// objects carry no STAT part, which clients strip as a matter of
+    /// course.
+    fn removePart(this: This, fourcc: u32) callconv(cc) HRESULT {
+        const c = of(this);
+        var i: usize = 0;
+        while (i < c.parts.items.len) {
+            if (c.parts.items[i].fourcc == fourcc) _ = c.parts.orderedRemove(i) else i += 1;
+        }
+        return S_OK;
+    }
+    fn serializeContainer(this: This, out: ?Out) callconv(cc) HRESULT {
+        const c = of(this);
+        const o = out orelse return E_POINTER;
+        o.* = null;
+        const bytes = zdxc.dxil.container.assemble(gpa, c.parts.items) catch return E_OUTOFMEMORY;
+        defer gpa.free(bytes);
+        const r = gpa.create(Result) catch return E_OUTOFMEMORY;
+        r.* = .{ .status = S_OK, .primary = .object };
+        addOutput(r, .object, Blob.copy(.binary, bytes, CP_ACP) catch {
+            r.destroy();
+            return E_OUTOFMEMORY;
+        }, null) catch {
+            r.destroy();
+            return E_OUTOFMEMORY;
+        };
+        o.* = &r.iface;
+        return S_OK;
     }
 };
 
@@ -1073,6 +2030,18 @@ fn createInstance(clsid: ?*const GUID, iid: ?*const GUID, out: ?Out) HRESULT {
         u.* = .{};
         defer _ = Utils.release(&u.iface);
         return Utils.queryInterface(&u.iface, want, o);
+    }
+    if (class.eql(CLSID_DxcContainerReflection)) {
+        const c = gpa.create(ContainerReflection) catch return E_OUTOFMEMORY;
+        c.* = .{};
+        defer _ = ContainerReflection.release(&c.iface);
+        return ContainerReflection.queryInterface(&c.iface, want, o);
+    }
+    if (class.eql(CLSID_DxcContainerBuilder)) {
+        const c = gpa.create(ContainerBuilder) catch return E_OUTOFMEMORY;
+        c.* = .{};
+        defer _ = ContainerBuilder.release(&c.iface);
+        return ContainerBuilder.queryInterface(&c.iface, want, o);
     }
     return REGDB_E_CLASSNOTREG;
 }
