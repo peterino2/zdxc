@@ -565,6 +565,7 @@ const Lowerer = struct {
                 const merge = try l.b.newBlock();
                 const else_b = if (x.@"else" != null) try l.b.newBlock() else merge;
                 l.b.f.block(l.b.cur).merge = .{ .selection = merge };
+                l.b.f.block(l.b.cur).selection_control = selectionControl(st.attrs);
                 l.b.terminate(.{ .cond_br = .{ .cond = cond, .then = then_b, .@"else" = else_b } });
                 l.b.setBlock(then_b);
                 try l.stmt(x.then);
@@ -597,7 +598,7 @@ const Lowerer = struct {
                 l.b.terminate(.{ .br = target.cont });
             },
             .discard => l.b.terminate(.discard),
-            .@"switch" => |x| try l.switchStmt(x),
+            .@"switch" => |x| try l.switchStmt(x, st.attrs),
             .case, .default => {
                 l.unsupported(st.loc, "case labels outside a switch body", .{});
                 return error.Unsupported;
@@ -607,7 +608,16 @@ const Lowerer = struct {
 
     /// `switch`: the header branches to one block per label (labels in a
     /// row get their own, falling through); `break` goes to the merge.
-    fn switchStmt(l: *Lowerer, x: @FieldType(ast.Stmt.Kind, "switch")) Error!void {
+    /// `[flatten]` / `[branch]` on an `if` or `switch`.
+    fn selectionControl(attrs: []const ast.Attribute) ir.SelectionControl {
+        for (attrs) |a| {
+            if (std.ascii.eqlIgnoreCase(a.name, "flatten")) return .flatten;
+            if (std.ascii.eqlIgnoreCase(a.name, "branch")) return .dont_flatten;
+        }
+        return .none;
+    }
+
+    fn switchStmt(l: *Lowerer, x: @FieldType(ast.Stmt.Kind, "switch"), attrs: []const ast.Attribute) Error!void {
         if (x.cond_decl) |d| try l.localDecl(d);
         const t = l.types();
         var cond_ty = x.cond.ty;
@@ -648,6 +658,7 @@ const Lowerer = struct {
             if (sg.value) |v| try cases.append(l.arena, .{ .value = v, .block = sg.block }) else default = sg.block;
         }
         l.b.f.block(header).merge = .{ .selection = merge };
+        l.b.f.block(header).selection_control = selectionControl(attrs);
         l.b.terminate(.{ .@"switch" = .{ .value = cond, .default = default, .cases = cases.items } });
         const cont: BlockId = if (l.loops.items.len > 0) l.loops.getLast().cont else .none;
         try l.loops.append(l.arena, .{ .brk = merge, .cont = cont });

@@ -187,6 +187,8 @@ const Options = struct {
     dump_ast: bool = false,
     sema: bool = false,
     dump_ir: bool = false,
+    /// -zdxc-no-opt: no SPIR-V IR optimizations.
+    no_opt: bool = false,
     /// -O0..-O3 / -Od (default -O3, as in dxc).
     opt_level: enum { od, o0, o1, o2, o3 } = .o3,
     /// Accepted options with no effect yet, reported once each.
@@ -219,6 +221,7 @@ fn parseArgs(ctx: *Ctx, arena: std.mem.Allocator, args: []const []const u8) !?Op
                 },
                 .zdxc_sema => opts.sema = true,
                 .zdxc_ir => opts.dump_ir = true,
+                .zdxc_no_opt => opts.no_opt = true,
                 .job => opts.job = a.value(),
                 .fcolor_diagnostics => opts.color = true,
                 .fno_color_diagnostics => opts.color = false,
@@ -493,10 +496,6 @@ fn run(ctx: *Ctx, arena: std.mem.Allocator) !void {
         if (profile == null) return ctx.fail("missing -T <profile>", .{});
         if (module) |*m| {
             try zdxc.ir.opt.run(arena, m);
-            if (opts.dump_ir) {
-                try zdxc.ir.ir.dump(m, ctx.stdout);
-                return;
-            }
             if (opts.spirv) {
                 zdxc.ir.split_resources.run(arena, m, &diags) catch |err| switch (err) {
                     error.Unsupported => {
@@ -505,6 +504,18 @@ fn run(ctx: *Ctx, arena: std.mem.Allocator) !void {
                     },
                     else => |x| return x,
                 };
+                // Legalization and cleanup dxc's SPIR-V gets from its
+                // optimizer (skipped for -Od).
+                if (!opts.no_opt and opts.opt_level != .od) {
+                    try zdxc.ir.inline_calls.run(m);
+                    try zdxc.ir.ssa.run(m);
+                }
+            }
+            if (opts.dump_ir) {
+                try zdxc.ir.ir.dump(m, ctx.stdout);
+                return;
+            }
+            if (opts.spirv) {
                 const bytes = zdxc.spirv.emit.emit(arena, m, &diags, zdxc.spirv.emit.TargetEnv.parse(opts.target_env) orelse return ctx.fail("unknown SPIR-V target environment '{s}'", .{opts.target_env})) catch |err| switch (err) {
                     error.Unsupported => {
                         try diags.render(&sm, ctx.stderr, .{ .format = opts.diag_format, .color = false });
@@ -520,7 +531,7 @@ fn run(ctx: *Ctx, arena: std.mem.Allocator) !void {
             if (opts.rootsig_define) |macro| if (m.entries.items.len == 1) {
                 m.entries.items[0].root_signature = try rootSignatureMacroText(ctx, arena, opts, input, macro) orelse return error.CompileFailed;
             };
-            const bytes = zdxc.dxil.emit.emit(arena, m, profile.?, &diags) catch |err| switch (err) {
+            const bytes = zdxc.dxil.emit.emit(arena, m, profile.?, &diags, !opts.no_opt and opts.opt_level != .od) catch |err| switch (err) {
                 error.Unsupported => {
                     try diags.render(&sm, ctx.stderr, .{ .format = opts.diag_format, .color = false });
                     return error.CompileFailed;

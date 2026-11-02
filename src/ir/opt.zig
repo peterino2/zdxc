@@ -181,7 +181,7 @@ fn mapRefs(a: Allocator, xs: []const Ref, ctx: anytype) Allocator.Error![]const 
 /// `op` with every operand passed through `ctx.map`.
 pub fn mapOp(a: Allocator, op: Op, ctx: anytype) Allocator.Error!Op {
     return switch (op) {
-        .constant, .param, .global, .local_var, .input, .input_vertex, .emit, .cut, .patch_input, .output_vertex, .mesh_output, .mesh_payload, .ray_incoming, .spec_constant => op,
+        .constant, .param, .global, .local_var, .input, .input_vertex, .emit, .cut, .patch_input, .output_vertex, .mesh_output, .mesh_payload, .ray_incoming, .spec_constant, .undef => op,
         .load => |p| .{ .load = ctx.map(p) },
         .store => |x| .{ .store = .{ .ptr = ctx.map(x.ptr), .value = ctx.map(x.value) } },
         .access => |x| .{ .access = .{ .base = ctx.map(x.base), .indices = try mapRefs(a, x.indices, ctx) } },
@@ -221,6 +221,68 @@ pub fn mapOp(a: Allocator, op: Op, ctx: anytype) Allocator.Error!Op {
             break :blk .{ .phi = out };
         },
     };
+}
+
+/// Calls `ctx.use(r)` for every operand of `op` (none skipped), without
+/// allocating.
+pub fn eachOperand(op: Op, ctx: anytype) void {
+    switch (op) {
+        .constant, .param, .global, .local_var, .input, .input_vertex, .emit, .cut, .patch_input, .output_vertex, .mesh_output, .mesh_payload, .ray_incoming, .spec_constant, .undef => {},
+        .load => |p| ctx.use(p),
+        .store => |x| {
+            ctx.use(x.ptr);
+            ctx.use(x.value);
+        },
+        .access => |x| {
+            ctx.use(x.base);
+            for (x.indices) |r| ctx.use(r);
+        },
+        .binary => |x| {
+            ctx.use(x.lhs);
+            ctx.use(x.rhs);
+        },
+        .unary => |x| ctx.use(x.operand),
+        .cmp => |x| {
+            ctx.use(x.lhs);
+            ctx.use(x.rhs);
+        },
+        .convert, .bitcast, .splat => |x| ctx.use(x),
+        .extract => |x| ctx.use(x.agg),
+        .insert => |x| {
+            ctx.use(x.agg);
+            ctx.use(x.value);
+        },
+        .construct => |xs| for (xs) |r| ctx.use(r),
+        .shuffle => |x| ctx.use(x.vec),
+        .select => |x| {
+            ctx.use(x.cond);
+            ctx.use(x.t);
+            ctx.use(x.f);
+        },
+        .call => |x| for (x.args) |r| ctx.use(r),
+        .intrinsic => |x| for (x.args) |r| ctx.use(r),
+        .res_load => |x| {
+            ctx.use(x.res);
+            ctx.use(x.index);
+        },
+        .res_store => |x| {
+            ctx.use(x.res);
+            ctx.use(x.index);
+            ctx.use(x.value);
+        },
+        .method => |x| {
+            ctx.use(x.res);
+            for (x.args) |r| ctx.use(r);
+        },
+        .output => |x| ctx.use(x.value),
+        .heap_resource => |h| ctx.use(h.index),
+        .spirv_inst => |x| for (x.operands) |o| switch (o) {
+            .value => |v| ctx.use(v),
+            .literal, .type => {},
+        },
+        .patch_output => |x| ctx.use(x.value),
+        .phi => |ps| for (ps) |pp| ctx.use(pp.value),
+    }
 }
 
 /// Calls `ctx.use(r)` for every operand of `op` and of terminator `term`.
@@ -672,7 +734,7 @@ fn unrollOne(a: Allocator, t: *TypeTable, f: *ir.Function, h: u32, set: []const 
                 .selection => |b| .{ .selection = mapBlock(&bmap, b) },
                 .loop => |l| .{ .loop = .{ .merge = mapBlock(&bmap, l.merge), .@"continue" = mapBlock(&bmap, l.@"continue"), .unroll = l.unroll } },
             };
-            f.blocks.items[nb] = .{ .insts = insts, .term = term, .merge = mg };
+            f.blocks.items[nb] = .{ .insts = insts, .term = term, .merge = mg, .selection_control = src.selection_control };
         }
         entries[iter] = bmap.get(body).?;
         conts[iter] = bmap.get(cont).?;

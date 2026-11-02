@@ -1,8 +1,9 @@
 //! IR -> DXIL. Everything is inlined into the entry function while
 //! emitting (each call instantiates its callee); values are scalarized
-//! (DXIL has no vectors); locals become flattened `[N x scalar]` allocas;
-//! resources become handles created on entry. The result is a signed DXIL
-//! container.
+//! (DXIL has no vectors); locals become flattened `[N x scalar]` allocas,
+//! which promote.zig turns into SSA values where they are not indexed
+//! dynamically; resources become handles created on entry. The result is a
+//! signed DXIL container.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -21,6 +22,8 @@ const rdat = @import("rdat.zig");
 const linalg_info = @import("linalg_info.zig");
 const libinfo = @import("libinfo.zig");
 const rootsig = @import("rootsig.zig");
+const promote = @import("promote.zig");
+const opt = @import("../ir/opt.zig");
 
 const TypeId = types.TypeId;
 const TypeTable = types.TypeTable;
@@ -31,10 +34,13 @@ const Value = module.Value;
 
 pub const Error = Allocator.Error || error{Unsupported};
 
-pub fn emit(gpa: Allocator, m: *const ir.Module, profile: shader.Profile, diags: *diag.Diagnostics) Error![]u8 {
+/// `optimize` (off for -Od and -zdxc-no-opt) promotes locals to SSA values,
+/// passes arrays to callees that only read them in place and reuses
+/// inlined callees' arrays.
+pub fn emit(gpa: Allocator, m: *const ir.Module, profile: shader.Profile, diags: *diag.Diagnostics, optimize: bool) Error![]u8 {
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
-    var e: Emitter = .{ .arena = arena_state.allocator(), .dm = .init(gpa), .m = m, .t = m.types, .profile = profile, .diags = diags };
+    var e: Emitter = .{ .arena = arena_state.allocator(), .dm = .init(gpa), .m = m, .t = m.types, .profile = profile, .diags = diags, .optimize = optimize };
     defer e.dm.deinit();
     // Native 16-bit types are laid out at their own size.
     if (m.native_16bit) e.dm.datalayout = "e-m:e-p:32:32-i1:32-i8:8-i16:16-i32:32-i64:64-f16:16-f32:32-f64:64-n8:16:32:64";
@@ -102,6 +108,9 @@ const Ptr = struct {
     scalar_ty: DType,
     offset_const: u32 = 0,
     offset_dyn: ?Value = null,
+    /// The components `offset_dyn` can reach: the extent of the array (or
+    /// vector or matrix) it indexes. Null when not known.
+    dyn_range: ?[2]u32 = null,
     /// bools are stored as i32.
     bool_storage: bool = false,
     /// Mixed 32-bit component types share i32 storage (floats bitcast).
@@ -149,6 +158,16 @@ const Frame = struct {
     rets: std.ArrayList(struct { block: u32, vals: []const Value }) = .empty,
     /// The resources a function returns (every return the same ones).
     ret_res: ?[]const Lowered = null,
+    /// Loads of locals and constant buffers: the place (a `.ptr` or
+    /// `.cbuf`), and the block and write count when read, so a call right
+    /// after can pass the place itself.
+    load_srcs: std.AutoHashMapUnmanaged(u32, struct { src: Lowered, block: u32, writes: u32 }) = .empty,
+    /// By-value parameters passed as the caller's place (see paramCopies).
+    param_srcs: []const ?Lowered = &.{},
+    /// paramCopies of the function, when some parameter is aliased.
+    param_copies: []const u32 = &.{},
+    /// Array locals of an inlined callee, back to the pool on return.
+    arrays: std.ArrayList(struct { ty: TypeId, ptr: Ptr }) = .empty,
 };
 
 const PInst = struct { inst: module.Inst, id: u32 };
@@ -214,6 +233,18 @@ const Emitter = struct {
     /// validator wants CheckAccessFullyMapped's operand to be one.
     status_vals: std.AutoHashMapUnmanaged(Value, void) = .empty,
     forwarded: std.AutoHashMapUnmanaged(struct { Value, u32 }, struct { v: Value, block: u32 }) = .empty,
+    /// Dynamically indexed getelementptrs into locals (by id) and the
+    /// components they can reach, for promote.run.
+    dyn_ranges: std.AutoHashMapUnmanaged(u32, [2]u32) = .empty,
+    /// See `emit`.
+    optimize: bool = true,
+    /// Arrays of inlined callees that have returned, by type, for later
+    /// callees' locals of that type (per function).
+    array_pool: std.AutoHashMapUnmanaged(TypeId, std.ArrayList(Ptr)) = .empty,
+    /// Instructions emitted so far that may write memory.
+    writes: u32 = 0,
+    /// paramCopies per IR function.
+    param_copies: std.AutoHashMapUnmanaged(u32, []const u32) = .empty,
     uses_barycentrics: bool = false,
     uses_sampler_heap: bool = false,
 
@@ -262,6 +293,13 @@ const Emitter = struct {
     fn add(e: *Emitter, ty: DType, op: @FieldType(module.Inst, "op")) Error!Value {
         const id = e.next_id;
         e.next_id += 1;
+        switch (op) {
+            .store, .atomicrmw, .cmpxchg => e.writes += 1,
+            .call => |c| if (!std.mem.startsWith(u8, e.dm.functions.items[c.callee].name, "dx.op.")) {
+                e.writes += 1;
+            },
+            else => {},
+        }
         try e.blocks.items[e.cur].append(e.arena, .{ .inst = .{ .ty = ty, .op = op }, .id = id });
         return .{ .inst = id };
     }
@@ -634,6 +672,9 @@ const Emitter = struct {
                 return x.func < y.func;
             }
         }.lt);
+        if (try promote.pruneDeclarations(e.arena, &e.dm)) |index| for (funcs.items) |*lf| {
+            lf.func = index[lf.func];
+        };
         const bitcode = try e.writeLibraryModule(funcs.items);
         defer gpa.free(bitcode);
         return e.assembleLibrary(gpa, funcs.items, bitcode);
@@ -1221,6 +1262,12 @@ const Emitter = struct {
         const all = [_][]const PInst{e.prologue.items};
         for (all) |items| for (items) |pi| try f.insts.append(e.dm.allocator(), try remapInst(e.arena, map, pi.inst, remap));
         for (e.blocks.items) |blk| for (blk.items) |pi| try f.insts.append(e.dm.allocator(), try remapInst(e.arena, map, pi.inst, remap));
+        var ranges: std.AutoHashMapUnmanaged(u32, [2]u32) = .empty;
+        var it = e.dyn_ranges.iterator();
+        while (it.next()) |kv| try ranges.put(e.arena, map[kv.key_ptr.*], kv.value_ptr.*);
+        e.dyn_ranges.clearRetainingCapacity();
+        e.array_pool.clearRetainingCapacity();
+        if (e.optimize) try promote.run(e.arena, &e.dm, func, &ranges);
     }
 
     /// Drops removable prologue instructions nothing uses (repeatedly: a
@@ -1332,12 +1379,24 @@ const Emitter = struct {
     /// Emits function `fi` inline at the current block with `args`; returns
     /// its result components and leaves the current block after the call.
     fn inlineCall(e: *Emitter, fi: u32, args: []const Lowered) Error![]const Value {
+        return e.inlineCallAliased(fi, args, &.{});
+    }
+
+    /// `aliases[k]`, when set, is the caller's place holding by-value
+    /// argument `k`, which the callee may read in place of a copy (see
+    /// argAliases).
+    fn inlineCallAliased(e: *Emitter, fi: u32, args: []const Lowered, aliases: []const ?Lowered) Error![]const Value {
         const f = e.m.functions.items[fi];
         var frame: Frame = .{
             .f = f,
             .vals = try e.arena.alloc(Lowered, f.insts.items.len),
             .params = args,
             .blocks = try e.arena.alloc(?u32, f.blocks.items.len),
+        };
+        for (aliases) |al| if (al != null) {
+            frame.param_srcs = aliases;
+            frame.param_copies = try e.paramCopies(fi);
+            break;
         };
         @memset(frame.vals, .none);
         @memset(frame.blocks, null);
@@ -1352,6 +1411,14 @@ const Emitter = struct {
             try e.emitBlock(&frame, @intCast(bi));
         }
         e.last_ret_res = frame.ret_res;
+        // The callee's arrays are dead now: later callees can have them
+        // (with no values forwarded from what they held).
+        if (frame.arrays.items.len > 0) e.forwarded.clearRetainingCapacity();
+        for (frame.arrays.items) |x| {
+            const gop = try e.array_pool.getOrPut(e.arena, x.ty);
+            if (!gop.found_existing) gop.value_ptr.* = .empty;
+            try gop.value_ptr.append(e.arena, x.ptr);
+        }
         if (frame.cont) |cont| {
             e.cur = cont;
             if (f.ret == TypeTable.void_type or frame.rets.items.len == 0) return &.{};
@@ -1366,6 +1433,101 @@ const Emitter = struct {
             return out;
         }
         return &.{};
+    }
+
+    /// Places the by-value array and struct arguments of a call to `fi` can
+    /// be read from: a constant buffer they were loaded from (none with
+    /// matrices, whose constant buffer access is narrower than a local's),
+    /// or a local loaded in the same block with no write since. Calls with
+    /// out / inout arguments get no locals (the callee could write one
+    /// through them while reading it through another).
+    fn argAliases(e: *Emitter, frame: *const Frame, fi: u32, refs: []const Ref) Error![]const ?Lowered {
+        const params = e.m.functions.items[fi].params;
+        var by_ref = false;
+        for (params) |p| by_ref = by_ref or p.by_ref;
+        const out = try e.arena.alloc(?Lowered, refs.len);
+        for (refs, params, out) |r, p, *o| {
+            o.* = null;
+            if (p.by_ref) continue;
+            switch (e.t.get(p.ty)) {
+                .array, .@"struct" => if (e.holdsResources(p.ty)) continue,
+                else => continue,
+            }
+            const src = frame.load_srcs.get(r.index()) orelse continue;
+            switch (src.src) {
+                .cbuf => if (!e.containsMatrix(p.ty)) {
+                    o.* = src.src;
+                },
+                else => if (!by_ref and src.block == e.cur and src.writes == e.writes) {
+                    o.* = src.src;
+                },
+            }
+        }
+        return out;
+    }
+
+    /// For each instruction of IR function `fi`: the parameter a
+    /// `local_var` only ever holds a copy of (stored once, from that
+    /// by-value parameter, and otherwise only read), else maxInt.
+    fn paramCopies(e: *Emitter, fi: u32) Error![]const u32 {
+        const gop = try e.param_copies.getOrPut(e.arena, fi);
+        if (gop.found_existing) return gop.value_ptr.*;
+        const none = std.math.maxInt(u32);
+        const f = e.m.functions.items[fi];
+        const n = f.insts.items.len;
+        // The local each pointer is into.
+        const root = try e.arena.alloc(u32, n);
+        @memset(root, none);
+        var changed = true;
+        while (changed) {
+            changed = false;
+            for (f.insts.items, 0..) |inst, k| {
+                const want: u32 = switch (inst.op) {
+                    .local_var => @intCast(k),
+                    .access => |x| root[x.base.index()],
+                    else => none,
+                };
+                if (want != root[k]) {
+                    root[k] = want;
+                    changed = true;
+                }
+            }
+        }
+        const out = try e.arena.alloc(u32, n);
+        @memset(out, none);
+        const ok = try e.arena.alloc(bool, n);
+        @memset(ok, true);
+        const Use = struct {
+            root: []const u32,
+            ok: []bool,
+            pub fn map(s: @This(), x: Ref) Ref {
+                if (x != .none and s.root[x.index()] != none) s.ok[s.root[x.index()]] = false;
+                return x;
+            }
+        };
+        for (f.insts.items) |inst| switch (inst.op) {
+            .local_var => {},
+            .load => {},
+            .access => |x| for (x.indices) |ix| {
+                _ = (Use{ .root = root, .ok = ok }).map(ix);
+            },
+            .store => |x| {
+                _ = (Use{ .root = root, .ok = ok }).map(x.value);
+                const l = root[x.ptr.index()];
+                if (l == none) continue;
+                const v = f.inst(x.value).op;
+                if (x.ptr.index() == l and v == .param and !f.params[v.param].by_ref and out[l] == none) {
+                    out[l] = v.param;
+                } else ok[l] = false;
+            },
+            else => _ = try opt.mapOp(e.arena, inst.op, Use{ .root = root, .ok = ok }),
+        };
+        // Terminators returning pointers do not occur.
+        for (out, ok) |*o, good| if (!good) {
+            o.* = none;
+        };
+        gop.value_ptr.* = out;
+        return out;
     }
 
     /// A call of `[noinline]` function `fi` (module function `func`), as
@@ -1614,6 +1776,12 @@ const Emitter = struct {
                 return .{ .handle = ri };
             },
             .local_var => {
+                // (First: the store of the parameter is skipped whenever
+                // there is an alias.)
+                if (frame.param_copies.len > 0) {
+                    const k = frame.param_copies[r.index()];
+                    if (k != std.math.maxInt(u32)) if (frame.param_srcs[k]) |alias| return alias;
+                }
                 if (e.payload_local) |pl| if (pl.func == f and pl.inst == r.index()) {
                     const dty = try e.memoryType(i.ty);
                     const base = try e.addPrologue(try e.dm.ptrType(dty), .{ .alloca = .{ .elem = dty, .size = try e.i32Const(1) } });
@@ -1639,6 +1807,12 @@ const Emitter = struct {
                     const dty = try e.memoryType(i.ty);
                     const base = try e.addPrologue(try e.dm.ptrType(dty), .{ .alloca = .{ .elem = dty, .size = try e.i32Const(1) } });
                     return .{ .typed = .{ .base = base, .dty = dty, .addr_space = 0, .ty = i.ty } };
+                }
+                if (e.optimize and frame.cont != null and e.t.get(i.ty) == .array) {
+                    const pooled = if (e.array_pool.getPtr(i.ty)) |l| l.pop() else null;
+                    const ptr = pooled orelse try e.alloca(i.ty);
+                    try frame.arrays.append(e.arena, .{ .ty = i.ty, .ptr = ptr });
+                    return .{ .ptr = ptr };
                 }
                 return .{ .ptr = try e.alloca(i.ty) };
             },
@@ -1670,6 +1844,7 @@ const Emitter = struct {
                     return .{ .scalars = try e.textureLoad(res, mip, tx.coords, null, i.ty) };
                 },
                 .cbuf => |c| {
+                    if (c.dyn_comp == null) try frame.load_srcs.put(e.arena, r.index(), .{ .src = .{ .cbuf = c }, .block = e.cur, .writes = e.writes });
                     const dc = c.dyn_comp orelse return e.cbufferLoad(c.res, c.offset, c.dyn_regs, c.row_major, i.ty);
                     const whole = (try e.cbufferLoad(c.res, c.offset, c.dyn_regs, c.row_major, c.vec)).scalars;
                     return .{ .scalars = try e.arena.dupe(Value, &.{try e.pickComponent(whole, dc, i.ty)}) };
@@ -1699,12 +1874,19 @@ const Emitter = struct {
                     }
                     return .{ .scalars = out };
                 },
-                .ptr => |ptr| return e.loadPtr(ptr, i.ty),
+                .ptr => |ptr| {
+                    if (ptr.addr_space == 0 and localRoot(f, p)) try frame.load_srcs.put(e.arena, r.index(), .{ .src = .{ .ptr = ptr }, .block = e.cur, .writes = e.writes });
+                    return e.loadPtr(ptr, i.ty);
+                },
                 .typed => |tp| return e.typedLoad(tp, i.ty),
                 .mesh => return e.unsupported("reading mesh shader outputs is not supported", .{}),
                 else => return e.unsupported("internal: load from a non-pointer", .{}),
             },
             .store => |s| {
+                if (frame.param_copies.len > 0) if (f.inst(s.value).op == .param) {
+                    const k = f.inst(s.value).op.param;
+                    if (frame.param_copies[s.ptr.index()] == k and frame.param_srcs[k] != null) return .none;
+                };
                 if (frame.vals[s.ptr.index()] == .rq_local) {
                     // A copy of a query is the same query.
                     const v = frame.vals[s.value.index()];
@@ -1830,6 +2012,7 @@ const Emitter = struct {
                             } else {
                                 const idx = (try e.scalars(frame, x))[0];
                                 const scaled = if (s == 1) idx else try e.add(try e.dm.intType(32), .{ .binop = .{ .op = .mul, .lhs = idx, .rhs = try e.i32Const(s) } });
+                                if (ptr.offset_dyn == null) ptr.dyn_range = .{ ptr.offset_const, ptr.offset_const + try e.flatCount(cur) };
                                 ptr.offset_dyn = if (ptr.offset_dyn) |d| try e.add(try e.dm.intType(32), .{ .binop = .{ .op = .add, .lhs = d, .rhs = scaled } }) else scaled;
                             }
                             cur = elem;
@@ -1964,7 +2147,7 @@ const Emitter = struct {
                 if (e.lib_calls.get(c.func)) |func| return e.libCall(frame, c.func, func, c.args);
                 const args = try e.arena.alloc(Lowered, c.args.len);
                 for (c.args, args) |a, *o| o.* = frame.vals[a.index()];
-                const res = try e.inlineCall(c.func, args);
+                const res = try e.inlineCallAliased(c.func, args, if (e.optimize) try e.argAliases(frame, c.func, c.args) else &.{});
                 // Functions returning resources (or structs of them).
                 if (isResourceType(e.t, i.ty) and !isRayQuery(e.t, i.ty)) {
                     const rr = e.last_ret_res orelse return e.unsupported("a function returning a resource with no return value", .{});
@@ -1999,6 +2182,7 @@ const Emitter = struct {
             },
             .output_vertex => |x| return e.outputControlPoint(x.element, i.ty, x.vertex),
             .phi => return e.unsupported("phi", .{}),
+            .undef => return e.unsupported("undef", .{}),
         }
     }
 
@@ -2093,6 +2277,7 @@ const Emitter = struct {
             const konst: ?u32 = if (xi.op == .constant) @intCast(xi.op.constant.int) else null;
             var data_off: u32 = 0;
             var data_dyn: ?Value = null;
+            var data_extent: u32 = 0;
             switch (e.t.get(cur)) {
                 .@"struct" => |st| {
                     const k = konst.?;
@@ -2113,6 +2298,7 @@ const Emitter = struct {
                         const idx = (try e.scalars(frame, x))[0];
                         const n = try e.flatCount(arr.elem);
                         data_dyn = if (n == 1) idx else try e.add(try e.dm.intType(32), .{ .binop = .{ .op = .mul, .lhs = idx, .rhs = try e.i32Const(n) } });
+                        data_extent = try e.flatCount(cur);
                     }
                     cur = arr.elem;
                 },
@@ -2121,7 +2307,10 @@ const Emitter = struct {
             if (data) |*d| switch (d.*) {
                 .ptr => |*ptr| {
                     ptr.offset_const += data_off;
-                    if (data_dyn) |dd| ptr.offset_dyn = if (ptr.offset_dyn) |old| try e.add(try e.dm.intType(32), .{ .binop = .{ .op = .add, .lhs = old, .rhs = dd } }) else dd;
+                    if (data_dyn) |dd| {
+                        if (ptr.offset_dyn == null) ptr.dyn_range = .{ ptr.offset_const, ptr.offset_const + data_extent };
+                        ptr.offset_dyn = if (ptr.offset_dyn) |old| try e.add(try e.dm.intType(32), .{ .binop = .{ .op = .add, .lhs = old, .rhs = dd } }) else dd;
+                    }
                 },
                 .typed => try path.append(e.arena, (try e.scalars(frame, x))[0]),
                 else => {},
@@ -2299,7 +2488,9 @@ const Emitter = struct {
         var idx = try e.i32Const(ptr.offset_const + c);
         if (ptr.offset_dyn) |d| idx = try e.add(try e.dm.intType(32), .{ .binop = .{ .op = .add, .lhs = d, .rhs = idx } });
         const pt = try e.dm.getType(.{ .pointer = .{ .elem = ptr.scalar_ty, .addr_space = ptr.addr_space } });
-        return e.add(pt, .{ .gep = .{ .elem = ptr.array_ty, .ptr = ptr.base, .indices = try e.arena.dupe(Value, &.{ try e.i32Const(0), idx }) } });
+        const gep = try e.add(pt, .{ .gep = .{ .elem = ptr.array_ty, .ptr = ptr.base, .indices = try e.arena.dupe(Value, &.{ try e.i32Const(0), idx }) } });
+        if (ptr.offset_dyn != null) if (ptr.dyn_range) |r| try e.dyn_ranges.put(e.arena, gep.inst, r);
+        return gep;
     }
 
     fn convertScalar(e: *Emitter, v: Value, from: Scalar, to: Scalar) Error!Value {
@@ -4587,6 +4778,17 @@ const Emitter = struct {
         return dty;
     }
 
+    fn containsMatrix(e: *Emitter, ty: TypeId) bool {
+        return switch (e.t.get(ty)) {
+            .matrix => true,
+            .array => |a| e.containsMatrix(a.elem),
+            .@"struct" => |st| for (st.fields.items) |fld| {
+                if (e.containsMatrix(fld.type)) break true;
+            } else false,
+            else => false,
+        };
+    }
+
     fn containsLinAlg(e: *Emitter, ty: TypeId) bool {
         return switch (e.t.get(ty)) {
             .linalg => true,
@@ -5500,6 +5702,7 @@ const Emitter = struct {
         try dm.addNamedMetadata("dx.shaderModel", &.{sm});
         if (resources) |r| try dm.addNamedMetadata("dx.resources", &.{r});
         try dm.addNamedMetadata("dx.entryPoints", &.{entry_md});
+        _ = try promote.pruneDeclarations(e.arena, dm);
         return dm.writeBitcode(dm.arena.child_allocator);
     }
 
@@ -5698,4 +5901,12 @@ fn reachableBlocks(a: Allocator, f: *const ir.Function) Allocator.Error![]bool {
         }
     }
     return seen;
+}
+
+/// Whether pointer `p` is into a function's own local (not a global or a
+/// parameter's storage).
+fn localRoot(f: *const ir.Function, p: Ref) bool {
+    var x = p;
+    while (f.inst(x).op == .access) x = f.inst(x).op.access.base;
+    return f.inst(x).op == .local_var;
 }

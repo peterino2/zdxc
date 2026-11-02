@@ -141,6 +141,9 @@ pub const Op = union(enum) {
     emit: u32,
     cut: u32,
     phi: []const struct { value: Ref, block: BlockId },
+    /// An undefined value of the result type (a read before any write,
+    /// after promotion to SSA values).
+    undef,
 };
 
 pub const Inst = struct {
@@ -177,7 +180,11 @@ pub const Block = struct {
     insts: std.ArrayList(Ref) = .empty,
     term: Terminator = .none,
     merge: Merge = .none,
+    /// `[flatten]` / `[branch]` on the selection this block heads.
+    selection_control: SelectionControl = .none,
 };
+
+pub const SelectionControl = enum { none, flatten, dont_flatten };
 
 pub const Param = struct {
     name: []const u8,
@@ -208,6 +215,8 @@ pub const Function = struct {
     /// `[noinline]` (plain functions, not methods or template instances):
     /// libraries keep it a function of its own.
     no_inline: bool = false,
+    /// Nothing calls it any more (inlined everywhere): not emitted.
+    dead: bool = false,
     insts: std.ArrayList(Inst) = .empty,
     blocks: std.ArrayList(Block) = .empty,
 
@@ -703,6 +712,7 @@ fn dumpInst(m: *const Module, f: *const Function, r: Ref, w: *std.Io.Writer) !vo
         },
         .input => |i| try w.print("input {d}", .{i}),
         .output => |o| try w.print("output {d}, %{d}", .{ o.element, o.value.index() }),
+        .undef => try w.writeAll("undef"),
         .phi => |ins| {
             try w.writeAll("phi");
             for (ins, 0..) |in, i| try w.print("{s} [%{d}, b{d}]", .{ if (i > 0) "," else "", in.value.index(), in.block.index() });
