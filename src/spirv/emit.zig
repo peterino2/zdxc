@@ -2189,7 +2189,14 @@ const Emitter = struct {
             switch (blk.merge) {
                 .none => {},
                 .selection => |mb| try e.b.emit(.functions, .selection_merge, &.{ labels[mb.index()], 0 }),
-                .loop => |l| try e.b.emit(.functions, .loop_merge, &.{ labels[l.merge.index()], labels[l.@"continue".index()], 0 }),
+                // [unroll] / [loop] the IR could not act on are the
+                // driver's to honor (LoopControl Unroll / DontUnroll), as
+                // in dxc.
+                .loop => |l| try e.b.emit(.functions, .loop_merge, &.{ labels[l.merge.index()], labels[l.@"continue".index()], switch (l.unroll) {
+                    .auto => 0,
+                    .unroll => 1,
+                    .dont => 2,
+                } }),
             }
             switch (blk.term) {
                 .none, .@"unreachable" => try e.b.emit(.functions, .@"unreachable", &.{}),
