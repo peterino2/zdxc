@@ -945,6 +945,7 @@ const Emitter = struct {
         }
 
         for (m.functions.items, e.func_ids) |f, id| {
+            if (f.dead) continue;
             e.setEntry(f.entry);
             if (!e.hasResourceParams(f)) try e.emitFunction(f, id, &.{});
         }
@@ -984,7 +985,7 @@ const Emitter = struct {
             try e.entryPoint(entry);
         }
         for (m.functions.items, e.func_ids) |f, id| {
-            if (!e.hasResourceParams(f)) try e.b.emitWithString(.debug_names, .name, &.{id}, f.name, &.{});
+            if (!f.dead and !e.hasResourceParams(f)) try e.b.emitWithString(.debug_names, .name, &.{id}, f.name, &.{});
         }
     }
 

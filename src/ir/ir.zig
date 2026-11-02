@@ -208,6 +208,8 @@ pub const Function = struct {
     /// `[noinline]` (plain functions, not methods or template instances):
     /// libraries keep it a function of its own.
     no_inline: bool = false,
+    /// Nothing calls it any more (inlined everywhere): not emitted.
+    dead: bool = false,
     insts: std.ArrayList(Inst) = .empty,
     blocks: std.ArrayList(Block) = .empty,
 
