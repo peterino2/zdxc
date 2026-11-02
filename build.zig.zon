@@ -9,6 +9,7 @@
         "build.zig",
         "build.zig.zon",
         "docs",
+        "include",
         "src",
         "tools",
         "vendor",

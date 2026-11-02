@@ -43,8 +43,10 @@ pub fn build(b: *std.Build) void {
     mod.addAnonymousImport("options_table", .{ .root_source_file = options_table });
     mod.addAnonymousImport("intrinsics_table", .{ .root_source_file = intrinsics_table });
 
+    // The command line. Its step is "zdxc-cli" so that a dependent's
+    // artifact("zdxc") names the library; it still installs as bin/zdxc.
     const exe = b.addExecutable(.{
-        .name = "zdxc",
+        .name = "zdxc-cli",
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/main.zig"),
             .target = target,
@@ -52,7 +54,26 @@ pub fn build(b: *std.Build) void {
             .imports = &.{.{ .name = "zdxc", .module = mod }},
         }),
     });
-    b.installArtifact(exe);
+    const exe_name = if (target.result.os.tag == .windows) "zdxc.exe" else "zdxc";
+    b.getInstallStep().dependOn(&b.addInstallArtifact(exe, .{ .dest_sub_path = exe_name }).step);
+
+    // libzdxc: the C API (include/zdxc.h), static by default.
+    const linkage = b.option(std.builtin.LinkMode, "linkage", "libzdxc: static (default) or dynamic") orelse .static;
+    const lib = b.addLibrary(.{
+        .name = "zdxc",
+        .linkage = linkage,
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/capi.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "zdxc", .module = mod }},
+        }),
+    });
+    // A static library carries its own compiler runtime, so C callers
+    // need nothing else.
+    lib.bundle_compiler_rt = true;
+    lib.installHeader(b.path("include/zdxc.h"), "zdxc.h");
+    b.installArtifact(lib);
 
     const run_step = b.step("run", "Run zdxc");
     const run_cmd = b.addRunArtifact(exe);

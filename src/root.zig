@@ -2,6 +2,7 @@
 
 pub const diag = @import("diag.zig");
 pub const options = @import("options.zig");
+pub const compile = @import("compile.zig");
 pub const Diagnostics = diag.Diagnostics;
 
 pub const front = struct {
