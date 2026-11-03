@@ -524,7 +524,7 @@ pub const Parser = struct {
         defer p.last_quals = words.items;
         while (p.at(.identifier)) {
             const word = p.tok().text;
-            if (inList(&reserved_declspecs, word)) {
+            if (isReservedDeclspec(word)) {
                 // dxc reports these and parses on as if they were absent.
                 _ = p.reportAt(p.pos, .@"error", "'{s}' is a reserved keyword in HLSL", .{word});
                 _ = p.advance();
@@ -1566,7 +1566,7 @@ pub const Parser = struct {
             if (std.mem.eql(u8, w, "struct") or std.mem.eql(u8, w, "class") or std.mem.eql(u8, w, "typedef") or
                 std.mem.eql(u8, w, "using") or std.mem.eql(u8, w, "enum") or std.mem.eql(u8, w, "_Static_assert"))
                 return true;
-            if (inList(&reserved_declspecs, w)) return true;
+            if (isReservedDeclspec(w)) return true;
             if (isEffectObjectWord(t) and p.peek(1).kind == .identifier) return true;
             if (qualifierField(w) != null) {
                 if (!isContextualQualifier(w)) return true;
@@ -1940,14 +1940,22 @@ fn isTechniqueWord(t: Token) bool {
 }
 
 /// dxc's g_DeprecatedEffectObjectNames.
+const effect_object_words = [_][]const u8{
+    "texture",         "Texture",          "pixelshader",    "PixelShader",       "vertexshader",
+    "VertexShader",    "pixelfragment",    "vertexfragment", "ComputeShader",     "DomainShader",
+    "GeometryShader",  "HullShader",       "BlendState",     "DepthStencilState", "DepthStencilView",
+    "RasterizerState", "RenderTargetView",
+};
+
 fn isEffectObjectWord(t: Token) bool {
-    const names = [_][]const u8{
-        "texture",         "Texture",          "pixelshader",    "PixelShader",       "vertexshader",
-        "VertexShader",    "pixelfragment",    "vertexfragment", "ComputeShader",     "DomainShader",
-        "GeometryShader",  "HullShader",       "BlendState",     "DepthStencilState", "DepthStencilView",
-        "RasterizerState", "RenderTargetView",
-    };
-    return t.kind == .identifier and inList(&names, t.text);
+    if (t.kind != .identifier) return false;
+    const info = word_map.get(t.text) orelse return false;
+    return info.effect_object;
+}
+
+fn isReservedDeclspec(w: []const u8) bool {
+    const info = word_map.get(w) orelse return false;
+    return info.declspec;
 }
 
 /// Type attributes that may precede a type: `unorm float`,
@@ -2078,6 +2086,8 @@ const WordInfo = struct {
     numeric_scalar: bool = false,
     object: bool = false,
     template: bool = false,
+    declspec: bool = false,
+    effect_object: bool = false,
 };
 
 fn inList(list: []const []const u8, w: []const u8) bool {
@@ -2089,7 +2099,7 @@ fn inList(list: []const []const u8, w: []const u8) bool {
 /// replaces linear scans of the lists above (a third of parse time).
 const word_map = blk: {
     @setEvalBranchQuota(1_000_000);
-    var words: []const []const u8 = &(reserved_words ++ contextual_words ++ scalar_types ++ object_types ++ enum_typedefs ++ template_types ++ template_funcs);
+    var words: []const []const u8 = &(reserved_words ++ contextual_words ++ scalar_types ++ object_types ++ enum_typedefs ++ template_types ++ template_funcs ++ reserved_declspecs ++ effect_object_words);
     for (qualifier_words) |q| words = words ++ &[_][]const u8{q[0]};
     var kvs: [words.len]struct { []const u8, WordInfo } = undefined;
     var n: usize = 0;
@@ -2102,6 +2112,8 @@ const word_map = blk: {
             .numeric_scalar = inList(&scalar_types, w) and !std.mem.endsWith(u8, w, "_packed"),
             .object = inList(&object_types, w) or inList(&enum_typedefs, w),
             .template = inList(&template_types, w) or inList(&template_funcs, w),
+            .declspec = inList(&reserved_declspecs, w),
+            .effect_object = inList(&effect_object_words, w),
         };
         for (qualifier_words) |q| {
             if (std.mem.eql(u8, q[0], w)) info.qualifier = q[1];
@@ -2110,8 +2122,65 @@ const word_map = blk: {
         n += 1;
     }
     const final = kvs[0..n].*;
-    break :blk std.StaticStringMap(WordInfo).initComptime(final);
+    break :blk WordMap(WordInfo, final.len).init(final);
 };
+
+/// A string map built at compile time: an open-addressing table on a cheap
+/// hash, comparing a stored hash before any bytes. Most identifiers a
+/// lookup sees are not in it, and miss after a probe or two (what
+/// std.StaticStringMap does is compare every key of the same length).
+fn WordMap(comptime V: type, comptime n: usize) type {
+    return struct {
+        const Self = @This();
+        /// Twice the keys or more, a power of two.
+        const size = std.math.ceilPowerOfTwoAssert(usize, n * 4);
+        const empty = std.math.maxInt(u16);
+
+        keys: [n][]const u8,
+        values: [n]V,
+        hashes: [n]u32,
+        slots: [size]u16,
+
+        fn hash(w: []const u8) u32 {
+            var h: u32 = 2166136261;
+            for (w) |c| h = (h ^ c) *% 16777619;
+            return h;
+        }
+
+        fn init(comptime kvs: anytype) Self {
+            var m: Self = undefined;
+            m.slots = @splat(empty);
+            for (kvs, 0..) |kv, k| {
+                m.keys[k] = kv[0];
+                m.values[k] = kv[1];
+                m.hashes[k] = hash(kv[0]);
+                var i = m.hashes[k] & (size - 1);
+                while (m.slots[i] != empty) i = (i + 1) & (size - 1);
+                m.slots[i] = k;
+            }
+            return m;
+        }
+
+        fn get(m: *const Self, w: []const u8) ?V {
+            const h = hash(w);
+            var i = h & (size - 1);
+            while (true) : (i = (i + 1) & (size - 1)) {
+                const k = m.slots[i];
+                if (k == empty) return null;
+                if (m.hashes[k] == h and std.mem.eql(u8, m.keys[k], w)) return m.values[k];
+            }
+        }
+    };
+}
+
+test WordMap {
+    const M = WordMap(u8, 3);
+    const m = comptime M.init(.{ .{ "float", 1 }, .{ "in", 2 }, .{ "inout", 3 } });
+    try std.testing.expectEqual(1, m.get("float").?);
+    try std.testing.expectEqual(3, m.get("inout").?);
+    try std.testing.expectEqual(null, m.get("floa"));
+    try std.testing.expectEqual(null, m.get(""));
+}
 
 fn isNumericScalar(w: []const u8) bool {
     const info = word_map.get(w) orelse return false;
