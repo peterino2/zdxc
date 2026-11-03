@@ -4,6 +4,7 @@
 //! (binding = register number, descriptor set = register space).
 
 const std = @import("std");
+const BumpArena = @import("../BumpArena.zig");
 const Allocator = std.mem.Allocator;
 const ir = @import("../ir/ir.zig");
 const types = @import("../sema/types.zig");
@@ -142,7 +143,7 @@ pub const TargetEnv = struct {
 };
 
 pub fn emit(gpa: Allocator, m: *const ir.Module, diags: *diag.Diagnostics, env: TargetEnv) Error![]u8 {
-    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    var arena_state = BumpArena.init(gpa);
     defer arena_state.deinit();
     var e: Emitter = .{ .arena = arena_state.allocator(), .b = .init(gpa), .m = m, .t = m.types, .diags = diags, .spv_minor = env.minor, .universal = env.universal, .vk = m.vk };
     defer e.b.deinit();

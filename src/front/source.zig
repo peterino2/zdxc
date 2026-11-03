@@ -1,6 +1,7 @@
 //! Source files and locations.
 
 const std = @import("std");
+const BumpArena = @import("../BumpArena.zig");
 const Allocator = std.mem.Allocator;
 const scan = @import("scan.zig");
 
@@ -134,7 +135,7 @@ pub const LineOverride = struct {
 pub const PresumedLoc = struct { file: []const u8, line: u32 };
 
 pub const SourceManager = struct {
-    arena: std.heap.ArenaAllocator,
+    arena: BumpArena,
     files: std.ArrayList(File) = .empty,
     fs: FileSystem,
     /// path -> contents, or null if the path could not be read.

@@ -7,6 +7,7 @@
 //! builtin types are recognized by name.
 
 const std = @import("std");
+const BumpArena = @import("../BumpArena.zig");
 const Allocator = std.mem.Allocator;
 const ast = @import("ast.zig");
 const lexer = @import("lexer.zig");
@@ -2154,7 +2155,7 @@ const TestParse = struct {
     mfs: source.MemoryFs = .{},
     sm: source.SourceManager = undefined,
     diags: Diagnostics = undefined,
-    arena: std.heap.ArenaAllocator = undefined,
+    arena: BumpArena = undefined,
     out: std.Io.Writer.Allocating = undefined,
 
     fn run(t: *TestParse, text: []const u8) ![]const u8 {

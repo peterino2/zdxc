@@ -6,6 +6,7 @@
 //! signed DXIL container.
 
 const std = @import("std");
+const BumpArena = @import("../BumpArena.zig");
 const Allocator = std.mem.Allocator;
 const ir = @import("../ir/ir.zig");
 const types = @import("../sema/types.zig");
@@ -52,7 +53,7 @@ pub fn emit(gpa: Allocator, m: *const ir.Module, profile: shader.Profile, diags:
 pub const Output = struct { object: []u8, reflection: []u8 };
 
 pub fn emitWithReflection(gpa: Allocator, m: *const ir.Module, profile: shader.Profile, diags: *diag.Diagnostics, optimize: bool) Error!Output {
-    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    var arena_state: BumpArena = .init(gpa);
     defer arena_state.deinit();
     var e: Emitter = .{ .arena = arena_state.allocator(), .dm = .init(gpa), .m = m, .t = m.types, .profile = profile, .diags = diags, .optimize = optimize };
     defer e.dm.deinit();
@@ -6040,7 +6041,7 @@ const Emitter = struct {
         if (resources) |r| try dm.addNamedMetadata("dx.resources", &.{r});
         if (funcs.len > 0) try dm.addNamedMetadata("dx.typeAnnotations", &.{type_annotations});
         try dm.addNamedMetadata("dx.entryPoints", entries.items);
-        return dm.writeBitcode(dm.arena.child_allocator);
+        return dm.writeBitcode(dm.arena.child);
     }
 
     // ---- Reflection (reflect.zig) -----------------------------------------
@@ -6741,7 +6742,7 @@ const Emitter = struct {
         try dm.addNamedMetadata("dx.entryPoints", &.{entry_md});
         try promote.pruneGlobals(e.arena, dm);
         _ = try promote.pruneDeclarations(e.arena, dm);
-        return dm.writeBitcode(dm.arena.child_allocator);
+        return dm.writeBitcode(dm.arena.child);
     }
 
     /// `!{id, name, comp, kind, !{indices}, interp, rows, cols, row, col,
