@@ -823,15 +823,28 @@ fn foldConstantBranches(a: Allocator, m: *module.Module, insts: []Inst, block_st
                 else => 0,
             };
         }
-        /// Whether entry `x` of `ins` (from `ins[x].block`) is one of the
-        /// edges there still are.
-        fn keeps(s: @This(), ins: []const Edge, x: usize, t: u32) bool {
-            var before: u32 = 0;
-            for (ins[0..x]) |in| before += @intFromBool(in.block == ins[x].block);
-            return before < s.count(ins[x].block, t);
+        /// Whether each entry of `ins` (from `ins[x].block`) is one of the
+        /// edges to `t` there still are: the k-th entry from a block is,
+        /// if the block has more than k edges to `t`. `seen` and `edges_to`
+        /// are per-block scratch (0 and `none`), left as they were.
+        fn keeps(s: @This(), ins: []const Edge, t: u32, seen: []u32, edges_to: []u32, out: []bool) void {
+            for (ins, out) |in, *o| {
+                if (edges_to[in.block] == none) edges_to[in.block] = s.count(in.block, t);
+                o.* = seen[in.block] < edges_to[in.block];
+                seen[in.block] += 1;
+            }
+            for (ins) |in| {
+                seen[in.block] = 0;
+                edges_to[in.block] = none;
+            }
         }
     };
     const edges: Edges = .{ .insts = insts, .block_start = block_start, .reach = reach };
+    const seen = try a.alloc(u32, nb);
+    @memset(seen, 0);
+    const edges_to = try a.alloc(u32, nb);
+    @memset(edges_to, none);
+    var kept: std.ArrayList(bool) = .empty;
     for (0..nb) |b| {
         const t: u32 = @intCast(b);
         const last = block_start[b + 1] - 1;
@@ -842,12 +855,14 @@ fn foldConstantBranches(a: Allocator, m: *module.Module, insts: []Inst, block_st
         var i = block_start[b];
         while (i < last and insts[i].op == .phi) : (i += 1) {
             const old = insts[i].op.phi.incoming;
-            var keep: usize = 0;
-            for (0..old.len) |x| keep += @intFromBool(edges.keeps(old, x, t));
+            kept.clearRetainingCapacity();
+            try kept.resize(a, old.len);
+            edges.keeps(old, t, seen, edges_to, kept.items);
+            const keep = std.mem.count(bool, kept.items, &.{true});
             if (keep == old.len) continue;
             const new = try m.allocator().alloc(Edge, keep);
             var k: usize = 0;
-            for (old, 0..) |in, x| if (edges.keeps(old, x, t)) {
+            for (old, kept.items) |in, kp| if (kp) {
                 new[k] = in;
                 k += 1;
             };
@@ -856,9 +871,12 @@ fn foldConstantBranches(a: Allocator, m: *module.Module, insts: []Inst, block_st
         for (bphis[bphi_off[b]..bphi_off[b + 1]]) |j| {
             // (Kept entries move down; each is checked against those
             // before it in the original order.)
-            const orig = try a.dupe(Edge, incoming[j]);
+            const ins = incoming[j];
+            kept.clearRetainingCapacity();
+            try kept.resize(a, ins.len);
+            edges.keeps(ins, t, seen, edges_to, kept.items);
             var k: usize = 0;
-            for (orig, 0..) |in, x| if (edges.keeps(orig, x, t)) {
+            for (ins, kept.items) |in, kp| if (kp) {
                 incoming[j][k] = in;
                 k += 1;
             };
