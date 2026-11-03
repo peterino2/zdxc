@@ -196,7 +196,23 @@ const Frame = struct {
     arrays: std.ArrayList(struct { ty: TypeId, ptr: Ptr }) = .empty,
 };
 
-const PInst = struct { inst: module.Inst, id: u32 };
+/// The current function's instructions, by id, in chunks that never move
+/// (blocks and the prologue list ids).
+const InstStore = struct {
+    const shift = 10;
+    const chunk_len = 1 << shift;
+    chunks: std.ArrayList(*[chunk_len]module.Inst) = .empty,
+
+    /// Stores instruction `id`, the next one.
+    fn put(s: *InstStore, a: Allocator, id: u32, inst: module.Inst) Allocator.Error!void {
+        if (id >> shift >= s.chunks.items.len) try s.chunks.append(a, try a.create([chunk_len]module.Inst));
+        s.chunks.items[id >> shift][id & (chunk_len - 1)] = inst;
+    }
+
+    fn at(s: *const InstStore, id: u32) *module.Inst {
+        return &s.chunks.items[id >> shift][id & (chunk_len - 1)];
+    }
+};
 
 const Emitter = struct {
     arena: Allocator,
@@ -215,8 +231,9 @@ const Emitter = struct {
     payload_global: ?u32 = null,
     payload_local: ?struct { func: *const ir.Function, inst: u32 } = null,
     /// Instructions per block, in creation order, with provisional ids.
-    blocks: std.ArrayList(std.ArrayList(PInst)) = .empty,
-    prologue: std.ArrayList(PInst) = .empty,
+    insts: InstStore = .{},
+    blocks: std.ArrayList(std.ArrayList(u32)) = .empty,
+    prologue: std.ArrayList(u32) = .empty,
     next_id: u32 = 0,
     /// Each instruction's type, by id.
     inst_types: std.ArrayList(DType) = .empty,
@@ -353,7 +370,8 @@ const Emitter = struct {
             },
             else => {},
         }
-        try e.blocks.items[e.cur].append(e.arena, .{ .inst = .{ .ty = ty, .op = op }, .id = id });
+        try e.insts.put(e.arena, id, .{ .ty = ty, .op = op });
+        try e.blocks.items[e.cur].append(e.arena, id);
         return .{ .inst = id };
     }
 
@@ -361,7 +379,8 @@ const Emitter = struct {
         const id = e.next_id;
         e.next_id += 1;
         try e.inst_types.append(e.arena, ty);
-        try e.prologue.append(e.arena, .{ .inst = .{ .ty = ty, .op = op }, .id = id });
+        try e.insts.put(e.arena, id, .{ .ty = ty, .op = op });
+        try e.prologue.append(e.arena, id);
         return .{ .inst = id };
     }
 
@@ -577,6 +596,7 @@ const Emitter = struct {
             e.call_memo = .empty;
             e.texel_copies = .empty;
             e.next_id = 0;
+            e.insts = .{};
             e.inst_types = .empty;
             e.private_globals = .empty;
             e.private_typed = .empty;
@@ -766,6 +786,7 @@ const Emitter = struct {
             e.call_memo = .empty;
             e.texel_copies = .empty;
             e.next_id = 0;
+            e.insts = .{};
             e.inst_types = .empty;
             e.private_globals = .empty;
             e.private_typed = .empty;
@@ -801,6 +822,7 @@ const Emitter = struct {
                 e.call_memo = .empty;
                 e.texel_copies = .empty;
                 e.next_id = 0;
+                e.insts = .{};
                 e.inst_types = .empty;
                 e.private_globals = .empty;
                 e.private_typed = .empty;
@@ -971,6 +993,7 @@ const Emitter = struct {
         e.call_memo = .empty;
         e.texel_copies = .empty;
         e.next_id = 0;
+        e.insts = .{};
         e.inst_types = .empty;
         e.private_globals = .empty;
         e.private_typed = .empty;
@@ -1413,12 +1436,12 @@ const Emitter = struct {
         if (e.lib_removable.count() > 0) try e.pruneProlog();
         const map = try e.arena.alloc(u32, e.next_id);
         var n: u32 = 0;
-        for (e.prologue.items) |pi| {
-            map[pi.id] = n;
+        for (e.prologue.items) |id| {
+            map[id] = n;
             n += 1;
         }
-        for (e.blocks.items) |blk| for (blk.items) |pi| {
-            map[pi.id] = n;
+        for (e.blocks.items) |blk| for (blk.items) |id| {
+            map[id] = n;
             n += 1;
         };
         const f = &e.dm.functions.items[func];
@@ -1440,9 +1463,8 @@ const Emitter = struct {
         };
         stats.add(.dxil_lowered, n);
         try f.insts.ensureUnusedCapacity(e.dm.allocator(), n);
-        const all = [_][]const PInst{e.prologue.items};
-        for (all) |items| for (items) |pi| f.insts.appendAssumeCapacity(try remapInst(e.arena, map, pi.inst, remap));
-        for (e.blocks.items) |blk| for (blk.items) |pi| f.insts.appendAssumeCapacity(try remapInst(e.arena, map, pi.inst, remap));
+        for (e.prologue.items) |id| f.insts.appendAssumeCapacity(try remapInst(e.arena, map, e.insts.at(id).*, remap));
+        for (e.blocks.items) |blk| for (blk.items) |id| f.insts.appendAssumeCapacity(try remapInst(e.arena, map, e.insts.at(id).*, remap));
         var ranges: std.AutoHashMapUnmanaged(u32, [2]u32) = .empty;
         var it = e.dyn_ranges.iterator();
         while (it.next()) |kv| try ranges.put(e.arena, map[kv.key_ptr.*], kv.value_ptr.*);
@@ -1481,13 +1503,12 @@ const Emitter = struct {
         while (changed) {
             changed = false;
             @memset(used, false);
-            const all = [_][]const PInst{e.prologue.items};
-            for (all) |items| for (items) |pi| markUses(e.arena, pi.inst, used);
-            for (e.blocks.items) |blk| for (blk.items) |pi| markUses(e.arena, pi.inst, used);
+            for (e.prologue.items) |id| markUses(e.arena, e.insts.at(id).*, used);
+            for (e.blocks.items) |blk| for (blk.items) |id| markUses(e.arena, e.insts.at(id).*, used);
             var k: usize = 0;
             while (k < e.prologue.items.len) {
-                const pi = e.prologue.items[k];
-                if (e.lib_removable.contains(pi.id) and !used[pi.id]) {
+                const id = e.prologue.items[k];
+                if (e.lib_removable.contains(id) and !used[id]) {
                     _ = e.prologue.orderedRemove(k);
                     changed = true;
                 } else k += 1;
@@ -1611,7 +1632,7 @@ const Emitter = struct {
             try e.prologue.appendSlice(e.arena, items[from .. items.len - 1]);
             items[from] = br;
             e.blocks.items[b].items.len = from + 1;
-            b = br.inst.op.br.then;
+            b = e.insts.at(br).op.br.then;
             from = 0;
         }
         e.forwarded.clearRetainingCapacity();
@@ -1629,11 +1650,11 @@ const Emitter = struct {
         while (b != e.cur) {
             const items = e.blocks.items[b].items;
             if (items.len <= from) return false;
-            for (items[from .. items.len - 1]) |pi| switch (pi.inst.op) {
+            for (items[from .. items.len - 1]) |id| switch (e.insts.at(id).op) {
                 .br, .@"switch", .ret, .phi => return false,
                 else => {},
             };
-            const last = items[items.len - 1].inst.op;
+            const last = e.insts.at(items[items.len - 1]).op;
             if (last != .br or last.br.cond != null or last.br.then < first_new) return false;
             b = last.br.then;
             from = 0;
@@ -4012,7 +4033,7 @@ const Emitter = struct {
         const ptr = try e.add(try e.dm.ptrType(class_ty), .{ .gep = .{ .elem = arr_ty, .ptr = .{ .global = lg }, .indices = try e.arena.dupe(Value, &.{ try e.i32Const(0), index }) } });
         if (nonuniform) {
             const blk = e.blocks.items[e.cur].items;
-            blk[blk.len - 1].inst.md = .{ .kind = try e.dm.mdKind("dx.nonuniform"), .node = try e.dm.mdNode(&.{try e.dm.mdI32(1)}) };
+            e.insts.at(blk[blk.len - 1]).md = .{ .kind = try e.dm.mdKind("dx.nonuniform"), .node = try e.dm.mdNode(&.{try e.dm.mdI32(1)}) };
         }
         const loaded = try e.add(class_ty, .{ .load = .{ .ptr = ptr, .@"align" = 4 } });
         const struct_name = e.dm.types.items[class_ty].@"struct".name;
