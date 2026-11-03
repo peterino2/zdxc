@@ -173,8 +173,8 @@ const Resource = struct {
 
 const Frame = struct {
     f: *const ir.Function,
-    /// `f`'s index (inlined calls; see Emitter.regsLocals).
-    fi: u32 = 0,
+    /// For inlined calls: Emitter.regsLocals of `f`.
+    regs: []const bool = &.{},
     vals: []Lowered,
     params: []const Lowered,
     blocks: []?u32,
@@ -1781,7 +1781,6 @@ const Emitter = struct {
         const f = e.m.functions.items[fi];
         var frame: Frame = .{
             .f = f,
-            .fi = fi,
             .vals = try e.arena.alloc(Lowered, f.insts.items.len),
             .params = args,
             .blocks = try e.arena.alloc(?u32, f.blocks.items.len),
@@ -1794,6 +1793,7 @@ const Emitter = struct {
         @memset(frame.vals, .none);
         @memset(frame.blocks, null);
         if (e.optimize and args.len > 0) frame.copies = try e.paramCopies(fi);
+        if (e.optimize) frame.regs = try e.regsLocals(fi);
         const is_entry = e.cur == 0 and e.blocks.items[0].items.len == 0 and (fi == e.entry.wrapper or fi == e.entry.patch_wrapper);
         if (!is_entry) frame.cont = try e.newBlock();
         // The callee's entry continues the current block.
@@ -1876,21 +1876,105 @@ const Emitter = struct {
     }
 
     /// For each instruction of IR function `fi`: whether it is a local
-    /// paramCopies gives a parameter for, indexed only by constants (so it
-    /// can be the argument's values; see Lowered.regs).
+    /// that can be the values stored into it (see Lowered.regs), indexed
+    /// only by constants and either a copy of a parameter (paramCopies) or
+    /// stored once, whole, in the entry block before any other use of it
+    /// (and otherwise only read).
     fn regsLocals(e: *Emitter, fi: u32) Error![]const bool {
         const gop = try e.regs_locals.getOrPut(e.arena, fi);
         if (gop.found_existing) return gop.value_ptr.*;
+        const none = std.math.maxInt(u32);
         const f = e.m.functions.items[fi];
         const copies = try e.paramCopies(fi);
-        const out = try e.arena.alloc(bool, copies.len);
-        for (out, copies) |*o, c| o.* = c != std.math.maxInt(u32);
-        for (f.insts.items) |inst| if (inst.op == .access) {
-            var root = inst.op.access.base;
-            while (f.inst(root).op == .access) root = f.inst(root).op.access.base;
-            if (f.inst(root).op != .local_var) continue;
+        const n = copies.len;
+        const out = try e.arena.alloc(bool, n);
+        for (out, copies) |*o, c| o.* = c != none;
+
+        // Locals stored once from a value. The local each pointer is into:
+        const root = try e.arena.alloc(u32, n);
+        @memset(root, none);
+        var changed = true;
+        while (changed) {
+            changed = false;
+            for (f.insts.items, 0..) |inst, k| {
+                const want: u32 = switch (inst.op) {
+                    .local_var => @intCast(k),
+                    .access => |x| root[x.base.index()],
+                    else => none,
+                };
+                if (want != root[k]) {
+                    root[k] = want;
+                    changed = true;
+                }
+            }
+        }
+        const stores = try e.arena.alloc(u32, n);
+        @memset(stores, 0);
+        const bad = try e.arena.alloc(bool, n);
+        @memset(bad, false);
+        const Use = struct {
+            root: []const u32,
+            bad: []bool,
+            pub fn map(u: @This(), x: Ref) Ref {
+                if (x != .none and u.root[x.index()] != none) u.bad[u.root[x.index()]] = true;
+                return x;
+            }
+        };
+        const use: Use = .{ .root = root, .bad = bad };
+        for (f.insts.items) |inst| switch (inst.op) {
+            .local_var, .load => {},
+            .access => |x| for (x.indices) |ix| {
+                _ = use.map(ix);
+            },
+            .store => |x| {
+                _ = use.map(x.value);
+                const l = root[x.ptr.index()];
+                if (l == none) continue;
+                if (x.ptr.index() != l) bad[l] = true;
+                stores[l] += 1;
+            },
+            else => _ = try opt.mapOp(e.arena, inst.op, use),
+        };
+        // The store: in the entry block (not branched back to), before any
+        // load or access of the local there.
+        var reentered = false;
+        for (f.blocks.items) |blk| switch (blk.term) {
+            .br => |t| reentered = reentered or t.index() == 0,
+            .cond_br => |c| reentered = reentered or c.then.index() == 0 or c.@"else".index() == 0,
+            .@"switch" => |sw| {
+                reentered = reentered or sw.default.index() == 0;
+                for (sw.cases) |cs| reentered = reentered or cs.block.index() == 0;
+            },
+            else => {},
+        };
+        if (!reentered and f.blocks.items.len > 0) {
+            const used = try e.arena.alloc(bool, n);
+            @memset(used, false);
+            for (f.blocks.items[0].insts.items) |r| {
+                const inst = f.inst(r);
+                switch (inst.op) {
+                    .load => |p| if (root[p.index()] != none) {
+                        used[root[p.index()]] = true;
+                    },
+                    .access => if (root[r.index()] != none) {
+                        used[root[r.index()]] = true;
+                    },
+                    .store => |x| {
+                        const l = root[x.ptr.index()];
+                        if (l == none or used[l] or bad[l] or stores[l] != 1 or copies[l] != none) continue;
+                        if (f.inst(x.value).op == .param) continue;
+                        const ty = f.inst(@fromBackingInt(@intCast(l))).ty;
+                        if (isResourceType(e.t, ty) or e.holdsResources(ty) or e.containsLinAlg(ty) or isRayQuery(e.t, ty)) continue;
+                        out[l] = true;
+                    },
+                    else => {},
+                }
+            }
+        }
+        // Only constant indices.
+        for (f.insts.items, 0..) |inst, k| if (inst.op == .access and root[k] != none) {
             for (inst.op.access.indices) |ix| if (f.inst(ix).op != .constant or f.inst(ix).op.constant != .int) {
-                out[root.index()] = false;
+                out[root[k]] = false;
             };
         };
         gop.value_ptr.* = out;
@@ -2239,12 +2323,14 @@ const Emitter = struct {
                     const k = frame.param_copies[r.index()];
                     if (k != std.math.maxInt(u32)) if (frame.param_srcs[k]) |alias| return alias;
                 }
-                // A copy of a parameter passed as values, never written:
-                // those values (no alloca, no stores, no loads).
-                if (frame.copies.len > 0) {
-                    const k = frame.copies[r.index()];
-                    if (k != std.math.maxInt(u32) and frame.params[k] == .scalars and (try e.regsLocals(frame.fi))[r.index()])
-                        return .{ .regs = .{ .vals = frame.params[k].scalars } };
+                // A copy of a parameter passed as values, or a local stored
+                // once from a value before any use, never written again:
+                // those values (no alloca, no stores, no loads). Its store
+                // sets them.
+                if (frame.regs.len > 0 and frame.regs[r.index()]) {
+                    const k = if (frame.copies.len > 0) frame.copies[r.index()] else std.math.maxInt(u32);
+                    if (k == std.math.maxInt(u32)) return .{ .regs = .{ .vals = &.{} } };
+                    if (frame.params[k] == .scalars) return .{ .regs = .{ .vals = frame.params[k].scalars } };
                 }
                 if (e.payload_local) |pl| if (pl.func == f and pl.inst == r.index()) {
                     const dty = try e.memoryType(i.ty);
@@ -2358,8 +2444,11 @@ const Emitter = struct {
                 else => |v| return e.unsupported("internal: load from a non-pointer ({s} from %{d} '{s}' in '{s}')", .{ @tagName(v), p.index(), @tagName(frame.f.inst(p).op), frame.f.name }),
             },
             .store => |s| {
-                // (The copy into a parameter's copy kept as its values.)
-                if (frame.vals[s.ptr.index()] == .regs) return .none;
+                // (The values a local kept as values holds.)
+                if (frame.vals[s.ptr.index()] == .regs) {
+                    frame.vals[s.ptr.index()] = .{ .regs = .{ .vals = try e.scalars(frame, s.value) } };
+                    return .none;
+                }
                 if (frame.param_copies.len > 0) if (f.inst(s.value).op == .param) {
                     const k = f.inst(s.value).op.param;
                     if (frame.param_copies[s.ptr.index()] == k and frame.param_srcs[k] != null) return .none;
