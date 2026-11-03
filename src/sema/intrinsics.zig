@@ -112,6 +112,37 @@ pub const Db = struct {
     pub const Resolved = struct { ret: TypeId, index: u16 = 0, params: []const TypeId = &.{}, ok: bool = false };
 
     pub fn resolve(db: *const Db, sema: anytype, loc: source.Loc, ns: []const u8, name: []const u8, object: ?TypeId, args: []const ArgInfo, explicit: ?TypeId) !Resolved {
+        // The same call (name, object, explicit type, argument types and
+        // lvalues) resolves the same way: matched once per compile.
+        var key_buf: [256]u8 = undefined;
+        var key: std.ArrayList(u8) = .initBuffer(&key_buf);
+        const keyed = memoKey(&key, ns, name, object, args, explicit);
+        if (keyed) if (sema.intrinsic_memo.get(key.items)) |r| return r;
+        const reported = sema.diags.list.items.len;
+        const r = try db.resolveUncached(sema, loc, ns, name, object, args, explicit);
+        // (Not one that reported something: a repeat reports it again.)
+        if (keyed and r.ok and sema.diags.list.items.len == reported) try sema.intrinsic_memo.put(sema.arena, try sema.arena.dupe(u8, key.items), r);
+        return r;
+    }
+
+    /// The memo key of a call; false if it does not fit.
+    fn memoKey(key: *std.ArrayList(u8), ns: []const u8, name: []const u8, object: ?TypeId, args: []const ArgInfo, explicit: ?TypeId) bool {
+        const fixed = ns.len + name.len + 2 + 2 * @sizeOf(TypeId) + args.len * (@sizeOf(TypeId) + 1);
+        if (fixed > key.capacity) return false;
+        key.appendSliceAssumeCapacity(ns);
+        key.appendAssumeCapacity(0);
+        key.appendSliceAssumeCapacity(name);
+        key.appendAssumeCapacity(0);
+        key.appendSliceAssumeCapacity(std.mem.asBytes(&@as(TypeId, object orelse std.math.maxInt(TypeId))));
+        key.appendSliceAssumeCapacity(std.mem.asBytes(&@as(TypeId, explicit orelse std.math.maxInt(TypeId))));
+        for (args) |a| {
+            key.appendSliceAssumeCapacity(std.mem.asBytes(&a.ty));
+            key.appendAssumeCapacity(@intFromBool(a.lvalue));
+        }
+        return true;
+    }
+
+    fn resolveUncached(db: *const Db, sema: anytype, loc: source.Loc, ns: []const u8, name: []const u8, object: ?TypeId, args: []const ArgInfo, explicit: ?TypeId) !Resolved {
         const cands = try db.candidates(sema.arena, ns, name);
         if (cands.len == 0) {
             if (object) |o| {

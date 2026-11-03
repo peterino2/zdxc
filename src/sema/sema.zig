@@ -219,6 +219,8 @@ pub const Sema = struct {
     loop_depth: u32 = 0,
     switch_depth: u32 = 0,
     intrinsic_db: *const intrinsics.Db,
+    /// Intrinsic calls resolved so far (see Db.resolve).
+    intrinsic_memo: std.StringHashMapUnmanaged(intrinsics.Db.Resolved) = .empty,
     enum_scopes: std.AutoHashMapUnmanaged(*types.EnumInfo, *Scope) = .empty,
     /// Where each template was declared (its names resolve from there).
     template_scopes: std.AutoHashMapUnmanaged(*const ast.Decl, *Scope) = .empty,
