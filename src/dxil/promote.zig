@@ -309,7 +309,9 @@ pub fn run(a: Allocator, m: *module.Module, func: u32, dyn: *const std.AutoHashM
             return v;
         }
     };
-    for (insts, 0..) |inst, i| switch (inst.op) {
+    // (Code no path reaches, such as loops unrolling left behind, does
+    // not count.)
+    for (insts, 0..) |inst, i| if (rpo_index[block_of[i]] != none) switch (inst.op) {
         .gep => |g| if (g.ptr == .inst and var_base[g.ptr.inst] != none and insts[g.ptr.inst].op == .alloca) {
             const al = g.ptr.inst;
             if (direct[al]) {
@@ -329,10 +331,11 @@ pub fn run(a: Allocator, m: *module.Module, func: u32, dyn: *const std.AutoHashM
     };
     {
         var scan: Scan = .{ .insts = insts, .var_base = var_base, .direct = direct, .gep_alloca = gep_alloca };
-        for (insts) |*inst| try operands(false, a, inst, &scan);
+        for (insts, 0..) |*inst, i| if (rpo_index[block_of[i]] != none) try operands(false, a, inst, &scan);
     }
     // Loads and stores must move whole elements of the element type.
-    for (insts) |inst| {
+    for (insts, 0..) |inst, i| {
+        if (rpo_index[block_of[i]] == none) continue;
         const ptr, const ty = switch (inst.op) {
             .load => |x| .{ x.ptr, inst.ty },
             .store => |x| .{ x.ptr, typeOf(m, f, x.val) },
@@ -350,7 +353,6 @@ pub fn run(a: Allocator, m: *module.Module, func: u32, dyn: *const std.AutoHashM
         var_base[i] = nv;
         nv += if (direct[i]) 1 else @intCast(m.types.items[inst.op.alloca.elem].array.len);
     }
-    if (nv == 0) return;
     const var_ty = try a.alloc(TypeId, nv);
     for (insts, 0..) |inst, i| {
         if (inst.op != .alloca or var_base[i] == none) continue;
@@ -591,8 +593,17 @@ pub fn run(a: Allocator, m: *module.Module, func: u32, dyn: *const std.AutoHashM
     // selects on a constant.
     for (insts, 0..) |inst, i| {
         if (repl[i] != null) continue;
+        if (inst.op == .phi) if (try edgePhi(m, insts, block_start, repl, n, block_of[i], inst)) |v| {
+            repl[i] = v;
+            continue;
+        };
         repl[i] = try simplify(m, f, repl, n, phi_var.items, var_ty, inst);
     }
+
+    // Branches on what is now a constant go one way (as dxc's simplifycfg
+    // makes them): blocks no longer reachable keep only an `unreachable`,
+    // and phis lose the edges that are gone.
+    var reach = try foldConstantBranches(a, m, insts, block_start, repl, bphis, bphi_off, incoming);
 
     // The instructions that go: promoted allocas, their getelementptrs,
     // loads and stores.
@@ -608,50 +619,66 @@ pub fn run(a: Allocator, m: *module.Module, func: u32, dyn: *const std.AutoHashM
     // transitively; new phis likewise. (The loads promotion leaves dead,
     // such as copies of arguments never read, go too.)
     const live = try a.alloc(bool, n + np);
-    @memset(live, false);
-    {
-        var work: std.ArrayList(u32) = .empty;
-        const Mark = struct {
-            repl: []const ?Value,
-            live: []bool,
-            removed: []const bool,
-            work: *std.ArrayList(u32),
-            a: Allocator,
-            failed: bool = false,
+    while (true) {
+        @memset(live, false);
+        {
+            var work: std.ArrayList(u32) = .empty;
+            const Mark = struct {
+                repl: []const ?Value,
+                live: []bool,
+                removed: []const bool,
+                work: *std.ArrayList(u32),
+                a: Allocator,
+                failed: bool = false,
 
-            fn visit(s: *@This(), v: Value, _: Role) Value {
-                const x = resolve(s.repl, v);
-                if (x == .inst and !s.live[x.inst] and !(x.inst < s.removed.len and s.removed[x.inst])) {
-                    s.live[x.inst] = true;
-                    s.work.append(s.a, x.inst) catch {
-                        s.failed = true;
-                    };
+                fn visit(s: *@This(), v: Value, _: Role) Value {
+                    const x = resolve(s.repl, v);
+                    if (x == .inst and !s.live[x.inst] and !(x.inst < s.removed.len and s.removed[x.inst])) {
+                        s.live[x.inst] = true;
+                        s.work.append(s.a, x.inst) catch {
+                            s.failed = true;
+                        };
+                    }
+                    return v;
                 }
-                return v;
+            };
+            var mark: Mark = .{ .repl = repl, .live = live, .removed = removed, .work = &work, .a = a };
+            for (insts, 0..) |inst, i| if (!removed[i] and hasEffects(m, inst) and (reach[block_of[i]] or i == block_start[block_of[i] + 1] - 1)) {
+                live[i] = true;
+                try work.append(a, @intCast(i));
+            };
+            while (work.pop()) |x| {
+                if (x < n) {
+                    var inst = insts[x];
+                    try operands(false, a, &inst, &mark);
+                } else for (incoming[x - n]) |in| {
+                    _ = mark.visit(in.val, .other);
+                }
             }
-        };
-        var mark: Mark = .{ .repl = repl, .live = live, .removed = removed, .work = &work, .a = a };
-        for (insts, 0..) |inst, i| if (!removed[i] and hasEffects(m, inst)) {
-            live[i] = true;
-            try work.append(a, @intCast(i));
-        };
-        while (work.pop()) |x| {
-            if (x < n) {
-                var inst = insts[x];
-                try operands(false, a, &inst, &mark);
-            } else for (incoming[x - n]) |in| {
-                _ = mark.visit(in.val, .other);
-            }
+            if (mark.failed) return error.OutOfMemory;
         }
-        if (mark.failed) return error.OutOfMemory;
+        // A branch whose arms do nothing (live) and meet again, with the
+        // same values for the merge's phis, goes nowhere: its condition
+        // becomes `true` (dxc's simplifycfg removes the branch) and liveness
+        // runs again without what only the condition read.
+        if (!try foldEmptyBranches(a, m, insts, block_start, reach, live, repl, n, bphis, bphi_off, incoming)) break;
+        reach = try foldConstantBranches(a, m, insts, block_start, repl, bphis, bphi_off, incoming);
     }
 
     // New indices: in each block the existing phis, then the new ones,
     // then the rest.
+    // (Blocks no path reaches go: the validator rejects `unreachable`.)
+    const new_block = try a.alloc(u32, nb);
+    var kept: u32 = 0;
+    for (new_block, reach) |*nbk, r| {
+        nbk.* = if (r) kept else none;
+        if (r) kept += 1;
+    }
     const index = try a.alloc(u32, n + np);
     @memset(index, none);
     var count: u32 = 0;
     for (0..nb) |b| {
+        if (!reach[b]) continue;
         var i = block_start[b];
         while (i < block_start[b + 1] and insts[i].op == .phi) : (i += 1) if (live[i]) {
             index[i] = count;
@@ -679,25 +706,234 @@ pub fn run(a: Allocator, m: *module.Module, func: u32, dyn: *const std.AutoHashM
     var out: std.ArrayList(Inst) = .empty;
     try out.ensureTotalCapacityPrecise(ma, count);
     for (0..nb) |b| {
+        if (!reach[b]) continue;
         var i = block_start[b];
         while (i < block_start[b + 1] and insts[i].op == .phi) : (i += 1) if (live[i]) {
             var inst = insts[i];
             try operands(true, ma, &inst, &map);
+            const edges = try ma.alloc(Edge, inst.op.phi.incoming.len);
+            for (inst.op.phi.incoming, edges) |in, *e| e.* = .{ .val = in.val, .block = new_block[in.block] };
+            inst.op.phi.incoming = edges;
             out.appendAssumeCapacity(inst);
         };
         for (bphis[bphi_off[b]..bphi_off[b + 1]]) |j| if (live[n + j]) {
             const edges = try ma.alloc(Edge, incoming[j].len);
-            for (incoming[j], edges) |in, *e| e.* = .{ .val = map.visit(in.val, .other), .block = in.block };
+            for (incoming[j], edges) |in, *e| e.* = .{ .val = map.visit(in.val, .other), .block = new_block[in.block] };
             out.appendAssumeCapacity(.{ .ty = var_ty[phi_var.items[j]], .op = .{ .phi = .{ .incoming = edges } } });
         };
         while (i < block_start[b + 1]) : (i += 1) if (live[i]) {
             var inst = insts[i];
             try operands(true, ma, &inst, &map);
             if (inst.op == .gep) try clampIndex(m, &inst.op.gep);
+            switch (inst.op) {
+                .br => |*br| {
+                    br.then = new_block[br.then];
+                    if (br.@"else") |*e| e.* = new_block[e.*];
+                },
+                .@"switch" => |*sw| {
+                    sw.default = new_block[sw.default];
+                    const cs = try ma.alloc(@typeInfo(@TypeOf(sw.cases)).pointer.child, sw.cases.len);
+                    for (sw.cases, cs) |c, *o| o.* = .{ .val = c.val, .block = new_block[c.block] };
+                    sw.cases = cs;
+                },
+                else => {},
+            }
             out.appendAssumeCapacity(inst);
         };
     }
     f.insts = out;
+    f.num_blocks = kept;
+}
+
+/// See run. Returns the blocks still reachable.
+fn foldConstantBranches(a: Allocator, m: *module.Module, insts: []Inst, block_start: []const u32, repl: []const ?Value, bphis: []const u32, bphi_off: []const u32, incoming: [][]Edge) Allocator.Error![]bool {
+    const nb = block_start.len - 1;
+    for (0..nb) |b| {
+        const term = &insts[block_start[b + 1] - 1];
+        if (term.op != .br) continue;
+        const br = term.op.br;
+        const cond = br.cond orelse continue;
+        const els = br.@"else" orelse continue;
+        const c = constInt(m, resolve(repl, cond)) orelse continue;
+        term.op = .{ .br = .{ .then = if (c != 0) br.then else els } };
+    }
+    // Switches on a constant too.
+    for (0..nb) |b| {
+        const term = &insts[block_start[b + 1] - 1];
+        if (term.op != .@"switch") continue;
+        const sw = term.op.@"switch";
+        const c = constInt(m, resolve(repl, sw.cond)) orelse continue;
+        var target = sw.default;
+        for (sw.cases) |cs| if (constInt(m, cs.val) == c) {
+            target = cs.block;
+        };
+        term.op = .{ .br = .{ .then = target } };
+    }
+    const reach = try a.alloc(bool, nb);
+    @memset(reach, false);
+    var stack: std.ArrayList(u32) = .empty;
+    try stack.append(a, 0);
+    while (stack.pop()) |b| {
+        if (reach[b]) continue;
+        reach[b] = true;
+        switch (insts[block_start[b + 1] - 1].op) {
+            .br => |br| {
+                try stack.append(a, br.then);
+                if (br.@"else") |e| try stack.append(a, e);
+            },
+            .@"switch" => |sw| {
+                try stack.append(a, sw.default);
+                for (sw.cases) |cs| try stack.append(a, cs.block);
+            },
+            else => {},
+        }
+    }
+    const Edges = struct {
+        insts: []const Inst,
+        block_start: []const u32,
+        reach: []const bool,
+        /// How many edges go from `p` to `t` (a phi has an entry per edge).
+        fn count(s: @This(), p: u32, t: u32) u32 {
+            if (!s.reach[p]) return 0;
+            return switch (s.insts[s.block_start[p + 1] - 1].op) {
+                .br => |br| @as(u32, @intFromBool(br.then == t)) + @intFromBool(br.@"else" == t),
+                .@"switch" => |sw| blk: {
+                    var k: u32 = @intFromBool(sw.default == t);
+                    for (sw.cases) |cs| k += @intFromBool(cs.block == t);
+                    break :blk k;
+                },
+                else => 0,
+            };
+        }
+        /// Whether entry `x` of `ins` (from `ins[x].block`) is one of the
+        /// edges there still are.
+        fn keeps(s: @This(), ins: []const Edge, x: usize, t: u32) bool {
+            var before: u32 = 0;
+            for (ins[0..x]) |in| before += @intFromBool(in.block == ins[x].block);
+            return before < s.count(ins[x].block, t);
+        }
+    };
+    const edges: Edges = .{ .insts = insts, .block_start = block_start, .reach = reach };
+    for (0..nb) |b| {
+        const t: u32 = @intCast(b);
+        const last = block_start[b + 1] - 1;
+        if (!reach[b]) {
+            insts[last].op = .@"unreachable";
+            continue;
+        }
+        var i = block_start[b];
+        while (i < last and insts[i].op == .phi) : (i += 1) {
+            const old = insts[i].op.phi.incoming;
+            var keep: usize = 0;
+            for (0..old.len) |x| keep += @intFromBool(edges.keeps(old, x, t));
+            if (keep == old.len) continue;
+            const new = try m.allocator().alloc(Edge, keep);
+            var k: usize = 0;
+            for (old, 0..) |in, x| if (edges.keeps(old, x, t)) {
+                new[k] = in;
+                k += 1;
+            };
+            insts[i].op.phi.incoming = new;
+        }
+        for (bphis[bphi_off[b]..bphi_off[b + 1]]) |j| {
+            // (Kept entries move down; each is checked against those
+            // before it in the original order.)
+            const orig = try a.dupe(Edge, incoming[j]);
+            var k: usize = 0;
+            for (orig, 0..) |in, x| if (edges.keeps(orig, x, t)) {
+                incoming[j][k] = in;
+                k += 1;
+            };
+            incoming[j] = incoming[j][0..k];
+        }
+    }
+    return reach;
+}
+
+/// See run: rewrites such branches' conditions; true if any changed.
+fn foldEmptyBranches(a: Allocator, m: *module.Module, insts: []Inst, block_start: []const u32, reach: []const bool, live: []const bool, repl: []const ?Value, n: u32, bphis: []const u32, bphi_off: []const u32, incoming: []const []Edge) Allocator.Error!bool {
+    const nb = block_start.len - 1;
+    var changed = false;
+    const from_of = try a.alloc(u32, nb);
+    @memset(from_of, none);
+    var marked: std.ArrayList(u32) = .empty;
+    for (0..nb) |b| {
+        if (!reach[b]) continue;
+        const term = &insts[block_start[b + 1] - 1];
+        if (term.op != .br) continue;
+        const br = term.op.br;
+        const cond = br.cond orelse continue;
+        if (cond != .inst) continue;
+        const f_ = br.@"else" orelse continue;
+        // Each side: the block it lands in, and the predecessor that
+        // edge reaches it from.
+        const Side = struct { land: u32, from: u32 };
+        // Each side's way on: the blocks it lands in, through empty blocks
+        // (only an unconditional branch live, and no live phis; other
+        // branches may enter them too, the way on is the same). The first
+        // side's marks each block it lands in with the edge it came by;
+        // the second stops where it lands in a marked one.
+        var sides: [2]Side = undefined;
+        var met = false;
+        marked.clearRetainingCapacity();
+        for ([2]u32{ br.then, f_ }, 0..) |t0, k| {
+            var side: Side = .{ .land = t0, .from = @intCast(b) };
+            var steps: usize = 0;
+            while (steps <= nb) : (steps += 1) {
+                if (k == 0) {
+                    if (from_of[side.land] != none) break; // a cycle
+                    from_of[side.land] = side.from;
+                    try marked.append(a, side.land);
+                } else if (from_of[side.land] != none) {
+                    sides = .{ .{ .land = side.land, .from = from_of[side.land] }, side };
+                    met = true;
+                    break;
+                }
+                const t = side.land;
+                const last = block_start[t + 1] - 1;
+                if (insts[last].op != .br) break;
+                // (A branch on a constant goes one way.)
+                const tb = insts[last].op.br;
+                const next = if (tb.cond) |c| blk: {
+                    const kc = constInt(m, resolve(repl, c)) orelse break;
+                    break :blk if (kc != 0) tb.then else tb.@"else" orelse tb.then;
+                } else tb.then;
+                var empty = true;
+                for (block_start[t]..last) |i| if (live[i]) {
+                    empty = false;
+                };
+                for (bphis[bphi_off[t]..bphi_off[t + 1]]) |j| if (live[n + j]) {
+                    empty = false;
+                };
+                if (!empty) break;
+                side = .{ .land = next, .from = t };
+            }
+        }
+        for (marked.items) |x| from_of[x] = none;
+        if (!met or sides[0].from == sides[1].from) continue;
+        const mb = sides[0].land;
+        // The merge's phis take the same value from both sides.
+        var same = true;
+        var i = block_start[mb];
+        while (i < block_start[mb + 1] and insts[i].op == .phi) : (i += 1) if (live[i]) {
+            var vals: [2]?Value = .{ null, null };
+            for (insts[i].op.phi.incoming) |in| for (sides, 0..) |sd, k| if (in.block == sd.from) {
+                vals[k] = resolve(repl, in.val);
+            };
+            if (vals[0] == null or vals[1] == null or !std.meta.eql(vals[0].?, vals[1].?)) same = false;
+        };
+        for (bphis[bphi_off[mb]..bphi_off[mb + 1]]) |j| if (live[n + j]) {
+            var vals: [2]?Value = .{ null, null };
+            for (incoming[j]) |in| for (sides, 0..) |sd, k| if (in.block == sd.from) {
+                vals[k] = resolve(repl, in.val);
+            };
+            if (vals[0] == null or vals[1] == null or !std.meta.eql(vals[0].?, vals[1].?)) same = false;
+        };
+        if (!same) continue;
+        term.op.br.cond = try m.constInt(1, 1);
+        changed = true;
+    }
+    return changed;
 }
 
 /// An index into an array that folding made a constant out of range (on
@@ -743,7 +979,30 @@ fn simplify(m: *module.Module, f: *const module.Function, repl: []const ?Value, 
         }
     };
     switch (inst.op) {
+        // A phi taking one value on every edge is that value.
+        .phi => |p| {
+            if (p.incoming.len == 0) return null;
+            const first = resolve(repl, p.incoming[0].val);
+            if (first == .inst and first.inst < n and std.meta.eql(f.insts.items[first.inst].op, inst.op)) return null;
+            for (p.incoming[1..]) |in| if (!std.meta.eql(resolve(repl, in.val), first)) return null;
+            return first;
+        },
         .cast => |c| {
+            // Integer widening and narrowing of a constant.
+            if (c.op == .zext or c.op == .sext or c.op == .trunc) {
+                const v = resolve(repl, c.val);
+                const k = constInt(m, v) orelse return null;
+                const from = S.intWidth(m, typeOf(m, f, v)) orelse return null;
+                const to = S.intWidth(m, inst.ty) orelse return null;
+                const p = S.bits(k, from);
+                const out: u64 = switch (c.op) {
+                    .zext => p,
+                    // (i1 is stored as 0 / 1: true sign-extends to all ones.)
+                    .sext => if (from == 1) (if (p & 1 != 0) ~@as(u64, 0) else 0) else @bitCast(S.stored(p, from)),
+                    else => p,
+                };
+                return try m.constant(.{ .ty = inst.ty, .kind = .{ .int = S.stored(S.bits(@bitCast(out), to), to) } });
+            }
             if (c.op != .bitcast) return null;
             const x = resolve(repl, c.val);
             if (x == .inst and x.inst < n) {
@@ -817,9 +1076,35 @@ fn simplify(m: *module.Module, f: *const module.Function, repl: []const ?Value, 
             return null;
         },
         .cmp => |c| {
-            if (c.pred < 32 or c.pred > 41) return null; // integer predicates only
             const l = resolve(repl, c.lhs);
             const r = resolve(repl, c.rhs);
+            if (c.pred <= 15) {
+                // Floating-point predicates on two constants (ordered:
+                // false with a NaN; unordered: true).
+                const x = constFloat(m, l) orelse return null;
+                const y = constFloat(m, r) orelse return null;
+                const uno = std.math.isNan(x) or std.math.isNan(y);
+                const t = switch (c.pred) {
+                    0 => false,
+                    1 => !uno and x == y,
+                    2 => !uno and x > y,
+                    3 => !uno and x >= y,
+                    4 => !uno and x < y,
+                    5 => !uno and x <= y,
+                    6 => !uno and x != y,
+                    7 => !uno,
+                    8 => uno,
+                    9 => uno or x == y,
+                    10 => uno or x > y,
+                    11 => uno or x >= y,
+                    12 => uno or x < y,
+                    13 => uno or x <= y,
+                    14 => uno or x != y,
+                    else => true,
+                };
+                return try m.constant(.{ .ty = inst.ty, .kind = .{ .int = @intFromBool(t) } });
+            }
+            if (c.pred < 32 or c.pred > 41) return null; // integer predicates
             const w = S.intWidth(m, S.ty(m, f, n, phi_var, var_ty, l)) orelse return null;
             const x = S.bits(constInt(m, l) orelse return null, w);
             const y = S.bits(constInt(m, r) orelse return null, w);
@@ -859,6 +1144,71 @@ fn hasEffects(m: *const module.Module, inst: Inst) bool {
             else => true,
         },
         else => false,
+    };
+}
+
+/// Wave and quad operations: declared without readnone (so nothing moves
+/// them across control flow), but with no effect besides their result.
+/// (Only loop deletion drops them, as dxc's does; dxc's dead code removal
+/// keeps them, and with them what they read.)
+pub fn isWaveOp(name: []const u8) bool {
+    return std.mem.startsWith(u8, name, "dx.op.wave") or std.mem.startsWith(u8, name, "dx.op.quad");
+}
+
+/// A phi that is one constant once each input is read on its edge: an input
+/// that is the condition of the branch the edge leaves by (or its zext or
+/// sext) is known there. (`a && b` with `b` false merges `zext a`, on the
+/// edge where `a` is false, with `false`; dxc's optimizer folds it.)
+fn edgePhi(m: *module.Module, insts: []const Inst, block_start: []const u32, repl: []const ?Value, n: u32, block: u32, inst: Inst) Allocator.Error!?Value {
+    var same: ?i64 = null;
+    var known = false;
+    for (inst.op.phi.incoming) |in| {
+        const x = resolve(repl, in.val);
+        var k = constInt(m, x);
+        if (k == null) {
+            const term = insts[block_start[in.block + 1] - 1].op;
+            const br = switch (term) {
+                .br => |b| b,
+                else => return null,
+            };
+            const cond = resolve(repl, br.cond orelse return null);
+            const other = br.@"else" orelse return null;
+            if (br.then == other) return null;
+            const truth: i64 = if (block == br.then) 1 else if (block == other) 0 else return null;
+            if (std.meta.eql(x, cond)) {
+                k = truth;
+            } else if (x == .inst and x.inst < n and insts[x.inst].op == .cast) {
+                const c = insts[x.inst].op.cast;
+                if (!std.meta.eql(resolve(repl, c.val), cond)) return null;
+                k = switch (c.op) {
+                    .zext => truth,
+                    .sext => -truth,
+                    else => return null,
+                };
+            } else return null;
+            known = true;
+        }
+        if (same) |s| {
+            if (s != k.?) return null;
+        } else same = k;
+    }
+    if (!known) return null;
+    return try m.constant(.{ .ty = inst.ty, .kind = .{ .int = same orelse return null } });
+}
+
+/// A half, float or double constant's value.
+fn constFloat(m: *const module.Module, v: Value) ?f64 {
+    if (v != .constant) return null;
+    const c = m.constants.items[v.constant];
+    const b = switch (c.kind) {
+        .float_bits => |b| b,
+        else => return null,
+    };
+    return switch (m.types.items[c.ty]) {
+        .half => @floatCast(@as(f16, @bitCast(@as(u16, @truncate(b))))),
+        .float => @floatCast(@as(f32, @bitCast(@as(u32, @truncate(b))))),
+        .double => @bitCast(b),
+        else => null,
     };
 }
 
@@ -904,6 +1254,52 @@ fn typeOf(m: *const module.Module, f: *const module.Function, v: Value) TypeId {
 /// rejects unused external functions), renumbering the other functions.
 /// Run last: indices the emitter holds go stale. Returns the new index of
 /// each old function (`none` for dropped ones), or null if none went.
+/// Drops groupshared variables nothing refers to any more (dead code
+/// removal can take their last use, and the validator rejects unused
+/// internal declarations), renumbering the other globals.
+pub fn pruneGlobals(a: Allocator, m: *module.Module) Allocator.Error!void {
+    const globals = m.globals.items;
+    const used = try a.alloc(bool, globals.len);
+    for (globals, used) |g, *u| u.* = g.addr_space != 3;
+    const Use = struct {
+        used: []bool,
+        fn visit(s: *@This(), v: Value, _: Role) Value {
+            if (v == .global) s.used[v.global] = true;
+            return v;
+        }
+    };
+    var use: Use = .{ .used = used };
+    for (m.functions.items) |f| for (f.insts.items) |*inst| try operands(false, a, inst, &use);
+    for (m.metadata.items) |md| if (md == .value and md.value.val == .global) {
+        used[md.value.val.global] = true;
+    };
+    if (std.mem.indexOfScalar(bool, used, false) == null) return;
+    const index = try a.alloc(u32, globals.len);
+    var count: u32 = 0;
+    for (used, index) |u, *x| {
+        x.* = if (u) count else none;
+        if (u) count += 1;
+    }
+    const Map = struct {
+        index: []const u32,
+        fn visit(s: *@This(), v: Value, _: Role) Value {
+            return if (v == .global) .{ .global = s.index[v.global] } else v;
+        }
+    };
+    var map: Map = .{ .index = index };
+    const ma = m.allocator();
+    for (m.functions.items) |*f| for (f.insts.items) |*inst| try operands(true, ma, inst, &map);
+    for (m.metadata.items) |*md| if (md.* == .value and md.value.val == .global) {
+        md.value.val = .{ .global = index[md.value.val.global] };
+    };
+    var k: usize = 0;
+    for (globals, used) |g, u| if (u) {
+        globals[k] = g;
+        k += 1;
+    };
+    m.globals.shrinkRetainingCapacity(k);
+}
+
 pub fn pruneDeclarations(a: Allocator, m: *module.Module) Allocator.Error!?[]const u32 {
     const funcs = m.functions.items;
     const used = try a.alloc(bool, funcs.len);

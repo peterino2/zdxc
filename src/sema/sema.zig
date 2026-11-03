@@ -25,6 +25,9 @@ pub const Options = struct {
     entry: ?[]const u8 = null,
     spirv: bool = false,
     enable_16bit: bool = false,
+    /// HLSL 2016-2018 (below 2021): `&&`, `||` and `?:` work component-wise
+    /// on vectors and evaluate both operands.
+    hlsl_version: u16 = 2021,
     /// Target shader model 6.x (long vectors need 6.9).
     sm_minor: u8 = 10,
     /// Library target (`lib_6_x`): exported functions are the roots of
@@ -113,13 +116,20 @@ pub const Function = struct {
     param_vars: []?*Variable = &.{},
     /// A function template instance's arguments.
     template_args: []const Bound = &.{},
+    /// A method of a class template instance: its body, checked when the
+    /// method is first called (as C++ instantiates members).
+    pending: ?*const PendingBody = null,
 };
+
+pub const PendingBody = struct { f: *const ast.FuncDecl, scope: *Scope, strct: ?*types.StructInfo };
 
 /// A bound template argument.
 pub const Bound = types.TemplateArg;
 
 pub const FuncSet = struct {
     funcs: std.ArrayList(*Function) = .empty,
+    /// Function templates of the same name, overloading with `funcs`.
+    templates: ?*TemplateSet = null,
 };
 
 pub const Symbol = union(enum) {
@@ -309,8 +319,15 @@ pub const Sema = struct {
         const set = blk: {
             if (s.scope.syms.get(name)) |sym| switch (sym) {
                 .template => |t| break :blk t,
-                // Plain functions take precedence over templates.
-                .functions => return,
+                // Function templates overload the plain functions.
+                .functions => |fs| {
+                    if (d.kind != .func) return;
+                    if (fs.templates == null) {
+                        fs.templates = try s.arena.create(TemplateSet);
+                        fs.templates.?.* = .{};
+                    }
+                    break :blk fs.templates.?;
+                },
                 else => {},
             };
             const set = try s.arena.create(TemplateSet);
@@ -740,18 +757,74 @@ pub const Sema = struct {
     /// A call to a function template: deduce, instantiate (once per
     /// argument list), then resolve as an ordinary call.
     fn callTemplate(s: *Sema, e: *ast.Expr, tset: *TemplateSet, explicit: []const ast.TemplateArg, args: []const intrinsics.ArgInfo, callee: *ast.Expr, owner: ?*types.StructInfo) Allocator.Error!TypeId {
-        // Every overload that deduces contributes its instance.
-        const all = try s.arena.create(FuncSet);
-        all.* = .{};
-        for (tset.decls.items) |d| {
-            if (d.kind != .func) continue;
-            const inst = try s.instantiateCall(d, explicit, args, callee, tset.decls.items.len > 1, owner);
-            if (inst) |set| try all.funcs.appendSlice(s.arena, set.funcs.items);
-        }
+        const all = try s.templateInstances(tset, explicit, args, callee, owner, tset.decls.items.len > 1);
         if (all.funcs.items.len == 0) {
             s.err(callee.loc, "this call to a function template is not supported yet", .{});
             return TypeTable.error_type;
         }
+        return s.resolveInstances(e, all, args, callee);
+    }
+
+    /// The instances of `tset`'s function templates that deduce for `args`.
+    fn templateInstances(s: *Sema, tset: *TemplateSet, explicit: []const ast.TemplateArg, args: []const intrinsics.ArgInfo, callee: *ast.Expr, owner: ?*types.StructInfo, quiet: bool) Allocator.Error!*FuncSet {
+        const all = try s.arena.create(FuncSet);
+        all.* = .{};
+        for (tset.decls.items) |d| {
+            if (d.kind != .func) continue;
+            // (Not with too many or too few arguments.)
+            const ps = d.kind.func.params;
+            var required: usize = 0;
+            for (ps) |p| {
+                if (p.init == null) required += 1;
+            }
+            if (args.len > ps.len or args.len < required) continue;
+            const inst = try s.instantiateCall(d, explicit, args, callee, quiet, owner);
+            if (inst) |set| try all.funcs.appendSlice(s.arena, set.funcs.items);
+        }
+        return all;
+    }
+
+    /// A call to plain functions and function templates of one name: the
+    /// templates' instances win only by a lower cost (as in C++, a tie goes
+    /// to the plain function).
+    fn callOverloads(s: *Sema, e: *ast.Expr, set: *FuncSet, tset: *TemplateSet, args: []const intrinsics.ArgInfo, callee: *ast.Expr) Allocator.Error!Typed {
+        const insts = try s.templateInstances(tset, &.{}, args, callee, null, true);
+        const both = try s.arena.create(FuncSet);
+        both.* = .{};
+        try both.funcs.appendSlice(s.arena, set.funcs.items);
+        try both.funcs.appendSlice(s.arena, insts.funcs.items);
+        if (try s.intrinsicFitsBetter(callee, both, args)) return s.intrinsicCall(e, callee, callee.kind.name.parts[0], args, &.{});
+        var plain: ?u32 = null;
+        for (set.funcs.items) |f| {
+            const cost = s.callCost(f, args) orelse continue;
+            if (plain == null or cost < plain.?) plain = cost;
+        }
+        var templ: ?u32 = null;
+        for (insts.funcs.items) |f| {
+            const cost = s.callCost(f, args) orelse continue;
+            if (templ == null or cost < templ.?) templ = cost;
+        }
+        if (templ != null and (plain == null or templ.? < plain.?)) return rvalue(try s.resolveInstances(e, insts, args, callee));
+        return rvalue(s.resolveUserCall(e, set, args, callee));
+    }
+
+    /// Whether a call by an intrinsic's name to user functions `set` (or
+    /// template instances) goes to the intrinsic: when it fits better, or
+    /// when none of them fits (a tie goes to the user function).
+    fn intrinsicFitsBetter(s: *Sema, callee: *ast.Expr, set: *FuncSet, args: []const intrinsics.ArgInfo) Allocator.Error!bool {
+        if (callee.kind != .name or callee.kind.name.parts.len != 1) return false;
+        const name = callee.kind.name.parts[0];
+        if (!s.intrinsic_db.has(name, s.opts.spirv)) return false;
+        var user: ?u32 = null;
+        for (set.funcs.items) |f| {
+            const cost = s.callCost(f, args) orelse continue;
+            if (user == null or cost < user.?) user = cost;
+        }
+        const ic = try s.intrinsic_db.bestCost(s, name, args) orelse return user == null;
+        return user == null or ic < user.?;
+    }
+
+    fn resolveInstances(s: *Sema, e: *ast.Expr, all: *FuncSet, args: []const intrinsics.ArgInfo, callee: *ast.Expr) Allocator.Error!TypeId {
         // A template declared, then defined: its definition's instance.
         var kept: usize = 0;
         for (all.funcs.items) |a| {
@@ -1279,6 +1352,14 @@ pub const Sema = struct {
         // `S<T>::type` where the instance has no such member (the
         // parser cannot tell); other unknown names were reported there.
         if (t.name.parts.len > 1 and t.name.args.len > 0) s.err(t.loc, "no type named '{s}' in this template instance", .{n});
+        // `struct S` before any declaration of S: forward-declares it.
+        if (t.elaborated and t.name.parts.len == 1 and s.global.syms.get(n) == null) {
+            const info = try s.arena.create(types.StructInfo);
+            info.* = .{ .name = n, .scopes = &.{} };
+            const ty = try s.types.intern(.{ .@"struct" = info });
+            try s.global.syms.put(s.arena, n, .{ .type = ty });
+            return ty;
+        }
         return TypeTable.error_type;
     }
 
@@ -2300,10 +2381,16 @@ pub const Sema = struct {
         // Unsized arrays take their size from the initializer.
         if (v.init) |init_e| if (!is_auto) {
             if (s.types.get(ty) == .array and s.types.get(ty).array.len == 0 and init_e.kind == .init_list) {
+                // (Its items typed first: their sizes count.)
+                _ = try s.checkInitializer(TypeTable.error_type, init_e);
                 const elem = s.types.get(ty).array.elem;
                 const elem_count = s.types.componentCount(elem) orelse 1;
                 const flat = s.flatCount(init_e);
                 ty = try s.types.array(elem, @intCast(@max(1, (flat + elem_count - 1) / @max(1, elem_count))));
+                variable.type = ty;
+                init_e.ty = ty;
+                if (!s.checkInitCount(ty, init_e)) variable.type = TypeTable.error_type;
+                return;
             }
             variable.type = ty;
             // Uses of a declaration with a bad initializer are not
@@ -2395,15 +2482,17 @@ pub const Sema = struct {
 
         // Add to the overload set, matching an earlier prototype if any.
         const set = blk: {
+            var templates: ?*TemplateSet = null;
             if (s.scope.syms.get(name)) |sym| {
                 if (sym == .functions) break :blk sym.functions;
                 if (sym != .template) {
                     s.err(d.loc, "redefinition of '{s}' as a different kind of symbol", .{name});
                     return;
                 }
+                if (sym.template.decls.items.len > 0 and sym.template.decls.items[0].kind == .func) templates = sym.template;
             }
             const set = try s.arena.create(FuncSet);
-            set.* = .{};
+            set.* = .{ .templates = templates };
             try s.declare(name, .{ .functions = set }, d.loc);
             break :blk set;
         };
@@ -2525,6 +2614,26 @@ pub const Sema = struct {
     }
 
     fn funcBody(s: *Sema, func: *Function, f: *const ast.FuncDecl) Allocator.Error!void {
+        if (f.body != null and func.owner != null and s.instance_depth > 0 and s.current_fn == null) {
+            const p = try s.arena.create(PendingBody);
+            p.* = .{ .f = f, .scope = s.scope, .strct = s.current_struct };
+            func.pending = p;
+            return;
+        }
+        return s.checkBody(func, f);
+    }
+
+    /// Checks a pending method body (see Function.pending).
+    fn ensureBody(s: *Sema, func: *Function) Allocator.Error!void {
+        const p = func.pending orelse return;
+        func.pending = null;
+        const ctx = s.enterInstance(p.scope);
+        defer s.leaveInstance(ctx);
+        s.current_struct = p.strct;
+        try s.checkBody(func, p.f);
+    }
+
+    fn checkBody(s: *Sema, func: *Function, f: *const ast.FuncDecl) Allocator.Error!void {
         const params = func.params;
         const body = f.body orelse return;
         const saved_fn = s.current_fn;
@@ -2799,7 +2908,36 @@ pub const Sema = struct {
         }
     }
 
+    /// Whether `name` is declared in the current function (its parameters
+    /// and blocks).
+    fn inFunctionScope(s: *Sema, name: []const u8) bool {
+        var sc: ?*Scope = s.scope;
+        while (sc) |c| : (sc = c.parent) {
+            if (c.kind != .block and c.kind != .function) return false;
+            if (c.syms.contains(name)) return true;
+            if (c.kind == .function) return false;
+        }
+        return false;
+    }
+
+    /// A field (or bitfield) of the method's struct named `name`.
+    fn thisField(s: *Sema, e: *ast.Expr, info: *types.StructInfo, name: []const u8) Allocator.Error!?Typed {
+        for (info.fields.items, 0..) |f, k| if (std.mem.eql(u8, f.name, name)) {
+            s.record(e, .{ .this_field = @intCast(k) });
+            return .{ .ty = f.type, .lvalue = true };
+        };
+        if (findBitfield(info, name)) |bf| {
+            s.record(e, .{ .this_bitfield = bf });
+            return .{ .ty = bf.type, .lvalue = true };
+        }
+        return null;
+    }
+
     fn nameExpr(s: *Sema, e: *ast.Expr, n: ast.Name) Allocator.Error!Typed {
+        // Inside methods, fields come before names outside the function.
+        if (n.parts.len == 1 and s.current_struct != null and !s.inFunctionScope(n.parts[0])) {
+            if (try s.thisField(e, s.current_struct.?, n.parts[0])) |t| return t;
+        }
         if (s.lookupName(n)) |sym| switch (sym) {
             .variable => |v| {
                 s.record(e, .{ .variable = v });
@@ -2827,16 +2965,7 @@ pub const Sema = struct {
         }
         // Struct fields and methods used unqualified inside methods.
         if (s.current_struct) |info| {
-            if (n.parts.len == 1) {
-                for (info.fields.items, 0..) |f, k| if (std.mem.eql(u8, f.name, n.parts[0])) {
-                    s.record(e, .{ .this_field = @intCast(k) });
-                    return .{ .ty = f.type, .lvalue = true };
-                };
-                if (findBitfield(info, n.parts[0])) |bf| {
-                    s.record(e, .{ .this_bitfield = bf });
-                    return .{ .ty = bf.type, .lvalue = true };
-                }
-            }
+            if (n.parts.len == 1) if (try s.thisField(e, info, n.parts[0])) |t| return t;
         }
         if (n.parts.len > 1) {
             for (n.parts[0 .. n.parts.len - 1], 0..) |part, i| {
@@ -3027,6 +3156,10 @@ pub const Sema = struct {
         const ls = s.types.shape(lt) orelse return s.invalidOperands(loc, lt, rt);
         const rs = s.types.shape(rt) orelse return s.invalidOperands(loc, lt, rt);
         if (logical) {
+            if (s.opts.hlsl_version < 2021 and (ls.kind != .scalar or rs.kind != .scalar)) {
+                const sh = TypeTable.combineDimensions(ls, rs) orelse return s.invalidOperands(loc, lt, rt);
+                return try s.types.withShape(.bool, sh);
+            }
             if (ls.kind != .scalar or rs.kind != .scalar) {
                 s.err(loc, "operands for short-circuiting logical binary operator must be scalar, for non-scalar types use '{s}'", .{if (op == .log_and) "and" else "or"});
                 return null;
@@ -3160,6 +3293,7 @@ pub const Sema = struct {
         const c = try s.expr(cond);
         const t = try s.expr(then);
         const f = try s.expr(else_e);
+        if (s.opts.hlsl_version < 2021) return s.legacyConditional(e, c, t, f);
         if (c.ty != TypeTable.error_type) {
             if (s.types.shape(c.ty)) |sh| {
                 if (sh.kind != .scalar) {
@@ -3175,6 +3309,29 @@ pub const Sema = struct {
         }
         s.err(e.loc, "incompatible operand types ('{s}' and '{s}')", .{ s.typeName(t.ty), s.typeName(f.ty) });
         return err_typed;
+    }
+
+    /// HLSL 2018's `?:`: a vector condition selects per component, and the
+    /// result takes the shape of all three operands.
+    fn legacyConditional(s: *Sema, e: *ast.Expr, c: Typed, t: Typed, f: Typed) Allocator.Error!Typed {
+        if (c.ty == TypeTable.error_type or t.ty == TypeTable.error_type or f.ty == TypeTable.error_type) return err_typed;
+        const r = if (t.ty == f.ty) t.ty else if (s.types.isNumeric(t.ty) and s.types.isNumeric(f.ty))
+            s.arithmetic(e, t.ty, f.ty) orelse return err_typed
+        else {
+            s.err(e.loc, "incompatible operand types ('{s}' and '{s}')", .{ s.typeName(t.ty), s.typeName(f.ty) });
+            return err_typed;
+        };
+        const cs = s.types.shape(c.ty) orelse return rvalue(r);
+        if (cs.kind == .scalar) return rvalue(r);
+        const rs = s.types.shape(r) orelse {
+            s.err(e.loc, "incompatible operand types ('{s}' and '{s}')", .{ s.typeName(c.ty), s.typeName(r) });
+            return err_typed;
+        };
+        const sh = TypeTable.combineDimensions(cs, rs) orelse {
+            s.err(e.loc, "incompatible operand types ('{s}' and '{s}')", .{ s.typeName(c.ty), s.typeName(r) });
+            return err_typed;
+        };
+        return rvalue(try s.types.withShape(s.types.component(r).?, sh));
     }
 
     /// `sizeof(ty)` plus one, or zero when it has no size: HLSL sizes are
@@ -3520,7 +3677,13 @@ pub const Sema = struct {
         };
         for (arg_types) |a| if (a.ty == TypeTable.error_type) return err_typed;
         switch (target) {
-            .functions => |set| return rvalue(s.resolveUserCall(e, set, arg_types, callee)),
+            .functions => |set| if (set.templates) |tset| {
+                if (template_args.len > 0) return rvalue(try s.callTemplate(e, tset, template_args, arg_types, callee, null));
+                return s.callOverloads(e, set, tset, arg_types, callee);
+            } else {
+                if (try s.intrinsicFitsBetter(callee, set, arg_types)) return s.intrinsicCall(e, callee, callee.kind.name.parts[0], arg_types, template_args);
+                return rvalue(s.resolveUserCall(e, set, arg_types, callee));
+            },
             .template => |set| {
                 // A member template called unqualified from a method.
                 var owner: ?*types.StructInfo = null;
@@ -3530,15 +3693,13 @@ pub const Sema = struct {
                         owner = info;
                     };
                 };
+                if (template_args.len == 0 and owner == null) {
+                    const insts = try s.templateInstances(set, &.{}, arg_types, callee, null, true);
+                    if (try s.intrinsicFitsBetter(callee, insts, arg_types)) return s.intrinsicCall(e, callee, callee.kind.name.parts[0], arg_types, template_args);
+                }
                 return rvalue(try s.callTemplate(e, set, template_args, arg_types, callee, owner));
             },
-            .intrinsic => |name| {
-                var explicit: ?TypeId = null;
-                if (template_args.len > 0) explicit = try s.typeArg(template_args[0]);
-                const r = try s.intrinsic_db.resolve(s, e.loc, if (s.opts.spirv and isVkQualified(callee)) "VkIntrinsics" else "Intrinsics", name, null, arg_types, explicit);
-                if (r.ok) s.record(e, .{ .intrinsic = .{ .index = r.index, .params = r.params } });
-                return rvalue(r.ret);
-            },
+            .intrinsic => |name| return s.intrinsicCall(e, callee, name, arg_types, template_args),
             .method => |m| {
                 switch (s.types.get(m.object)) {
                     .@"struct" => |info| {
@@ -3592,33 +3753,44 @@ pub const Sema = struct {
         return null;
     }
 
+    fn intrinsicCall(s: *Sema, e: *ast.Expr, callee: *ast.Expr, name: []const u8, arg_types: []const intrinsics.ArgInfo, template_args: []const ast.TemplateArg) Allocator.Error!Typed {
+        var explicit: ?TypeId = null;
+        if (template_args.len > 0) explicit = try s.typeArg(template_args[0]);
+        const r = try s.intrinsic_db.resolve(s, e.loc, if (s.opts.spirv and isVkQualified(callee)) "VkIntrinsics" else "Intrinsics", name, null, arg_types, explicit);
+        if (r.ok) s.record(e, .{ .intrinsic = .{ .index = r.index, .params = r.params } });
+        return rvalue(r.ret);
+    }
+
+    /// The cost of calling `f` with `args`, or null if it cannot take them.
+    fn callCost(s: *Sema, f: *const Function, args: []const intrinsics.ArgInfo) ?u32 {
+        if (args.len > f.params.len) return null;
+        var required: usize = 0;
+        for (f.params) |p| {
+            if (!p.has_default) required += 1;
+        }
+        if (args.len < required) return null;
+        var sum: u32 = 0;
+        var worst: u32 = 0;
+        for (args, 0..) |a, i| {
+            const p = f.params[i];
+            var c = s.conversionCost(a.ty, p.type) orelse return null;
+            // groupshared parameters bind only groupshared arguments
+            // (and are preferred for them).
+            if (p.groupshared and !a.groupshared) return null;
+            if (a.groupshared and !p.groupshared) c += 4;
+            sum += c;
+            worst = @max(worst, c);
+        }
+        return types.Scalar.overloadCost(worst, sum);
+    }
+
     /// Overload resolution among user functions by conversion cost.
     fn resolveUserCall(s: *Sema, e: *ast.Expr, set: *FuncSet, args: []const intrinsics.ArgInfo, callee: *ast.Expr) TypeId {
         var best: ?*Function = null;
         var best_cost: u32 = std.math.maxInt(u32);
         var ambiguous = false;
         for (set.funcs.items) |f| {
-            if (args.len > f.params.len) continue;
-            var required: usize = 0;
-            for (f.params) |p| {
-                if (!p.has_default) required += 1;
-            }
-            if (args.len < required) continue;
-            var cost: u32 = 0;
-            var ok = true;
-            for (args, 0..) |a, i| {
-                const p = f.params[i];
-                const c = s.conversionCost(a.ty, p.type);
-                // groupshared parameters bind only groupshared arguments
-                // (and are preferred for them).
-                if (c == null or (p.groupshared and !a.groupshared)) {
-                    ok = false;
-                    break;
-                }
-                cost += c.?;
-                if (a.groupshared and !p.groupshared) cost += 1;
-            }
-            if (!ok) continue;
+            const cost = s.callCost(f, args) orelse continue;
             if (cost < best_cost) {
                 best = f;
                 best_cost = cost;
@@ -3641,6 +3813,7 @@ pub const Sema = struct {
         }
         if (s.current_fn) |caller| caller.callees.append(s.arena, f) catch {};
         s.record(e, .{ .function = f });
+        s.ensureBody(f) catch {};
         return f.ret;
     }
 
@@ -3658,24 +3831,24 @@ pub const Sema = struct {
             if (tt == .@"enum" and (tt.@"enum".scoped or ft == .@"enum")) return null; // needs a cast
             const fs = s.types.shape(from).?;
             const ts = s.types.shape(to).?;
-            var cost: u32 = if (fc.? == tc.?) 0 else if (fc.?.isLiteral()) 1 else if (fc.?.isFloat() == tc.?.isFloat() and tc.?.rank() > fc.?.rank()) 2 else 3;
+            var cost: u32 = fc.?.conversionCost(tc.?);
             cost += switch (TypeTable.convertDimensions(ts, fs) orelse return null) {
                 .identity => 0,
-                .scalar => 1, // float1 -> float
-                .splat => if (ts.count() == 1) 1 else 4,
-                .conversion => 6, // vector <-> matrix of the same size
-                .truncation => if (ts.count() == 1) 10 else 8,
+                .scalar => 4, // float1 -> float
+                .splat => if (ts.count() == 1) 4 else 16,
+                .conversion => 24, // vector <-> matrix of the same size
+                .truncation => if (ts.count() == 1) 40 else 32,
             };
             return cost;
         }
         // A descriptor heap element converts to any resource or sampler.
         if (ft == .dynamic_resource and (tt == .resource or tt == .sampler)) return 0;
         // Derived structs convert to their bases.
-        if (ft == .@"struct" and tt == .@"struct" and derivesFrom(ft.@"struct", tt.@"struct")) return 2;
+        if (ft == .@"struct" and tt == .@"struct" and derivesFrom(ft.@"struct", tt.@"struct")) return 8;
         // int -> unscoped enum (dxc accepts it).
-        if (tt == .@"enum" and !tt.@"enum".scoped and s.types.isNumeric(from) and ft != .@"enum") return 3;
+        if (tt == .@"enum" and !tt.@"enum".scoped and s.types.isNumeric(from) and ft != .@"enum") return 12;
         // ConstantBuffer<S> / TextureBuffer<S> are usable as an S value.
-        if (ft == .resource and (ft.resource.kind == .constant_buffer or ft.resource.kind == .texture_buffer) and ft.resource.elem == to) return 1;
+        if (ft == .resource and (ft.resource.kind == .constant_buffer or ft.resource.kind == .texture_buffer) and ft.resource.elem == to) return 4;
         return switch (ft) {
             .array => |fa| switch (tt) {
                 .array => |ta| if ((ta.len == fa.len or ta.len == 0) and s.conversionCost(fa.elem, ta.elem) == 0) 0 else null,
@@ -3730,18 +3903,7 @@ pub const Sema = struct {
                 if (item.kind != .init_list) _ = try s.expr(item) else _ = try s.checkInitializer(TypeTable.error_type, item);
             }
             e.ty = target;
-            if (target == TypeTable.error_type) return true;
-            const want = if (s.types.get(target) == .string) 1 else s.types.componentCount(target) orelse return true;
-            const have = s.flatCount(e);
-            if (have != want and have != 0) {
-                if (have < want) {
-                    s.err(e.loc, "too few elements in vector initialization (expected {d} element{s}, have {d})", .{ want, if (want == 1) "" else "s", have });
-                } else {
-                    s.err(e.loc, "too many elements in vector initialization (expected {d} element{s}, have {d})", .{ want, if (want == 1) "" else "s", have });
-                }
-                return false;
-            }
-            return true;
+            return s.checkInitCount(target, e);
         }
         const t = try s.expr(e);
         if (t.callee != null and t.ty == TypeTable.error_type) {
@@ -3755,6 +3917,23 @@ pub const Sema = struct {
         }
         s.err(e.loc, "cannot initialize a variable of type '{s}' with an {s} of type '{s}'", .{ s.typeName(target), if (t.lvalue) "lvalue" else "rvalue", s.typeName(t.ty) });
         return false;
+    }
+
+    /// An initializer list (its items typed) has as many components as
+    /// `target`.
+    fn checkInitCount(s: *Sema, target: TypeId, e: *ast.Expr) bool {
+        if (target == TypeTable.error_type) return true;
+        const want = if (s.types.get(target) == .string) 1 else s.types.componentCount(target) orelse return true;
+        const have = s.flatCount(e);
+        if (have != want and have != 0) {
+            if (have < want) {
+                s.err(e.loc, "too few elements in vector initialization (expected {d} element{s}, have {d})", .{ want, if (want == 1) "" else "s", have });
+            } else {
+                s.err(e.loc, "too many elements in vector initialization (expected {d} element{s}, have {d})", .{ want, if (want == 1) "" else "s", have });
+            }
+            return false;
+        }
+        return true;
     }
 
     /// dxc's err_hlsl_cannot_convert: "implicitly" only when an explicit

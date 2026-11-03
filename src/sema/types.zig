@@ -97,6 +97,45 @@ pub const Scalar = enum(u8) {
         };
     }
 
+    /// The cost of converting a component from `a` to `b` in overload
+    /// resolution (lower is better), ordered as dxc ranks them: a literal to
+    /// its own kind, widening within a kind, then a change of sign, then
+    /// integer to bool, then narrowing or a change of kind, and integer to
+    /// float last.
+    pub fn conversionCost(a: Scalar, b: Scalar) u32 {
+        if (a == b) return 0;
+        const l = a.props();
+        const r = b.props();
+        if (a.isLiteral()) {
+            // (An integer literal takes bool before float.)
+            if (r.p.floating == l.p.floating and b != .bool) return if (r.p.min_precision) 5 else 4;
+            return if (b == .bool and !l.p.floating) 6 else 7;
+        }
+        if (l.p.floating and r.p.floating) {
+            if (r.bits < l.bits) return 12;
+            // `half` (32-bit, partial precision) ranks after float.
+            return if (r.p.partial_precision) 9 else 8;
+        }
+        if (a.isInt() and b.isInt()) {
+            const same_sign = l.p.unsigned == r.p.unsigned;
+            if (r.bits < l.bits) return if (same_sign and !l.p.unsigned) 10 else 12;
+            if (same_sign) return 8;
+            // A change of sign: to signed best at the same width, to
+            // unsigned best wider.
+            return if ((r.bits == l.bits) == l.p.unsigned) 9 else 10;
+        }
+        // (From 64 bits, bool ranks with the narrowing to 32.)
+        if (a.isInt() and b == .bool) return if (l.bits <= 32) 11 else if (l.p.unsigned) 12 else 10;
+        if (a.isInt() and r.p.floating) return 13;
+        return 12;
+    }
+
+    /// An overload candidate's cost from its arguments' conversion costs:
+    /// dxc ranks candidates by their worst conversion, then by all of them.
+    pub fn overloadCost(worst: u32, sum: u32) u32 {
+        return worst << 16 | @min(sum, 0xffff);
+    }
+
     /// The component type of a binary operation on `a` and `b`: a port of
     /// dxc's CombineBasicTypes.
     pub fn combine(a: Scalar, b: Scalar) Scalar {

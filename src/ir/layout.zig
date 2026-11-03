@@ -169,9 +169,7 @@ fn structAlign(t: *const TypeTable, info: *const types.StructInfo, rules: Rules)
 }
 
 fn structSize(t: *const TypeTable, info: *const types.StructInfo, rules: Rules) Error!u32 {
-    var buf: [256]u32 = undefined;
-    if (info.fields.items.len > buf.len) return error.Unsupported;
-    const off = try layoutFields(t, info, rules, buf[0..info.fields.items.len]);
+    const off = try layoutFields(t, info, rules, null);
     return switch (rules) {
         .dx_legacy => off,
         // (Packed structs still round up to their widest component: a
@@ -180,9 +178,9 @@ fn structSize(t: *const TypeTable, info: *const types.StructInfo, rules: Rules) 
     };
 }
 
-/// Stores the offsets of `info`'s fields in `out`; returns where the last
-/// one ends.
-fn layoutFields(t: *const TypeTable, info: *const types.StructInfo, rules: Rules, out: []u32) Error!u32 {
+/// Stores the offsets of `info`'s fields in `out` (if given); returns where
+/// the last one ends.
+fn layoutFields(t: *const TypeTable, info: *const types.StructInfo, rules: Rules, out: ?[]u32) Error!u32 {
     var off: u32 = 0;
     var first: usize = 0;
     if (info.bases.items.len > 0 and rules != .dx_legacy and rules != .dx_packed) {
@@ -190,7 +188,7 @@ fn layoutFields(t: *const TypeTable, info: *const types.StructInfo, rules: Rules
         // its alignment); DXIL lays its fields out in place.
         const base = info.bases.items[0];
         first = base.fields.items.len;
-        _ = try layoutFields(t, base, rules, out[0..first]);
+        _ = try layoutFields(t, base, rules, if (out) |o| o[0..first] else null);
         off = try structSize(t, base, rules);
     }
     // Explicit offsets (packoffset / register(cN)): the other members
@@ -201,20 +199,20 @@ fn layoutFields(t: *const TypeTable, info: *const types.StructInfo, rules: Rules
     };
     if (packed_end) |pe| off = @max(off, pe);
     var end: u32 = off;
-    for (info.fields.items[first..], out[first..]) |f, *o| {
+    for (info.fields.items[first..], first..) |f, i| {
         // (Resources in structs take no space in buffers.)
-        if (isOpaque(t, f.type)) {
-            o.* = off;
-            continue;
-        }
-        if (f.pack_offset) |po| {
-            o.* = po;
-            continue;
-        }
-        // [[vk::offset]] (SPIR-V only): later members continue from it.
-        o.* = if (f.vk_offset) |vo| vo else try place(t, off, f.type, f.row_major, rules);
-        off = o.* + try sizeOf(t, f.type, f.row_major, rules);
-        end = @max(end, off);
+        const at = if (isOpaque(t, f.type))
+            off
+        else if (f.pack_offset) |po|
+            po
+        else at: {
+            // [[vk::offset]] (SPIR-V only): later members continue from it.
+            const o = if (f.vk_offset) |vo| vo else try place(t, off, f.type, f.row_major, rules);
+            off = o + try sizeOf(t, f.type, f.row_major, rules);
+            end = @max(end, off);
+            break :at o;
+        };
+        if (out) |o| o[i] = at;
     }
     return @max(end, packed_end orelse 0);
 }
