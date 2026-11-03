@@ -1497,8 +1497,17 @@ const Emitter = struct {
         };
         stats.add(.dxil_lowered, n);
         try f.insts.ensureUnusedCapacity(e.dm.allocator(), n);
-        for (e.prologue.items) |id| f.insts.appendAssumeCapacity(try remapInst(e.arena, map, e.insts.at(id).*, remap));
-        for (e.blocks.items) |blk| for (blk.items) |id| f.insts.appendAssumeCapacity(try remapInst(e.arena, map, e.insts.at(id).*, remap));
+        // (Copied into place, then renumbered there.)
+        for (e.prologue.items) |id| {
+            const dst = f.insts.addOneAssumeCapacity();
+            dst.* = e.insts.at(id).*;
+            try remapInst(e.arena, map, dst, remap);
+        }
+        for (e.blocks.items) |blk| for (blk.items) |id| {
+            const dst = f.insts.addOneAssumeCapacity();
+            dst.* = e.insts.at(id).*;
+            try remapInst(e.arena, map, dst, remap);
+        };
         var ranges: std.AutoHashMapUnmanaged(u32, [2]u32) = .empty;
         var it = e.dyn_ranges.iterator();
         while (it.next()) |kv| try ranges.put(e.arena, map[kv.key_ptr.*], kv.value_ptr.*);
@@ -1564,11 +1573,11 @@ const Emitter = struct {
             }
         };
         M.u = used;
-        _ = remapInst(a, &.{}, inst, M) catch {};
+        var copy = inst;
+        remapInst(a, &.{}, &copy, M) catch {};
     }
 
-    fn remapInst(a: Allocator, map: []const u32, inst: module.Inst, comptime R: type) Allocator.Error!module.Inst {
-        var out = inst;
+    fn remapInst(a: Allocator, map: []const u32, out: *module.Inst, comptime R: type) Allocator.Error!void {
         switch (out.op) {
             .ret => |*v| if (v.*) |x| {
                 v.* = R.v(map, x);
@@ -1628,7 +1637,6 @@ const Emitter = struct {
                 x.index = R.v(map, x.index);
             },
         }
-        return out;
     }
 
     // ------------------------------------------------------------------
