@@ -30,6 +30,7 @@ pub const Options = struct {
     /// SPIR-V 1.x of the target environment.
     spirv_minor: u32 = 0,
     enable_16bit: bool = false,
+    hlsl_version: u16 = 2021,
 };
 
 const Builtin = enum {
@@ -229,7 +230,10 @@ pub const Preprocessor = struct {
             \\#define __DXC_VERSION_MINOR 10
             \\#define __DXC_VERSION_RELEASE 0
             \\#define __DXC_VERSION_COMMITS 0
-            \\#define __HLSL_VERSION 2021
+            \\
+        );
+        try w.print("#define __HLSL_VERSION {d}\n", .{o.hlsl_version});
+        try w.writeAll(
             \\#define __SHADER_STAGE_VERTEX 1
             \\#define __SHADER_STAGE_PIXEL 0
             \\#define __SHADER_STAGE_GEOMETRY 2

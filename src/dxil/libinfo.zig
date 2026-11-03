@@ -237,7 +237,7 @@ pub fn featureInfo(fl: u64) u64 {
         .{ bit.typed_uav_load, 0x800 }, .{ bit.resource_heap, 0x2000000 }, .{ bit.sampler_heap, 0x4000000 },
         .{ bit.barycentrics, 0x20000 }, .{ bit.extended_command_info, 0x100000000 }, .{ bit.tiled_resources, 0x100 },
         .{ 1 << 29, 0x1000000 },       .{ 1 << 18, 0x1000 },        .{ 1 << 41, 0x200000000 },       .{ bit.raytracing_1_1, 0x100000 }, .{ bit.sampler_feedback, 0x200000 },
-        .{ bit.advanced_texture_ops, 0x20000000 }, .{ bit.uses_derivatives, 0x100 << 32 }, .{ bit.requires_group, 0x200 << 32 },
+        .{ bit.advanced_texture_ops, 0x20000000 }, .{ 1 << 27, 0x400000 }, .{ bit.uses_derivatives, 0x100 << 32 }, .{ bit.requires_group, 0x200 << 32 },
     };
     var out: u64 = 0;
     for (map) |e| if (fl & e[0] != 0) {

@@ -20,7 +20,8 @@ const Loc = source.Loc;
 
 pub const Error = Allocator.Error || error{Syntax};
 
-const NameKind = enum { type, template_type, template_func, value };
+/// (`function`: a plain function, which may overload function templates.)
+const NameKind = enum { type, template_type, template_func, value, function };
 
 pub const Parser = struct {
     arena: Allocator,
@@ -316,6 +317,14 @@ pub const Parser = struct {
         try p.scopes.items[p.scopes.items.len - 1].append(p.arena, name);
     }
 
+    /// Declares `name` in the outermost scope (under any inner entries).
+    fn declareGlobalName(p: *Parser, name: []const u8, kind: NameKind) Allocator.Error!void {
+        const gop = try p.names.getOrPut(p.arena, name);
+        if (!gop.found_existing) gop.value_ptr.* = .empty;
+        try gop.value_ptr.insert(p.arena, 0, kind);
+        try p.scopes.items[0].append(p.arena, name);
+    }
+
     fn lookupName(p: *const Parser, name: []const u8) ?NameKind {
         const list = p.names.get(name) orelse return null;
         if (list.items.len == 0) return null;
@@ -336,6 +345,10 @@ pub const Parser = struct {
         if (p.lookupName(name)) |k| {
             if (k == .template_type or k == .template_func) return true;
             if (k == .value) return false;
+            if (k == .function) {
+                for (p.names.get(name).?.items) |o| if (o == .template_func) return true;
+                return false;
+            }
         }
         // Builtin templates keep working when a same-named user type exists
         // in some namespace (the name table is not namespace-aware).
@@ -347,6 +360,7 @@ pub const Parser = struct {
     fn scanType(p: *const Parser, start: usize) ?usize {
         var i = start;
         while (isTypeAttrWord(p.toks[i])) i += 1;
+        if ((p.toks[i].isIdent("struct") or p.toks[i].isIdent("class")) and p.toks[i + 1].kind == .identifier) i += 1;
         if (p.toks[i].isIdent("typename")) return p.scanDependentType(i + 1);
         if (p.toks[i].isIdent("unsigned") or p.toks[i].isIdent("signed")) {
             i += 1;
@@ -555,6 +569,12 @@ pub const Parser = struct {
     }
 
     fn parseTypeInner(p: *Parser) Error!*ast.TypeRef {
+        // An elaborated type: `struct S` names S (declaring it if needed).
+        const elaborated = (p.atIdent("struct") or p.atIdent("class")) and p.peek(1).kind == .identifier and p.peek(2).kind != .l_brace and p.peek(2).kind != .colon;
+        if (elaborated) {
+            _ = p.advance();
+            if (!p.isTypeName(p.tok().text)) try p.declareGlobalName(p.tok().text, .type);
+        }
         const start = p.tok();
         if (p.eatIdent("typename")) {
             // Dependent name: `typename X<T>::type`.
@@ -586,7 +606,7 @@ pub const Parser = struct {
         }
         var args: []const ast.TemplateArg = &.{};
         if (p.at(.less) and (p.forced_template or p.isTemplateName(name.last()))) args = try p.parseTemplateArgs();
-        return p.mk(ast.TypeRef, .{ .loc = start.loc, .name = name, .args = args });
+        return p.mk(ast.TypeRef, .{ .loc = start.loc, .name = name, .args = args, .elaborated = elaborated });
     }
 
     /// A qualified name whose final part may carry template arguments.
@@ -1269,7 +1289,7 @@ pub const Parser = struct {
         if (template_params.len > 0) {
             try p.declareNameOuter(name.last(), .template_func, true);
         } else if (ctx != .member) {
-            try p.declareName(name.last(), .value);
+            try p.declareName(name.last(), .function);
         }
         _ = try p.expect(.l_paren, "'('");
         try p.pushScope();

@@ -168,6 +168,8 @@ const Options = struct {
     preprocess: bool = false,
     pp_output: ?[]const u8 = null,
     enable_16bit: bool = false,
+    /// -HV: 2021, or 2016-2018 (component-wise `&&`, `||` and `?:`).
+    hlsl_version: u16 = 2021,
     row_major: bool = false,
     col_major: bool = false,
     /// -force-rootsig-ver, -Qstrip_rootsignature, -rootsig-define, -Frs.
@@ -249,8 +251,12 @@ fn parseArgs(ctx: *Ctx, arena: std.mem.Allocator, args: []const []const u8) !?Op
                         try opts.defines.append(arena, .{ .name = v[0..eq], .value = v[eq + 1 ..] });
                     } else try opts.defines.append(arena, .{ .name = v }),
                     .I => try opts.include_dirs.append(arena, v),
-                    .hlsl_version => if (!std.mem.eql(u8, v, "2021")) {
-                        return ctx.fail("HLSL version {s} is not supported; zdxc implements HLSL 2021 only", .{v});
+                    .hlsl_version => {
+                        const n = std.fmt.parseInt(u16, v, 10) catch 0;
+                        if (n != 2021 and (n < 2016 or n > 2018)) {
+                            return ctx.fail("HLSL version {s} is not supported; zdxc implements HLSL 2016-2018 and 2021", .{v});
+                        }
+                        opts.hlsl_version = n;
                     },
                     .P => opts.preprocess = true,
                     .spirv => opts.spirv = true,
@@ -435,6 +441,7 @@ fn run(ctx: *Ctx, arena: std.mem.Allocator) !void {
             .spirv = opts.spirv,
             .spirv_minor = if (zdxc.spirv.emit.TargetEnv.parse(opts.target_env)) |t| t.minor else 0,
             .enable_16bit = opts.enable_16bit,
+            .hlsl_version = opts.hlsl_version,
         });
         var out: Io.Writer.Allocating = .init(arena);
         var module: ?zdxc.ir.ir.Module = null;
@@ -452,6 +459,7 @@ fn run(ctx: *Ctx, arena: std.mem.Allocator) !void {
                         .entry = if (opts.sema or is_lib) null else opts.entry,
                         .spirv = opts.spirv,
                         .enable_16bit = opts.enable_16bit,
+                        .hlsl_version = opts.hlsl_version,
                         .sm_minor = if (profile) |p| p.minor else 10,
                         .library = is_lib,
                         .root = opts.entry,
@@ -502,6 +510,7 @@ fn run(ctx: *Ctx, arena: std.mem.Allocator) !void {
         if (opts.parse or opts.sema) return;
         if (profile == null) return ctx.fail("missing -T <profile>", .{});
         if (module) |*m| {
+            m.auto_unroll = !opts.spirv and !opts.no_opt and opts.opt_level != .od;
             try zdxc.ir.opt.run(arena, m);
             if (opts.spirv) {
                 zdxc.ir.split_resources.run(arena, m, &diags) catch |err| switch (err) {

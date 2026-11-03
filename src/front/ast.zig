@@ -51,6 +51,8 @@ pub const TypeRef = struct {
     /// `#pragma pack_matrix` in effect where the type was written (true:
     /// row_major): the orientation of a matrix declared without one.
     pack_matrix: ?bool = null,
+    /// `struct S`: declares S (at namespace scope) if it is not yet a type.
+    elaborated: bool = false,
 };
 
 /// Storage classes, type qualifiers and parameter / interpolation

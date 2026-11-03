@@ -1026,6 +1026,15 @@ const Lowerer = struct {
             },
             .conditional => |x| {
                 const ty = try l.concrete(e.ty);
+                // HLSL 2018: both operands, then a (per-component) select.
+                if (l.s.opts.hlsl_version < 2021 and t.isNumeric(ty)) {
+                    const cs = t.shape(x.cond.ty);
+                    const cond_ty = if (cs != null and cs.?.kind != .scalar) try t.withComponent(ty, .bool) else try t.scalar(.bool);
+                    const cond = try l.converted(x.cond, cond_ty);
+                    const a = try l.converted(x.then, ty);
+                    const b = try l.converted(x.@"else", ty);
+                    return l.b.add(.{ .op = .{ .select = .{ .cond = cond, .t = a, .f = b } }, .ty = ty });
+                }
                 const tmp = try l.b.add(.{ .op = .local_var, .ty = ty, .ptr = .function });
                 const cond = try l.condition(x.cond);
                 const then_b = try l.b.newBlock();
@@ -1072,6 +1081,9 @@ const Lowerer = struct {
                 return l.b.load(p);
             },
             .sizeof_type, .sizeof_expr, .is_same => {
+                // (Sema keeps the size; a template instance's type names
+                // no longer resolve here.)
+                if (e.kind == .sizeof_type and e.info != 0) return l.b.constInt(try l.concrete(e.ty), e.info - 1);
                 if (l.s.evalInt(e)) |v| return l.b.constInt(try l.concrete(e.ty), v);
                 return l.fail(e, "this expression");
             },
@@ -1103,7 +1115,13 @@ const Lowerer = struct {
                 _ = try l.rvalue(lhs);
                 return l.rvalue(rhs);
             },
-            .log_and, .log_or => {
+            .log_and, .log_or => if (l.s.opts.hlsl_version < 2021) {
+                // HLSL 2018: both operands, component-wise.
+                const ty = try l.concrete(e.ty);
+                const a = try l.converted(lhs, ty);
+                const b = try l.converted(rhs, ty);
+                return l.b.add(.{ .op = .{ .binary = .{ .op = if (op == .log_and) .log_and else .log_or, .lhs = a, .rhs = b } }, .ty = ty });
+            } else {
                 // Short-circuit (HLSL 2021: scalar operands).
                 const bool_ty = try t.scalar(.bool);
                 const tmp = try l.b.add(.{ .op = .local_var, .ty = bool_ty, .ptr = .function });
@@ -1756,6 +1774,12 @@ const Lowerer = struct {
                 return l.variableLvalue(e, r.variable);
             },
             .member => |m| {
+                // One component of a vector (atomics' `ref`, `B[i].x`).
+                if (l.s.resolution(e) == null and t.get(m.base.ty) == .vector) if (try swizzleComponents(l.arena, m.name)) |comps| if (comps.len == 1) {
+                    const base = try l.lvalue(m.base);
+                    const idx = try l.b.constInt(try t.scalar(.uint), comps[0]);
+                    return l.b.add(.{ .op = .{ .access = .{ .base = base, .indices = try l.arena.dupe(Ref, &.{idx}) } }, .ty = e.ty, .ptr = l.b.f.inst(base).ptr });
+                };
                 const r = l.s.resolution(e) orelse return l.fail(e, "this member");
                 // A static member through an object.
                 if (r == .variable) return l.variableLvalue(e, r.variable);

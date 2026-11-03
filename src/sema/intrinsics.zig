@@ -8,7 +8,8 @@
 //! coerced into the group's class (`float_like`, `numeric`, `any_int`...),
 //! and the layout is taken from the declared dimensions (binding symbolic
 //! sizes like `c` and `r2` across arguments) or, for `<>`, from the
-//! arguments. Candidates are ranked by total conversion cost.
+//! arguments. Candidates are ranked by their worst conversion, then their
+//! total conversion cost.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -89,6 +90,17 @@ pub const Db = struct {
             if (db.by_name.get(key)) |l| try list.appendSlice(a, l.items);
         }
         return list.items;
+    }
+
+    /// The conversion cost of the best overload of global intrinsic `name`
+    /// for `args`, or null if none fits (no diagnostics).
+    pub fn bestCost(db: *const Db, sema: anytype, name: []const u8, args: []const ArgInfo) !?u32 {
+        var best: ?u32 = null;
+        for (try db.candidates(sema.arena, "Intrinsics", name)) |ci| {
+            const m = try matchOne(sema, &table.intrinsics[ci], null, args, null) orelse continue;
+            if (best == null or m.cost < best.?) best = m.cost;
+        }
+        return best;
     }
 
     /// Resolve a call; reports a diagnostic and returns the error type when
@@ -211,11 +223,13 @@ fn matchOne(sema: anytype, it: *const table.Intrinsic, object: ?TypeId, args: []
 
     var bindings: Bindings = .{};
     for (args[0..it.params.len], 1..) |a, i| {
-        if (!specs[i].any_layout) continue;
+        // (Also arguments whose layout links to a `<>` one.)
+        if (!specs[i].any_layout and !specs[layout_group[i]].any_layout) continue;
         const sh = t.shape(a.ty) orelse continue;
         if (bindings.any_shape == null or sh.count() > bindings.any_shape.?.count()) bindings.any_shape = sh;
     }
-    var cost: u32 = 0;
+    var sum: u32 = 0;
+    var worst: u32 = 0;
     const out_params = try sema.arena.alloc(bool, args.len);
     @memset(out_params, false);
     const param_types = try sema.arena.alloc(TypeId, args.len);
@@ -230,13 +244,17 @@ fn matchOne(sema: anytype, it: *const table.Intrinsic, object: ?TypeId, args: []
         param_types[ai] = if (pt == TypeTable.error_type) a.ty else pt;
         if (pt == TypeTable.error_type) continue; // unconstrained object / unknown class
         const c = sema.conversionCost(a.ty, pt) orelse return null;
-        cost += c;
+        // A `ref` argument (InterlockedAdd's destination) is the storage
+        // itself: its type must match.
+        if (s.qual == .ref and c != 0) return null;
+        sum += c;
+        worst = @max(worst, c);
     }
 
     // Return type.
     const ret = try paramType(sema, specs, 0, comp_group, layout_group, group_comp, &bindings, args, obj_elem, explicit) orelse return null;
     for (args[@min(args.len, it.params.len)..], @min(args.len, it.params.len)..) |a, ai| param_types[ai] = a.ty; // varargs
-    return .{ .ret = ret, .cost = cost, .out_params = out_params, .params = param_types };
+    return .{ .ret = ret, .cost = Scalar.overloadCost(worst, sum), .out_params = out_params, .params = param_types };
 }
 
 /// The concrete type of spec `i`, or null if the arguments cannot fit.
