@@ -4033,7 +4033,8 @@ const Emitter = struct {
         const ptr = try e.add(try e.dm.ptrType(class_ty), .{ .gep = .{ .elem = arr_ty, .ptr = .{ .global = lg }, .indices = try e.arena.dupe(Value, &.{ try e.i32Const(0), index }) } });
         if (nonuniform) {
             const blk = e.blocks.items[e.cur].items;
-            e.insts.at(blk[blk.len - 1]).md = .{ .kind = try e.dm.mdKind("dx.nonuniform"), .node = try e.dm.mdNode(&.{try e.dm.mdI32(1)}) };
+            const kind = try e.dm.mdKind("dx.nonuniform");
+            e.insts.at(blk[blk.len - 1]).md = try e.dm.instMd(kind, try e.dm.mdNode(&.{try e.dm.mdI32(1)}));
         }
         const loaded = try e.add(class_ty, .{ .load = .{ .ptr = ptr, .@"align" = 4 } });
         const struct_name = e.dm.types.items[class_ty].@"struct".name;

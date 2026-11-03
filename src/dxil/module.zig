@@ -159,10 +159,14 @@ pub const Inst = struct {
         extractelement: struct { vec: Value, index: Value },
         insertelement: struct { vec: Value, val: Value, index: Value },
     },
-    /// An attached metadata node (`kind` from Module.mdKind), as
-    /// `!dx.nonuniform` on a resource array's getelementptr.
-    md: ?struct { kind: u32, node: MdId } = null,
+    /// An attached metadata node, as `!dx.nonuniform` on a resource
+    /// array's getelementptr (see Module.instMd).
+    md: InstMd = .none,
 };
+
+/// An instruction's metadata attachment: an index into Module.inst_mds,
+/// kept out of line (few instructions have one).
+pub const InstMd = enum(u32) { none = 0, _ };
 
 pub const Function = struct {
     name: []const u8,
@@ -199,6 +203,8 @@ pub const Module = struct {
     globals: std.ArrayList(GlobalVar) = .empty,
     metadata: std.ArrayList(Metadata) = .empty,
     named_metadata: std.ArrayList(struct { name: []const u8, nodes: []const MdId }) = .empty,
+    /// Instruction metadata attachments (InstMd), from 1.
+    inst_mds: std.ArrayList(struct { kind: u32, node: MdId }) = .empty,
     /// Instruction metadata kinds, by id.
     md_kinds: std.ArrayList([]const u8) = .empty,
 
@@ -283,6 +289,12 @@ pub const Module = struct {
             return .{ .constant = m.small_i32[k] };
         }
         return m.constant(.{ .ty = try m.intType(bits), .kind = .{ .int = v } });
+    }
+
+    /// An attachment of node `node` as metadata kind `kind` (from mdKind).
+    pub fn instMd(m: *Module, kind: u32, node: MdId) !InstMd {
+        try m.inst_mds.append(m.allocator(), .{ .kind = kind, .node = node });
+        return @fromBackingInt(@intCast(m.inst_mds.items.len));
     }
 
     pub fn addFunction(m: *Module, f: Function) !u32 {
@@ -776,10 +788,11 @@ const Encoder = struct {
         }
         // METADATA_ATTACHMENT: [instruction index, (kind, node)...]
         var any_md = false;
-        for (f.insts.items) |inst| any_md = any_md or inst.md != null;
+        for (f.insts.items) |inst| any_md = any_md or inst.md != .none;
         if (any_md) {
             try w.enterBlock(block_metadata_attachment, 3);
-            for (f.insts.items, 0..) |inst, k| if (inst.md) |md| {
+            for (f.insts.items, 0..) |inst, k| if (inst.md != .none) {
+                const md = e.m.inst_mds.items[@backingInt(inst.md) - 1];
                 try e.ops.appendSlice(e.gpa(), &.{ k, md.kind, md.node });
                 try e.rec(11);
             };
