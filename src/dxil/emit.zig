@@ -2912,8 +2912,10 @@ const Emitter = struct {
                 const key = .{ ptr.base, ptr.offset_const + @as(u32, @intCast(c)) };
                 // (Constants too, in locals: ops such as linear algebra
                 // layouts need immediates passed through parameters.)
-                const forward = e.status_vals.contains(v) or (v == .constant and ptr.addr_space == 0);
-                if (forward) try e.forwarded.put(e.arena, key, .{ .v = v, .block = e.cur }) else _ = e.forwarded.remove(key);
+                const forward = (v == .constant and ptr.addr_space == 0) or (e.status_vals.count() > 0 and e.status_vals.contains(v));
+                if (forward) {
+                    try e.forwarded.put(e.arena, key, .{ .v = v, .block = e.cur });
+                } else if (e.forwarded.count() > 0) _ = e.forwarded.remove(key);
             } else e.forwarded.clearRetainingCapacity();
             const p = try e.elementPtr(ptr, @intCast(c));
             const ct = e.compOf(try e.componentType(ty, @intCast(c)));
