@@ -357,10 +357,10 @@ pub const ResourceKind = enum(u8) {
 
     /// vk::SampledTexture* by name.
     pub const vk_names = [_]struct { []const u8, ResourceKind }{
-        .{ "SampledTexture1D", .sampled_texture1d },               .{ "SampledTexture1DArray", .sampled_texture1d_array },
-        .{ "SampledTexture2D", .sampled_texture2d },               .{ "SampledTexture2DArray", .sampled_texture2d_array },
-        .{ "SampledTexture2DMS", .sampled_texture2dms },           .{ "SampledTexture2DMSArray", .sampled_texture2dms_array },
-        .{ "SampledTexture3D", .sampled_texture3d },               .{ "SampledTextureCUBE", .sampled_texture_cube },
+        .{ "SampledTexture1D", .sampled_texture1d },                 .{ "SampledTexture1DArray", .sampled_texture1d_array },
+        .{ "SampledTexture2D", .sampled_texture2d },                 .{ "SampledTexture2DArray", .sampled_texture2d_array },
+        .{ "SampledTexture2DMS", .sampled_texture2dms },             .{ "SampledTexture2DMSArray", .sampled_texture2dms_array },
+        .{ "SampledTexture3D", .sampled_texture3d },                 .{ "SampledTextureCUBE", .sampled_texture_cube },
         .{ "SampledTextureCUBEArray", .sampled_texture_cube_array },
     };
 
@@ -536,6 +536,8 @@ pub const TypeTable = struct {
     gpa: Allocator,
     types: std.ArrayList(Type) = .empty,
     map: std.AutoHashMapUnmanaged(Key, TypeId) = .empty,
+    /// scalar's results.
+    scalars: [@typeInfo(Scalar).@"enum".field_names.len]TypeId = @splat(std.math.maxInt(TypeId)),
 
     pub const error_type: TypeId = 0;
     pub const void_type: TypeId = 1;
@@ -591,7 +593,9 @@ pub const TypeTable = struct {
     }
 
     pub fn scalar(t: *TypeTable, s: Scalar) !TypeId {
-        return t.intern(.{ .scalar = s });
+        const k = @backingInt(s);
+        if (t.scalars[k] == std.math.maxInt(TypeId)) t.scalars[k] = try t.intern(.{ .scalar = s });
+        return t.scalars[k];
     }
 
     /// `len == 1` vectors are kept distinct from scalars (float1 != float).

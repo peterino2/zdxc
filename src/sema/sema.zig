@@ -940,12 +940,25 @@ pub const Sema = struct {
     }
 
     fn lookup(s: *Sema, name: []const u8) ?Symbol {
+        // (The name hashed once, for every scope out to the global one.)
+        const key: Prehashed = .{ .h = std.hash_map.hashString(name) };
         var sc: ?*Scope = s.scope;
         while (sc) |c| : (sc = c.parent) {
-            if (c.syms.get(name)) |sym| return sym;
+            if (c.syms.getAdapted(name, key)) |sym| return sym;
         }
         return null;
     }
+
+    /// A string hash map key context with the hash already worked out.
+    const Prehashed = struct {
+        h: u64,
+        pub fn hash(k: Prehashed, _: []const u8) u64 {
+            return k.h;
+        }
+        pub fn eql(_: Prehashed, a: []const u8, b: []const u8) bool {
+            return std.mem.eql(u8, a, b);
+        }
+    };
 
     /// Resolve a possibly qualified name.
     fn lookupName(s: *Sema, n: ast.Name) ?Symbol {
