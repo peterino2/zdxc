@@ -535,9 +535,6 @@ pub const Module = struct {
     resource_structs: bool = false,
     /// -enable-16bit-types: half and 16-bit integers are native types.
     native_16bit: bool = false,
-    /// Unroll small loops with a constant trip count too (DXIL with the
-    /// optimizer on, as dxc's loop unrolling does).
-    auto_unroll: bool = false,
     /// -Zpr: matrices that are structured buffer elements themselves
     /// (not fields, which carry their own orientation) are row_major.
     /// DXIL only: dxc's SPIR-V keeps those column_major.

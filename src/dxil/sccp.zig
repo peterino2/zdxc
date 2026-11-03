@@ -79,6 +79,26 @@ fn isTerminator(inst: Inst) bool {
     };
 }
 
+/// A terminator's successor blocks.
+const Succs = struct {
+    br: [2]u32 = undefined,
+    sw: ?@FieldType(@FieldType(Inst, "op"), "switch") = null,
+    len: usize = 0,
+
+    fn get(s: Succs, k: usize) u32 {
+        if (s.sw) |sw| return if (k == 0) sw.default else sw.cases[k - 1].block;
+        return s.br[k];
+    }
+};
+
+fn successors(term: Inst) Succs {
+    return switch (term.op) {
+        .br => |br| if (br.@"else") |e| .{ .br = .{ br.then, e }, .len = 2 } else .{ .br = .{ br.then, 0 }, .len = 1 },
+        .@"switch" => |sw| .{ .sw = sw, .len = 1 + sw.cases.len },
+        else => .{},
+    };
+}
+
 /// Runs the propagation on `func`; true if it changed anything.
 pub fn run(a: Allocator, m: *module.Module, func: u32) Allocator.Error!bool {
     const f = &m.functions.items[func];
@@ -217,15 +237,45 @@ pub fn run(a: Allocator, m: *module.Module, func: u32) Allocator.Error!bool {
     };
     const ev: Eval = .{ .m = m, .f = f, .lat = lat };
 
-    // Iterated to the fixed point in block order (the lattice is three
-    // levels deep, so this ends quickly).
+    // Blocks in reverse postorder: definitions before uses except round
+    // loops, so the fixed point takes a few passes (the lattice is three
+    // levels deep).
+    var rpo: std.ArrayList(u32) = .empty;
+    {
+        var post: std.ArrayList(u32) = .empty;
+        const seen = try a.alloc(bool, nb);
+        @memset(seen, false);
+        const Fr = struct { b: u32, next: u32 };
+        var stack: std.ArrayList(Fr) = .empty;
+        try stack.append(a, .{ .b = 0, .next = 0 });
+        seen[0] = true;
+        while (stack.items.len > 0) {
+            const top = &stack.items[stack.items.len - 1];
+            const succs = successors(insts[block_start[top.b + 1] - 1]);
+            if (top.next < succs.len) {
+                const t = succs.get(top.next);
+                top.next += 1;
+                if (!seen[t]) {
+                    seen[t] = true;
+                    try stack.append(a, .{ .b = t, .next = 0 });
+                }
+            } else {
+                try post.append(a, top.b);
+                _ = stack.pop();
+            }
+        }
+        var k = post.items.len;
+        while (k > 0) {
+            k -= 1;
+            try rpo.append(a, post.items[k]);
+        }
+    }
     var changed = true;
     var rounds: u32 = 0;
     while (changed) : (rounds += 1) {
         if (rounds > 1000) return false;
         changed = false;
-        for (0..nb) |bb| {
-            const b: u32 = @intCast(bb);
+        for (rpo.items) |b| {
             if (!exec[b]) continue;
             for (block_start[b]..block_start[b + 1]) |ii| {
                 const i: u32 = @intCast(ii);

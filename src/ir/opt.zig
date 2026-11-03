@@ -19,7 +19,7 @@ const Scalar = types.Scalar;
 
 pub fn run(a: Allocator, m: *ir.Module) Allocator.Error!void {
     for (m.functions.items) |f| {
-        try unrollLoops(a, m.types, f, m.auto_unroll);
+        try unrollLoops(a, m.types, f);
         try fold(a, m.types, f);
     }
 }
@@ -432,9 +432,6 @@ pub fn fold(a: Allocator, t: *TypeTable, f: *ir.Function) Allocator.Error!void {
 const unroll_limit = 1024;
 /// Trip limit for loops unrolled only to make texel offsets constant.
 const auto_unroll_limit = 64;
-/// Instructions a loop may grow to when unrolled for no other reason
-/// than its constant trip count (`auto_unroll`).
-const auto_unroll_budget = 2048;
 
 /// Evaluates scalar `r` with the induction variable `iv` holding `v`.
 fn eval(t: *TypeTable, f: *ir.Function, r: Ref, iv: Ref, v: ?Constant, depth: u32) ?Constant {
@@ -452,7 +449,7 @@ fn eval(t: *TypeTable, f: *ir.Function, r: Ref, iv: Ref, v: ?Constant, depth: u3
     };
 }
 
-fn unrollLoops(a: Allocator, t: *TypeTable, f: *ir.Function, auto: bool) Allocator.Error!void {
+fn unrollLoops(a: Allocator, t: *TypeTable, f: *ir.Function) Allocator.Error!void {
     var kept: std.AutoHashMapUnmanaged(u32, void) = .empty;
     while (true) {
         const live = try reachable(a, f);
@@ -473,7 +470,7 @@ fn unrollLoops(a: Allocator, t: *TypeTable, f: *ir.Function, auto: bool) Allocat
             break;
         }
         const h = pick orelse return;
-        if (!try unrollOne(a, t, f, h, sets.get(h).?, live, auto)) try kept.put(a, h, {});
+        if (!try unrollOne(a, t, f, h, sets.get(h).?, live)) try kept.put(a, h, {});
     }
 }
 
@@ -521,7 +518,7 @@ fn hasTexelOffsets(t: *TypeTable, f: *ir.Function, set: []const bool) bool {
     return false;
 }
 
-fn unrollOne(a: Allocator, t: *TypeTable, f: *ir.Function, h: u32, set: []const bool, live: []const bool, auto: bool) Allocator.Error!bool {
+fn unrollOne(a: Allocator, t: *TypeTable, f: *ir.Function, h: u32, set: []const bool, live: []const bool) Allocator.Error!bool {
     const hb = f.blocks.items[h];
     const lp = hb.merge.loop;
     if (lp.unroll == .dont) return false;
@@ -617,7 +614,7 @@ fn unrollOne(a: Allocator, t: *TypeTable, f: *ir.Function, h: u32, set: []const 
     var v = init orelse return false;
 
     const wanted = lp.unroll == .unroll or hasTexelOffsets(t, f, set);
-    if (!wanted and !auto) return false;
+    if (!wanted) return false;
     const limit: usize = if (lp.unroll == .unroll) unroll_limit else auto_unroll_limit;
     const cond = cb.term.cond_br.cond;
     var values: std.ArrayList(Constant) = .empty;
@@ -627,14 +624,6 @@ fn unrollOne(a: Allocator, t: *TypeTable, f: *ir.Function, h: u32, set: []const 
         if (values.items.len >= limit) return false;
         try values.append(a, v);
         v = eval(t, f, step, iv, v, 0) orelse return false;
-    }
-    // Otherwise only small loops: their size, unrolled, within a budget.
-    if (!wanted) {
-        var size: usize = 0;
-        for (f.blocks.items, 0..) |blk, bi| if (set[bi]) {
-            size += blk.insts.items.len + 1;
-        };
-        if (values.items.len * size > auto_unroll_budget) return false;
     }
 
     // The condition block is dropped: nothing else may use its values.

@@ -23,9 +23,12 @@ const Edge = @typeInfo(@FieldType(@FieldType(@FieldType(Inst, "op"), "phi"), "in
 
 const none = std.math.maxInt(u32);
 
-/// Most iterations unrolled, and most instructions one function may grow
-/// by.
+/// Most iterations unrolled, most instructions one loop may grow to
+/// unrolled (small loops only, as dxc's full unrolling of loops without
+/// [unroll]: larger ones cost compile time and code size for little), and
+/// most one function may grow by.
 const max_trips = 256;
+const max_loop_growth = 300;
 const max_growth = 65536;
 
 /// Unrolls the qualifying loops of `func`, innermost first; true if any.
@@ -472,7 +475,7 @@ fn unrollOne(a: Allocator, m: *module.Module, func: u32, budget: *usize, tried: 
         }
         const trips = states.items.len;
         const growth = (trips + 1) * size;
-        if (growth > budget.*) continue;
+        if (growth > max_loop_growth or growth > budget.*) continue;
         budget.* -= growth;
         try states.append(a, state); // the last pass, up to the exit
 

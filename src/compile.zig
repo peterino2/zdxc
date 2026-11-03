@@ -510,7 +510,6 @@ fn run(ctx: *Ctx, arena: std.mem.Allocator) !void {
         if (opts.parse or opts.sema) return;
         if (profile == null) return ctx.fail("missing -T <profile>", .{});
         if (module) |*m| {
-            m.auto_unroll = !opts.spirv and !opts.no_opt and opts.opt_level != .od;
             try zdxc.ir.opt.run(arena, m);
             if (opts.spirv) {
                 zdxc.ir.split_resources.run(arena, m, &diags) catch |err| switch (err) {
