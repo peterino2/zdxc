@@ -15,6 +15,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const module = @import("module.zig");
+const stats = @import("../stats.zig");
 const promote = @import("promote.zig");
 
 const Value = module.Value;
@@ -33,6 +34,8 @@ const max_growth = 65536;
 
 /// Unrolls the qualifying loops of `func`, innermost first; true if any.
 pub fn run(a: Allocator, m: *module.Module, func: u32) Allocator.Error!bool {
+    const zone = stats.begin(.unroll);
+    defer zone.end();
     var budget: usize = max_growth;
     var tried: std.AutoHashMapUnmanaged(u32, void) = .empty;
     var any = false;
@@ -46,15 +49,76 @@ const Cfg = struct {
     succs: [][]u32,
     preds: [][]u32,
     idom: []u32,
+    /// Each reachable block's interval in a depth-first walk of the
+    /// dominator tree (`none` for unreachable blocks): `d` dominates `b`
+    /// when `b`'s interval is inside `d`'s.
+    dom_pre: []u32,
+    dom_post: []u32,
 
     fn dominates(c: *const Cfg, d: u32, b: u32) bool {
-        var x = b;
-        while (true) {
-            if (x == d) return true;
-            const p = c.idom[x];
-            if (p == none or p == x) return false;
-            x = p;
+        if (d == b) return true;
+        if (c.dom_pre[d] == none or c.dom_pre[b] == none) return false;
+        return c.dom_pre[d] <= c.dom_pre[b] and c.dom_post[b] <= c.dom_post[d];
+    }
+};
+
+/// Numbers the dominator tree's blocks in and out of a depth-first walk.
+fn domIntervals(a: Allocator, idom: []const u32) Allocator.Error!struct { []u32, []u32 } {
+    const nb = idom.len;
+    // Children lists, packed: block b's are kids[first[b]..first[b + 1]].
+    const first = try a.alloc(u32, nb + 1);
+    @memset(first, 0);
+    for (idom, 0..) |p, b| if (p != none and p != b) {
+        first[p + 1] += 1;
+    };
+    for (1..nb + 1) |k| first[k] += first[k - 1];
+    const fill = try a.dupe(u32, first[0..nb]);
+    const kids = try a.alloc(u32, first[nb]);
+    for (idom, 0..) |p, b| if (p != none and p != b) {
+        kids[fill[p]] = @intCast(b);
+        fill[p] += 1;
+    };
+    const pre = try a.alloc(u32, nb);
+    const post = try a.alloc(u32, nb);
+    @memset(pre, none);
+    @memset(post, none);
+    if (nb == 0) return .{ pre, post };
+    var clock: u32 = 0;
+    // `next` reuses fill: the next child to visit.
+    @memcpy(fill, first[0..nb]);
+    var stack: std.ArrayList(u32) = .empty;
+    try stack.append(a, 0);
+    pre[0] = clock;
+    clock += 1;
+    while (stack.items.len > 0) {
+        const b = stack.items[stack.items.len - 1];
+        if (fill[b] < first[b + 1]) {
+            const k = kids[fill[b]];
+            fill[b] += 1;
+            pre[k] = clock;
+            clock += 1;
+            try stack.append(a, k);
+        } else {
+            post[b] = clock;
+            clock += 1;
+            _ = stack.pop();
         }
+    }
+    return .{ pre, post };
+}
+
+/// A loop's blocks: a bit per block of the function, and the list in
+/// block order.
+const Body = struct {
+    bits: []u64,
+    blocks: []const u32,
+
+    fn has(b: Body, x: u32) bool {
+        return b.bits[x >> 6] >> @intCast(x & 63) & 1 != 0;
+    }
+
+    fn add(b: *Body, x: u32) void {
+        b.bits[x >> 6] |= @as(u64, 1) << @intCast(x & 63);
     }
 };
 
@@ -79,27 +143,43 @@ fn buildCfg(a: Allocator, f: *const module.Function) Allocator.Error!?Cfg {
         }
     }
     if (b != nb) return null;
-    const succs = try a.alloc([]u32, nb);
-    var pred_lists = try a.alloc(std.ArrayList(u32), nb);
-    for (pred_lists) |*p| p.* = .empty;
+    // Successors (each once) and predecessors, packed: each block's are a
+    // slice of one array.
+    var succ_flat: std.ArrayList(u32) = .empty;
+    try succ_flat.ensureTotalCapacity(a, 2 * nb);
+    const succ_off = try a.alloc(u32, nb + 1);
     for (0..nb) |bi| {
-        var s: std.ArrayList(u32) = .empty;
+        const start = succ_flat.items.len;
+        succ_off[bi] = @intCast(start);
         switch (insts[block_start[bi + 1] - 1].op) {
             .br => |br| {
-                try s.append(a, br.then);
-                if (br.@"else") |e| if (e != br.then) try s.append(a, e);
+                try succ_flat.append(a, br.then);
+                if (br.@"else") |e| if (e != br.then) try succ_flat.append(a, e);
             },
             .@"switch" => |sw| {
-                try s.append(a, sw.default);
-                for (sw.cases) |c| if (std.mem.indexOfScalar(u32, s.items, c.block) == null) try s.append(a, c.block);
+                try succ_flat.append(a, sw.default);
+                for (sw.cases) |c| if (std.mem.indexOfScalar(u32, succ_flat.items[start..], c.block) == null) try succ_flat.append(a, c.block);
             },
             else => {},
         }
-        succs[bi] = s.items;
-        for (s.items) |t| try pred_lists[t].append(a, @intCast(bi));
+    }
+    succ_off[nb] = @intCast(succ_flat.items.len);
+    const succs = try a.alloc([]u32, nb);
+    for (succs, 0..) |*sl, bi| sl.* = succ_flat.items[succ_off[bi]..succ_off[bi + 1]];
+    const pred_off = try a.alloc(u32, nb + 1);
+    @memset(pred_off, 0);
+    for (succ_flat.items) |t| pred_off[t + 1] += 1;
+    for (1..nb + 1) |k| pred_off[k] += pred_off[k - 1];
+    const pred_flat = try a.alloc(u32, succ_flat.items.len);
+    {
+        const fill = try a.dupe(u32, pred_off[0..nb]);
+        for (0..nb) |bi| for (succs[bi]) |t| {
+            pred_flat[fill[t]] = @intCast(bi);
+            fill[t] += 1;
+        };
     }
     const preds = try a.alloc([]u32, nb);
-    for (preds, pred_lists) |*p, l| p.* = l.items;
+    for (preds, 0..) |*pl, bi| pl.* = pred_flat[pred_off[bi]..pred_off[bi + 1]];
 
     // Reverse postorder, then Cooper, Harvey and Kennedy's dominators.
     const order = try a.alloc(u32, nb);
@@ -162,7 +242,8 @@ fn buildCfg(a: Allocator, f: *const module.Function) Allocator.Error!?Cfg {
             }
         }
     }
-    return .{ .nb = nb, .block_start = block_start, .succs = succs, .preds = preds, .idom = idom };
+    const pre, const post = try domIntervals(a, idom);
+    return .{ .nb = nb, .block_start = block_start, .succs = succs, .preds = preds, .idom = idom, .dom_pre = pre, .dom_post = post };
 }
 
 fn constInt(m: *const module.Module, v: Value) ?i64 {
@@ -282,7 +363,7 @@ fn unrollOne(a: Allocator, m: *module.Module, func: u32, budget: *usize, tried: 
 
     // Loops: headers with back edges (from blocks they dominate), and
     // their blocks.
-    const Loop = struct { h: u32, body: []bool, latches: []u32 };
+    const Loop = struct { h: u32, body: Body, latches: []u32 };
     var loops: std.ArrayList(Loop) = .empty;
     for (0..nb) |hb| {
         const h: u32 = @intCast(hb);
@@ -290,16 +371,30 @@ fn unrollOne(a: Allocator, m: *module.Module, func: u32, budget: *usize, tried: 
         var latches: std.ArrayList(u32) = .empty;
         for (cfg.preds[h]) |p| if (cfg.idom[p] != none and cfg.dominates(h, p)) try latches.append(a, p);
         if (latches.items.len == 0) continue;
-        const body = try a.alloc(bool, nb);
-        @memset(body, false);
-        body[h] = true;
+        const bits = try a.alloc(u64, (nb + 63) / 64);
+        @memset(bits, 0);
+        var body: Body = .{ .bits = bits, .blocks = &.{} };
+        body.add(h);
+        var count: usize = 1;
         var stack: std.ArrayList(u32) = .empty;
         try stack.appendSlice(a, latches.items);
         while (stack.pop()) |x| {
-            if (body[x]) continue;
-            body[x] = true;
+            if (body.has(x)) continue;
+            body.add(x);
+            count += 1;
             for (cfg.preds[x]) |p| if (cfg.idom[p] != none) try stack.append(a, p);
         }
+        // The blocks in order, from the bits.
+        const blocks = try a.alloc(u32, count);
+        var k: usize = 0;
+        for (bits, 0..) |word, wi| {
+            var w = word;
+            while (w != 0) : (w &= w - 1) {
+                blocks[k] = @intCast(wi * 64 + @ctz(w));
+                k += 1;
+            }
+        }
+        body.blocks = blocks;
         try loops.append(a, .{ .h = h, .body = body, .latches = latches.items });
     }
 
@@ -309,10 +404,14 @@ fn unrollOne(a: Allocator, m: *module.Module, func: u32, budget: *usize, tried: 
     // that block; their blocks are left unreachable for promotion to drop.
     // (Nested ones too: an outer loop whose inner loops do nothing.)
     const loop_inst = try a.alloc(bool, insts.len);
+    @memset(loop_inst, false);
+    // (The loop whose instructions loop_inst marks, cleared for the next.)
+    var marked: ?Body = null;
     dead: for (loops.items) |lp| {
+        if (marked) |mk| for (mk.blocks) |bb| @memset(loop_inst[cfg.block_start[bb]..cfg.block_start[bb + 1]], false);
+        marked = null;
         var exit: u32 = none;
-        for (0..nb) |bb| {
-            if (!lp.body[bb]) continue;
+        for (lp.body.blocks) |bb| {
             for (cfg.block_start[bb]..cfg.block_start[bb + 1]) |i| switch (insts[i].op) {
                 .br, .@"switch" => {},
                 .ret, .@"unreachable", .store, .atomicrmw, .cmpxchg => continue :dead,
@@ -322,14 +421,14 @@ fn unrollOne(a: Allocator, m: *module.Module, func: u32, budget: *usize, tried: 
                 },
                 else => {},
             };
-            for (cfg.succs[bb]) |s| if (!lp.body[s]) {
+            for (cfg.succs[bb]) |s| if (!lp.body.has(s)) {
                 if (exit != none and exit != s) continue :dead;
                 exit = s;
             };
         }
         if (exit == none) continue;
         var pre: u32 = none;
-        for (cfg.preds[lp.h]) |p| if (!lp.body[p]) {
+        for (cfg.preds[lp.h]) |p| if (!lp.body.has(p)) {
             if (pre != none) continue :dead;
             pre = p;
         };
@@ -338,9 +437,8 @@ fn unrollOne(a: Allocator, m: *module.Module, func: u32, budget: *usize, tried: 
         if (pterm.op != .br) continue;
         if (pterm.op.br.then == exit or pterm.op.br.@"else" == exit) continue;
 
-        for (0..nb) |bb| for (cfg.block_start[bb]..cfg.block_start[bb + 1]) |i| {
-            loop_inst[i] = lp.body[bb];
-        };
+        for (lp.body.blocks) |bb| @memset(loop_inst[cfg.block_start[bb]..cfg.block_start[bb + 1]], true);
+        marked = lp.body;
         // The exit's phis: one value from the loop, from before it.
         const phi_end = blk: {
             var i = cfg.block_start[exit];
@@ -350,7 +448,7 @@ fn unrollOne(a: Allocator, m: *module.Module, func: u32, budget: *usize, tried: 
         const from_loop = try a.alloc(?Value, phi_end - cfg.block_start[exit]);
         for (cfg.block_start[exit]..phi_end, from_loop) |i, *fl| {
             fl.* = null;
-            for (insts[i].op.phi.incoming) |in| if (lp.body[in.block]) {
+            for (insts[i].op.phi.incoming) |in| if (lp.body.has(in.block)) {
                 if (in.val == .inst and loop_inst[in.val.inst]) continue :dead;
                 if (fl.* != null and !std.meta.eql(fl.*.?, in.val)) continue :dead;
                 fl.* = in.val;
@@ -367,7 +465,7 @@ fn unrollOne(a: Allocator, m: *module.Module, func: u32, budget: *usize, tried: 
         };
         var check: Check = .{ .loop_inst = loop_inst };
         for (0..nb) |bb| {
-            if (lp.body[bb]) continue;
+            if (lp.body.has(@intCast(bb))) continue;
             for (cfg.block_start[bb]..cfg.block_start[bb + 1]) |i| {
                 if (bb == exit and i < phi_end) continue;
                 var copy = insts[i];
@@ -379,7 +477,7 @@ fn unrollOne(a: Allocator, m: *module.Module, func: u32, budget: *usize, tried: 
         const ma = m.allocator();
         for (cfg.block_start[exit]..phi_end, from_loop) |i, fl| {
             var edges: std.ArrayList(Edge) = .empty;
-            for (insts[i].op.phi.incoming) |in| if (!lp.body[in.block]) try edges.append(ma, in);
+            for (insts[i].op.phi.incoming) |in| if (!lp.body.has(in.block)) try edges.append(ma, in);
             if (fl) |v| try edges.append(ma, .{ .val = v, .block = pre });
             insts[i].op.phi.incoming = edges.items;
         }
@@ -387,9 +485,7 @@ fn unrollOne(a: Allocator, m: *module.Module, func: u32, budget: *usize, tried: 
         if (pterm.op.br.@"else") |*e| if (e.* == lp.h) {
             e.* = exit;
         };
-        for (0..nb) |bb| if (lp.body[bb]) {
-            insts[cfg.block_start[bb + 1] - 1].op = .@"unreachable";
-        };
+        for (lp.body.blocks) |bb| insts[cfg.block_start[bb + 1] - 1].op = .@"unreachable";
         return true;
     }
 
@@ -397,7 +493,7 @@ fn unrollOne(a: Allocator, m: *module.Module, func: u32, budget: *usize, tried: 
         const h = lp.h;
         if (tried.contains(h)) continue;
         // Innermost: no other loop's header inside.
-        for (loops.items) |other| if (other.h != h and lp.body[other.h]) continue :candidates;
+        for (loops.items) |other| if (other.h != h and lp.body.has(other.h)) continue :candidates;
         try tried.put(a, h, {});
 
         // One way out: a conditional branch from one block, to one block.
@@ -405,17 +501,16 @@ fn unrollOne(a: Allocator, m: *module.Module, func: u32, budget: *usize, tried: 
         var exit: u32 = none;
         var size: usize = 0;
         var body_blocks: std.ArrayList(u32) = .empty;
-        for (0..nb) |bb| {
-            if (!lp.body[bb]) continue;
-            try body_blocks.append(a, @intCast(bb));
+        for (lp.body.blocks) |bb| {
+            try body_blocks.append(a, bb);
             size += cfg.block_start[bb + 1] - cfg.block_start[bb];
             const term = insts[cfg.block_start[bb + 1] - 1].op;
             if (term == .@"switch") {
-                for (cfg.succs[bb]) |s| if (!lp.body[s]) continue :candidates;
+                for (cfg.succs[bb]) |s| if (!lp.body.has(s)) continue :candidates;
             }
-            for (cfg.succs[bb]) |s| if (!lp.body[s]) {
+            for (cfg.succs[bb]) |s| if (!lp.body.has(s)) {
                 if (exiting != none) continue :candidates;
-                exiting = @intCast(bb);
+                exiting = bb;
                 exit = s;
             };
         }
@@ -423,11 +518,11 @@ fn unrollOne(a: Allocator, m: *module.Module, func: u32, budget: *usize, tried: 
         const xterm = insts[cfg.block_start[exiting + 1] - 1].op;
         if (xterm != .br or xterm.br.@"else" == null) continue;
         const stay = if (xterm.br.then == exit) xterm.br.@"else".? else xterm.br.then;
-        if (!lp.body[stay] or stay == exit) continue;
+        if (!lp.body.has(stay) or stay == exit) continue;
         for (lp.latches) |l| if (!cfg.dominates(exiting, l)) continue :candidates;
         // One way in.
         var pre: u32 = none;
-        for (cfg.preds[h]) |p| if (!lp.body[p]) {
+        for (cfg.preds[h]) |p| if (!lp.body.has(p)) {
             if (pre != none) continue :candidates;
             pre = p;
         };
@@ -620,7 +715,7 @@ fn unrollOne(a: Allocator, m: *module.Module, func: u32, budget: *usize, tried: 
         const last: Mapper = .{ .maps = maps, .new_index = new_index, .k = copies - 1 };
         const in_body = try a.alloc(bool, n0);
         for (0..nb) |bb| for (cfg.block_start[bb]..cfg.block_start[bb + 1]) |i| {
-            in_body[i] = lp.body[bb];
+            in_body[i] = lp.body.has(@intCast(bb));
         };
         const Outside = struct {
             last: Mapper,
@@ -632,7 +727,7 @@ fn unrollOne(a: Allocator, m: *module.Module, func: u32, budget: *usize, tried: 
         };
         var outside: Outside = .{ .last = last, .in_body = in_body };
         for (0..nb) |bb| {
-            if (lp.body[bb]) {
+            if (lp.body.has(@intCast(bb))) {
                 // The originals: unreachable now.
                 insts[cfg.block_start[bb + 1] - 1].op = .@"unreachable";
                 continue;

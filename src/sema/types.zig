@@ -357,10 +357,10 @@ pub const ResourceKind = enum(u8) {
 
     /// vk::SampledTexture* by name.
     pub const vk_names = [_]struct { []const u8, ResourceKind }{
-        .{ "SampledTexture1D", .sampled_texture1d },               .{ "SampledTexture1DArray", .sampled_texture1d_array },
-        .{ "SampledTexture2D", .sampled_texture2d },               .{ "SampledTexture2DArray", .sampled_texture2d_array },
-        .{ "SampledTexture2DMS", .sampled_texture2dms },           .{ "SampledTexture2DMSArray", .sampled_texture2dms_array },
-        .{ "SampledTexture3D", .sampled_texture3d },               .{ "SampledTextureCUBE", .sampled_texture_cube },
+        .{ "SampledTexture1D", .sampled_texture1d },                 .{ "SampledTexture1DArray", .sampled_texture1d_array },
+        .{ "SampledTexture2D", .sampled_texture2d },                 .{ "SampledTexture2DArray", .sampled_texture2d_array },
+        .{ "SampledTexture2DMS", .sampled_texture2dms },             .{ "SampledTexture2DMSArray", .sampled_texture2dms_array },
+        .{ "SampledTexture3D", .sampled_texture3d },                 .{ "SampledTextureCUBE", .sampled_texture_cube },
         .{ "SampledTextureCUBEArray", .sampled_texture_cube_array },
     };
 
@@ -535,13 +535,32 @@ pub const LinAlgMatrix = struct { comp: u32, m: u32, n: u32, use: u32, scope: u3
 pub const TypeTable = struct {
     gpa: Allocator,
     types: std.ArrayList(Type) = .empty,
-    map: std.AutoHashMapUnmanaged(Key, TypeId) = .empty,
+    map: std.HashMapUnmanaged(Key, TypeId, KeyContext, std.hash_map.default_max_load_percentage) = .empty,
+    /// scalar's results.
+    scalars: [@typeInfo(Scalar).@"enum".field_names.len]TypeId = @splat(std.math.maxInt(TypeId)),
 
     pub const error_type: TypeId = 0;
     pub const void_type: TypeId = 1;
 
     /// Hashable identity of structural types.
     const Key = struct { tag: u8, a: u64, b: u64 };
+
+    /// Hashes a Key's words (it has padding, which the automatic context
+    /// hashes around field by field).
+    const KeyContext = struct {
+        fn mix(x: u64) u64 {
+            var z = x;
+            z = (z ^ (z >> 30)) *% 0xbf58476d1ce4e5b9;
+            z = (z ^ (z >> 27)) *% 0x94d049bb133111eb;
+            return z ^ (z >> 31);
+        }
+        pub fn hash(_: KeyContext, k: Key) u64 {
+            return mix(k.a ^ mix(k.b ^ @as(u64, k.tag) << 56));
+        }
+        pub fn eql(_: KeyContext, x: Key, y: Key) bool {
+            return x.tag == y.tag and x.a == y.a and x.b == y.b;
+        }
+    };
 
     pub fn init(gpa: Allocator) !TypeTable {
         var t: TypeTable = .{ .gpa = gpa };
@@ -591,7 +610,9 @@ pub const TypeTable = struct {
     }
 
     pub fn scalar(t: *TypeTable, s: Scalar) !TypeId {
-        return t.intern(.{ .scalar = s });
+        const k = @backingInt(s);
+        if (t.scalars[k] == std.math.maxInt(TypeId)) t.scalars[k] = try t.intern(.{ .scalar = s });
+        return t.scalars[k];
     }
 
     /// `len == 1` vectors are kept distinct from scalars (float1 != float).

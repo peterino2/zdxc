@@ -11,6 +11,7 @@ const container = zdxc.dxil.container;
 const front = zdxc.front;
 const options = zdxc.options;
 const FileSystem = front.source.FileSystem;
+const stats = zdxc.stats;
 
 pub const Request = struct {
     /// dxc command-line options, without the program name: "-T", "ps_6_0",
@@ -371,7 +372,9 @@ fn parseArgs(ctx: *Ctx, arena: std.mem.Allocator, args: []const []const u8) !?Op
 }
 
 fn run(ctx: *Ctx, arena: std.mem.Allocator) !void {
+    const za = stats.begin(.args);
     const opts = try parseArgs(ctx, arena, ctx.req.args) orelse return;
+    za.end();
     ctx.result.object_name = opts.output;
     ctx.result.root_signature_name = opts.rootsig_output;
     ctx.result.preprocessed_name = opts.pp_output;
@@ -445,13 +448,18 @@ fn run(ctx: *Ctx, arena: std.mem.Allocator) !void {
         });
         var out: Io.Writer.Allocating = .init(arena);
         var module: ?zdxc.ir.ir.Module = null;
+        const zp = stats.begin(.preprocess);
         const opened = try pp.enterMainFile(input);
         if (opened) {
             if (opts.preprocess) {
                 try front.pp_print.print(&pp, &out.writer);
+                zp.end();
             } else {
                 var parser = try front.parser.Parser.fromPreprocessor(arena, &diags, &pp);
+                zp.end();
+                const zparse = stats.begin(.parse);
                 const tu = try parser.parseTranslationUnit();
+                zparse.end();
                 if (opts.dump_ast) try front.ast_dump.dumpUnit(ctx.stdout, tu);
                 if (!opts.parse) {
                     const is_lib = if (profile) |p| p.kind == .library else true;
@@ -467,8 +475,10 @@ fn run(ctx: *Ctx, arena: std.mem.Allocator) !void {
                     });
                     // About one resolution per expression: reserve rather
                     // than grow, which leaves every old buffer in the arena.
+                    const zs = stats.begin(.sema);
                     try sema.resolutions.ensureTotalCapacity(arena, parser.toks.len);
                     try sema.checkUnit(tu);
+                    zs.end();
                     if (!opts.sema and !diags.hasErrors() and profile != null) {
                         const stage: zdxc.ir.ir.Stage = switch (profile.?.kind) {
                             .vertex => .vertex,
@@ -481,10 +491,12 @@ fn run(ctx: *Ctx, arena: std.mem.Allocator) !void {
                             .amplification => .amplification,
                             else => .library,
                         };
+                        const zl = stats.begin(.lower);
                         module = zdxc.ir.lower.lowerUnit(arena, &sema, .{ .entry = opts.entry, .stage = stage }) catch |e| switch (e) {
                             error.Unsupported => null,
                             else => |x| return x,
                         };
+                        zl.end();
                         if (module) |*mm| {
                             mm.native_16bit = opts.enable_16bit;
                             mm.row_major = opts.row_major;
@@ -510,7 +522,11 @@ fn run(ctx: *Ctx, arena: std.mem.Allocator) !void {
         if (opts.parse or opts.sema) return;
         if (profile == null) return ctx.fail("missing -T <profile>", .{});
         if (module) |*m| {
+            const zo = stats.begin(.ir_opt);
             try zdxc.ir.opt.run(arena, m);
+            zo.end();
+            const zv = stats.begin(.spirv);
+            defer if (opts.spirv) zv.end();
             if (opts.spirv) {
                 zdxc.ir.split_resources.run(arena, m, &diags) catch |err| switch (err) {
                     error.Unsupported => {
@@ -546,6 +562,7 @@ fn run(ctx: *Ctx, arena: std.mem.Allocator) !void {
             if (opts.rootsig_define) |macro| if (m.entries.items.len == 1) {
                 m.entries.items[0].root_signature = try rootSignatureMacroText(ctx, arena, opts, input, macro) orelse return error.CompileFailed;
             };
+            const zd = stats.begin(.dxil);
             const dxil_out = zdxc.dxil.emit.emitWithReflection(arena, m, profile.?, &diags, !opts.no_opt and opts.opt_level != .od) catch |err| switch (err) {
                 error.Unsupported => {
                     try diags.render(&sm, ctx.stderr, .{ .format = opts.diag_format, .color = false });
@@ -553,6 +570,7 @@ fn run(ctx: *Ctx, arena: std.mem.Allocator) !void {
                 },
                 else => |x| return x,
             };
+            zd.end();
             try ctx.needOutput(opts);
             ctx.result.object = dxil_out.object;
             ctx.result.reflection = dxil_out.reflection;

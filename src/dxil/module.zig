@@ -3,6 +3,7 @@
 //! unabbreviated records only.
 
 const std = @import("std");
+const BumpArena = @import("../BumpArena.zig");
 const Allocator = std.mem.Allocator;
 const bitstream = @import("bitstream.zig");
 
@@ -39,6 +40,38 @@ pub const Type = union(enum) {
     }
 };
 
+/// splitmix64's finalizer: a cheap hash of a word, for the type and
+/// constant pools (a hash map uses both its high and low bits).
+fn mix(x: u64) u64 {
+    var z = x;
+    z = (z ^ (z >> 30)) *% 0xbf58476d1ce4e5b9;
+    z = (z ^ (z >> 27)) *% 0x94d049bb133111eb;
+    return z ^ (z >> 31);
+}
+
+/// Hashes what Type.eql compares.
+const TypeContext = struct {
+    pub fn hash(_: TypeContext, t: Type) u64 {
+        const tag: u64 = @backingInt(t);
+        return switch (t) {
+            .void, .label, .metadata, .half, .float, .double => mix(tag),
+            .int => |w| mix(tag << 56 | w),
+            .pointer => |p| mix(tag << 56 | @as(u64, p.addr_space) << 32 | p.elem),
+            .function => |f| mix(tag << 56 | f.ret) ^ std.hash.Wyhash.hash(0, std.mem.sliceAsBytes(f.params)),
+            .@"struct" => |st| mix(tag) ^ std.hash.Wyhash.hash(0, st.name),
+            .array => |x| mix(mix(tag << 56 | x.elem) ^ x.len),
+            .vector => |x| mix(tag << 56 | @as(u64, x.len) << 32 | x.elem),
+        };
+    }
+
+    pub fn eql(_: TypeContext, a: Type, b: Type) bool {
+        return a.eql(b);
+    }
+};
+
+const no_type = std.math.maxInt(TypeId);
+const no_const = std.math.maxInt(ConstId);
+
 pub const Constant = struct {
     ty: TypeId,
     kind: union(enum) {
@@ -50,6 +83,24 @@ pub const Constant = struct {
         /// Struct / array / vector of earlier constants.
         aggregate: []const ConstId,
     },
+};
+
+/// Constants are equal when their type and kind are (aggregates: the same
+/// element slice, as std.meta.eql compares slices).
+const ConstantContext = struct {
+    pub fn hash(_: ConstantContext, c: Constant) u64 {
+        const head = mix(@as(u64, @backingInt(c.kind)) << 32 | c.ty);
+        return switch (c.kind) {
+            .int => |v| mix(head ^ @as(u64, @bitCast(v))),
+            .float_bits => |v| mix(head ^ v),
+            .undef, .null => head,
+            .aggregate => |a| mix(head ^ @intFromPtr(a.ptr) ^ a.len << 48),
+        };
+    }
+
+    pub fn eql(_: ConstantContext, a: Constant, b: Constant) bool {
+        return a.ty == b.ty and std.meta.eql(a.kind, b.kind);
+    }
 };
 
 pub const Linkage = enum(u32) { external = 0, internal = 3 };
@@ -106,10 +157,14 @@ pub const Inst = struct {
         extractelement: struct { vec: Value, index: Value },
         insertelement: struct { vec: Value, val: Value, index: Value },
     },
-    /// An attached metadata node (`kind` from Module.mdKind), as
-    /// `!dx.nonuniform` on a resource array's getelementptr.
-    md: ?struct { kind: u32, node: MdId } = null,
+    /// An attached metadata node, as `!dx.nonuniform` on a resource
+    /// array's getelementptr (see Module.instMd).
+    md: InstMd = .none,
 };
+
+/// An instruction's metadata attachment: an index into Module.inst_mds,
+/// kept out of line (few instructions have one).
+pub const InstMd = enum(u32) { none = 0, _ };
 
 pub const Function = struct {
     name: []const u8,
@@ -130,15 +185,24 @@ pub const Metadata = union(enum) {
 };
 
 pub const Module = struct {
-    arena: std.heap.ArenaAllocator,
+    arena: BumpArena,
     triple: []const u8 = "dxil-ms-dx",
     datalayout: []const u8 = "e-m:e-p:32:32-i1:32-i8:32-i16:32-i32:32-i64:64-f16:32-f32:32-f64:64-n8:16:32:64",
     types: std.ArrayList(Type) = .empty,
+    /// Index of `types`, for getType to find existing ones.
+    type_ids: std.HashMapUnmanaged(Type, TypeId, TypeContext, std.hash_map.default_max_load_percentage) = .empty,
     constants: std.ArrayList(Constant) = .empty,
+    /// Index of `constants`, for constant() to find existing ones.
+    constant_ids: std.HashMapUnmanaged(Constant, ConstId, ConstantContext, std.hash_map.default_max_load_percentage) = .empty,
     functions: std.ArrayList(Function) = .empty,
+    /// intType's and constInt's results for common arguments.
+    int_types: [65]TypeId = @splat(no_type),
+    small_i32: [1024]ConstId = @splat(no_const),
     globals: std.ArrayList(GlobalVar) = .empty,
     metadata: std.ArrayList(Metadata) = .empty,
     named_metadata: std.ArrayList(struct { name: []const u8, nodes: []const MdId }) = .empty,
+    /// Instruction metadata attachments (InstMd), from 1.
+    inst_mds: std.ArrayList(struct { kind: u32, node: MdId }) = .empty,
     /// Instruction metadata kinds, by id.
     md_kinds: std.ArrayList([]const u8) = .empty,
 
@@ -155,9 +219,7 @@ pub const Module = struct {
     }
 
     pub fn getType(m: *Module, t: Type) !TypeId {
-        for (m.types.items, 0..) |existing, i| {
-            if (existing.eql(t)) return @intCast(i);
-        }
+        if (m.type_ids.get(t)) |id| return id;
         const a = m.allocator();
         var owned = t;
         switch (owned) {
@@ -168,11 +230,18 @@ pub const Module = struct {
             },
             else => {},
         }
+        const id: TypeId = @intCast(m.types.items.len);
+        try m.type_ids.ensureUnusedCapacity(a, 1);
         try m.types.append(a, owned);
-        return @intCast(m.types.items.len - 1);
+        m.type_ids.putAssumeCapacity(owned, id);
+        return id;
     }
 
     pub fn intType(m: *Module, bits: u32) !TypeId {
+        if (bits < m.int_types.len) {
+            if (m.int_types[bits] == no_type) m.int_types[bits] = try m.getType(.{ .int = bits });
+            return m.int_types[bits];
+        }
         return m.getType(.{ .int = bits });
     }
 
@@ -200,15 +269,132 @@ pub const Module = struct {
     }
 
     pub fn constant(m: *Module, c: Constant) !Value {
-        for (m.constants.items, 0..) |existing, i| {
-            if (existing.ty == c.ty and std.meta.eql(existing.kind, c.kind)) return .{ .constant = @intCast(i) };
+        const gop = try m.constant_ids.getOrPut(m.allocator(), c);
+        if (!gop.found_existing) {
+            gop.value_ptr.* = @intCast(m.constants.items.len);
+            m.constants.append(m.allocator(), c) catch |err| {
+                m.constant_ids.removeByPtr(gop.key_ptr);
+                return err;
+            };
         }
-        try m.constants.append(m.allocator(), c);
-        return .{ .constant = @intCast(m.constants.items.len - 1) };
+        return .{ .constant = gop.value_ptr.* };
     }
 
     pub fn constInt(m: *Module, bits: u32, v: i64) !Value {
+        if (bits == 32 and v >= 0 and v < m.small_i32.len) {
+            const k: usize = @intCast(v);
+            if (m.small_i32[k] == no_const) m.small_i32[k] = (try m.constant(.{ .ty = try m.intType(32), .kind = .{ .int = v } })).constant;
+            return .{ .constant = m.small_i32[k] };
+        }
         return m.constant(.{ .ty = try m.intType(bits), .kind = .{ .int = v } });
+    }
+
+    /// An attachment of node `node` as metadata kind `kind` (from mdKind).
+    pub fn instMd(m: *Module, kind: u32, node: MdId) !InstMd {
+        try m.inst_mds.append(m.allocator(), .{ .kind = kind, .node = node });
+        return @fromBackingInt(@intCast(m.inst_mds.items.len));
+    }
+
+    /// Drops the constants nothing uses, and numbers the rest in order of
+    /// first use (functions' instructions, then metadata), grouped by type,
+    /// with aggregates last, after their elements. The output then depends
+    /// only on the code that is left, not on code made and removed again or
+    /// on the order constants were first asked for.
+    fn pruneConstants(m: *Module) !void {
+        const a = m.allocator();
+        const n = m.constants.items.len;
+        if (n == 0) return;
+        const Walk = struct {
+            m: *Module,
+            a: Allocator,
+            seen: []bool,
+            order: std.ArrayList(ConstId) = .empty,
+            failed: bool = false,
+
+            fn map(w: *@This(), v: Value) Value {
+                if (v == .constant) w.visit(v.constant) catch {
+                    w.failed = true;
+                };
+                return v;
+            }
+
+            fn visit(w: *@This(), c: ConstId) Allocator.Error!void {
+                if (w.seen[c]) return;
+                w.seen[c] = true;
+                switch (w.m.constants.items[c].kind) {
+                    .aggregate => |els| for (els) |el| try w.visit(el),
+                    else => {},
+                }
+                try w.order.append(w.a, c);
+            }
+        };
+        var walk: Walk = .{ .m = m, .a = a, .seen = try a.alloc(bool, n) };
+        @memset(walk.seen, false);
+        for (m.functions.items) |f| for (f.insts.items) |inst| {
+            var copy = inst;
+            // (Reading only: no slice is copied, nothing changes.)
+            try mapOperands(a, &copy, &walk);
+        };
+        for (m.metadata.items) |md| if (md == .value) {
+            _ = walk.map(md.value.val);
+        };
+        if (walk.failed) return error.OutOfMemory;
+
+        // Types in order of first use; scalars by type (stable), then
+        // aggregates in walk order (each after its elements).
+        var rank: std.AutoHashMapUnmanaged(TypeId, u32) = .empty;
+        const Key = struct { rank: u32, id: ConstId };
+        var scalars: std.ArrayList(Key) = .empty;
+        var aggregates: std.ArrayList(ConstId) = .empty;
+        for (walk.order.items) |c| {
+            const k = m.constants.items[c];
+            if (k.kind == .aggregate) {
+                try aggregates.append(a, c);
+                continue;
+            }
+            const gop = try rank.getOrPut(a, k.ty);
+            if (!gop.found_existing) gop.value_ptr.* = rank.count() - 1;
+            try scalars.append(a, .{ .rank = gop.value_ptr.*, .id = c });
+        }
+        std.sort.block(Key, scalars.items, {}, struct {
+            fn lt(_: void, x: Key, y: Key) bool {
+                return x.rank < y.rank;
+            }
+        }.lt);
+
+        const new_id = try a.alloc(ConstId, n);
+        @memset(new_id, no_const);
+        var kept: std.ArrayList(Constant) = .empty;
+        try kept.ensureTotalCapacityPrecise(a, walk.order.items.len);
+        for (scalars.items) |k| {
+            new_id[k.id] = @intCast(kept.items.len);
+            kept.appendAssumeCapacity(m.constants.items[k.id]);
+        }
+        for (aggregates.items) |c| {
+            var k = m.constants.items[c];
+            const els = try a.alloc(ConstId, k.kind.aggregate.len);
+            for (k.kind.aggregate, els) |el, *o| o.* = new_id[el];
+            k.kind = .{ .aggregate = els };
+            new_id[c] = @intCast(kept.items.len);
+            kept.appendAssumeCapacity(k);
+        }
+
+        const Remap = struct {
+            new_id: []const ConstId,
+            fn map(r: @This(), v: Value) Value {
+                return if (v == .constant) .{ .constant = r.new_id[v.constant] } else v;
+            }
+        };
+        const remap: Remap = .{ .new_id = new_id };
+        for (m.functions.items) |*f| for (f.insts.items) |*inst| try mapOperands(a, inst, remap);
+        for (m.metadata.items) |*md| if (md.* == .value) {
+            md.value.val = remap.map(md.value.val);
+        };
+        m.constants = kept;
+        // (Constants made from here on start a new index.)
+        m.constant_ids = .empty;
+        for (m.constants.items, 0..) |c, i| try m.constant_ids.put(a, c, @intCast(i));
+        m.small_i32 = @splat(no_const);
     }
 
     pub fn addFunction(m: *Module, f: Function) !u32 {
@@ -269,11 +455,93 @@ pub const Module = struct {
 
     /// Encode the module as raw LLVM bitcode (starting with 'BC' 0xC0DE).
     pub fn writeBitcode(m: *Module, gpa: Allocator) ![]u8 {
+        try m.pruneConstants();
         var enc: Encoder = .{ .m = m, .w = .init(gpa) };
         defer enc.w.deinit();
         return enc.write();
     }
 };
+
+/// Calls `ctx.map(v) Value` on each value operand of `inst` and stores the
+/// results; operand slices whose values change are copied (slices may be
+/// shared between instructions).
+fn mapOperands(a: Allocator, inst: *Inst, ctx: anytype) !void {
+    const S = struct {
+        fn many(al: Allocator, c: anytype, xs: []const Value) ![]const Value {
+            for (xs, 0..) |x, k| {
+                if (std.meta.eql(c.map(x), x)) continue;
+                const out = try al.dupe(Value, xs);
+                for (out[k..]) |*o| o.* = c.map(o.*);
+                return out;
+            }
+            return xs;
+        }
+    };
+    switch (inst.op) {
+        .ret => |*v| if (v.*) |x| {
+            v.* = ctx.map(x);
+        },
+        .br => |*b| if (b.cond) |c| {
+            b.cond = ctx.map(c);
+        },
+        .@"switch" => |*sw| {
+            sw.cond = ctx.map(sw.cond);
+            const cases = try a.dupe(@typeInfo(@TypeOf(sw.cases)).pointer.child, sw.cases);
+            for (cases) |*c| c.val = ctx.map(c.val);
+            sw.cases = cases;
+        },
+        .call => |*c| c.args = try S.many(a, ctx, c.args),
+        .binop => |*b| {
+            b.lhs = ctx.map(b.lhs);
+            b.rhs = ctx.map(b.rhs);
+        },
+        .cast => |*c| c.val = ctx.map(c.val),
+        .cmp => |*c| {
+            c.lhs = ctx.map(c.lhs);
+            c.rhs = ctx.map(c.rhs);
+        },
+        .select => |*x| {
+            x.cond = ctx.map(x.cond);
+            x.t = ctx.map(x.t);
+            x.f = ctx.map(x.f);
+        },
+        .extractvalue => |*x| x.agg = ctx.map(x.agg),
+        .phi => |*p| {
+            const ins = try a.dupe(@typeInfo(@TypeOf(p.incoming)).pointer.child, p.incoming);
+            for (ins) |*in| in.val = ctx.map(in.val);
+            p.incoming = ins;
+        },
+        .alloca => |*x| x.size = ctx.map(x.size),
+        .load => |*x| x.ptr = ctx.map(x.ptr),
+        .store => |*x| {
+            x.ptr = ctx.map(x.ptr);
+            x.val = ctx.map(x.val);
+        },
+        .gep => |*x| {
+            x.ptr = ctx.map(x.ptr);
+            x.indices = try S.many(a, ctx, x.indices);
+        },
+        .atomicrmw => |*x| {
+            x.ptr = ctx.map(x.ptr);
+            x.val = ctx.map(x.val);
+        },
+        .cmpxchg => |*x| {
+            x.ptr = ctx.map(x.ptr);
+            x.cmp = ctx.map(x.cmp);
+            x.new = ctx.map(x.new);
+        },
+        .@"unreachable" => {},
+        .extractelement => |*x| {
+            x.vec = ctx.map(x.vec);
+            x.index = ctx.map(x.index);
+        },
+        .insertelement => |*x| {
+            x.vec = ctx.map(x.vec);
+            x.val = ctx.map(x.val);
+            x.index = ctx.map(x.index);
+        },
+    }
+}
 
 const block_module = 8;
 const block_paramattr = 9;
@@ -702,10 +970,11 @@ const Encoder = struct {
         }
         // METADATA_ATTACHMENT: [instruction index, (kind, node)...]
         var any_md = false;
-        for (f.insts.items) |inst| any_md = any_md or inst.md != null;
+        for (f.insts.items) |inst| any_md = any_md or inst.md != .none;
         if (any_md) {
             try w.enterBlock(block_metadata_attachment, 3);
-            for (f.insts.items, 0..) |inst, k| if (inst.md) |md| {
+            for (f.insts.items, 0..) |inst, k| if (inst.md != .none) {
+                const md = e.m.inst_mds.items[@backingInt(inst.md) - 1];
                 try e.ops.appendSlice(e.gpa(), &.{ k, md.kind, md.node });
                 try e.rec(11);
             };

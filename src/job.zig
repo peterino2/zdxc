@@ -28,6 +28,7 @@
 //! and fails its job.
 
 const std = @import("std");
+const BumpArena = @import("zdxc").BumpArena;
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
 const FileSystem = @import("zdxc").front.source.FileSystem;
@@ -238,7 +239,7 @@ const Batch = struct {
     /// jobs ahead of the compiles.
     fn read(b: *Batch) void {
         const gpa = std.heap.smp_allocator;
-        var arena: std.heap.ArenaAllocator = .init(gpa);
+        var arena: BumpArena = .init(gpa);
         defer arena.deinit();
         for (b.jobs, b.sources, 0..) |args, *s, i| {
             while (true) {
@@ -303,7 +304,7 @@ const Batch = struct {
 
     fn work(b: *Batch) void {
         const gpa = std.heap.smp_allocator;
-        var arena: std.heap.ArenaAllocator = .init(gpa);
+        var arena: BumpArena = .init(gpa);
         defer arena.deinit();
         while (true) {
             const i = b.next.fetchAdd(1, .monotonic);

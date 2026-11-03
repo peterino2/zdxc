@@ -8,6 +8,7 @@
 //! ZRFL part holding the rest as JSON.
 
 const std = @import("std");
+const BumpArena = @import("../BumpArena.zig");
 const Allocator = std.mem.Allocator;
 const container = @import("container.zig");
 
@@ -194,7 +195,7 @@ test "encode and decode" {
     };
     const blob = try encode(a, r, &.{});
     defer a.free(blob);
-    var arena: std.heap.ArenaAllocator = .init(a);
+    var arena: BumpArena = .init(a);
     defer arena.deinit();
     const view = try container.parse(arena.allocator(), blob);
     const back = try decode(arena.allocator(), view.find(part) orelse return error.TestUnexpectedResult);

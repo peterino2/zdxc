@@ -6,6 +6,7 @@
 //! signed DXIL container.
 
 const std = @import("std");
+const BumpArena = @import("../BumpArena.zig");
 const Allocator = std.mem.Allocator;
 const ir = @import("../ir/ir.zig");
 const types = @import("../sema/types.zig");
@@ -25,6 +26,7 @@ const reflect = @import("reflect.zig");
 const rootsig = @import("rootsig.zig");
 const promote = @import("promote.zig");
 const unroll = @import("unroll.zig");
+const stats = @import("../stats.zig");
 const sccp = @import("sccp.zig");
 const opt = @import("../ir/opt.zig");
 
@@ -51,7 +53,7 @@ pub fn emit(gpa: Allocator, m: *const ir.Module, profile: shader.Profile, diags:
 pub const Output = struct { object: []u8, reflection: []u8 };
 
 pub fn emitWithReflection(gpa: Allocator, m: *const ir.Module, profile: shader.Profile, diags: *diag.Diagnostics, optimize: bool) Error!Output {
-    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    var arena_state: BumpArena = .init(gpa);
     defer arena_state.deinit();
     var e: Emitter = .{ .arena = arena_state.allocator(), .dm = .init(gpa), .m = m, .t = m.types, .profile = profile, .diags = diags, .optimize = optimize };
     defer e.dm.deinit();
@@ -75,6 +77,10 @@ const Lowered = union(enum) {
     /// per resource, each an alias of what is stored into it.
     agg_ptr: struct { data: ?*const Lowered, slots: []const u32, ty: TypeId },
     ptr: Ptr,
+    /// A by-value parameter's copy that is never written and only indexed
+    /// by constants (Emitter.regsLocals): the argument's components, from
+    /// `offset` on, with no memory behind them.
+    regs: struct { vals: []const Value, offset: u32 = 0 },
     /// A resource handle (index into Emitter.resources).
     handle: u32,
     /// A local holding a resource (index into Emitter.res_locals): an
@@ -167,6 +173,8 @@ const Resource = struct {
 
 const Frame = struct {
     f: *const ir.Function,
+    /// For inlined calls: Emitter.regsLocals of `f`.
+    regs: []const bool = &.{},
     vals: []Lowered,
     params: []const Lowered,
     blocks: []?u32,
@@ -195,7 +203,56 @@ const Frame = struct {
     arrays: std.ArrayList(struct { ty: TypeId, ptr: Ptr }) = .empty,
 };
 
-const PInst = struct { inst: module.Inst, id: u32 };
+/// Hash maps keyed by a Value (or a Value and an offset). A Value has
+/// padding, so the automatic context hashes it field by field; this one
+/// mixes its tag and index into one word.
+fn ValueMap(comptime V: type) type {
+    return std.HashMapUnmanaged(Value, V, ValueContext, std.hash_map.default_max_load_percentage);
+}
+
+const ValueContext = struct {
+    fn word(v: Value) u64 {
+        return @as(u64, @backingInt(v)) << 32 | switch (v) {
+            inline else => |x| x,
+        };
+    }
+
+    fn mix(x: u64) u64 {
+        var z = x;
+        z = (z ^ (z >> 30)) *% 0xbf58476d1ce4e5b9;
+        z = (z ^ (z >> 27)) *% 0x94d049bb133111eb;
+        return z ^ (z >> 31);
+    }
+
+    pub fn hash(_: ValueContext, k: anytype) u64 {
+        return switch (@TypeOf(k)) {
+            Value => mix(word(k)),
+            else => mix(word(k[0]) ^ @as(u64, k[1]) << 40),
+        };
+    }
+
+    pub fn eql(_: ValueContext, a: anytype, b: @TypeOf(a)) bool {
+        return std.meta.eql(a, b);
+    }
+};
+
+/// The current function's instructions, by id, in chunks that never move
+/// (blocks and the prologue list ids).
+const InstStore = struct {
+    const shift = 10;
+    const chunk_len = 1 << shift;
+    chunks: std.ArrayList(*[chunk_len]module.Inst) = .empty,
+
+    /// Stores instruction `id`, the next one.
+    fn put(s: *InstStore, a: Allocator, id: u32, inst: module.Inst) Allocator.Error!void {
+        if (id >> shift >= s.chunks.items.len) try s.chunks.append(a, try a.create([chunk_len]module.Inst));
+        s.chunks.items[id >> shift][id & (chunk_len - 1)] = inst;
+    }
+
+    fn at(s: *const InstStore, id: u32) *module.Inst {
+        return &s.chunks.items[id >> shift][id & (chunk_len - 1)];
+    }
+};
 
 const Emitter = struct {
     arena: Allocator,
@@ -214,8 +271,9 @@ const Emitter = struct {
     payload_global: ?u32 = null,
     payload_local: ?struct { func: *const ir.Function, inst: u32 } = null,
     /// Instructions per block, in creation order, with provisional ids.
-    blocks: std.ArrayList(std.ArrayList(PInst)) = .empty,
-    prologue: std.ArrayList(PInst) = .empty,
+    insts: InstStore = .{},
+    blocks: std.ArrayList(std.ArrayList(u32)) = .empty,
+    prologue: std.ArrayList(u32) = .empty,
     next_id: u32 = 0,
     /// Each instruction's type, by id.
     inst_types: std.ArrayList(DType) = .empty,
@@ -227,12 +285,12 @@ const Emitter = struct {
     private_typed: std.AutoHashMapUnmanaged(u32, @FieldType(Lowered, "typed")) = .empty,
     /// Locals holding a copy of a texel read through an index (see the
     /// `access` op): writes through them would not reach the texture.
-    texel_copies: std.AutoHashMapUnmanaged(Value, void) = .empty,
+    texel_copies: ValueMap(void) = .empty,
     /// Static globals holding resources (as locals: Emitter.aggLocal).
     private_aggs: std.AutoHashMapUnmanaged(u32, Lowered) = .empty,
     res_locals: std.ArrayList(?Lowered) = .empty,
     /// Indices marked with NonUniformResourceIndex.
-    nonuniform: std.AutoHashMapUnmanaged(Value, void) = .empty,
+    nonuniform: ValueMap(void) = .empty,
     uses_double: bool = false,
     uses_int64: bool = false,
     /// 16-bit min-precision values cross the signature.
@@ -265,8 +323,8 @@ const Emitter = struct {
     last_resret: Value = undefined,
     /// Status values, forwarded through locals within a block: the
     /// validator wants CheckAccessFullyMapped's operand to be one.
-    status_vals: std.AutoHashMapUnmanaged(Value, void) = .empty,
-    forwarded: std.AutoHashMapUnmanaged(struct { Value, u32 }, struct { v: Value, block: u32 }) = .empty,
+    status_vals: ValueMap(void) = .empty,
+    forwarded: std.HashMapUnmanaged(struct { Value, u32 }, struct { v: Value, block: u32 }, ValueContext, std.hash_map.default_max_load_percentage) = .empty,
     /// Dynamically indexed getelementptrs into locals (by id) and the
     /// components they can reach, for promote.run.
     dyn_ranges: std.AutoHashMapUnmanaged(u32, [2]u32) = .empty,
@@ -279,6 +337,7 @@ const Emitter = struct {
     writes: u32 = 0,
     /// paramCopies per IR function.
     param_copies: std.AutoHashMapUnmanaged(u32, []const u32) = .empty,
+    regs_locals: std.AutoHashMapUnmanaged(u32, []const bool) = .empty,
     uses_barycentrics: bool = false,
     uses_sampler_heap: bool = false,
     /// The shader's reflection (reflect.zig), made with the object; owned
@@ -315,6 +374,16 @@ const Emitter = struct {
     /// Each HLSL struct's module type (struct types are named, and two
     /// structs may share a name: `A<int>::In`, `A<float>::In`).
     struct_types: std.AutoHashMapUnmanaged(TypeId, DType) = .empty,
+    /// Per type: see structComps, mixedSizes and mixedStorage.
+    struct_comps: std.AutoHashMapUnmanaged(TypeId, []const TypeId) = .empty,
+    comp_offsets: std.AutoHashMapUnmanaged(struct { TypeId, bool, layout.Rules }, []const u32) = .empty,
+    field_offsets: std.AutoHashMapUnmanaged(struct { *const types.StructInfo, layout.Rules }, []const u32) = .empty,
+    /// elementPtr's last pointer type, and its shared index slices (by the
+    /// index constant).
+    elem_ptr_ty: struct { elem: DType = std.math.maxInt(DType), space: u32 = 0, ty: DType = 0 } = .{},
+    zero_indexed: std.ArrayList([]const Value) = .empty,
+    mixed_sizes: std.AutoHashMapUnmanaged(TypeId, bool) = .empty,
+    mixed_storage: std.AutoHashMapUnmanaged(TypeId, bool) = .empty,
     /// Prologue instructions dropped again if unused (resource handles).
     lib_removable: std.AutoHashMapUnmanaged(u32, void) = .empty,
 
@@ -342,7 +411,8 @@ const Emitter = struct {
             },
             else => {},
         }
-        try e.blocks.items[e.cur].append(e.arena, .{ .inst = .{ .ty = ty, .op = op }, .id = id });
+        try e.insts.put(e.arena, id, .{ .ty = ty, .op = op });
+        try e.blocks.items[e.cur].append(e.arena, id);
         return .{ .inst = id };
     }
 
@@ -350,7 +420,8 @@ const Emitter = struct {
         const id = e.next_id;
         e.next_id += 1;
         try e.inst_types.append(e.arena, ty);
-        try e.prologue.append(e.arena, .{ .inst = .{ .ty = ty, .op = op }, .id = id });
+        try e.insts.put(e.arena, id, .{ .ty = ty, .op = op });
+        try e.prologue.append(e.arena, id);
         return .{ .inst = id };
     }
 
@@ -416,13 +487,56 @@ const Emitter = struct {
             .vector => |v| v.len,
             .matrix => |m| @as(u32, m.rows) * m.cols,
             .array => |a| a.len * try e.flatCount(a.elem),
-            .@"struct" => |s| blk: {
-                var n: u32 = 0;
-                for (s.fields.items) |f| n += try e.flatCount(f.type);
-                break :blk n;
-            },
+            .@"struct" => @intCast((try e.structComps(ty)).len),
             else => e.unsupported("values of type '{s}' are not supported yet", .{try e.t.format(e.arena, ty)}),
         };
+    }
+
+    /// Byte offsets of `st`'s fields under `rules`, worked out once per
+    /// struct.
+    fn fieldOffsets(e: *Emitter, st: *const types.StructInfo, rules: layout.Rules) layout.Error![]const u32 {
+        const gop = try e.field_offsets.getOrPut(e.arena, .{ st, rules });
+        if (gop.found_existing) return gop.value_ptr.*;
+        gop.value_ptr.* = layout.fieldOffsets(e.arena, e.t, st, rules) catch |err| {
+            _ = e.field_offsets.remove(.{ st, rules });
+            return err;
+        };
+        return gop.value_ptr.*;
+    }
+
+    /// layout.componentOffset, from a table of `ty`'s components worked out
+    /// once per type.
+    fn componentOffset(e: *Emitter, ty: TypeId, row_major: bool, k: u32, rules: layout.Rules) layout.Error!u32 {
+        const gop = try e.comp_offsets.getOrPut(e.arena, .{ ty, row_major, rules });
+        if (!gop.found_existing) {
+            gop.value_ptr.* = &.{};
+            const n = layout.flatCount(e.t, ty) catch 0;
+            // (Small types: worked out each time, as cheaply.)
+            if (n > 4) {
+                const table = try e.arena.alloc(u32, n);
+                const ok = for (table, 0..) |*o, c| {
+                    o.* = layout.componentOffset(e.arena, e.t, ty, row_major, @intCast(c), rules) catch break false;
+                } else true;
+                if (ok) gop.value_ptr.* = table;
+            }
+        }
+        const table = gop.value_ptr.*;
+        if (k < table.len) return table[k];
+        return layout.componentOffset(e.arena, e.t, ty, row_major, k, rules);
+    }
+
+    /// The scalar type of each flattened component of struct `ty`, worked
+    /// out once per type.
+    fn structComps(e: *Emitter, ty: TypeId) Error![]const TypeId {
+        if (e.struct_comps.get(ty)) |c| return c;
+        var out: std.ArrayList(TypeId) = .empty;
+        for (e.t.get(ty).@"struct".fields.items) |f| {
+            const n = try e.flatCount(f.type);
+            try out.ensureUnusedCapacity(e.arena, n);
+            for (0..n) |k| out.appendAssumeCapacity(try e.componentType(f.type, @intCast(k)));
+        }
+        try e.struct_comps.put(e.arena, ty, out.items);
+        return out.items;
     }
 
     /// Undefined values for the flattened components of `ty`.
@@ -511,8 +625,10 @@ const Emitter = struct {
         try e.buildSignatures(entry);
         if (entry.stage == .amplification) e.findDispatchPayload();
         e.cur = try e.newBlock();
+        const zl = stats.begin(.dxil_lower);
         try e.createHandles();
         _ = try e.inlineCall(entry.wrapper, &.{});
+        zl.end();
         try e.finish(e.main_fn);
         if (entry.patch_wrapper) |pw| {
             // The patch constant function is a function of its own.
@@ -521,6 +637,7 @@ const Emitter = struct {
             e.call_memo = .empty;
             e.texel_copies = .empty;
             e.next_id = 0;
+            e.insts = .{};
             e.inst_types = .empty;
             e.private_globals = .empty;
             e.private_typed = .empty;
@@ -536,6 +653,7 @@ const Emitter = struct {
 
         if (e.optimize) e.inputUsage();
         if (e.optimize and e.profile.minor >= 6) try e.dropDeadResources();
+        for (e.dm.functions.items) |f| stats.add(.dxil_final, f.insts.items.len);
         const bitcode = try e.writeModule(entry);
         defer gpa.free(bitcode);
         return e.assemble(gpa, entry, bitcode);
@@ -709,6 +827,7 @@ const Emitter = struct {
             e.call_memo = .empty;
             e.texel_copies = .empty;
             e.next_id = 0;
+            e.insts = .{};
             e.inst_types = .empty;
             e.private_globals = .empty;
             e.private_typed = .empty;
@@ -744,6 +863,7 @@ const Emitter = struct {
                 e.call_memo = .empty;
                 e.texel_copies = .empty;
                 e.next_id = 0;
+                e.insts = .{};
                 e.inst_types = .empty;
                 e.private_globals = .empty;
                 e.private_typed = .empty;
@@ -914,6 +1034,7 @@ const Emitter = struct {
         e.call_memo = .empty;
         e.texel_copies = .empty;
         e.next_id = 0;
+        e.insts = .{};
         e.inst_types = .empty;
         e.private_globals = .empty;
         e.private_typed = .empty;
@@ -1352,15 +1473,16 @@ const Emitter = struct {
     /// Assigns final instruction indices: prologue first, then blocks in
     /// creation order.
     fn finish(e: *Emitter, func: u32) Error!void {
+        const zf = stats.begin(.dxil_finish);
         if (e.lib_removable.count() > 0) try e.pruneProlog();
         const map = try e.arena.alloc(u32, e.next_id);
         var n: u32 = 0;
-        for (e.prologue.items) |pi| {
-            map[pi.id] = n;
+        for (e.prologue.items) |id| {
+            map[id] = n;
             n += 1;
         }
-        for (e.blocks.items) |blk| for (blk.items) |pi| {
-            map[pi.id] = n;
+        for (e.blocks.items) |blk| for (blk.items) |id| {
+            map[id] = n;
             n += 1;
         };
         const f = &e.dm.functions.items[func];
@@ -1370,20 +1492,35 @@ const Emitter = struct {
                 return if (x == .inst) .{ .inst = mp[x.inst] } else x;
             }
             fn vs(a: Allocator, mp: []const u32, xs: []const Value) Allocator.Error![]const Value {
+                // (Nothing to renumber, as in most getelementptr indices:
+                // the slice is kept; no pass writes operand slices.)
+                for (xs) |x| {
+                    if (x == .inst) break;
+                } else return xs;
                 const out = try a.alloc(Value, xs.len);
                 for (xs, out) |x, *o| o.* = v(mp, x);
                 return out;
             }
         };
+        stats.add(.dxil_lowered, n);
         try f.insts.ensureUnusedCapacity(e.dm.allocator(), n);
-        const all = [_][]const PInst{e.prologue.items};
-        for (all) |items| for (items) |pi| try f.insts.append(e.dm.allocator(), try remapInst(e.arena, map, pi.inst, remap));
-        for (e.blocks.items) |blk| for (blk.items) |pi| try f.insts.append(e.dm.allocator(), try remapInst(e.arena, map, pi.inst, remap));
+        // (Copied into place, then renumbered there.)
+        for (e.prologue.items) |id| {
+            const dst = f.insts.addOneAssumeCapacity();
+            dst.* = e.insts.at(id).*;
+            try remapInst(e.arena, map, dst, remap);
+        }
+        for (e.blocks.items) |blk| for (blk.items) |id| {
+            const dst = f.insts.addOneAssumeCapacity();
+            dst.* = e.insts.at(id).*;
+            try remapInst(e.arena, map, dst, remap);
+        };
         var ranges: std.AutoHashMapUnmanaged(u32, [2]u32) = .empty;
         var it = e.dyn_ranges.iterator();
         while (it.next()) |kv| try ranges.put(e.arena, map[kv.key_ptr.*], kv.value_ptr.*);
         e.dyn_ranges.clearRetainingCapacity();
         e.array_pool.clearRetainingCapacity();
+        zf.end();
         if (e.optimize) {
             try promote.run(e.arena, &e.dm, func, &ranges);
             // Values only ever one constant (through loops too), and the
@@ -1416,13 +1553,12 @@ const Emitter = struct {
         while (changed) {
             changed = false;
             @memset(used, false);
-            const all = [_][]const PInst{e.prologue.items};
-            for (all) |items| for (items) |pi| markUses(e.arena, pi.inst, used);
-            for (e.blocks.items) |blk| for (blk.items) |pi| markUses(e.arena, pi.inst, used);
+            for (e.prologue.items) |id| markUses(e.arena, e.insts.at(id).*, used);
+            for (e.blocks.items) |blk| for (blk.items) |id| markUses(e.arena, e.insts.at(id).*, used);
             var k: usize = 0;
             while (k < e.prologue.items.len) {
-                const pi = e.prologue.items[k];
-                if (e.lib_removable.contains(pi.id) and !used[pi.id]) {
+                const id = e.prologue.items[k];
+                if (e.lib_removable.contains(id) and !used[id]) {
                     _ = e.prologue.orderedRemove(k);
                     changed = true;
                 } else k += 1;
@@ -1444,11 +1580,11 @@ const Emitter = struct {
             }
         };
         M.u = used;
-        _ = remapInst(a, &.{}, inst, M) catch {};
+        var copy = inst;
+        remapInst(a, &.{}, &copy, M) catch {};
     }
 
-    fn remapInst(a: Allocator, map: []const u32, inst: module.Inst, comptime R: type) Allocator.Error!module.Inst {
-        var out = inst;
+    fn remapInst(a: Allocator, map: []const u32, out: *module.Inst, comptime R: type) Allocator.Error!void {
         switch (out.op) {
             .ret => |*v| if (v.*) |x| {
                 v.* = R.v(map, x);
@@ -1508,7 +1644,6 @@ const Emitter = struct {
                 x.index = R.v(map, x.index);
             },
         }
-        return out;
     }
 
     // ------------------------------------------------------------------
@@ -1546,7 +1681,7 @@ const Emitter = struct {
             try e.prologue.appendSlice(e.arena, items[from .. items.len - 1]);
             items[from] = br;
             e.blocks.items[b].items.len = from + 1;
-            b = br.inst.op.br.then;
+            b = e.insts.at(br).op.br.then;
             from = 0;
         }
         e.forwarded.clearRetainingCapacity();
@@ -1564,11 +1699,11 @@ const Emitter = struct {
         while (b != e.cur) {
             const items = e.blocks.items[b].items;
             if (items.len <= from) return false;
-            for (items[from .. items.len - 1]) |pi| switch (pi.inst.op) {
+            for (items[from .. items.len - 1]) |id| switch (e.insts.at(id).op) {
                 .br, .@"switch", .ret, .phi => return false,
                 else => {},
             };
-            const last = items[items.len - 1].inst.op;
+            const last = e.insts.at(items[items.len - 1]).op;
             if (last != .br or last.br.cond != null or last.br.then < first_new) return false;
             b = last.br.then;
             from = 0;
@@ -1658,6 +1793,7 @@ const Emitter = struct {
         @memset(frame.vals, .none);
         @memset(frame.blocks, null);
         if (e.optimize and args.len > 0) frame.copies = try e.paramCopies(fi);
+        if (e.optimize) frame.regs = try e.regsLocals(fi);
         const is_entry = e.cur == 0 and e.blocks.items[0].items.len == 0 and (fi == e.entry.wrapper or fi == e.entry.patch_wrapper);
         if (!is_entry) frame.cont = try e.newBlock();
         // The callee's entry continues the current block.
@@ -1736,6 +1872,112 @@ const Emitter = struct {
                 },
             }
         }
+        return out;
+    }
+
+    /// For each instruction of IR function `fi`: whether it is a local
+    /// that can be the values stored into it (see Lowered.regs), indexed
+    /// only by constants and either a copy of a parameter (paramCopies) or
+    /// stored once, whole, in the entry block before any other use of it
+    /// (and otherwise only read).
+    fn regsLocals(e: *Emitter, fi: u32) Error![]const bool {
+        const gop = try e.regs_locals.getOrPut(e.arena, fi);
+        if (gop.found_existing) return gop.value_ptr.*;
+        const none = std.math.maxInt(u32);
+        const f = e.m.functions.items[fi];
+        const copies = try e.paramCopies(fi);
+        const n = copies.len;
+        const out = try e.arena.alloc(bool, n);
+        for (out, copies) |*o, c| o.* = c != none;
+
+        // Locals stored once from a value. The local each pointer is into:
+        const root = try e.arena.alloc(u32, n);
+        @memset(root, none);
+        var changed = true;
+        while (changed) {
+            changed = false;
+            for (f.insts.items, 0..) |inst, k| {
+                const want: u32 = switch (inst.op) {
+                    .local_var => @intCast(k),
+                    .access => |x| root[x.base.index()],
+                    else => none,
+                };
+                if (want != root[k]) {
+                    root[k] = want;
+                    changed = true;
+                }
+            }
+        }
+        const stores = try e.arena.alloc(u32, n);
+        @memset(stores, 0);
+        const bad = try e.arena.alloc(bool, n);
+        @memset(bad, false);
+        const Use = struct {
+            root: []const u32,
+            bad: []bool,
+            pub fn map(u: @This(), x: Ref) Ref {
+                if (x != .none and u.root[x.index()] != none) u.bad[u.root[x.index()]] = true;
+                return x;
+            }
+        };
+        const use: Use = .{ .root = root, .bad = bad };
+        for (f.insts.items) |inst| switch (inst.op) {
+            .local_var, .load => {},
+            .access => |x| for (x.indices) |ix| {
+                _ = use.map(ix);
+            },
+            .store => |x| {
+                _ = use.map(x.value);
+                const l = root[x.ptr.index()];
+                if (l == none) continue;
+                if (x.ptr.index() != l) bad[l] = true;
+                stores[l] += 1;
+            },
+            else => _ = try opt.mapOp(e.arena, inst.op, use),
+        };
+        // The store: in the entry block (not branched back to), before any
+        // load or access of the local there.
+        var reentered = false;
+        for (f.blocks.items) |blk| switch (blk.term) {
+            .br => |t| reentered = reentered or t.index() == 0,
+            .cond_br => |c| reentered = reentered or c.then.index() == 0 or c.@"else".index() == 0,
+            .@"switch" => |sw| {
+                reentered = reentered or sw.default.index() == 0;
+                for (sw.cases) |cs| reentered = reentered or cs.block.index() == 0;
+            },
+            else => {},
+        };
+        if (!reentered and f.blocks.items.len > 0) {
+            const used = try e.arena.alloc(bool, n);
+            @memset(used, false);
+            for (f.blocks.items[0].insts.items) |r| {
+                const inst = f.inst(r);
+                switch (inst.op) {
+                    .load => |p| if (root[p.index()] != none) {
+                        used[root[p.index()]] = true;
+                    },
+                    .access => if (root[r.index()] != none) {
+                        used[root[r.index()]] = true;
+                    },
+                    .store => |x| {
+                        const l = root[x.ptr.index()];
+                        if (l == none or used[l] or bad[l] or stores[l] != 1 or copies[l] != none) continue;
+                        if (f.inst(x.value).op == .param) continue;
+                        const ty = f.inst(@fromBackingInt(@intCast(l))).ty;
+                        if (isResourceType(e.t, ty) or e.holdsResources(ty) or e.containsLinAlg(ty) or isRayQuery(e.t, ty)) continue;
+                        out[l] = true;
+                    },
+                    else => {},
+                }
+            }
+        }
+        // Only constant indices.
+        for (f.insts.items, 0..) |inst, k| if (inst.op == .access and root[k] != none) {
+            for (inst.op.access.indices) |ix| if (f.inst(ix).op != .constant or f.inst(ix).op.constant != .int) {
+                out[root[k]] = false;
+            };
+        };
+        gop.value_ptr.* = out;
         return out;
     }
 
@@ -2081,6 +2323,15 @@ const Emitter = struct {
                     const k = frame.param_copies[r.index()];
                     if (k != std.math.maxInt(u32)) if (frame.param_srcs[k]) |alias| return alias;
                 }
+                // A copy of a parameter passed as values, or a local stored
+                // once from a value before any use, never written again:
+                // those values (no alloca, no stores, no loads). Its store
+                // sets them.
+                if (frame.regs.len > 0 and frame.regs[r.index()]) {
+                    const k = if (frame.copies.len > 0) frame.copies[r.index()] else std.math.maxInt(u32);
+                    if (k == std.math.maxInt(u32)) return .{ .regs = .{ .vals = &.{} } };
+                    if (frame.params[k] == .scalars) return .{ .regs = .{ .vals = frame.params[k].scalars } };
+                }
                 if (e.payload_local) |pl| if (pl.func == f and pl.inst == r.index()) {
                     const dty = try e.memoryType(i.ty);
                     const base = try e.addPrologue(try e.dm.ptrType(dty), .{ .alloca = .{ .elem = dty, .size = try e.i32Const(1) } });
@@ -2121,6 +2372,11 @@ const Emitter = struct {
                 return frame.params[frame.copies[p.index()]];
             } else switch (frame.vals[p.index()]) {
                 .handle => |h| return .{ .handle = h },
+                .regs => |rg| {
+                    const n = try e.flatCount(i.ty);
+                    if (rg.offset + n > rg.vals.len) return .{ .scalars = try e.undefValues(i.ty) };
+                    return .{ .scalars = rg.vals[rg.offset..][0..n] };
+                },
                 .agg_ptr => |ap| {
                     const vals: []const Value = if (ap.data) |d| switch (d.*) {
                         .ptr => |ptr| (try e.loadPtr(ptr, ap.ty)).scalars,
@@ -2188,6 +2444,11 @@ const Emitter = struct {
                 else => |v| return e.unsupported("internal: load from a non-pointer ({s} from %{d} '{s}' in '{s}')", .{ @tagName(v), p.index(), @tagName(frame.f.inst(p).op), frame.f.name }),
             },
             .store => |s| {
+                // (The values a local kept as values holds.)
+                if (frame.vals[s.ptr.index()] == .regs) {
+                    frame.vals[s.ptr.index()] = .{ .regs = .{ .vals = try e.scalars(frame, s.value) } };
+                    return .none;
+                }
                 if (frame.param_copies.len > 0) if (f.inst(s.value).op == .param) {
                     const k = f.inst(s.value).op.param;
                     if (frame.param_copies[s.ptr.index()] == k and frame.param_srcs[k] != null) return .none;
@@ -2272,6 +2533,31 @@ const Emitter = struct {
                     return .{ .typed = tp };
                 }
                 if (frame.vals[a.base.index()] == .agg_ptr) return e.aggAccess(frame, frame.vals[a.base.index()].agg_ptr, a.indices);
+                if (frame.vals[a.base.index()] == .regs) {
+                    var rg = frame.vals[a.base.index()].regs;
+                    var cur = f.inst(a.base).ty;
+                    for (a.indices) |x| {
+                        const k: u32 = @intCast(@max(f.inst(x).op.constant.int, 0));
+                        switch (e.t.get(cur)) {
+                            .@"struct" => |st| {
+                                if (k >= st.fields.items.len) return e.unsupported("struct member index out of range", .{});
+                                for (st.fields.items[0..k]) |fld| rg.offset += try e.flatCount(fld.type);
+                                cur = st.fields.items[k].type;
+                            },
+                            else => {
+                                const elem: TypeId = switch (e.t.get(cur)) {
+                                    .array => |arr| arr.elem,
+                                    .vector => |v| try e.t.scalar(v.elem),
+                                    .matrix => |mt| try e.t.vector(mt.elem, mt.cols),
+                                    else => return e.unsupported("indexing this type is not supported yet", .{}),
+                                };
+                                rg.offset += k * try e.flatCount(elem);
+                                cur = elem;
+                            },
+                        }
+                    }
+                    return .{ .regs = rg };
+                }
                 // An element of a local array of resources: of the array
                 // it aliases.
                 if (frame.vals[a.base.index()] == .res_local) {
@@ -2745,6 +3031,18 @@ const Emitter = struct {
     /// memory rather than a flat array).
     fn mixedSizes(e: *Emitter, ty: TypeId) Error!bool {
         if (e.t.get(ty) != .@"struct" and e.t.get(ty) != .array) return false;
+        if (e.mixed_sizes.get(ty)) |v| return v;
+        const v = try e.checkMixedSizes(ty);
+        try e.mixed_sizes.put(e.arena, ty, v);
+        return v;
+    }
+
+    fn checkMixedSizes(e: *Emitter, ty: TypeId) Error!bool {
+        // (An array's components repeat its element's.)
+        if (e.t.get(ty) == .array) {
+            const arr = e.t.get(ty).array;
+            return arr.len > 0 and try e.mixedSizes(arr.elem);
+        }
         const n = try e.flatCount(ty);
         var size: ?u32 = null;
         for (0..n) |k| {
@@ -2758,6 +3056,17 @@ const Emitter = struct {
     /// Whether `ty`'s components differ in type (all 32-bit), so storage is
     /// i32 with bitcasts.
     fn mixedStorage(e: *Emitter, ty: TypeId) Error!bool {
+        if (e.mixed_storage.get(ty)) |v| return v;
+        const v = try e.checkMixedStorage(ty);
+        try e.mixed_storage.put(e.arena, ty, v);
+        return v;
+    }
+
+    fn checkMixedStorage(e: *Emitter, ty: TypeId) Error!bool {
+        if (e.t.get(ty) == .array) {
+            const arr = e.t.get(ty).array;
+            return arr.len > 0 and try e.mixedStorage(arr.elem);
+        }
         const n = try e.flatCount(ty);
         var first: ?Scalar = null;
         var mixed = false;
@@ -2777,7 +3086,7 @@ const Emitter = struct {
         const n = try e.flatCount(ty);
         const out = try e.arena.alloc(Value, n);
         for (out, 0..) |*o, c| {
-            if (ptr.offset_dyn == null) if (e.forwarded.get(.{ ptr.base, ptr.offset_const + @as(u32, @intCast(c)) })) |fw| if (fw.block == e.cur) {
+            if (ptr.offset_dyn == null and e.forwarded.count() > 0) if (e.forwarded.get(.{ ptr.base, ptr.offset_const + @as(u32, @intCast(c)) })) |fw| if (fw.block == e.cur) {
                 o.* = fw.v;
                 continue;
             };
@@ -2800,10 +3109,14 @@ const Emitter = struct {
         for (vals, 0..) |v, c| {
             if (ptr.offset_dyn == null) {
                 const key = .{ ptr.base, ptr.offset_const + @as(u32, @intCast(c)) };
-                // (Constants too, in locals: ops such as linear algebra
-                // layouts need immediates passed through parameters.)
-                const forward = e.status_vals.contains(v) or (v == .constant and ptr.addr_space == 0);
-                if (forward) try e.forwarded.put(e.arena, key, .{ .v = v, .block = e.cur }) else _ = e.forwarded.remove(key);
+                // (Every value stored to a local: later loads of it in the
+                // block need no instructions, and constants stay constants,
+                // as ops such as linear algebra layouts need immediates
+                // passed through parameters.)
+                const forward = ptr.addr_space == 0 or (e.status_vals.count() > 0 and e.status_vals.contains(v));
+                if (forward) {
+                    try e.forwarded.put(e.arena, key, .{ .v = v, .block = e.cur });
+                } else if (e.forwarded.count() > 0) _ = e.forwarded.remove(key);
             } else e.forwarded.clearRetainingCapacity();
             const p = try e.elementPtr(ptr, @intCast(c));
             const ct = e.compOf(try e.componentType(ty, @intCast(c)));
@@ -2829,10 +3142,25 @@ const Emitter = struct {
     fn elementPtr(e: *Emitter, ptr: Ptr, c: u32) Error!Value {
         var idx = try e.i32Const(ptr.offset_const + c);
         if (ptr.offset_dyn) |d| idx = try e.add(try e.dm.intType(32), .{ .binop = .{ .op = .add, .lhs = d, .rhs = idx } });
-        const pt = try e.dm.getType(.{ .pointer = .{ .elem = ptr.scalar_ty, .addr_space = ptr.addr_space } });
-        const gep = try e.add(pt, .{ .gep = .{ .elem = ptr.array_ty, .ptr = ptr.base, .indices = try e.arena.dupe(Value, &.{ try e.i32Const(0), idx }) } });
+        if (e.elem_ptr_ty.elem != ptr.scalar_ty or e.elem_ptr_ty.space != ptr.addr_space) e.elem_ptr_ty = .{
+            .elem = ptr.scalar_ty,
+            .space = ptr.addr_space,
+            .ty = try e.dm.getType(.{ .pointer = .{ .elem = ptr.scalar_ty, .addr_space = ptr.addr_space } }),
+        };
+        const zero = try e.i32Const(0);
+        const gep = try e.add(e.elem_ptr_ty.ty, .{ .gep = .{ .elem = ptr.array_ty, .ptr = ptr.base, .indices = try e.zeroIndexed(zero, idx) } });
         if (ptr.offset_dyn != null) if (ptr.dyn_range) |r| try e.dyn_ranges.put(e.arena, gep.inst, r);
         return gep;
+    }
+
+    /// The indices `{ 0, idx }`, shared between getelementptrs with the
+    /// same constant `idx` (no pass writes operand slices).
+    fn zeroIndexed(e: *Emitter, zero: Value, idx: Value) Error![]const Value {
+        if (idx != .constant) return e.arena.dupe(Value, &.{ zero, idx });
+        const k = idx.constant;
+        if (k >= e.zero_indexed.items.len) try e.zero_indexed.appendNTimes(e.arena, &.{}, k + 1 - e.zero_indexed.items.len);
+        if (e.zero_indexed.items[k].len == 0) e.zero_indexed.items[k] = try e.arena.dupe(Value, &.{ zero, idx });
+        return e.zero_indexed.items[k];
     }
 
     fn convertScalar(e: *Emitter, v: Value, from: Scalar, to: Scalar) Error!Value {
@@ -3675,7 +4003,7 @@ const Emitter = struct {
             switch (e.t.get(cur)) {
                 .@"struct" => |st| {
                     const k: u32 = @intCast(xi.op.constant.int);
-                    const offs = layout.fieldOffsets(e.arena, e.t, st, .dx_legacy) catch return e.unsupported("constant buffer member types", .{});
+                    const offs = e.fieldOffsets(st, .dx_legacy) catch return e.unsupported("constant buffer member types", .{});
                     c.offset += offs[k];
                     c.row_major = st.fields.items[k].row_major;
                     cur = st.fields.items[k].type;
@@ -3727,7 +4055,7 @@ const Emitter = struct {
             const mem_c: Scalar = if (c == .bool) .uint else c;
             // A register holds 16 bytes: 4 32-bit, 2 64-bit or 8 16-bit values.
             const sz = mem_c.size();
-            const off = offset + (layout.componentOffset(e.arena, e.t, ty, row_major, @intCast(k), .dx_legacy) catch return e.unsupported("constant buffer member types", .{}));
+            const off = offset + (e.componentOffset(ty, row_major, @intCast(k), .dx_legacy) catch return e.unsupported("constant buffer member types", .{}));
             const reg = off / 16;
             const st = try e.scalarTy(mem_c);
             if (res.kind == 15) {
@@ -3792,14 +4120,10 @@ const Emitter = struct {
             .scalar, .@"enum", .linalg => return ty,
             .vector, .matrix => return e.t.scalar(e.t.component(ty).?),
             .array => |a| return e.componentType(a.elem, k % try e.flatCount(a.elem)),
-            .@"struct" => |s| {
-                var kk = k;
-                for (s.fields.items) |f| {
-                    const n = try e.flatCount(f.type);
-                    if (kk < n) return e.componentType(f.type, kk);
-                    kk -= n;
-                }
-                return e.unsupported("struct component", .{});
+            .@"struct" => {
+                const comps = try e.structComps(ty);
+                if (k >= comps.len) return e.unsupported("struct component", .{});
+                return comps[k];
             },
             else => return e.unsupported("component type", .{}),
         }
@@ -3913,7 +4237,8 @@ const Emitter = struct {
         const ptr = try e.add(try e.dm.ptrType(class_ty), .{ .gep = .{ .elem = arr_ty, .ptr = .{ .global = lg }, .indices = try e.arena.dupe(Value, &.{ try e.i32Const(0), index }) } });
         if (nonuniform) {
             const blk = e.blocks.items[e.cur].items;
-            blk[blk.len - 1].inst.md = .{ .kind = try e.dm.mdKind("dx.nonuniform"), .node = try e.dm.mdNode(&.{try e.dm.mdI32(1)}) };
+            const kind = try e.dm.mdKind("dx.nonuniform");
+            e.insts.at(blk[blk.len - 1]).md = try e.dm.instMd(kind, try e.dm.mdNode(&.{try e.dm.mdI32(1)}));
         }
         const loaded = try e.add(class_ty, .{ .load = .{ .ptr = ptr, .@"align" = 4 } });
         const struct_name = e.dm.types.items[class_ty].@"struct".name;
@@ -4412,7 +4737,7 @@ const Emitter = struct {
             switch (e.t.get(cur)) {
                 .@"struct" => |st| {
                     const k: u32 = @intCast(xi.op.constant.int);
-                    const offs = layout.fieldOffsets(e.arena, e.t, st, .dx_packed) catch return e.unsupported("buffer member types", .{});
+                    const offs = e.fieldOffsets(st, .dx_packed) catch return e.unsupported("buffer member types", .{});
                     b.offset += offs[k];
                     b.row_major = st.fields.items[k].row_major;
                     cur = st.fields.items[k].type;
@@ -4456,15 +4781,15 @@ const Emitter = struct {
         const res = e.resources.items[b.res];
         for (vals, 0..) |v, j| {
             const c: u32 = mat.col orelse @intCast(j);
-            const off0 = layout.componentOffset(e.arena, e.t, mat.ty, b.row_major, c, .dx_packed) catch return e.unsupported("buffer element types", .{});
+            const off0 = e.componentOffset(mat.ty, b.row_major, c, .dx_packed) catch return e.unsupported("buffer element types", .{});
             const const_row: ?i64 = if (m.rows == 1) 0 else e.constIntOf(mat.row);
             if (const_row) |row| {
-                const off = layout.componentOffset(e.arena, e.t, mat.ty, b.row_major, @as(u32, @intCast(row)) * m.cols + c, .dx_packed) catch return e.unsupported("buffer element types", .{});
+                const off = e.componentOffset(mat.ty, b.row_major, @as(u32, @intCast(row)) * m.cols + c, .dx_packed) catch return e.unsupported("buffer element types", .{});
                 try e.structuredStore(res, b.index, b.offset + off, b.dyn, b.row_major, ec, &.{v});
                 continue;
             }
             // A dynamic row: rows are a constant byte step apart.
-            const step = (layout.componentOffset(e.arena, e.t, mat.ty, b.row_major, m.cols + c, .dx_packed) catch return e.unsupported("buffer element types", .{})) - off0;
+            const step = (e.componentOffset(mat.ty, b.row_major, m.cols + c, .dx_packed) catch return e.unsupported("buffer element types", .{})) - off0;
             var dyn = try e.add(i32t, .{ .binop = .{ .op = .mul, .lhs = mat.row, .rhs = try e.i32Const(step) } });
             if (b.dyn) |d| dyn = try e.add(i32t, .{ .binop = .{ .op = .add, .lhs = d, .rhs = dyn } });
             try e.structuredStore(res, b.index, b.offset + off0, dyn, b.row_major, ec, &.{v});
@@ -4482,12 +4807,12 @@ const Emitter = struct {
         while (k < n) {
             const c0 = e.compOf(try e.componentType(ty, k));
             const mem: Scalar = if (c0 == .bool) .uint else c0;
-            const off0 = layout.componentOffset(e.arena, e.t, ty, row_major, k, .dx_packed) catch return e.unsupported("buffer element types", .{});
+            const off0 = e.componentOffset(ty, row_major, k, .dx_packed) catch return e.unsupported("buffer element types", .{});
             var count: u32 = 1;
             while (k + count < n and count < 4) : (count += 1) {
                 const cn = e.compOf(try e.componentType(ty, k + count));
                 const mn: Scalar = if (cn == .bool) .uint else cn;
-                const on = layout.componentOffset(e.arena, e.t, ty, row_major, k + count, .dx_packed) catch break;
+                const on = e.componentOffset(ty, row_major, k + count, .dx_packed) catch break;
                 if (mn != mem or on != off0 + count * mem.size()) break;
             }
             const st = try e.scalarTy(mem);
@@ -4541,12 +4866,12 @@ const Emitter = struct {
         while (k < n) {
             const c0 = e.compOf(try e.componentType(ty, k));
             const mem: Scalar = if (c0 == .bool) .uint else c0;
-            const off0 = layout.componentOffset(e.arena, e.t, ty, row_major, k, .dx_packed) catch return e.unsupported("buffer element types", .{});
+            const off0 = e.componentOffset(ty, row_major, k, .dx_packed) catch return e.unsupported("buffer element types", .{});
             var count: u32 = 1;
             while (k + count < n and count < 4) : (count += 1) {
                 const cn = e.compOf(try e.componentType(ty, k + count));
                 const mn: Scalar = if (cn == .bool) .uint else cn;
-                const on = layout.componentOffset(e.arena, e.t, ty, row_major, k + count, .dx_packed) catch break;
+                const on = e.componentOffset(ty, row_major, k + count, .dx_packed) catch break;
                 if (mn != mem or on != off0 + count * mem.size()) break;
             }
             const st = try e.scalarTy(mem);
@@ -4659,7 +4984,7 @@ const Emitter = struct {
     /// (templated Load / Store: natural alignment; dxc's DXIL lays
     /// matrices out by row here, its SPIR-V by column).
     fn rawOffset(e: *Emitter, ty: TypeId, k: u32) Error!u32 {
-        return layout.componentOffset(e.arena, e.t, ty, true, k, .dx_packed) catch e.unsupported("byte-address buffer accesses of type '{s}' are not supported yet", .{try e.t.format(e.arena, ty)});
+        return e.componentOffset(ty, true, k, .dx_packed) catch e.unsupported("byte-address buffer accesses of type '{s}' are not supported yet", .{try e.t.format(e.arena, ty)});
     }
 
     /// A templated byte-address Load: one raw load per component.
@@ -5919,7 +6244,7 @@ const Emitter = struct {
         if (resources) |r| try dm.addNamedMetadata("dx.resources", &.{r});
         if (funcs.len > 0) try dm.addNamedMetadata("dx.typeAnnotations", &.{type_annotations});
         try dm.addNamedMetadata("dx.entryPoints", entries.items);
-        return dm.writeBitcode(dm.arena.child_allocator);
+        return dm.writeBitcode(dm.arena.child);
     }
 
     // ---- Reflection (reflect.zig) -----------------------------------------
@@ -6200,7 +6525,7 @@ const Emitter = struct {
                 d.rows = 1;
                 d.cols = layout.flatCount(e.t, t) catch 0;
                 d.name = s.name;
-                const offs = layout.fieldOffsets(e.arena, e.t, s, .dx_legacy) catch return e.unsupported("reflection of '{s}'", .{s.name});
+                const offs = e.fieldOffsets(s, .dx_legacy) catch return e.unsupported("reflection of '{s}'", .{s.name});
                 var members: std.ArrayList(reflect.Member) = .empty;
                 for (s.fields.items, offs) |fld, off| {
                     if (fld.bits or layout.isOpaque(e.t, fld.type)) continue;
@@ -6363,7 +6688,7 @@ const Emitter = struct {
         if (g.space == .cbuffer and e.t.get(g.ty) == .@"struct") {
             // A cbuffer block: its members are the variables.
             const s = e.t.get(g.ty).@"struct";
-            const offs = layout.fieldOffsets(e.arena, e.t, s, .dx_legacy) catch return e.unsupported("reflection of constant buffer '{s}'", .{g.name});
+            const offs = e.fieldOffsets(s, .dx_legacy) catch return e.unsupported("reflection of constant buffer '{s}'", .{g.name});
             for (s.fields.items, offs) |fld, off| {
                 if (fld.bits) continue;
                 const fsize = layout.sizeOf(e.t, fld.type, fld.row_major, .dx_legacy) catch 0;
@@ -6578,6 +6903,8 @@ const Emitter = struct {
     }
 
     fn writeModule(e: *Emitter, entry: ir.Entry) Error![]u8 {
+        const zone = stats.begin(.bitcode);
+        defer zone.end();
         const dm = &e.dm;
         const mdI32 = struct {
             fn f(m: *module.Module, v: i64) !module.MdId {
@@ -6618,7 +6945,7 @@ const Emitter = struct {
         try dm.addNamedMetadata("dx.entryPoints", &.{entry_md});
         try promote.pruneGlobals(e.arena, dm);
         _ = try promote.pruneDeclarations(e.arena, dm);
-        return dm.writeBitcode(dm.arena.child_allocator);
+        return dm.writeBitcode(dm.arena.child);
     }
 
     /// `!{id, name, comp, kind, !{indices}, interp, rows, cols, row, col,
@@ -6648,6 +6975,8 @@ const Emitter = struct {
     }
 
     fn assemble(e: *Emitter, gpa: Allocator, entry: ir.Entry, bitcode: []const u8) Error![]u8 {
+        const zone = stats.begin(.container);
+        defer zone.end();
         const dxil_part = try shader.programPart(gpa, e.profile, bitcode);
         defer gpa.free(dxil_part);
         var binds: std.ArrayList(shader.ResourceBind) = .empty;

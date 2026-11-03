@@ -15,6 +15,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const module = @import("module.zig");
+const stats = @import("../stats.zig");
 
 const Value = module.Value;
 const Inst = module.Inst;
@@ -123,6 +124,9 @@ fn isScalar(m: *const module.Module, ty: TypeId) bool {
 /// `dyn` maps the dynamically indexed getelementptrs into locals to the
 /// components [lo, hi) they can reach; one missing from it can reach all.
 pub fn run(a: Allocator, m: *module.Module, func: u32, dyn: *const std.AutoHashMapUnmanaged(u32, [2]u32)) Allocator.Error!void {
+    const zone = stats.begin(.promote);
+    stats.add(.promote_runs, 1);
+    defer zone.end();
     const f = &m.functions.items[func];
     const insts = f.insts.items;
     const n: u32 = @intCast(insts.len);
@@ -133,15 +137,25 @@ pub fn run(a: Allocator, m: *module.Module, func: u32, dyn: *const std.AutoHashM
     // per edge, so a switch's repeated target counts once per case).
     const block_start = try a.alloc(u32, nb + 1);
     const block_of = try a.alloc(u32, n);
+    // The allocas, getelementptrs, and loads and stores, in order: the
+    // passes over just those walk these, not every instruction.
+    var allocas: std.ArrayList(u32) = .empty;
+    var geps: std.ArrayList(u32) = .empty;
+    var mems: std.ArrayList(u32) = .empty;
     {
         var b: u32 = 0;
         block_start[0] = 0;
         for (insts, 0..) |inst, i| {
             if (b >= nb) return; // not the block layout this pass expects
             block_of[i] = b;
-            if (isTerminator(inst)) {
-                b += 1;
-                block_start[b] = @intCast(i + 1);
+            switch (inst.op) {
+                .alloca => try allocas.append(a, @intCast(i)),
+                .gep => try geps.append(a, @intCast(i)),
+                .load, .store => try mems.append(a, @intCast(i)),
+                else => if (isTerminator(inst)) {
+                    b += 1;
+                    block_start[b] = @intCast(i + 1);
+                },
             }
         }
         if (b != nb) return;
@@ -267,8 +281,9 @@ pub fn run(a: Allocator, m: *module.Module, func: u32, dyn: *const std.AutoHashM
     @memset(var_base, none);
     const elem_ty = try a.alloc(TypeId, n);
     const direct = try a.alloc(bool, n);
-    for (insts, 0..) |inst, i| switch (inst.op) {
-        .alloca => |x| switch (m.types.items[x.elem]) {
+    for (allocas.items) |i| {
+        const x = insts[i].op.alloca;
+        switch (m.types.items[x.elem]) {
             .array => |arr| if (isScalar(m, arr.elem) and arr.len > 0) {
                 var_base[i] = 0;
                 elem_ty[i] = arr.elem;
@@ -279,9 +294,8 @@ pub fn run(a: Allocator, m: *module.Module, func: u32, dyn: *const std.AutoHashM
                 elem_ty[i] = x.elem;
                 direct[i] = true;
             },
-        },
-        else => {},
-    };
+        }
+    }
     // getelementptrs of candidates: the alloca and the element they
     // address (`none` for a dynamic index, which pins its range).
     const gep_alloca = try a.alloc(u32, n);
@@ -311,8 +325,9 @@ pub fn run(a: Allocator, m: *module.Module, func: u32, dyn: *const std.AutoHashM
     };
     // (Code no path reaches, such as loops unrolling left behind, does
     // not count.)
-    for (insts, 0..) |inst, i| if (rpo_index[block_of[i]] != none) switch (inst.op) {
-        .gep => |g| if (g.ptr == .inst and var_base[g.ptr.inst] != none and insts[g.ptr.inst].op == .alloca) {
+    for (geps.items) |i| if (rpo_index[block_of[i]] != none) {
+        const g = insts[i].op.gep;
+        if (g.ptr == .inst and var_base[g.ptr.inst] != none and insts[g.ptr.inst].op == .alloca) {
             const al = g.ptr.inst;
             if (direct[al]) {
                 var_base[al] = none;
@@ -322,20 +337,20 @@ pub fn run(a: Allocator, m: *module.Module, func: u32, dyn: *const std.AutoHashM
             if (k) |kk| {
                 gep_alloca[i] = al;
                 gep_k[i] = kk;
-            } else if (dyn.contains(@intCast(i)) and g.indices.len == 2 and constInt(m, g.indices[0]) == 0) {
+            } else if (dyn.contains(i) and g.indices.len == 2 and constInt(m, g.indices[0]) == 0) {
                 gep_alloca[i] = al;
                 gep_k[i] = none;
             } else var_base[al] = none;
-        },
-        else => {},
+        }
     };
     {
         var scan: Scan = .{ .insts = insts, .var_base = var_base, .direct = direct, .gep_alloca = gep_alloca };
         for (insts, 0..) |*inst, i| if (rpo_index[block_of[i]] != none) try operands(false, a, inst, &scan);
     }
     // Loads and stores must move whole elements of the element type.
-    for (insts, 0..) |inst, i| {
+    for (mems.items) |i| {
         if (rpo_index[block_of[i]] == none) continue;
+        const inst = insts[i];
         const ptr, const ty = switch (inst.op) {
             .load => |x| .{ x.ptr, inst.ty },
             .store => |x| .{ x.ptr, typeOf(m, f, x.val) },
@@ -348,14 +363,16 @@ pub fn run(a: Allocator, m: *module.Module, func: u32, dyn: *const std.AutoHashM
 
     // Variables.
     var nv: u32 = 0;
-    for (insts, 0..) |inst, i| {
-        if (inst.op != .alloca or var_base[i] == none) continue;
+    for (allocas.items) |i| {
+        const inst = insts[i];
+        if (var_base[i] == none) continue;
         var_base[i] = nv;
         nv += if (direct[i]) 1 else @intCast(m.types.items[inst.op.alloca.elem].array.len);
     }
     const var_ty = try a.alloc(TypeId, nv);
-    for (insts, 0..) |inst, i| {
-        if (inst.op != .alloca or var_base[i] == none) continue;
+    for (allocas.items) |i| {
+        const inst = insts[i];
+        if (var_base[i] == none) continue;
         const len: u32 = if (direct[i]) 1 else @intCast(m.types.items[inst.op.alloca.elem].array.len);
         @memset(var_ty[var_base[i]..][0..len], elem_ty[i]);
     }
@@ -365,12 +382,12 @@ pub fn run(a: Allocator, m: *module.Module, func: u32, dyn: *const std.AutoHashM
     @memset(pinned, false);
     const keep = try a.alloc(bool, n);
     @memset(keep, false);
-    for (insts, 0..) |inst, i| {
-        if (inst.op != .gep or gep_alloca[i] == none or gep_k[i] != none) continue;
+    for (geps.items) |i| {
+        if (gep_alloca[i] == none or gep_k[i] != none) continue;
         const al = gep_alloca[i];
         if (var_base[al] == none) continue;
         const len: u32 = @intCast(m.types.items[insts[al].op.alloca.elem].array.len);
-        const r = dyn.get(@intCast(i)).?;
+        const r = dyn.get(i).?;
         const lo = @min(r[0], len);
         const hi = @min(r[1], len);
         @memset(pinned[var_base[al] + lo .. var_base[al] + hi], true);
@@ -379,11 +396,11 @@ pub fn run(a: Allocator, m: *module.Module, func: u32, dyn: *const std.AutoHashM
     // The variable an instruction loads or stores, or `none`.
     const access = try a.alloc(u32, n);
     @memset(access, none);
-    for (insts, 0..) |inst, i| {
-        const ptr = switch (inst.op) {
+    for (mems.items) |i| {
+        const ptr = switch (insts[i].op) {
             .load => |x| x.ptr,
             .store => |x| x.ptr,
-            else => continue,
+            else => unreachable,
         };
         if (ptr != .inst) continue;
         const p = ptr.inst;
@@ -400,19 +417,19 @@ pub fn run(a: Allocator, m: *module.Module, func: u32, dyn: *const std.AutoHashM
     @memset(first_block, none);
     const global = try a.alloc(bool, nv);
     @memset(global, false);
-    for (insts, 0..) |inst, i| {
+    for (mems.items) |i| {
         const v = access[i];
         if (v == none) continue;
         if (first_block[v] == none) {
             first_block[v] = block_of[i];
-            if (inst.op == .load) global[v] = true;
+            if (insts[i].op == .load) global[v] = true;
         } else if (first_block[v] != block_of[i]) global[v] = true;
     }
     const Def = struct { v: u32, b: u32 };
     var defs: std.ArrayList(Def) = .empty;
-    for (insts, 0..) |inst, i| {
+    for (mems.items) |i| {
         const v = access[i];
-        if (v == none or inst.op != .store or !global[v] or rpo_index[block_of[i]] == none) continue;
+        if (v == none or insts[i].op != .store or !global[v] or rpo_index[block_of[i]] == none) continue;
         try defs.append(a, .{ .v = v, .b = block_of[i] });
     }
     std.sort.pdq(Def, defs.items, {}, struct {
@@ -552,8 +569,8 @@ pub fn run(a: Allocator, m: *module.Module, func: u32, dyn: *const std.AutoHashM
             filled[j] += 1;
         }
     }
-    for (insts, 0..) |inst, i| {
-        if (access[i] != none and inst.op == .load and repl[i] == null)
+    for (mems.items) |i| {
+        if (access[i] != none and insts[i].op == .load and repl[i] == null)
             repl[i] = try Zero.get(a, m, &zeros, var_ty[access[i]]);
     }
 
@@ -608,17 +625,18 @@ pub fn run(a: Allocator, m: *module.Module, func: u32, dyn: *const std.AutoHashM
     // The instructions that go: promoted allocas, their getelementptrs,
     // loads and stores.
     const removed = try a.alloc(bool, n);
-    for (insts, 0..) |inst, i| removed[i] = switch (inst.op) {
-        .alloca => var_base[i] != none and !keep[i],
-        .gep => gep_alloca[i] != none and var_base[gep_alloca[i]] != none and gep_k[i] != none and !pinned[var_base[gep_alloca[i]] + gep_k[i]],
-        .load, .store => access[i] != none,
-        else => false,
-    };
+    @memset(removed, false);
+    for (allocas.items) |i| removed[i] = var_base[i] != none and !keep[i];
+    for (geps.items) |i| removed[i] = gep_alloca[i] != none and var_base[gep_alloca[i]] != none and gep_k[i] != none and !pinned[var_base[gep_alloca[i]] + gep_k[i]];
+    for (mems.items) |i| removed[i] = access[i] != none;
 
     // What stays: instructions with effects, and what they read,
     // transitively; new phis likewise. (The loads promotion leaves dead,
     // such as copies of arguments never read, go too.)
     const live = try a.alloc(bool, n + np);
+    // (What has effects, worked out once for every round.)
+    var effects: std.ArrayList(u32) = .empty;
+    for (insts, 0..) |inst, i| if (!removed[i] and hasEffects(m, inst)) try effects.append(a, @intCast(i));
     while (true) {
         @memset(live, false);
         {
@@ -643,9 +661,9 @@ pub fn run(a: Allocator, m: *module.Module, func: u32, dyn: *const std.AutoHashM
                 }
             };
             var mark: Mark = .{ .repl = repl, .live = live, .removed = removed, .work = &work, .a = a };
-            for (insts, 0..) |inst, i| if (!removed[i] and hasEffects(m, inst) and (reach[block_of[i]] or i == block_start[block_of[i] + 1] - 1)) {
+            for (effects.items) |i| if (reach[block_of[i]] or i == block_start[block_of[i] + 1] - 1) {
                 live[i] = true;
-                try work.append(a, @intCast(i));
+                try work.append(a, i);
             };
             while (work.pop()) |x| {
                 if (x < n) {
@@ -805,15 +823,44 @@ fn foldConstantBranches(a: Allocator, m: *module.Module, insts: []Inst, block_st
                 else => 0,
             };
         }
-        /// Whether entry `x` of `ins` (from `ins[x].block`) is one of the
-        /// edges there still are.
-        fn keeps(s: @This(), ins: []const Edge, x: usize, t: u32) bool {
-            var before: u32 = 0;
-            for (ins[0..x]) |in| before += @intFromBool(in.block == ins[x].block);
-            return before < s.count(ins[x].block, t);
+        /// Whether each entry of `ins` (from `ins[x].block`) is one of the
+        /// edges to `t` there still are: the k-th entry from a block is,
+        /// if the block has more than k edges to `t`. `seen` and `edges_to`
+        /// are per-block scratch (0 and `none`), left as they were.
+        fn keeps(s: @This(), ins: []const Edge, t: u32, seen: []u32, edges_to: []u32, out: []bool) void {
+            for (ins, out) |in, *o| {
+                if (edges_to[in.block] == none) edges_to[in.block] = s.count(in.block, t);
+                o.* = seen[in.block] < edges_to[in.block];
+                seen[in.block] += 1;
+            }
+            for (ins) |in| {
+                seen[in.block] = 0;
+                edges_to[in.block] = none;
+            }
         }
     };
     const edges: Edges = .{ .insts = insts, .block_start = block_start, .reach = reach };
+    const seen = try a.alloc(u32, nb);
+    @memset(seen, 0);
+    const edges_to = try a.alloc(u32, nb);
+    @memset(edges_to, none);
+    var kept: std.ArrayList(bool) = .empty;
+    // Edges into each block from reachable ones. A phi has an entry per
+    // edge, and folding only takes edges away: one with that many entries
+    // lost none.
+    const into = try a.alloc(u32, nb);
+    @memset(into, 0);
+    for (0..nb) |p| if (reach[p]) switch (insts[block_start[p + 1] - 1].op) {
+        .br => |br| {
+            into[br.then] += 1;
+            if (br.@"else") |e| into[e] += 1;
+        },
+        .@"switch" => |sw| {
+            into[sw.default] += 1;
+            for (sw.cases) |cs| into[cs.block] += 1;
+        },
+        else => {},
+    };
     for (0..nb) |b| {
         const t: u32 = @intCast(b);
         const last = block_start[b + 1] - 1;
@@ -824,12 +871,15 @@ fn foldConstantBranches(a: Allocator, m: *module.Module, insts: []Inst, block_st
         var i = block_start[b];
         while (i < last and insts[i].op == .phi) : (i += 1) {
             const old = insts[i].op.phi.incoming;
-            var keep: usize = 0;
-            for (0..old.len) |x| keep += @intFromBool(edges.keeps(old, x, t));
+            if (old.len == into[b]) continue;
+            kept.clearRetainingCapacity();
+            try kept.resize(a, old.len);
+            edges.keeps(old, t, seen, edges_to, kept.items);
+            const keep = std.mem.count(bool, kept.items, &.{true});
             if (keep == old.len) continue;
             const new = try m.allocator().alloc(Edge, keep);
             var k: usize = 0;
-            for (old, 0..) |in, x| if (edges.keeps(old, x, t)) {
+            for (old, kept.items) |in, kp| if (kp) {
                 new[k] = in;
                 k += 1;
             };
@@ -838,9 +888,13 @@ fn foldConstantBranches(a: Allocator, m: *module.Module, insts: []Inst, block_st
         for (bphis[bphi_off[b]..bphi_off[b + 1]]) |j| {
             // (Kept entries move down; each is checked against those
             // before it in the original order.)
-            const orig = try a.dupe(Edge, incoming[j]);
+            const ins = incoming[j];
+            if (ins.len == into[b]) continue;
+            kept.clearRetainingCapacity();
+            try kept.resize(a, ins.len);
+            edges.keeps(ins, t, seen, edges_to, kept.items);
             var k: usize = 0;
-            for (orig, 0..) |in, x| if (edges.keeps(orig, x, t)) {
+            for (ins, kept.items) |in, kp| if (kp) {
                 incoming[j][k] = in;
                 k += 1;
             };

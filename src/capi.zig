@@ -2,6 +2,7 @@
 //! owns an arena; nothing is global.
 
 const std = @import("std");
+const BumpArena = @import("zdxc").BumpArena;
 const zdxc = @import("zdxc");
 const compile = zdxc.compile;
 const FileSystem = zdxc.front.source.FileSystem;
@@ -22,7 +23,7 @@ const CompileInfo = extern struct {
 const Output = enum(c_int) { object, diagnostics, preprocessed, root_signature, text, _ };
 
 const Result = struct {
-    arena: std.heap.ArenaAllocator,
+    arena: BumpArena,
     status: compile.Status,
     /// Indexed by `Output`; each NUL-terminated.
     outputs: [5]?[:0]const u8,
@@ -32,7 +33,7 @@ const Result = struct {
 export fn zdxc_compile(info: ?*const CompileInfo) ?*Result {
     const i = info orelse return null;
     if (i.size < @sizeOf(CompileInfo)) return null;
-    var arena: std.heap.ArenaAllocator = .init(std.heap.smp_allocator);
+    var arena: BumpArena = .init(std.heap.smp_allocator);
     const r = compileInto(&arena, i) catch {
         arena.deinit();
         return null;
@@ -41,7 +42,7 @@ export fn zdxc_compile(info: ?*const CompileInfo) ?*Result {
     return r;
 }
 
-fn compileInto(arena: *std.heap.ArenaAllocator, i: *const CompileInfo) !*Result {
+fn compileInto(arena: *BumpArena, i: *const CompileInfo) !*Result {
     const a = arena.allocator();
     const args = try a.alloc([]const u8, i.arg_count);
     for (args, 0..) |*d, k| d.* = std.mem.span(i.args.?[k] orelse return error.InvalidArgument);

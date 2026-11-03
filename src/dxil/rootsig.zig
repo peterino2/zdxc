@@ -18,6 +18,7 @@
 //! Self-contained: depends on std only.
 
 const std = @import("std");
+const BumpArena = @import("../BumpArena.zig");
 const Allocator = std.mem.Allocator;
 
 pub const Version = enum(u32) {
@@ -66,7 +67,7 @@ pub fn compile(gpa: Allocator, text: []const u8, version: Version, diag: *Diagno
 }
 
 pub fn compileWithOptions(gpa: Allocator, text: []const u8, opts: Options, diag: *Diagnostic) Allocator.Error!?[]u8 {
-    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    var arena_state = BumpArena.init(gpa);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 

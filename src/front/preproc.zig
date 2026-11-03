@@ -4,6 +4,7 @@
 //! disabled macro.
 
 const std = @import("std");
+const BumpArena = @import("../BumpArena.zig");
 const Allocator = std.mem.Allocator;
 const source = @import("source.zig");
 const lexer = @import("lexer.zig");
@@ -1446,7 +1447,7 @@ const TestPP = struct {
     mfs: source.MemoryFs = .{},
     sm: source.SourceManager = undefined,
     diags: Diagnostics = undefined,
-    arena: std.heap.ArenaAllocator = undefined,
+    arena: BumpArena = undefined,
     pp: Preprocessor = undefined,
 
     fn init(t: *TestPP, files: []const [2][]const u8, main: []const u8, opts: Options) !void {

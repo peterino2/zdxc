@@ -14,6 +14,7 @@
 //! does (test/dropin in the development repo compares the two).
 
 const std = @import("std");
+const BumpArena = @import("zdxc").BumpArena;
 const builtin = @import("builtin");
 const zdxc = @import("zdxc");
 const compile = zdxc.compile;
@@ -839,7 +840,7 @@ const Compiler = struct {
 /// gives its blocks back to the OS (smp_allocator maps 64 KiB and up
 /// directly), and faulting fresh pages in again costs more than the compile
 /// on many threads. What a thread keeps is capped at `retain_limit`.
-threadlocal var thread_arena: ?std.heap.ArenaAllocator = null;
+threadlocal var thread_arena: ?BumpArena = null;
 const retain_limit = 64 << 20;
 
 fn run(source: *const Buffer, wargs: []const ?[*:0]const WCHAR, include: ?*anyopaque) error{ OutOfMemory, InvalidArgument }!*Result {

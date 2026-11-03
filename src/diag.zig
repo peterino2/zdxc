@@ -3,6 +3,7 @@
 //! include chains and macro expansion backtraces.
 
 const std = @import("std");
+const BumpArena = @import("BumpArena.zig");
 const Allocator = std.mem.Allocator;
 const source = @import("front/source.zig");
 const Loc = source.Loc;
@@ -56,7 +57,7 @@ pub const Report = struct {
 };
 
 pub const Diagnostics = struct {
-    arena: std.heap.ArenaAllocator,
+    arena: BumpArena,
     list: std.ArrayList(*Diagnostic) = .empty,
     error_count: u32 = 0,
     warning_count: u32 = 0,
