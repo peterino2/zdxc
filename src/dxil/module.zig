@@ -40,26 +40,28 @@ pub const Type = union(enum) {
     }
 };
 
+/// splitmix64's finalizer: a cheap hash of a word, for the type and
+/// constant pools (a hash map uses both its high and low bits).
+fn mix(x: u64) u64 {
+    var z = x;
+    z = (z ^ (z >> 30)) *% 0xbf58476d1ce4e5b9;
+    z = (z ^ (z >> 27)) *% 0x94d049bb133111eb;
+    return z ^ (z >> 31);
+}
+
 /// Hashes what Type.eql compares.
 const TypeContext = struct {
     pub fn hash(_: TypeContext, t: Type) u64 {
-        var h: std.hash.Wyhash = .init(@backingInt(t));
-        switch (t) {
-            .void, .label, .metadata, .half, .float, .double => {},
-            .int => |w| h.update(std.mem.asBytes(&w)),
-            .pointer => |p| h.update(std.mem.asBytes(&[2]u32{ p.elem, p.addr_space })),
-            .function => |f| {
-                h.update(std.mem.asBytes(&f.ret));
-                h.update(std.mem.sliceAsBytes(f.params));
-            },
-            .@"struct" => |st| h.update(st.name),
-            .array => |x| {
-                h.update(std.mem.asBytes(&x.len));
-                h.update(std.mem.asBytes(&x.elem));
-            },
-            .vector => |x| h.update(std.mem.asBytes(&[2]u32{ x.len, x.elem })),
-        }
-        return h.final();
+        const tag: u64 = @backingInt(t);
+        return switch (t) {
+            .void, .label, .metadata, .half, .float, .double => mix(tag),
+            .int => |w| mix(tag << 56 | w),
+            .pointer => |p| mix(tag << 56 | @as(u64, p.addr_space) << 32 | p.elem),
+            .function => |f| mix(tag << 56 | f.ret) ^ std.hash.Wyhash.hash(0, std.mem.sliceAsBytes(f.params)),
+            .@"struct" => |st| mix(tag) ^ std.hash.Wyhash.hash(0, st.name),
+            .array => |x| mix(mix(tag << 56 | x.elem) ^ x.len),
+            .vector => |x| mix(tag << 56 | @as(u64, x.len) << 32 | x.elem),
+        };
     }
 
     pub fn eql(_: TypeContext, a: Type, b: Type) bool {
@@ -87,18 +89,13 @@ pub const Constant = struct {
 /// element slice, as std.meta.eql compares slices).
 const ConstantContext = struct {
     pub fn hash(_: ConstantContext, c: Constant) u64 {
-        var h: std.hash.Wyhash = .init(c.ty);
-        h.update(std.mem.asBytes(&@as(u8, @backingInt(c.kind))));
-        switch (c.kind) {
-            .int => |v| h.update(std.mem.asBytes(&v)),
-            .float_bits => |v| h.update(std.mem.asBytes(&v)),
-            .undef, .null => {},
-            .aggregate => |a| {
-                h.update(std.mem.asBytes(&@intFromPtr(a.ptr)));
-                h.update(std.mem.asBytes(&a.len));
-            },
-        }
-        return h.final();
+        const head = mix(@as(u64, @backingInt(c.kind)) << 32 | c.ty);
+        return switch (c.kind) {
+            .int => |v| mix(head ^ @as(u64, @bitCast(v))),
+            .float_bits => |v| mix(head ^ v),
+            .undef, .null => head,
+            .aggregate => |a| mix(head ^ @intFromPtr(a.ptr) ^ a.len << 48),
+        };
     }
 
     pub fn eql(_: ConstantContext, a: Constant, b: Constant) bool {
