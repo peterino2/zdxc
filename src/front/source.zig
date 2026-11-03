@@ -318,28 +318,44 @@ fn decodeUtf16(a: Allocator, raw: []const u8) !?[]const u8 {
 }
 
 fn spliceLines(a: Allocator, raw: []const u8) ![]const u8 {
-    if (std.mem.indexOfScalar(u8, raw, '\\') == null) return raw;
+    var i = std.mem.indexOfScalar(u8, raw, '\\') orelse return raw;
     var out: std.ArrayList(u8) = .empty;
     try out.ensureTotalCapacity(a, raw.len);
-    var i: usize = 0;
+    out.appendSliceAssumeCapacity(raw[0..i]);
+    // At a backslash: a splice, or the backslash kept; then the run to the
+    // next backslash, copied whole.
     while (i < raw.len) {
-        if (raw[i] == '\\') {
-            var j = i + 1;
-            // Clang tolerates whitespace between the backslash and newline.
-            while (j < raw.len and (raw[j] == ' ' or raw[j] == '\t')) j += 1;
-            if (j < raw.len and raw[j] == '\n') {
-                i = j + 1;
-                continue;
-            }
-            if (j + 1 < raw.len and raw[j] == '\r' and raw[j + 1] == '\n') {
-                i = j + 2;
-                continue;
-            }
+        var j = i + 1;
+        // Clang tolerates whitespace between the backslash and newline.
+        while (j < raw.len and (raw[j] == ' ' or raw[j] == '\t')) j += 1;
+        if (j < raw.len and raw[j] == '\n') {
+            i = j + 1;
+        } else if (j + 1 < raw.len and raw[j] == '\r' and raw[j + 1] == '\n') {
+            i = j + 2;
+        } else {
+            out.appendAssumeCapacity('\\');
+            i += 1;
         }
-        out.appendAssumeCapacity(raw[i]);
-        i += 1;
+        const next = std.mem.indexOfScalarPos(u8, raw, i, '\\') orelse raw.len;
+        out.appendSliceAssumeCapacity(raw[i..next]);
+        i = next;
     }
     return out.items;
+}
+
+test spliceLines {
+    const cases = [_][2][]const u8{
+        .{ "a\\\nb", "ab" },
+        .{ "a\\ \t\r\nb\\", "ab\\" },
+        .{ "\\x\\\\\ny", "\\x\\y" },
+        .{ "no splice", "no splice" },
+        .{ "#define A 1 \\\n + 2\n", "#define A 1  + 2\n" },
+    };
+    for (cases) |c| {
+        var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+        defer arena.deinit();
+        try std.testing.expectEqualStrings(c[1], try spliceLines(arena.allocator(), c[0]));
+    }
 }
 
 test "line and column lookup" {
