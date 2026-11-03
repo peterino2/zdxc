@@ -143,6 +143,8 @@ pub const PsvInfo = struct {
     /// The stage-specific PSVRuntimeInfo0 union.
     stage_info: [16]u8 = @splat(0),
     num_threads: [3]u32 = .{ 0, 0, 0 },
+    /// Minimum and maximum expected wave lane counts (WaveSize).
+    wave_lanes: [2]u32 = .{ 0, 0xFFFFFFFF },
     resources: []const ResourceBind = &.{},
     inputs: []const signature.Element = &.{},
     outputs: []const signature.Element = &.{},
@@ -172,8 +174,8 @@ pub fn psv(gpa: Allocator, info: PsvInfo) ![]u8 {
     try w(&buf, gpa, 60); // sizeof(PSVRuntimeInfo4)
     // PSVRuntimeInfo0
     try buf.appendSlice(gpa, &info.stage_info);
-    try w(&buf, gpa, 0); // MinimumExpectedWaveLaneCount
-    try w(&buf, gpa, 0xFFFFFFFF); // MaximumExpectedWaveLaneCount
+    try w(&buf, gpa, info.wave_lanes[0]); // MinimumExpectedWaveLaneCount
+    try w(&buf, gpa, info.wave_lanes[1]); // MaximumExpectedWaveLaneCount
     // PSVRuntimeInfo1: stage, UsesViewID, MaxVertexCount, element counts,
     // vector counts.
     // (The MaxVertexCount union holds SigPatchConstOrPrimVectors for hull
@@ -221,7 +223,7 @@ pub fn psv(gpa: Allocator, info: PsvInfo) ![]u8 {
         try w(&records, gpa, idx_off);
         var cols_and_start: u8 = @intCast(e.cols);
         if (e.start_row != null) cols_and_start |= 0x40 | @as(u8, @intCast(e.start_col << 4));
-        try records.appendSlice(gpa, &.{ @intCast(e.rows), @intCast(e.start_row orelse 0), cols_and_start, @intFromEnum(e.kind), @intCast(e.comp.sigCompType()), @intFromEnum(e.interp), @intCast((e.stream & 3) << 4), 0 });
+        try records.appendSlice(gpa, &.{ @intCast(e.rows), @intCast(e.start_row orelse 0), cols_and_start, @backingInt(e.kind), @intCast(e.comp.sigCompType()), @backingInt(e.interp), @intCast((e.stream & 3) << 4), 0 });
     };
     const entry_off: u32 = @intCast(strings.items.len);
     try strings.appendSlice(gpa, info.entry);

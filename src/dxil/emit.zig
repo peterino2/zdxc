@@ -6783,6 +6783,9 @@ const Emitter = struct {
                 .feature_info2 = @truncate(libinfo.featureInfo(info.flags) >> 32),
                 .shader_stage_flag = if (lf.stage == .library) info.mask & 0xffff else info.mask & (@as(u32, 1) << @intCast(kind)),
                 .min_shader_target = (kind << 16) | (6 << 4) | libinfo.minMinor(info, if (lf.stage == .library) null else kind),
+                // (RDAT: 0 where none is specified.)
+                .min_wave_lanes = @intCast(lf.entry.wave_size[0]),
+                .max_wave_lanes = @intCast(if (lf.entry.wave_size[1] != 0) lf.entry.wave_size[1] else lf.entry.wave_size[0]),
                 .extended_properties = props,
             });
         }
@@ -6838,6 +6841,14 @@ const Emitter = struct {
         });
     }
 
+    /// The wave lane counts PSV and RDAT give: WaveSize's minimum, and its
+    /// maximum (a range) or the minimum again; with none, 0 and maxInt.
+    fn waveLanes(entry: ir.Entry) [2]u32 {
+        const ws = entry.wave_size;
+        if (ws[0] == 0) return .{ 0, std.math.maxInt(u32) };
+        return .{ ws[0], if (ws[1] != 0) ws[1] else ws[0] };
+    }
+
     /// Entry properties of the stage: thread group size and the GS / HS /
     /// DS / MS / AS state.
     fn stageProps(e: *Emitter, entry: ir.Entry, props: *std.ArrayList(?module.MdId)) Error!void {
@@ -6849,6 +6860,14 @@ const Emitter = struct {
         }.f;
         const threads = try dm.mdNode(&.{ try mdI32(dm, entry.num_threads[0]), try mdI32(dm, entry.num_threads[1]), try mdI32(dm, entry.num_threads[2]) });
         if (entry.stage == .compute) try props.appendSlice(e.arena, &.{ try mdI32(dm, 4), threads });
+        // WaveSize: a value (tag 11) before SM 6.8, a range with a
+        // preferred size after (tag 23; zeros where not given).
+        if (entry.wave_size[0] != 0) {
+            const ws = entry.wave_size;
+            if (e.profile.minor >= 8) {
+                try props.appendSlice(e.arena, &.{ try mdI32(dm, 23), try dm.mdNode(&.{ try mdI32(dm, ws[0]), try mdI32(dm, ws[1]), try mdI32(dm, ws[2]) }) });
+            } else try props.appendSlice(e.arena, &.{ try mdI32(dm, 11), try dm.mdNode(&.{try mdI32(dm, ws[0])}) });
+        }
         const payload_size: u32 = if (entry.mesh.payload) |p| try e.payloadSize(p) else 0;
         if (entry.stage == .mesh) {
             // MS state: thread group, max vertices, max primitives,
@@ -7064,6 +7083,7 @@ const Emitter = struct {
             .entry = entry.name,
             .stage_info = stage_info,
             .num_threads = if (threaded) entry.num_threads else .{ 0, 0, 0 },
+            .wave_lanes = waveLanes(entry),
             .mesh_topology = if (entry.stage == .mesh) @backingInt(entry.mesh.topology) else 0,
             .uses_view_id = e.uses_view_id,
             .resources = binds.items,

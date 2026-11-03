@@ -436,6 +436,9 @@ pub const Entry = struct {
     name: []const u8,
     stage: Stage,
     num_threads: [3]u32 = .{ 1, 1, 1 },
+    /// `[WaveSize(min[, max[, preferred]])]`: zeros where not given (no
+    /// attribute: min 0).
+    wave_size: [3]u32 = .{ 0, 0, 0 },
     geometry: GeometryInfo = .{},
     tess: TessInfo = .{},
     mesh: MeshInfo = .{},

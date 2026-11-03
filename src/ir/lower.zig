@@ -73,11 +73,11 @@ pub fn lowerUnit(arena: Allocator, s: *Sema, opts: Options) Error!ir.Module {
 /// The stage a `[shader("...")]` attribute names.
 fn stageNamed(name: []const u8) ?ir.Stage {
     const names = [_]struct { []const u8, ir.Stage }{
-        .{ "vertex", .vertex },               .{ "pixel", .pixel },           .{ "geometry", .geometry },
-        .{ "hull", .hull },                   .{ "domain", .domain },         .{ "compute", .compute },
-        .{ "mesh", .mesh },                   .{ "amplification", .amplification }, .{ "raygeneration", .raygeneration },
-        .{ "intersection", .intersection },   .{ "anyhit", .anyhit },         .{ "closesthit", .closesthit },
-        .{ "miss", .miss },                   .{ "callable", .callable },
+        .{ "vertex", .vertex },             .{ "pixel", .pixel },                 .{ "geometry", .geometry },
+        .{ "hull", .hull },                 .{ "domain", .domain },               .{ "compute", .compute },
+        .{ "mesh", .mesh },                 .{ "amplification", .amplification }, .{ "raygeneration", .raygeneration },
+        .{ "intersection", .intersection }, .{ "anyhit", .anyhit },               .{ "closesthit", .closesthit },
+        .{ "miss", .miss },                 .{ "callable", .callable },
     };
     for (names) |t| if (std.ascii.eqlIgnoreCase(name, t[0])) return t[1];
     return null;
@@ -318,10 +318,10 @@ const Lowerer = struct {
     fn subobjects(l: *Lowerer) Error!void {
         const Kind = ir.Subobject.Kind;
         const kinds = [_]struct { []const u8, Kind }{
-            .{ "StateObjectConfig", .state_object_config },                       .{ "GlobalRootSignature", .global_root_signature },
-            .{ "LocalRootSignature", .local_root_signature },                     .{ "SubobjectToExportsAssociation", .subobject_to_exports_association },
-            .{ "RaytracingShaderConfig", .raytracing_shader_config },             .{ "RaytracingPipelineConfig", .raytracing_pipeline_config },
-            .{ "TriangleHitGroup", .hit_group },                                  .{ "ProceduralPrimitiveHitGroup", .hit_group },
+            .{ "StateObjectConfig", .state_object_config },                 .{ "GlobalRootSignature", .global_root_signature },
+            .{ "LocalRootSignature", .local_root_signature },               .{ "SubobjectToExportsAssociation", .subobject_to_exports_association },
+            .{ "RaytracingShaderConfig", .raytracing_shader_config },       .{ "RaytracingPipelineConfig", .raytracing_pipeline_config },
+            .{ "TriangleHitGroup", .hit_group },                            .{ "ProceduralPrimitiveHitGroup", .hit_group },
             .{ "RaytracingPipelineConfig1", .raytracing_pipeline_config1 },
         };
         // (Builtin objects are static globals.)
@@ -1412,49 +1412,49 @@ const Lowerer = struct {
     /// A call to `f` with `base_expr` as the object of a method (null:
     /// the current `this`, or no object).
     fn methodCall(l: *Lowerer, f: *const semamod.Function, fi: u32, base_expr: ?*ast.Expr, args: []const *ast.Expr, ret_ty: TypeId) Error!Ref {
-            var object: ?Ref = null;
-            var write_back: ?Ref = null;
-            const owner_ty = if (isMethod(f)) try l.s.types.intern(.{ .@"struct" = f.owner.? }) else TypeTable.void_type;
-            if (base_expr) |base| {
-                const direct = if (isAddressable(l.s, base)) try l.lvalue(base) else null;
-                const plain = if (direct) |p| l.b.f.inst(p).op == .local_var or l.b.f.inst(p).op == .param else false;
-                if (direct != null and plain and base.ty == owner_ty) {
-                    object = direct;
-                } else {
-                    // Through a function-local copy of the method's own
-                    // struct (a base prefix of derived objects), written
-                    // back afterwards to writable storage.
-                    const tmp = try l.b.add(.{ .op = .local_var, .ty = owner_ty, .ptr = .function });
-                    var whole = if (direct) |p| try l.b.load(p) else try l.rvalue(base);
-                    var whole_ty = base.ty;
-                    if (l.s.types.get(base.ty) == .resource) {
-                        // A method of ConstantBuffer<S>'s S: on a copy of S.
-                        whole_ty = l.s.types.get(base.ty).resource.elem;
-                        whole = try l.convert(whole, whole_ty);
-                    }
-                    try l.b.store(tmp, try l.basePrefix(whole, whole_ty, owner_ty));
-                    object = tmp;
-                    if (direct) |p| switch (l.b.f.inst(p).ptr) {
-                        .function, .private, .groupshared => write_back = p,
-                        else => {},
-                    };
+        var object: ?Ref = null;
+        var write_back: ?Ref = null;
+        const owner_ty = if (isMethod(f)) try l.s.types.intern(.{ .@"struct" = f.owner.? }) else TypeTable.void_type;
+        if (base_expr) |base| {
+            const direct = if (isAddressable(l.s, base)) try l.lvalue(base) else null;
+            const plain = if (direct) |p| l.b.f.inst(p).op == .local_var or l.b.f.inst(p).op == .param else false;
+            if (direct != null and plain and base.ty == owner_ty) {
+                object = direct;
+            } else {
+                // Through a function-local copy of the method's own
+                // struct (a base prefix of derived objects), written
+                // back afterwards to writable storage.
+                const tmp = try l.b.add(.{ .op = .local_var, .ty = owner_ty, .ptr = .function });
+                var whole = if (direct) |p| try l.b.load(p) else try l.rvalue(base);
+                var whole_ty = base.ty;
+                if (l.s.types.get(base.ty) == .resource) {
+                    // A method of ConstantBuffer<S>'s S: on a copy of S.
+                    whole_ty = l.s.types.get(base.ty).resource.elem;
+                    whole = try l.convert(whole, whole_ty);
+                }
+                try l.b.store(tmp, try l.basePrefix(whole, whole_ty, owner_ty));
+                object = tmp;
+                if (direct) |p| switch (l.b.f.inst(p).ptr) {
+                    .function, .private, .groupshared => write_back = p,
+                    else => {},
+                };
+            }
+        }
+        const res = try l.userCall(f, fi, args, ret_ty, object);
+        if (write_back) |p| {
+            const updated = try l.b.load(object.?);
+            if (base_expr.?.ty == owner_ty) {
+                try l.b.store(p, updated);
+            } else {
+                // Only the base's fields.
+                for (l.s.types.get(owner_ty).@"struct".fields.items, 0..) |fld, k| {
+                    const idx = try l.b.constInt(try l.types().scalar(.uint), @intCast(k));
+                    const fp = try l.b.add(.{ .op = .{ .access = .{ .base = p, .indices = try l.arena.dupe(Ref, &.{idx}) } }, .ty = fld.type, .ptr = l.b.f.inst(p).ptr });
+                    try l.b.store(fp, try l.b.add(.{ .op = .{ .extract = .{ .agg = updated, .index = @intCast(k) } }, .ty = fld.type }));
                 }
             }
-            const res = try l.userCall(f, fi, args, ret_ty, object);
-            if (write_back) |p| {
-                const updated = try l.b.load(object.?);
-                if (base_expr.?.ty == owner_ty) {
-                    try l.b.store(p, updated);
-                } else {
-                    // Only the base's fields.
-                    for (l.s.types.get(owner_ty).@"struct".fields.items, 0..) |fld, k| {
-                        const idx = try l.b.constInt(try l.types().scalar(.uint), @intCast(k));
-                        const fp = try l.b.add(.{ .op = .{ .access = .{ .base = p, .indices = try l.arena.dupe(Ref, &.{idx}) } }, .ty = fld.type, .ptr = l.b.f.inst(p).ptr });
-                        try l.b.store(fp, try l.b.add(.{ .op = .{ .extract = .{ .agg = updated, .index = @intCast(k) } }, .ty = fld.type }));
-                    }
-                }
-            }
-            return res;
+        }
+        return res;
     }
 
     /// An overloaded operator: a method call on the first operand.
@@ -2429,6 +2429,9 @@ const Lowerer = struct {
             if (std.ascii.eqlIgnoreCase(a.name, "numthreads") and a.args.len == 3) {
                 for (a.args, 0..) |arg, i| entry.num_threads[i] = @intCast(@max(1, l.s.evalInt(arg) orelse 1));
             }
+            if (std.ascii.eqlIgnoreCase(a.name, "wavesize") and a.args.len >= 1 and a.args.len <= 3) {
+                for (a.args, 0..) |arg, i| entry.wave_size[i] = @intCast(@max(0, l.s.evalInt(arg) orelse 0));
+            }
             if (std.ascii.eqlIgnoreCase(a.name, "maxvertexcount") and a.args.len == 1) entry.geometry.max_vertex_count = @intCast(@max(1, l.s.evalInt(a.args[0]) orelse 1));
             if (std.ascii.eqlIgnoreCase(a.name, "instance") and a.args.len == 1) entry.geometry.instance_count = @intCast(@max(1, l.s.evalInt(a.args[0]) orelse 1));
             if (std.ascii.eqlIgnoreCase(a.name, "RootSignature") and a.args.len == 1 and a.args[0].kind == .string_lit) entry.root_signature = try stringContents(l.arena, a.args[0].kind.string_lit);
@@ -2708,11 +2711,11 @@ fn packOffset(v: *const Variable) ?u32 {
 fn imageFormatNamed(name: ?[]const u8) ?u32 {
     const n = name orelse return null;
     const names = [_][]const u8{
-        "unknown",     "rgba32f",     "rgba16f",   "r32f",       "rgba8",      "rgba8snorm",  "rg32f",    "rg16f",
-        "r11g11b10f",  "r16f",        "rgba16",    "rgb10a2",    "rg16",       "rg8",         "r16",      "r8",
-        "rgba16snorm", "rg16snorm",   "rg8snorm",  "r16snorm",   "r8snorm",    "rgba32i",     "rgba16i",  "rgba8i",
-        "r32i",        "rg32i",       "rg16i",     "rg8i",       "r16i",       "r8i",         "rgba32ui", "rgba16ui",
-        "rgba8ui",     "r32ui",       "rgb10a2ui", "rg32ui",     "rg16ui",     "rg8ui",       "r16ui",    "r8ui",
+        "unknown",     "rgba32f",   "rgba16f",   "r32f",     "rgba8",   "rgba8snorm", "rg32f",    "rg16f",
+        "r11g11b10f",  "r16f",      "rgba16",    "rgb10a2",  "rg16",    "rg8",        "r16",      "r8",
+        "rgba16snorm", "rg16snorm", "rg8snorm",  "r16snorm", "r8snorm", "rgba32i",    "rgba16i",  "rgba8i",
+        "r32i",        "rg32i",     "rg16i",     "rg8i",     "r16i",    "r8i",        "rgba32ui", "rgba16ui",
+        "rgba8ui",     "r32ui",     "rgb10a2ui", "rg32ui",   "rg16ui",  "rg8ui",      "r16ui",    "r8ui",
         "r64ui",       "r64i",
     };
     for (names, 0..) |x, k| if (std.ascii.eqlIgnoreCase(x, n)) return @intCast(k);
@@ -2747,7 +2750,6 @@ pub fn isObject(t: *TypeTable, ty: TypeId) bool {
         else => false,
     };
 }
-
 
 fn semanticOf(sems: []const ast.Semantic) ?[]const u8 {
     for (sems) |sem| if (sem.kind == .semantic) return sem.values[0];
