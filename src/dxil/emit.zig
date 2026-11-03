@@ -197,6 +197,39 @@ const Frame = struct {
     arrays: std.ArrayList(struct { ty: TypeId, ptr: Ptr }) = .empty,
 };
 
+/// Hash maps keyed by a Value (or a Value and an offset). A Value has
+/// padding, so the automatic context hashes it field by field; this one
+/// mixes its tag and index into one word.
+fn ValueMap(comptime V: type) type {
+    return std.HashMapUnmanaged(Value, V, ValueContext, std.hash_map.default_max_load_percentage);
+}
+
+const ValueContext = struct {
+    fn word(v: Value) u64 {
+        return @as(u64, @intFromEnum(v)) << 32 | switch (v) {
+            inline else => |x| x,
+        };
+    }
+
+    fn mix(x: u64) u64 {
+        var z = x;
+        z = (z ^ (z >> 30)) *% 0xbf58476d1ce4e5b9;
+        z = (z ^ (z >> 27)) *% 0x94d049bb133111eb;
+        return z ^ (z >> 31);
+    }
+
+    pub fn hash(_: ValueContext, k: anytype) u64 {
+        return switch (@TypeOf(k)) {
+            Value => mix(word(k)),
+            else => mix(word(k[0]) ^ @as(u64, k[1]) << 40),
+        };
+    }
+
+    pub fn eql(_: ValueContext, a: anytype, b: @TypeOf(a)) bool {
+        return std.meta.eql(a, b);
+    }
+};
+
 /// The current function's instructions, by id, in chunks that never move
 /// (blocks and the prologue list ids).
 const InstStore = struct {
@@ -246,12 +279,12 @@ const Emitter = struct {
     private_typed: std.AutoHashMapUnmanaged(u32, @FieldType(Lowered, "typed")) = .empty,
     /// Locals holding a copy of a texel read through an index (see the
     /// `access` op): writes through them would not reach the texture.
-    texel_copies: std.AutoHashMapUnmanaged(Value, void) = .empty,
+    texel_copies: ValueMap(void) = .empty,
     /// Static globals holding resources (as locals: Emitter.aggLocal).
     private_aggs: std.AutoHashMapUnmanaged(u32, Lowered) = .empty,
     res_locals: std.ArrayList(?Lowered) = .empty,
     /// Indices marked with NonUniformResourceIndex.
-    nonuniform: std.AutoHashMapUnmanaged(Value, void) = .empty,
+    nonuniform: ValueMap(void) = .empty,
     uses_double: bool = false,
     uses_int64: bool = false,
     /// 16-bit min-precision values cross the signature.
@@ -284,8 +317,8 @@ const Emitter = struct {
     last_resret: Value = undefined,
     /// Status values, forwarded through locals within a block: the
     /// validator wants CheckAccessFullyMapped's operand to be one.
-    status_vals: std.AutoHashMapUnmanaged(Value, void) = .empty,
-    forwarded: std.AutoHashMapUnmanaged(struct { Value, u32 }, struct { v: Value, block: u32 }) = .empty,
+    status_vals: ValueMap(void) = .empty,
+    forwarded: std.HashMapUnmanaged(struct { Value, u32 }, struct { v: Value, block: u32 }, ValueContext, std.hash_map.default_max_load_percentage) = .empty,
     /// Dynamically indexed getelementptrs into locals (by id) and the
     /// components they can reach, for promote.run.
     dyn_ranges: std.AutoHashMapUnmanaged(u32, [2]u32) = .empty,
