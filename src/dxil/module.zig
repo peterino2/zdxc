@@ -39,6 +39,36 @@ pub const Type = union(enum) {
     }
 };
 
+/// Hashes what Type.eql compares.
+const TypeContext = struct {
+    pub fn hash(_: TypeContext, t: Type) u64 {
+        var h: std.hash.Wyhash = .init(@backingInt(t));
+        switch (t) {
+            .void, .label, .metadata, .half, .float, .double => {},
+            .int => |w| h.update(std.mem.asBytes(&w)),
+            .pointer => |p| h.update(std.mem.asBytes(&[2]u32{ p.elem, p.addr_space })),
+            .function => |f| {
+                h.update(std.mem.asBytes(&f.ret));
+                h.update(std.mem.sliceAsBytes(f.params));
+            },
+            .@"struct" => |st| h.update(st.name),
+            .array => |x| {
+                h.update(std.mem.asBytes(&x.len));
+                h.update(std.mem.asBytes(&x.elem));
+            },
+            .vector => |x| h.update(std.mem.asBytes(&[2]u32{ x.len, x.elem })),
+        }
+        return h.final();
+    }
+
+    pub fn eql(_: TypeContext, a: Type, b: Type) bool {
+        return a.eql(b);
+    }
+};
+
+const no_type = std.math.maxInt(TypeId);
+const no_const = std.math.maxInt(ConstId);
+
 pub const Constant = struct {
     ty: TypeId,
     kind: union(enum) {
@@ -50,6 +80,29 @@ pub const Constant = struct {
         /// Struct / array / vector of earlier constants.
         aggregate: []const ConstId,
     },
+};
+
+/// Constants are equal when their type and kind are (aggregates: the same
+/// element slice, as std.meta.eql compares slices).
+const ConstantContext = struct {
+    pub fn hash(_: ConstantContext, c: Constant) u64 {
+        var h: std.hash.Wyhash = .init(c.ty);
+        h.update(std.mem.asBytes(&@as(u8, @backingInt(c.kind))));
+        switch (c.kind) {
+            .int => |v| h.update(std.mem.asBytes(&v)),
+            .float_bits => |v| h.update(std.mem.asBytes(&v)),
+            .undef, .null => {},
+            .aggregate => |a| {
+                h.update(std.mem.asBytes(&@intFromPtr(a.ptr)));
+                h.update(std.mem.asBytes(&a.len));
+            },
+        }
+        return h.final();
+    }
+
+    pub fn eql(_: ConstantContext, a: Constant, b: Constant) bool {
+        return a.ty == b.ty and std.meta.eql(a.kind, b.kind);
+    }
 };
 
 pub const Linkage = enum(u32) { external = 0, internal = 3 };
@@ -134,8 +187,15 @@ pub const Module = struct {
     triple: []const u8 = "dxil-ms-dx",
     datalayout: []const u8 = "e-m:e-p:32:32-i1:32-i8:32-i16:32-i32:32-i64:64-f16:32-f32:32-f64:64-n8:16:32:64",
     types: std.ArrayList(Type) = .empty,
+    /// Index of `types`, for getType to find existing ones.
+    type_ids: std.HashMapUnmanaged(Type, TypeId, TypeContext, std.hash_map.default_max_load_percentage) = .empty,
     constants: std.ArrayList(Constant) = .empty,
+    /// Index of `constants`, for constant() to find existing ones.
+    constant_ids: std.HashMapUnmanaged(Constant, ConstId, ConstantContext, std.hash_map.default_max_load_percentage) = .empty,
     functions: std.ArrayList(Function) = .empty,
+    /// intType's and constInt's results for common arguments.
+    int_types: [65]TypeId = @splat(no_type),
+    small_i32: [1024]ConstId = @splat(no_const),
     globals: std.ArrayList(GlobalVar) = .empty,
     metadata: std.ArrayList(Metadata) = .empty,
     named_metadata: std.ArrayList(struct { name: []const u8, nodes: []const MdId }) = .empty,
@@ -155,9 +215,7 @@ pub const Module = struct {
     }
 
     pub fn getType(m: *Module, t: Type) !TypeId {
-        for (m.types.items, 0..) |existing, i| {
-            if (existing.eql(t)) return @intCast(i);
-        }
+        if (m.type_ids.get(t)) |id| return id;
         const a = m.allocator();
         var owned = t;
         switch (owned) {
@@ -168,11 +226,18 @@ pub const Module = struct {
             },
             else => {},
         }
+        const id: TypeId = @intCast(m.types.items.len);
+        try m.type_ids.ensureUnusedCapacity(a, 1);
         try m.types.append(a, owned);
-        return @intCast(m.types.items.len - 1);
+        m.type_ids.putAssumeCapacity(owned, id);
+        return id;
     }
 
     pub fn intType(m: *Module, bits: u32) !TypeId {
+        if (bits < m.int_types.len) {
+            if (m.int_types[bits] == no_type) m.int_types[bits] = try m.getType(.{ .int = bits });
+            return m.int_types[bits];
+        }
         return m.getType(.{ .int = bits });
     }
 
@@ -200,14 +265,23 @@ pub const Module = struct {
     }
 
     pub fn constant(m: *Module, c: Constant) !Value {
-        for (m.constants.items, 0..) |existing, i| {
-            if (existing.ty == c.ty and std.meta.eql(existing.kind, c.kind)) return .{ .constant = @intCast(i) };
+        const gop = try m.constant_ids.getOrPut(m.allocator(), c);
+        if (!gop.found_existing) {
+            gop.value_ptr.* = @intCast(m.constants.items.len);
+            m.constants.append(m.allocator(), c) catch |err| {
+                m.constant_ids.removeByPtr(gop.key_ptr);
+                return err;
+            };
         }
-        try m.constants.append(m.allocator(), c);
-        return .{ .constant = @intCast(m.constants.items.len - 1) };
+        return .{ .constant = gop.value_ptr.* };
     }
 
     pub fn constInt(m: *Module, bits: u32, v: i64) !Value {
+        if (bits == 32 and v >= 0 and v < m.small_i32.len) {
+            const k: usize = @intCast(v);
+            if (m.small_i32[k] == no_const) m.small_i32[k] = (try m.constant(.{ .ty = try m.intType(32), .kind = .{ .int = v } })).constant;
+            return .{ .constant = m.small_i32[k] };
+        }
         return m.constant(.{ .ty = try m.intType(bits), .kind = .{ .int = v } });
     }
 

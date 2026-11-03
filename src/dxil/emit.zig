@@ -316,6 +316,10 @@ const Emitter = struct {
     /// Each HLSL struct's module type (struct types are named, and two
     /// structs may share a name: `A<int>::In`, `A<float>::In`).
     struct_types: std.AutoHashMapUnmanaged(TypeId, DType) = .empty,
+    /// Per type: see structComps, mixedSizes and mixedStorage.
+    struct_comps: std.AutoHashMapUnmanaged(TypeId, []const TypeId) = .empty,
+    mixed_sizes: std.AutoHashMapUnmanaged(TypeId, bool) = .empty,
+    mixed_storage: std.AutoHashMapUnmanaged(TypeId, bool) = .empty,
     /// Prologue instructions dropped again if unused (resource handles).
     lib_removable: std.AutoHashMapUnmanaged(u32, void) = .empty,
 
@@ -417,13 +421,23 @@ const Emitter = struct {
             .vector => |v| v.len,
             .matrix => |m| @as(u32, m.rows) * m.cols,
             .array => |a| a.len * try e.flatCount(a.elem),
-            .@"struct" => |s| blk: {
-                var n: u32 = 0;
-                for (s.fields.items) |f| n += try e.flatCount(f.type);
-                break :blk n;
-            },
+            .@"struct" => @intCast((try e.structComps(ty)).len),
             else => e.unsupported("values of type '{s}' are not supported yet", .{try e.t.format(e.arena, ty)}),
         };
+    }
+
+    /// The scalar type of each flattened component of struct `ty`, worked
+    /// out once per type.
+    fn structComps(e: *Emitter, ty: TypeId) Error![]const TypeId {
+        if (e.struct_comps.get(ty)) |c| return c;
+        var out: std.ArrayList(TypeId) = .empty;
+        for (e.t.get(ty).@"struct".fields.items) |f| {
+            const n = try e.flatCount(f.type);
+            try out.ensureUnusedCapacity(e.arena, n);
+            for (0..n) |k| out.appendAssumeCapacity(try e.componentType(f.type, @intCast(k)));
+        }
+        try e.struct_comps.put(e.arena, ty, out.items);
+        return out.items;
     }
 
     /// Undefined values for the flattened components of `ty`.
@@ -1375,6 +1389,11 @@ const Emitter = struct {
                 return if (x == .inst) .{ .inst = mp[x.inst] } else x;
             }
             fn vs(a: Allocator, mp: []const u32, xs: []const Value) Allocator.Error![]const Value {
+                // (Nothing to renumber, as in most getelementptr indices:
+                // the slice is kept; no pass writes operand slices.)
+                for (xs) |x| {
+                    if (x == .inst) break;
+                } else return xs;
                 const out = try a.alloc(Value, xs.len);
                 for (xs, out) |x, *o| o.* = v(mp, x);
                 return out;
@@ -1383,8 +1402,8 @@ const Emitter = struct {
         stats.add(.dxil_lowered, n);
         try f.insts.ensureUnusedCapacity(e.dm.allocator(), n);
         const all = [_][]const PInst{e.prologue.items};
-        for (all) |items| for (items) |pi| try f.insts.append(e.dm.allocator(), try remapInst(e.arena, map, pi.inst, remap));
-        for (e.blocks.items) |blk| for (blk.items) |pi| try f.insts.append(e.dm.allocator(), try remapInst(e.arena, map, pi.inst, remap));
+        for (all) |items| for (items) |pi| f.insts.appendAssumeCapacity(try remapInst(e.arena, map, pi.inst, remap));
+        for (e.blocks.items) |blk| for (blk.items) |pi| f.insts.appendAssumeCapacity(try remapInst(e.arena, map, pi.inst, remap));
         var ranges: std.AutoHashMapUnmanaged(u32, [2]u32) = .empty;
         var it = e.dyn_ranges.iterator();
         while (it.next()) |kv| try ranges.put(e.arena, map[kv.key_ptr.*], kv.value_ptr.*);
@@ -2752,6 +2771,18 @@ const Emitter = struct {
     /// memory rather than a flat array).
     fn mixedSizes(e: *Emitter, ty: TypeId) Error!bool {
         if (e.t.get(ty) != .@"struct" and e.t.get(ty) != .array) return false;
+        if (e.mixed_sizes.get(ty)) |v| return v;
+        const v = try e.checkMixedSizes(ty);
+        try e.mixed_sizes.put(e.arena, ty, v);
+        return v;
+    }
+
+    fn checkMixedSizes(e: *Emitter, ty: TypeId) Error!bool {
+        // (An array's components repeat its element's.)
+        if (e.t.get(ty) == .array) {
+            const arr = e.t.get(ty).array;
+            return arr.len > 0 and try e.mixedSizes(arr.elem);
+        }
         const n = try e.flatCount(ty);
         var size: ?u32 = null;
         for (0..n) |k| {
@@ -2765,6 +2796,17 @@ const Emitter = struct {
     /// Whether `ty`'s components differ in type (all 32-bit), so storage is
     /// i32 with bitcasts.
     fn mixedStorage(e: *Emitter, ty: TypeId) Error!bool {
+        if (e.mixed_storage.get(ty)) |v| return v;
+        const v = try e.checkMixedStorage(ty);
+        try e.mixed_storage.put(e.arena, ty, v);
+        return v;
+    }
+
+    fn checkMixedStorage(e: *Emitter, ty: TypeId) Error!bool {
+        if (e.t.get(ty) == .array) {
+            const arr = e.t.get(ty).array;
+            return arr.len > 0 and try e.mixedStorage(arr.elem);
+        }
         const n = try e.flatCount(ty);
         var first: ?Scalar = null;
         var mixed = false;
@@ -3799,14 +3841,10 @@ const Emitter = struct {
             .scalar, .@"enum", .linalg => return ty,
             .vector, .matrix => return e.t.scalar(e.t.component(ty).?),
             .array => |a| return e.componentType(a.elem, k % try e.flatCount(a.elem)),
-            .@"struct" => |s| {
-                var kk = k;
-                for (s.fields.items) |f| {
-                    const n = try e.flatCount(f.type);
-                    if (kk < n) return e.componentType(f.type, kk);
-                    kk -= n;
-                }
-                return e.unsupported("struct component", .{});
+            .@"struct" => {
+                const comps = try e.structComps(ty);
+                if (k >= comps.len) return e.unsupported("struct component", .{});
+                return comps[k];
             },
             else => return e.unsupported("component type", .{}),
         }

@@ -49,17 +49,63 @@ const Cfg = struct {
     succs: [][]u32,
     preds: [][]u32,
     idom: []u32,
+    /// Each reachable block's interval in a depth-first walk of the
+    /// dominator tree (`none` for unreachable blocks): `d` dominates `b`
+    /// when `b`'s interval is inside `d`'s.
+    dom_pre: []u32,
+    dom_post: []u32,
 
     fn dominates(c: *const Cfg, d: u32, b: u32) bool {
-        var x = b;
-        while (true) {
-            if (x == d) return true;
-            const p = c.idom[x];
-            if (p == none or p == x) return false;
-            x = p;
-        }
+        if (d == b) return true;
+        if (c.dom_pre[d] == none or c.dom_pre[b] == none) return false;
+        return c.dom_pre[d] <= c.dom_pre[b] and c.dom_post[b] <= c.dom_post[d];
     }
 };
+
+/// Numbers the dominator tree's blocks in and out of a depth-first walk.
+fn domIntervals(a: Allocator, idom: []const u32) Allocator.Error!struct { []u32, []u32 } {
+    const nb = idom.len;
+    // Children lists, packed: block b's are kids[first[b]..first[b + 1]].
+    const first = try a.alloc(u32, nb + 1);
+    @memset(first, 0);
+    for (idom, 0..) |p, b| if (p != none and p != b) {
+        first[p + 1] += 1;
+    };
+    for (1..nb + 1) |k| first[k] += first[k - 1];
+    const fill = try a.dupe(u32, first[0..nb]);
+    const kids = try a.alloc(u32, first[nb]);
+    for (idom, 0..) |p, b| if (p != none and p != b) {
+        kids[fill[p]] = @intCast(b);
+        fill[p] += 1;
+    };
+    const pre = try a.alloc(u32, nb);
+    const post = try a.alloc(u32, nb);
+    @memset(pre, none);
+    @memset(post, none);
+    if (nb == 0) return .{ pre, post };
+    var clock: u32 = 0;
+    // `next` reuses fill: the next child to visit.
+    @memcpy(fill, first[0..nb]);
+    var stack: std.ArrayList(u32) = .empty;
+    try stack.append(a, 0);
+    pre[0] = clock;
+    clock += 1;
+    while (stack.items.len > 0) {
+        const b = stack.items[stack.items.len - 1];
+        if (fill[b] < first[b + 1]) {
+            const k = kids[fill[b]];
+            fill[b] += 1;
+            pre[k] = clock;
+            clock += 1;
+            try stack.append(a, k);
+        } else {
+            post[b] = clock;
+            clock += 1;
+            _ = stack.pop();
+        }
+    }
+    return .{ pre, post };
+}
 
 fn isTerminator(inst: Inst) bool {
     return switch (inst.op) {
@@ -165,7 +211,8 @@ fn buildCfg(a: Allocator, f: *const module.Function) Allocator.Error!?Cfg {
             }
         }
     }
-    return .{ .nb = nb, .block_start = block_start, .succs = succs, .preds = preds, .idom = idom };
+    const pre, const post = try domIntervals(a, idom);
+    return .{ .nb = nb, .block_start = block_start, .succs = succs, .preds = preds, .idom = idom, .dom_pre = pre, .dom_post = post };
 }
 
 fn constInt(m: *const module.Module, v: Value) ?i64 {
