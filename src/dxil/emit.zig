@@ -318,6 +318,8 @@ const Emitter = struct {
     struct_types: std.AutoHashMapUnmanaged(TypeId, DType) = .empty,
     /// Per type: see structComps, mixedSizes and mixedStorage.
     struct_comps: std.AutoHashMapUnmanaged(TypeId, []const TypeId) = .empty,
+    comp_offsets: std.AutoHashMapUnmanaged(struct { TypeId, bool, layout.Rules }, []const u32) = .empty,
+    field_offsets: std.AutoHashMapUnmanaged(struct { *const types.StructInfo, layout.Rules }, []const u32) = .empty,
     /// elementPtr's last pointer type, and its shared index slices (by the
     /// index constant).
     elem_ptr_ty: struct { elem: DType = std.math.maxInt(DType), space: u32 = 0, ty: DType = 0 } = .{},
@@ -428,6 +430,39 @@ const Emitter = struct {
             .@"struct" => @intCast((try e.structComps(ty)).len),
             else => e.unsupported("values of type '{s}' are not supported yet", .{try e.t.format(e.arena, ty)}),
         };
+    }
+
+    /// Byte offsets of `st`'s fields under `rules`, worked out once per
+    /// struct.
+    fn fieldOffsets(e: *Emitter, st: *const types.StructInfo, rules: layout.Rules) layout.Error![]const u32 {
+        const gop = try e.field_offsets.getOrPut(e.arena, .{ st, rules });
+        if (gop.found_existing) return gop.value_ptr.*;
+        gop.value_ptr.* = layout.fieldOffsets(e.arena, e.t, st, rules) catch |err| {
+            _ = e.field_offsets.remove(.{ st, rules });
+            return err;
+        };
+        return gop.value_ptr.*;
+    }
+
+    /// layout.componentOffset, from a table of `ty`'s components worked out
+    /// once per type.
+    fn componentOffset(e: *Emitter, ty: TypeId, row_major: bool, k: u32, rules: layout.Rules) layout.Error!u32 {
+        const gop = try e.comp_offsets.getOrPut(e.arena, .{ ty, row_major, rules });
+        if (!gop.found_existing) {
+            gop.value_ptr.* = &.{};
+            const n = layout.flatCount(e.t, ty) catch 0;
+            // (Small types: worked out each time, as cheaply.)
+            if (n > 4) {
+                const table = try e.arena.alloc(u32, n);
+                const ok = for (table, 0..) |*o, c| {
+                    o.* = layout.componentOffset(e.arena, e.t, ty, row_major, @intCast(c), rules) catch break false;
+                } else true;
+                if (ok) gop.value_ptr.* = table;
+            }
+        }
+        const table = gop.value_ptr.*;
+        if (k < table.len) return table[k];
+        return layout.componentOffset(e.arena, e.t, ty, row_major, k, rules);
     }
 
     /// The scalar type of each flattened component of struct `ty`, worked
@@ -3743,7 +3778,7 @@ const Emitter = struct {
             switch (e.t.get(cur)) {
                 .@"struct" => |st| {
                     const k: u32 = @intCast(xi.op.constant.int);
-                    const offs = layout.fieldOffsets(e.arena, e.t, st, .dx_legacy) catch return e.unsupported("constant buffer member types", .{});
+                    const offs = e.fieldOffsets(st, .dx_legacy) catch return e.unsupported("constant buffer member types", .{});
                     c.offset += offs[k];
                     c.row_major = st.fields.items[k].row_major;
                     cur = st.fields.items[k].type;
@@ -3795,7 +3830,7 @@ const Emitter = struct {
             const mem_c: Scalar = if (c == .bool) .uint else c;
             // A register holds 16 bytes: 4 32-bit, 2 64-bit or 8 16-bit values.
             const sz = mem_c.size();
-            const off = offset + (layout.componentOffset(e.arena, e.t, ty, row_major, @intCast(k), .dx_legacy) catch return e.unsupported("constant buffer member types", .{}));
+            const off = offset + (e.componentOffset(ty, row_major, @intCast(k), .dx_legacy) catch return e.unsupported("constant buffer member types", .{}));
             const reg = off / 16;
             const st = try e.scalarTy(mem_c);
             if (res.kind == 15) {
@@ -4476,7 +4511,7 @@ const Emitter = struct {
             switch (e.t.get(cur)) {
                 .@"struct" => |st| {
                     const k: u32 = @intCast(xi.op.constant.int);
-                    const offs = layout.fieldOffsets(e.arena, e.t, st, .dx_packed) catch return e.unsupported("buffer member types", .{});
+                    const offs = e.fieldOffsets(st, .dx_packed) catch return e.unsupported("buffer member types", .{});
                     b.offset += offs[k];
                     b.row_major = st.fields.items[k].row_major;
                     cur = st.fields.items[k].type;
@@ -4520,15 +4555,15 @@ const Emitter = struct {
         const res = e.resources.items[b.res];
         for (vals, 0..) |v, j| {
             const c: u32 = mat.col orelse @intCast(j);
-            const off0 = layout.componentOffset(e.arena, e.t, mat.ty, b.row_major, c, .dx_packed) catch return e.unsupported("buffer element types", .{});
+            const off0 = e.componentOffset(mat.ty, b.row_major, c, .dx_packed) catch return e.unsupported("buffer element types", .{});
             const const_row: ?i64 = if (m.rows == 1) 0 else e.constIntOf(mat.row);
             if (const_row) |row| {
-                const off = layout.componentOffset(e.arena, e.t, mat.ty, b.row_major, @as(u32, @intCast(row)) * m.cols + c, .dx_packed) catch return e.unsupported("buffer element types", .{});
+                const off = e.componentOffset(mat.ty, b.row_major, @as(u32, @intCast(row)) * m.cols + c, .dx_packed) catch return e.unsupported("buffer element types", .{});
                 try e.structuredStore(res, b.index, b.offset + off, b.dyn, b.row_major, ec, &.{v});
                 continue;
             }
             // A dynamic row: rows are a constant byte step apart.
-            const step = (layout.componentOffset(e.arena, e.t, mat.ty, b.row_major, m.cols + c, .dx_packed) catch return e.unsupported("buffer element types", .{})) - off0;
+            const step = (e.componentOffset(mat.ty, b.row_major, m.cols + c, .dx_packed) catch return e.unsupported("buffer element types", .{})) - off0;
             var dyn = try e.add(i32t, .{ .binop = .{ .op = .mul, .lhs = mat.row, .rhs = try e.i32Const(step) } });
             if (b.dyn) |d| dyn = try e.add(i32t, .{ .binop = .{ .op = .add, .lhs = d, .rhs = dyn } });
             try e.structuredStore(res, b.index, b.offset + off0, dyn, b.row_major, ec, &.{v});
@@ -4546,12 +4581,12 @@ const Emitter = struct {
         while (k < n) {
             const c0 = e.compOf(try e.componentType(ty, k));
             const mem: Scalar = if (c0 == .bool) .uint else c0;
-            const off0 = layout.componentOffset(e.arena, e.t, ty, row_major, k, .dx_packed) catch return e.unsupported("buffer element types", .{});
+            const off0 = e.componentOffset(ty, row_major, k, .dx_packed) catch return e.unsupported("buffer element types", .{});
             var count: u32 = 1;
             while (k + count < n and count < 4) : (count += 1) {
                 const cn = e.compOf(try e.componentType(ty, k + count));
                 const mn: Scalar = if (cn == .bool) .uint else cn;
-                const on = layout.componentOffset(e.arena, e.t, ty, row_major, k + count, .dx_packed) catch break;
+                const on = e.componentOffset(ty, row_major, k + count, .dx_packed) catch break;
                 if (mn != mem or on != off0 + count * mem.size()) break;
             }
             const st = try e.scalarTy(mem);
@@ -4605,12 +4640,12 @@ const Emitter = struct {
         while (k < n) {
             const c0 = e.compOf(try e.componentType(ty, k));
             const mem: Scalar = if (c0 == .bool) .uint else c0;
-            const off0 = layout.componentOffset(e.arena, e.t, ty, row_major, k, .dx_packed) catch return e.unsupported("buffer element types", .{});
+            const off0 = e.componentOffset(ty, row_major, k, .dx_packed) catch return e.unsupported("buffer element types", .{});
             var count: u32 = 1;
             while (k + count < n and count < 4) : (count += 1) {
                 const cn = e.compOf(try e.componentType(ty, k + count));
                 const mn: Scalar = if (cn == .bool) .uint else cn;
-                const on = layout.componentOffset(e.arena, e.t, ty, row_major, k + count, .dx_packed) catch break;
+                const on = e.componentOffset(ty, row_major, k + count, .dx_packed) catch break;
                 if (mn != mem or on != off0 + count * mem.size()) break;
             }
             const st = try e.scalarTy(mem);
@@ -4723,7 +4758,7 @@ const Emitter = struct {
     /// (templated Load / Store: natural alignment; dxc's DXIL lays
     /// matrices out by row here, its SPIR-V by column).
     fn rawOffset(e: *Emitter, ty: TypeId, k: u32) Error!u32 {
-        return layout.componentOffset(e.arena, e.t, ty, true, k, .dx_packed) catch e.unsupported("byte-address buffer accesses of type '{s}' are not supported yet", .{try e.t.format(e.arena, ty)});
+        return e.componentOffset(ty, true, k, .dx_packed) catch e.unsupported("byte-address buffer accesses of type '{s}' are not supported yet", .{try e.t.format(e.arena, ty)});
     }
 
     /// A templated byte-address Load: one raw load per component.
@@ -6264,7 +6299,7 @@ const Emitter = struct {
                 d.rows = 1;
                 d.cols = layout.flatCount(e.t, t) catch 0;
                 d.name = s.name;
-                const offs = layout.fieldOffsets(e.arena, e.t, s, .dx_legacy) catch return e.unsupported("reflection of '{s}'", .{s.name});
+                const offs = e.fieldOffsets(s, .dx_legacy) catch return e.unsupported("reflection of '{s}'", .{s.name});
                 var members: std.ArrayList(reflect.Member) = .empty;
                 for (s.fields.items, offs) |fld, off| {
                     if (fld.bits or layout.isOpaque(e.t, fld.type)) continue;
@@ -6427,7 +6462,7 @@ const Emitter = struct {
         if (g.space == .cbuffer and e.t.get(g.ty) == .@"struct") {
             // A cbuffer block: its members are the variables.
             const s = e.t.get(g.ty).@"struct";
-            const offs = layout.fieldOffsets(e.arena, e.t, s, .dx_legacy) catch return e.unsupported("reflection of constant buffer '{s}'", .{g.name});
+            const offs = e.fieldOffsets(s, .dx_legacy) catch return e.unsupported("reflection of constant buffer '{s}'", .{g.name});
             for (s.fields.items, offs) |fld, off| {
                 if (fld.bits) continue;
                 const fsize = layout.sizeOf(e.t, fld.type, fld.row_major, .dx_legacy) catch 0;
