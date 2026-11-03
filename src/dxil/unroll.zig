@@ -373,20 +373,28 @@ fn unrollOne(a: Allocator, m: *module.Module, func: u32, budget: *usize, tried: 
         if (latches.items.len == 0) continue;
         const bits = try a.alloc(u64, (nb + 63) / 64);
         @memset(bits, 0);
-        var blocks: std.ArrayList(u32) = .empty;
         var body: Body = .{ .bits = bits, .blocks = &.{} };
         body.add(h);
-        try blocks.append(a, h);
+        var count: usize = 1;
         var stack: std.ArrayList(u32) = .empty;
         try stack.appendSlice(a, latches.items);
         while (stack.pop()) |x| {
             if (body.has(x)) continue;
             body.add(x);
-            try blocks.append(a, x);
+            count += 1;
             for (cfg.preds[x]) |p| if (cfg.idom[p] != none) try stack.append(a, p);
         }
-        std.sort.pdq(u32, blocks.items, {}, std.sort.asc(u32));
-        body.blocks = blocks.items;
+        // The blocks in order, from the bits.
+        const blocks = try a.alloc(u32, count);
+        var k: usize = 0;
+        for (bits, 0..) |word, wi| {
+            var w = word;
+            while (w != 0) : (w &= w - 1) {
+                blocks[k] = @intCast(wi * 64 + @ctz(w));
+                k += 1;
+            }
+        }
+        body.blocks = blocks;
         try loops.append(a, .{ .h = h, .body = body, .latches = latches.items });
     }
 
