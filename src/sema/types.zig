@@ -535,7 +535,7 @@ pub const LinAlgMatrix = struct { comp: u32, m: u32, n: u32, use: u32, scope: u3
 pub const TypeTable = struct {
     gpa: Allocator,
     types: std.ArrayList(Type) = .empty,
-    map: std.AutoHashMapUnmanaged(Key, TypeId) = .empty,
+    map: std.HashMapUnmanaged(Key, TypeId, KeyContext, std.hash_map.default_max_load_percentage) = .empty,
     /// scalar's results.
     scalars: [@typeInfo(Scalar).@"enum".field_names.len]TypeId = @splat(std.math.maxInt(TypeId)),
 
@@ -544,6 +544,23 @@ pub const TypeTable = struct {
 
     /// Hashable identity of structural types.
     const Key = struct { tag: u8, a: u64, b: u64 };
+
+    /// Hashes a Key's words (it has padding, which the automatic context
+    /// hashes around field by field).
+    const KeyContext = struct {
+        fn mix(x: u64) u64 {
+            var z = x;
+            z = (z ^ (z >> 30)) *% 0xbf58476d1ce4e5b9;
+            z = (z ^ (z >> 27)) *% 0x94d049bb133111eb;
+            return z ^ (z >> 31);
+        }
+        pub fn hash(_: KeyContext, k: Key) u64 {
+            return mix(k.a ^ mix(k.b ^ @as(u64, k.tag) << 56));
+        }
+        pub fn eql(_: KeyContext, x: Key, y: Key) bool {
+            return x.tag == y.tag and x.a == y.a and x.b == y.b;
+        }
+    };
 
     pub fn init(gpa: Allocator) !TypeTable {
         var t: TypeTable = .{ .gpa = gpa };
