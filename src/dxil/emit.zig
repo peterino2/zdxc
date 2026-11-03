@@ -77,6 +77,10 @@ const Lowered = union(enum) {
     /// per resource, each an alias of what is stored into it.
     agg_ptr: struct { data: ?*const Lowered, slots: []const u32, ty: TypeId },
     ptr: Ptr,
+    /// A by-value parameter's copy that is never written and only indexed
+    /// by constants (Emitter.regsLocals): the argument's components, from
+    /// `offset` on, with no memory behind them.
+    regs: struct { vals: []const Value, offset: u32 = 0 },
     /// A resource handle (index into Emitter.resources).
     handle: u32,
     /// A local holding a resource (index into Emitter.res_locals): an
@@ -169,6 +173,8 @@ const Resource = struct {
 
 const Frame = struct {
     f: *const ir.Function,
+    /// `f`'s index (inlined calls; see Emitter.regsLocals).
+    fi: u32 = 0,
     vals: []Lowered,
     params: []const Lowered,
     blocks: []?u32,
@@ -206,7 +212,7 @@ fn ValueMap(comptime V: type) type {
 
 const ValueContext = struct {
     fn word(v: Value) u64 {
-        return @as(u64, @intFromEnum(v)) << 32 | switch (v) {
+        return @as(u64, @backingInt(v)) << 32 | switch (v) {
             inline else => |x| x,
         };
     }
@@ -331,6 +337,7 @@ const Emitter = struct {
     writes: u32 = 0,
     /// paramCopies per IR function.
     param_copies: std.AutoHashMapUnmanaged(u32, []const u32) = .empty,
+    regs_locals: std.AutoHashMapUnmanaged(u32, []const bool) = .empty,
     uses_barycentrics: bool = false,
     uses_sampler_heap: bool = false,
     /// The shader's reflection (reflect.zig), made with the object; owned
@@ -1774,6 +1781,7 @@ const Emitter = struct {
         const f = e.m.functions.items[fi];
         var frame: Frame = .{
             .f = f,
+            .fi = fi,
             .vals = try e.arena.alloc(Lowered, f.insts.items.len),
             .params = args,
             .blocks = try e.arena.alloc(?u32, f.blocks.items.len),
@@ -1864,6 +1872,28 @@ const Emitter = struct {
                 },
             }
         }
+        return out;
+    }
+
+    /// For each instruction of IR function `fi`: whether it is a local
+    /// paramCopies gives a parameter for, indexed only by constants (so it
+    /// can be the argument's values; see Lowered.regs).
+    fn regsLocals(e: *Emitter, fi: u32) Error![]const bool {
+        const gop = try e.regs_locals.getOrPut(e.arena, fi);
+        if (gop.found_existing) return gop.value_ptr.*;
+        const f = e.m.functions.items[fi];
+        const copies = try e.paramCopies(fi);
+        const out = try e.arena.alloc(bool, copies.len);
+        for (out, copies) |*o, c| o.* = c != std.math.maxInt(u32);
+        for (f.insts.items) |inst| if (inst.op == .access) {
+            var root = inst.op.access.base;
+            while (f.inst(root).op == .access) root = f.inst(root).op.access.base;
+            if (f.inst(root).op != .local_var) continue;
+            for (inst.op.access.indices) |ix| if (f.inst(ix).op != .constant or f.inst(ix).op.constant != .int) {
+                out[root.index()] = false;
+            };
+        };
+        gop.value_ptr.* = out;
         return out;
     }
 
@@ -2209,6 +2239,13 @@ const Emitter = struct {
                     const k = frame.param_copies[r.index()];
                     if (k != std.math.maxInt(u32)) if (frame.param_srcs[k]) |alias| return alias;
                 }
+                // A copy of a parameter passed as values, never written:
+                // those values (no alloca, no stores, no loads).
+                if (frame.copies.len > 0) {
+                    const k = frame.copies[r.index()];
+                    if (k != std.math.maxInt(u32) and frame.params[k] == .scalars and (try e.regsLocals(frame.fi))[r.index()])
+                        return .{ .regs = .{ .vals = frame.params[k].scalars } };
+                }
                 if (e.payload_local) |pl| if (pl.func == f and pl.inst == r.index()) {
                     const dty = try e.memoryType(i.ty);
                     const base = try e.addPrologue(try e.dm.ptrType(dty), .{ .alloca = .{ .elem = dty, .size = try e.i32Const(1) } });
@@ -2249,6 +2286,11 @@ const Emitter = struct {
                 return frame.params[frame.copies[p.index()]];
             } else switch (frame.vals[p.index()]) {
                 .handle => |h| return .{ .handle = h },
+                .regs => |rg| {
+                    const n = try e.flatCount(i.ty);
+                    if (rg.offset + n > rg.vals.len) return .{ .scalars = try e.undefValues(i.ty) };
+                    return .{ .scalars = rg.vals[rg.offset..][0..n] };
+                },
                 .agg_ptr => |ap| {
                     const vals: []const Value = if (ap.data) |d| switch (d.*) {
                         .ptr => |ptr| (try e.loadPtr(ptr, ap.ty)).scalars,
@@ -2316,6 +2358,8 @@ const Emitter = struct {
                 else => |v| return e.unsupported("internal: load from a non-pointer ({s} from %{d} '{s}' in '{s}')", .{ @tagName(v), p.index(), @tagName(frame.f.inst(p).op), frame.f.name }),
             },
             .store => |s| {
+                // (The copy into a parameter's copy kept as its values.)
+                if (frame.vals[s.ptr.index()] == .regs) return .none;
                 if (frame.param_copies.len > 0) if (f.inst(s.value).op == .param) {
                     const k = f.inst(s.value).op.param;
                     if (frame.param_copies[s.ptr.index()] == k and frame.param_srcs[k] != null) return .none;
@@ -2400,6 +2444,31 @@ const Emitter = struct {
                     return .{ .typed = tp };
                 }
                 if (frame.vals[a.base.index()] == .agg_ptr) return e.aggAccess(frame, frame.vals[a.base.index()].agg_ptr, a.indices);
+                if (frame.vals[a.base.index()] == .regs) {
+                    var rg = frame.vals[a.base.index()].regs;
+                    var cur = f.inst(a.base).ty;
+                    for (a.indices) |x| {
+                        const k: u32 = @intCast(@max(f.inst(x).op.constant.int, 0));
+                        switch (e.t.get(cur)) {
+                            .@"struct" => |st| {
+                                if (k >= st.fields.items.len) return e.unsupported("struct member index out of range", .{});
+                                for (st.fields.items[0..k]) |fld| rg.offset += try e.flatCount(fld.type);
+                                cur = st.fields.items[k].type;
+                            },
+                            else => {
+                                const elem: TypeId = switch (e.t.get(cur)) {
+                                    .array => |arr| arr.elem,
+                                    .vector => |v| try e.t.scalar(v.elem),
+                                    .matrix => |mt| try e.t.vector(mt.elem, mt.cols),
+                                    else => return e.unsupported("indexing this type is not supported yet", .{}),
+                                };
+                                rg.offset += k * try e.flatCount(elem);
+                                cur = elem;
+                            },
+                        }
+                    }
+                    return .{ .regs = rg };
+                }
                 // An element of a local array of resources: of the array
                 // it aliases.
                 if (frame.vals[a.base.index()] == .res_local) {
