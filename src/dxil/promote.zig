@@ -623,6 +623,9 @@ pub fn run(a: Allocator, m: *module.Module, func: u32, dyn: *const std.AutoHashM
     // transitively; new phis likewise. (The loads promotion leaves dead,
     // such as copies of arguments never read, go too.)
     const live = try a.alloc(bool, n + np);
+    // (What has effects, worked out once for every round.)
+    var effects: std.ArrayList(u32) = .empty;
+    for (insts, 0..) |inst, i| if (!removed[i] and hasEffects(m, inst)) try effects.append(a, @intCast(i));
     while (true) {
         @memset(live, false);
         {
@@ -647,9 +650,9 @@ pub fn run(a: Allocator, m: *module.Module, func: u32, dyn: *const std.AutoHashM
                 }
             };
             var mark: Mark = .{ .repl = repl, .live = live, .removed = removed, .work = &work, .a = a };
-            for (insts, 0..) |inst, i| if (!removed[i] and hasEffects(m, inst) and (reach[block_of[i]] or i == block_start[block_of[i] + 1] - 1)) {
+            for (effects.items) |i| if (reach[block_of[i]] or i == block_start[block_of[i] + 1] - 1) {
                 live[i] = true;
-                try work.append(a, @intCast(i));
+                try work.append(a, i);
             };
             while (work.pop()) |x| {
                 if (x < n) {
