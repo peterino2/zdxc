@@ -10,6 +10,7 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const shader = @import("shader.zig");
 
 pub const null_ref: u32 = 0xffff_ffff;
 
@@ -24,7 +25,8 @@ pub const Resource = struct {
     flags: u32 = 0,
 };
 
-/// RuntimeDataFunctionInfo3 (validator 1.10+).
+/// RuntimeDataFunctionInfo3 (validator 1.10+; before, 2: without the
+/// extended properties).
 pub const Function = struct {
     name: u32,
     unmangled_name: u32,
@@ -115,10 +117,10 @@ pub const Builder = struct {
     pub fn addFunction(b: *Builder, f: Function) Allocator.Error!void {
         const packed_wave: u32 = @as(u32, f.min_wave_lanes) | (@as(u32, f.max_wave_lanes) << 8) | (@as(u32, f.shader_flags) << 16);
         try b.functions.append(b.gpa, .{
-            f.name,                f.unmangled_name,  f.resources,         f.function_dependencies,
-            f.shader_kind,         f.payload_size,    f.attribute_size,    f.feature_info1,
-            f.feature_info2,       f.shader_stage_flag, f.min_shader_target, packed_wave,
-            f.raw_shader_ref,      f.extended_properties,
+            f.name,           f.unmangled_name,      f.resources,         f.function_dependencies,
+            f.shader_kind,    f.payload_size,        f.attribute_size,    f.feature_info1,
+            f.feature_info2,  f.shader_stage_flag,   f.min_shader_target, packed_wave,
+            f.raw_shader_ref, f.extended_properties,
         });
     }
 
@@ -132,7 +134,7 @@ pub const Builder = struct {
     /// (record deduplication, validator 1.7+).
     pub fn record(b: *Builder, t: Ext, rec: []const u8) Allocator.Error!u32 {
         std.debug.assert(rec.len == t.stride());
-        const tab = &b.ext[@intFromEnum(t) - 13];
+        const tab = &b.ext[@backingInt(t) - 13];
         var at: usize = 0;
         while (at < tab.items.len) : (at += rec.len) {
             if (std.mem.eql(u8, tab.items[at..][0..rec.len], rec)) return @intCast(at / rec.len);
@@ -165,7 +167,11 @@ pub const Builder = struct {
             try parts.append(b.gpa, .{ .ty = 3, .data = t });
         }
         if (b.functions.items.len > 0) {
-            const t = try table(b.gpa, 14, std.mem.sliceAsBytes(b.functions.items), b.functions.items.len);
+            const words: usize = if (shader.validatorAtLeast(1, 10)) 14 else 13;
+            const rows = try b.gpa.alloc(u32, words * b.functions.items.len);
+            defer b.gpa.free(rows);
+            for (b.functions.items, 0..) |f, k| @memcpy(rows[k * words ..][0..words], f[0..words]);
+            const t = try table(b.gpa, words, std.mem.sliceAsBytes(rows), b.functions.items.len);
             try tables.append(b.gpa, t);
             try parts.append(b.gpa, .{ .ty = 4, .data = t });
         }
@@ -177,7 +183,7 @@ pub const Builder = struct {
             try parts.append(b.gpa, .{ .ty = 6, .data = t });
         }
         for (b.ext, 13..) |rows, ty| if (rows.items.len > 0) {
-            const stride = @as(Ext, @enumFromInt(ty)).stride();
+            const stride = @as(Ext, @fromBackingInt(@intCast(ty))).stride();
             const t = try table(b.gpa, stride / 4, rows.items, rows.items.len / stride);
             try tables.append(b.gpa, t);
             try parts.append(b.gpa, .{ .ty = @intCast(ty), .data = t });

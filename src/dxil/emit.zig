@@ -3274,6 +3274,24 @@ const Emitter = struct {
             _ = try e.callOp(fn_i, try e.voidTy(), &.{ try e.i32Const(168), (try e.scalars(frame, args[0]))[0], (try e.scalars(frame, args[1]))[0] });
             return .none;
         }
+        // SM 6.8's Barrier(memory types or a UAV, semantics): the
+        // arguments as they are (as dxc).
+        if (eq(u8, name, "Barrier") and args.len == 2) {
+            const i32t = try e.dm.intType(32);
+            const sem = (try e.scalars(frame, args[1]))[0];
+            switch (frame.vals[args[0].index()]) {
+                .handle => |h| {
+                    const fn_i = try e.dxOp("dx.op.barrierByMemoryHandle", try e.voidTy(), &.{ i32t, e.handle_ty, i32t }, .nounwind);
+                    _ = try e.callOp(fn_i, try e.voidTy(), &.{ try e.i32Const(245), e.resources.items[h].handle, sem });
+                },
+                .scalars => |m| {
+                    const fn_i = try e.dxOp("dx.op.barrierByMemoryType", try e.voidTy(), &.{ i32t, i32t, i32t }, .nounwind);
+                    _ = try e.callOp(fn_i, try e.voidTy(), &.{ try e.i32Const(244), m[0], sem });
+                },
+                else => return e.unsupported("Barrier on this object is not supported yet", .{}),
+            }
+            return .none;
+        }
         for (args) |x| if (frame.vals[x.index()] != .scalars) return e.unsupported("intrinsic '{s}' is not supported yet", .{name});
         var a: [4][]const Value = undefined;
         for (args, 0..) |x, k| a[k] = try e.scalars(frame, x);
@@ -6178,7 +6196,7 @@ const Emitter = struct {
         }.f;
         const ident = try dm.mdNode(&.{try dm.mdString("zdxc 0.0.0")});
         const version = try dm.mdNode(&.{ try mdI32(dm, 1), try mdI32(dm, e.profile.minor) });
-        const val_ver = try dm.mdNode(&.{ try mdI32(dm, 1), try mdI32(dm, 11) });
+        const val_ver = try dm.mdNode(&.{ try mdI32(dm, shader.validator[0]), try mdI32(dm, shader.validator[1]) });
         const sm = try dm.mdNode(&.{ try dm.mdString("lib"), try mdI32(dm, e.profile.major), try mdI32(dm, e.profile.minor) });
         const resources = try e.resourcesMd();
         const analysis = try e.libAnalysis(funcs);
@@ -6933,7 +6951,7 @@ const Emitter = struct {
 
         const ident = try dm.mdNode(&.{try dm.mdString("zdxc 0.0.0")});
         const version = try dm.mdNode(&.{ try mdI32(dm, 1), try mdI32(dm, e.profile.minor) });
-        const val_ver = try dm.mdNode(&.{ try mdI32(dm, 1), try mdI32(dm, 11) });
+        const val_ver = try dm.mdNode(&.{ try mdI32(dm, shader.validator[0]), try mdI32(dm, shader.validator[1]) });
         const sm = try dm.mdNode(&.{ try dm.mdString(e.profile.kind.profilePrefix()), try mdI32(dm, e.profile.major), try mdI32(dm, e.profile.minor) });
 
         const resources = try e.resourcesMd();

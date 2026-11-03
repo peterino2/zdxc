@@ -191,6 +191,22 @@ pub fn analyze(m: *const module.Module, f: *const module.Function, o: Options) I
                 fl |= bit.requires_group;
                 info.mask &= stage_group;
             },
+            // Barrier by memory type, UAV or node record: groupshared memory
+            // (not as part of ALL_MEMORY, which may drop it) or group
+            // sync / scope semantics need a group (as dxc's
+            // BarrierRequiresGroup).
+            244, 245, 246 => if (args.len > 2) {
+                var needs = false;
+                if (code == 244) if (constInt(m, args[1])) |mem| {
+                    const kept = if (mem == 0xF) mem & ~@as(i64, 2) else mem;
+                    needs = kept & 2 != 0;
+                };
+                if (constInt(m, args[2])) |sem| needs = needs or sem & 3 != 0;
+                if (needs) {
+                    fl |= bit.requires_group;
+                    info.mask &= stage_group;
+                }
+            },
             else => {},
         }
     }
