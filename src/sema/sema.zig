@@ -89,6 +89,9 @@ pub const Resolution = union(enum) {
     /// A bitfield member (`this_bitfield`: named without `this.`).
     bitfield: types.Bitfield,
     this_bitfield: types.Bitfield,
+    /// A node object's record: `Get()`, `Get(i)` or `[i]` (lowered as an
+    /// element of the object).
+    node_record,
 };
 
 pub const Param = struct {
@@ -1352,6 +1355,18 @@ pub const Sema = struct {
         // Any other builtin object (RayQuery, node records, vk:: types...).
         // vk::ext_result_id<T>: a T (an inline instruction's result).
         if (eql(n, "ext_result_id") and args.len == 1) return try s.typeArg(args[0]) orelse TypeTable.error_type;
+        // Work graph node objects: their record type.
+        if (types.NodeKind.named(n)) |kind| {
+            var elem: TypeId = TypeTable.void_type;
+            if (kind.templated()) {
+                if (args.len == 0) {
+                    s.err(t.loc, "'{s}' requires a record type template argument", .{n});
+                    return TypeTable.error_type;
+                }
+                elem = try s.typeArg(args[0]) orelse return TypeTable.error_type;
+            }
+            return s.types.intern(.{ .node = .{ .kind = kind, .elem = elem } });
+        }
         if (isOtherBuiltinObject(n)) {
             var elem: TypeId = TypeTable.void_type;
             if (eql(n, "RayQuery")) {
@@ -1547,6 +1562,15 @@ pub const Sema = struct {
 
     // ------------------------------------------------------------------
     // Constant evaluation (array sizes, case labels, template arguments)
+
+    /// Whether struct `info` was declared with attribute `name` (any case).
+    pub fn structHasAttr(s: *const Sema, info: *const types.StructInfo, name: []const u8) bool {
+        _ = s;
+        const ss: *const StructSema = @ptrCast(@alignCast(info.sema orelse return false));
+        if (ss.decl.kind != .@"struct") return false;
+        for (ss.decl.kind.@"struct".attrs) |a| if (std.ascii.eqlIgnoreCase(a.name, name)) return true;
+        return false;
+    }
 
     pub fn evalInt(s: *Sema, e: *const ast.Expr) ?i64 {
         return switch (s.evalConst(e) orelse return null) {
@@ -2166,6 +2190,13 @@ pub const Sema = struct {
                 if (last_shader) |kept| {
                     if (!eql(kept, stage)) s.err(a.loc, "shader attribute type '{s}' conflicts with shader attribute type '{s}'", .{ stage, kept });
                 } else last_shader = stage;
+            } else if (std.ascii.eqlIgnoreCase(a.name, "nodelaunch") and a.args.len == 1 and a.args[0].kind == .string_lit) {
+                // (Exactly these: dxc compares case-sensitively.)
+                const lit = a.args[0].kind.string_lit;
+                const v = if (lit.len >= 2) lit[1 .. lit.len - 1] else lit;
+                if (!eql(v, "broadcasting") and !eql(v, "coalescing") and !eql(v, "thread")) {
+                    s.err(a.args[0].loc, "attribute 'NodeLaunch' must have one of these values: broadcasting,coalescing,thread", .{});
+                }
             } else if (std.ascii.eqlIgnoreCase(a.name, "wavesize")) {
                 if (last_wavesize) |kept| {
                     var same = kept.args.len == a.args.len;
@@ -3554,6 +3585,17 @@ pub const Sema = struct {
                 return .{ .ty = TypeTable.error_type, .callee = .{ .method = .{ .object = b.ty, .name = name, .object_lvalue = b.lvalue } } };
             },
             .stream, .patch => return .{ .ty = TypeTable.error_type, .callee = .{ .method = .{ .object = b.ty, .name = name, .object_lvalue = b.lvalue } } },
+            .node => |x| {
+                // Get: the record (records objects); the rest from the
+                // intrinsics table.
+                const known = (eql(name, "Get") and x.kind.hasRecords()) or
+                    if (methodNamespace(s.types.get(b.ty))) |ns| s.intrinsic_db.hasMethod(ns, name) else false;
+                if (!known) {
+                    s.err(name_loc, "no member named '{s}' in '{s}'", .{ name, s.typeName(b.ty) });
+                    return err_typed;
+                }
+                return .{ .ty = TypeTable.error_type, .callee = .{ .method = .{ .object = b.ty, .name = name, .object_lvalue = b.lvalue } } };
+            },
             else => {
                 s.err(name_loc, "member reference base type '{s}' is not a structure", .{s.typeName(b.ty)});
                 return err_typed;
@@ -3596,6 +3638,16 @@ pub const Sema = struct {
                     return err_typed;
                 };
                 return .{ .ty = try s.types.vector(m.elem, m.cols), .lvalue = b.lvalue, .read_only = b.read_only };
+            },
+            .node => |x| {
+                // Records of a records array; an output of an outputs array.
+                if (x.kind.isArray()) {
+                    s.record(e, .node_record);
+                    return .{ .ty = x.elem, .lvalue = true, .read_only = !x.kind.writable() };
+                }
+                if (x.kind.outputElement()) |k| return rvalue(try s.types.intern(.{ .node = .{ .kind = k, .elem = x.elem } }));
+                s.err(e.loc, "type '{s}' does not provide a subscript operator", .{s.typeName(b.ty)});
+                return err_typed;
             },
             .resource => |r| {
                 if (r.kind.indexDims() == 0 or r.elem == TypeTable.void_type) {
@@ -3723,6 +3775,25 @@ pub const Sema = struct {
                         if (sym == .template) return rvalue(try s.callTemplate(e, sym.template, template_args, arg_types, callee, info));
                         if (sym != .functions) return err_typed;
                         return rvalue(s.resolveUserCall(e, sym.functions, arg_types, callee));
+                    },
+                    .node => |x| if (eql(m.name, "Get")) {
+                        // The record (`Get(i)`: of several).
+                        const most: usize = if (x.kind.isArray()) 1 else 0;
+                        if (arg_types.len > most) {
+                            s.err(e.loc, "too many arguments to function call, expected at most {d}, have {d}", .{ most, arg_types.len });
+                            return err_typed;
+                        }
+                        if (arg_types.len == 1 and s.conversionCost(arg_types[0].ty, try s.types.scalar(.uint)) == null) {
+                            s.err(e.loc, "no matching member function for call to 'Get'", .{});
+                            return err_typed;
+                        }
+                        s.record(e, .node_record);
+                        return .{ .ty = x.elem, .lvalue = true, .read_only = !x.kind.writable() };
+                    } else {
+                        const ns = methodNamespace(s.types.get(m.object)) orelse return err_typed;
+                        const r = try s.intrinsic_db.resolve(s, e.loc, ns, m.name, m.object, arg_types, null);
+                        if (r.ok) s.record(e, .{ .intrinsic = .{ .index = r.index, .params = r.params, .object = m.object } });
+                        return rvalue(r.ret);
                     },
                     else => {
                         var explicit: ?TypeId = null;
@@ -4327,6 +4398,15 @@ fn methodNamespace(t: types.Type) ?[]const u8 {
             .sampled_texture_cube_array => "VkSampledTextureCUBEArrayMethods",
             .constant_buffer, .texture_buffer, .raytracing_acceleration_structure => null,
             .other => if (std.mem.eql(u8, r.name, "RayQuery")) "RayQueryMethods" else if (std.mem.eql(u8, r.name, "SubpassInput")) "VkSubpassInputMethods" else if (std.mem.eql(u8, r.name, "SubpassInputMS")) "VkSubpassInputMSMethods" else null,
+        },
+        .node => |x| switch (x.kind) {
+            .empty_input => "EmptyNodeInputMethods",
+            .rw_dispatch_input => "RWDispatchNodeInputRecordMethods",
+            .group_input, .rw_group_input => "GroupNodeInputRecordsMethods",
+            .output => "NodeOutputMethods",
+            .empty_output => "EmptyNodeOutputMethods",
+            .thread_output_records, .group_output_records => "GroupOrThreadNodeOutputRecordsMethods",
+            else => null,
         },
         else => null,
     };

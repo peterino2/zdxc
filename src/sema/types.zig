@@ -527,6 +527,110 @@ pub const Type = union(enum) {
     /// `__builtin_LinAlgMatrix [[__LinAlgMatrix_Attributes(c, m, n, use,
     /// scope)]]` (SM 6.10): an opaque matrix handle.
     linalg: LinAlgMatrix,
+    /// A work graph node input, output or output record object
+    /// (`DispatchNodeInputRecord<T>`, `NodeOutput<T>`, ...): `elem` is the
+    /// record type (void for the empty ones).
+    node: struct { kind: NodeKind, elem: TypeId },
+};
+
+/// Work graph node object types, as DXC's NodeIOKind.
+pub const NodeKind = enum {
+    dispatch_input,
+    rw_dispatch_input,
+    group_input,
+    rw_group_input,
+    thread_input,
+    rw_thread_input,
+    empty_input,
+    output,
+    output_array,
+    empty_output,
+    empty_output_array,
+    thread_output_records,
+    group_output_records,
+
+    pub const names = [_]struct { []const u8, NodeKind }{
+        .{ "DispatchNodeInputRecord", .dispatch_input },      .{ "RWDispatchNodeInputRecord", .rw_dispatch_input },
+        .{ "GroupNodeInputRecords", .group_input },           .{ "RWGroupNodeInputRecords", .rw_group_input },
+        .{ "ThreadNodeInputRecord", .thread_input },          .{ "RWThreadNodeInputRecord", .rw_thread_input },
+        .{ "EmptyNodeInput", .empty_input },                  .{ "NodeOutput", .output },
+        .{ "NodeOutputArray", .output_array },                .{ "EmptyNodeOutput", .empty_output },
+        .{ "EmptyNodeOutputArray", .empty_output_array },     .{ "ThreadNodeOutputRecords", .thread_output_records },
+        .{ "GroupNodeOutputRecords", .group_output_records },
+    };
+
+    pub fn named(n: []const u8) ?NodeKind {
+        for (names) |e| if (std.mem.eql(u8, e[0], n)) return e[1];
+        return null;
+    }
+
+    pub fn name(k: NodeKind) []const u8 {
+        for (names) |e| if (e[1] == k) return e[0];
+        unreachable;
+    }
+
+    /// NodeIOFlags: input 0x1, output 0x2, read-write 0x4, empty 0x8,
+    /// array 0x10; record granularity thread 0x20, group 0x40, dispatch
+    /// 0x60.
+    pub fn ioFlags(k: NodeKind) u32 {
+        return switch (k) {
+            .dispatch_input => 0x61,
+            .rw_dispatch_input => 0x65,
+            .group_input => 0x41,
+            .rw_group_input => 0x45,
+            .thread_input => 0x21,
+            .rw_thread_input => 0x25,
+            .empty_input => 0x9,
+            .output => 0x6,
+            .output_array => 0x16,
+            .empty_output => 0xA,
+            .empty_output_array => 0x1A,
+            .thread_output_records => 0x26,
+            .group_output_records => 0x46,
+        };
+    }
+
+    pub fn isInput(k: NodeKind) bool {
+        return k.ioFlags() & 1 != 0;
+    }
+
+    /// Objects holding records (Get and, for the group ones, indexing).
+    pub fn hasRecords(k: NodeKind) bool {
+        return switch (k) {
+            .dispatch_input, .rw_dispatch_input, .group_input, .rw_group_input, .thread_input, .rw_thread_input, .thread_output_records, .group_output_records => true,
+            else => false,
+        };
+    }
+
+    /// Several records: `Get(i)` and `[i]` (dxc's IsArray).
+    pub fn isArray(k: NodeKind) bool {
+        return switch (k) {
+            .group_input, .rw_group_input, .thread_output_records, .group_output_records => true,
+            else => false,
+        };
+    }
+
+    /// An array of outputs: `[i]` is one.
+    pub fn outputElement(k: NodeKind) ?NodeKind {
+        return switch (k) {
+            .output_array => .output,
+            .empty_output_array => .empty_output,
+            else => null,
+        };
+    }
+
+    /// Records that may be written.
+    pub fn writable(k: NodeKind) bool {
+        return k.ioFlags() & 4 != 0 and k.hasRecords();
+    }
+
+    /// Whether the type takes a record type argument.
+    pub fn templated(k: NodeKind) bool {
+        return switch (k) {
+            .empty_input, .empty_output, .empty_output_array => false,
+            else => true,
+        };
+    }
 };
 
 pub const LinAlgMatrix = struct { comp: u32, m: u32, n: u32, use: u32, scope: u32 };
@@ -597,6 +701,7 @@ pub const TypeTable = struct {
             .texture_view => |v| .{ .tag = 14, .a = v.texture, .b = @backingInt(v.kind) },
             .linalg => |x| .{ .tag = 16, .a = (@as(u64, x.comp) << 32) | x.m, .b = (@as(u64, x.n) << 32) | (@as(u64, x.use) << 16) | x.scope },
             .spirv => |x| .{ .tag = 15, .a = (@as(u64, x.opcode) << 32) | x.size, .b = std.hash.Wyhash.hash(x.alignment, std.mem.sliceAsBytes(x.operands)) },
+            .node => |x| .{ .tag = 17, .a = @backingInt(x.kind), .b = x.elem },
         };
     }
 
@@ -778,6 +883,7 @@ pub const TypeTable = struct {
                 .triangle => "TriangleStream",
             }, try t.format(gpa, s.elem), ""),
             .patch => |p| templateName(gpa, if (p.output) "OutputPatch" else "InputPatch", try t.format(gpa, p.elem), try std.fmt.allocPrint(gpa, ", {d}", .{p.count})),
+            .node => |x| if (x.kind.templated()) templateName(gpa, x.kind.name(), try t.format(gpa, x.elem), "") else x.kind.name(),
             .descriptor_heap => |h| if (h.sampler) "SamplerDescriptorHeap" else "ResourceDescriptorHeap",
             .dynamic_resource => "<dynamic resource>",
             .texture_view => |v| std.fmt.allocPrint(gpa, "{s}::{s}", .{ try t.format(gpa, v.texture), switch (v.kind) {

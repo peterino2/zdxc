@@ -1089,6 +1089,7 @@ const Emitter = struct {
             .miss => 5317,
             .callable => 5318,
             .library => return e.unsupported("library targets are not supported", .{}),
+            .node => return e.unsupported("work graph nodes are not supported in SPIR-V", .{}),
         };
         const wrapper = e.func_ids[entry.wrapper];
         const name = if (e.m.entries.items.len == 1) e.vk.entry_name orelse entry.name else entry.name;
@@ -2385,6 +2386,7 @@ const Emitter = struct {
         const ri = r.index();
         switch (i.op) {
             .constant, .param, .local_var => {},
+            .node_io => return e.unsupported("work graph nodes are not supported in SPIR-V", .{}),
             .spec_constant => |k| e.vals[ri] = try e.specConstant(k),
             .spirv_inst => |x| e.vals[ri] = try e.spirvInst(x, i.ty),
             .ray_incoming => |k| e.vals[ri] = try e.rayVar(switch (k) {

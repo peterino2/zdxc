@@ -181,7 +181,7 @@ fn mapRefs(a: Allocator, xs: []const Ref, ctx: anytype) Allocator.Error![]const 
 /// `op` with every operand passed through `ctx.map`.
 pub fn mapOp(a: Allocator, op: Op, ctx: anytype) Allocator.Error!Op {
     return switch (op) {
-        .constant, .param, .global, .local_var, .input, .input_vertex, .emit, .cut, .patch_input, .output_vertex, .mesh_output, .mesh_payload, .ray_incoming, .spec_constant, .undef => op,
+        .constant, .param, .global, .local_var, .input, .input_vertex, .emit, .cut, .patch_input, .output_vertex, .mesh_output, .mesh_payload, .ray_incoming, .spec_constant, .undef, .node_io => op,
         .load => |p| .{ .load = ctx.map(p) },
         .store => |x| .{ .store = .{ .ptr = ctx.map(x.ptr), .value = ctx.map(x.value) } },
         .access => |x| .{ .access = .{ .base = ctx.map(x.base), .indices = try mapRefs(a, x.indices, ctx) } },
@@ -227,7 +227,7 @@ pub fn mapOp(a: Allocator, op: Op, ctx: anytype) Allocator.Error!Op {
 /// allocating.
 pub fn eachOperand(op: Op, ctx: anytype) void {
     switch (op) {
-        .constant, .param, .global, .local_var, .input, .input_vertex, .emit, .cut, .patch_input, .output_vertex, .mesh_output, .mesh_payload, .ray_incoming, .spec_constant, .undef => {},
+        .constant, .param, .global, .local_var, .input, .input_vertex, .emit, .cut, .patch_input, .output_vertex, .mesh_output, .mesh_payload, .ray_incoming, .spec_constant, .undef, .node_io => {},
         .load => |p| ctx.use(p),
         .store => |x| {
             ctx.use(x.ptr);

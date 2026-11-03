@@ -5,8 +5,9 @@
 //! Layout: a header (version, part count), part offsets, then each
 //! non-empty part as (type, size) and its 4-byte aligned contents. Parts
 //! come in the order dxc adds them: strings, resources, functions, index
-//! arrays, raw bytes, subobjects, then the record tables of the extended
-//! function properties (SM 6.10 linear algebra).
+//! arrays, raw bytes, subobjects, then the other record tables: work graph
+//! nodes (validator 1.8+) and the extended function properties (SM 6.10
+//! linear algebra).
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -46,9 +47,14 @@ pub const Function = struct {
     extended_properties: u32 = null_ref,
 };
 
-/// The extended function property tables, in part order (part types
-/// 13..20).
+/// The other record tables, by part type: work graph nodes (7..11) and
+/// the extended function properties (13..20).
 pub const Ext = enum(u32) {
+    node_ids = 7,
+    node_io_attribs,
+    node_func_attribs,
+    io_nodes,
+    node_shaders,
     properties = 13,
     shapes,
     constructions,
@@ -61,8 +67,10 @@ pub const Ext = enum(u32) {
     /// Record size in bytes.
     pub fn stride(t: Ext) usize {
         return switch (t) {
+            .node_shaders => 20,
             .shapes => 12,
             .properties, .constructions, .wave_multiplies, .group_multiplies => 8,
+            .node_ids, .node_io_attribs, .node_func_attribs, .io_nodes => 8,
             .thread_matvec, .outer_products, .accumulate_stores => 4,
         };
     }
@@ -77,7 +85,8 @@ pub const Builder = struct {
     functions: std.ArrayList([14]u32) = .empty,
     raw: std.ArrayList(u8) = .empty,
     subobjects: std.ArrayList([6]u32) = .empty,
-    ext: [8]std.ArrayList(u8) = @splat(.empty),
+    /// By part type, from 7.
+    ext: [14]std.ArrayList(u8) = @splat(.empty),
 
     pub fn init(gpa: Allocator) Allocator.Error!Builder {
         var b: Builder = .{ .gpa = gpa };
@@ -134,7 +143,7 @@ pub const Builder = struct {
     /// (record deduplication, validator 1.7+).
     pub fn record(b: *Builder, t: Ext, rec: []const u8) Allocator.Error!u32 {
         std.debug.assert(rec.len == t.stride());
-        const tab = &b.ext[@backingInt(t) - 13];
+        const tab = &b.ext[@backingInt(t) - 7];
         var at: usize = 0;
         while (at < tab.items.len) : (at += rec.len) {
             if (std.mem.eql(u8, tab.items[at..][0..rec.len], rec)) return @intCast(at / rec.len);
@@ -182,8 +191,12 @@ pub const Builder = struct {
             try tables.append(b.gpa, t);
             try parts.append(b.gpa, .{ .ty = 6, .data = t });
         }
-        for (b.ext, 13..) |rows, ty| if (rows.items.len > 0) {
-            const stride = @as(Ext, @fromBackingInt(@intCast(ty))).stride();
+        // (dxc's table order: the node function attributes before the
+        // I/O attributes.)
+        const order = [_]u32{ 7, 9, 8, 10, 11, 13, 14, 15, 16, 17, 18, 19, 20 };
+        for (order) |ty| if (b.ext[ty - 7].items.len > 0) {
+            const rows = b.ext[ty - 7];
+            const stride = @as(Ext, @fromBackingInt(ty)).stride();
             const t = try table(b.gpa, stride / 4, rows.items, rows.items.len / stride);
             try tables.append(b.gpa, t);
             try parts.append(b.gpa, .{ .ty = @intCast(ty), .data = t });

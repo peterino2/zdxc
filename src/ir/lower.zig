@@ -73,11 +73,21 @@ pub fn lowerUnit(arena: Allocator, s: *Sema, opts: Options) Error!ir.Module {
 /// The stage a `[shader("...")]` attribute names.
 fn stageNamed(name: []const u8) ?ir.Stage {
     const names = [_]struct { []const u8, ir.Stage }{
-        .{ "vertex", .vertex },             .{ "pixel", .pixel },                 .{ "geometry", .geometry },
-        .{ "hull", .hull },                 .{ "domain", .domain },               .{ "compute", .compute },
-        .{ "mesh", .mesh },                 .{ "amplification", .amplification }, .{ "raygeneration", .raygeneration },
-        .{ "intersection", .intersection }, .{ "anyhit", .anyhit },               .{ "closesthit", .closesthit },
-        .{ "miss", .miss },                 .{ "callable", .callable },
+        .{ "node", .node },
+        .{ "vertex", .vertex },
+        .{ "pixel", .pixel },
+        .{ "geometry", .geometry },
+        .{ "hull", .hull },
+        .{ "domain", .domain },
+        .{ "compute", .compute },
+        .{ "mesh", .mesh },
+        .{ "amplification", .amplification },
+        .{ "raygeneration", .raygeneration },
+        .{ "intersection", .intersection },
+        .{ "anyhit", .anyhit },
+        .{ "closesthit", .closesthit },
+        .{ "miss", .miss },
+        .{ "callable", .callable },
     };
     for (names) |t| if (std.ascii.eqlIgnoreCase(name, t[0])) return t[1];
     return null;
@@ -1070,6 +1080,13 @@ const Lowerer = struct {
                     const idx = try l.indexValue(x.index, bt.resource.kind.indexDims());
                     return l.b.add(.{ .op = .{ .res_load = .{ .res = res, .index = idx } }, .ty = try l.concrete(e.ty) });
                 }
+                if (bt == .node) {
+                    if (bt.node.kind.isArray()) return l.b.load(try l.nodeRecordPtr(e));
+                    // An output of an outputs array: the node object.
+                    const obj = try l.rvalue(x.base);
+                    const idx = try l.converted(x.index, try t.scalar(.uint));
+                    return l.b.add(.{ .op = .{ .access = .{ .base = obj, .indices = try l.arena.dupe(Ref, &.{idx}) } }, .ty = e.ty });
+                }
                 if (isAddressable(l.s, x.base)) return l.b.load(try l.lvalue(e));
                 const base = try l.rvalue(x.base);
                 if (l.s.evalInt(x.index)) |k| return l.b.add(.{ .op = .{ .extract = .{ .agg = base, .index = @intCast(k) } }, .ty = try l.concrete(e.ty) });
@@ -1377,6 +1394,7 @@ const Lowerer = struct {
     fn call(l: *Lowerer, e: *ast.Expr, callee: *ast.Expr, args: []const *ast.Expr) Error!Ref {
         const r = l.s.resolution(e) orelse return l.fail(e, "this call");
         const ret_ty = try l.concrete(e.ty);
+        if (r == .node_record) return l.b.load(try l.nodeRecordPtr(e));
         switch (r) {
             .function => |f| {
                 if (!f.defined and hasAttr(f.decl.attrs, "vk::ext_instruction")) return l.spirvInstCall(e, f, args, ret_ty);
@@ -1754,7 +1772,22 @@ const Lowerer = struct {
         return l.b.add(.{ .op = .{ .global = g }, .ty = glob.ty, .ptr = glob.space });
     }
 
+    /// A node record: `obj.Get()`, `obj.Get(i)` or `obj[i]` (an element
+    /// of the node object, in node record memory).
+    fn nodeRecordPtr(l: *Lowerer, e: *ast.Expr) Error!Ref {
+        const t = l.types();
+        const obj_expr, const index: ?*ast.Expr = switch (e.kind) {
+            .call => |c| .{ c.callee.kind.member.base, if (c.args.len > 0) c.args[0] else null },
+            .index => |x| .{ x.base, x.index },
+            else => return l.fail(e, "this node record"),
+        };
+        const obj = try l.rvalue(obj_expr);
+        const idx = if (index) |i| try l.converted(i, try t.scalar(.uint)) else try l.b.constInt(try t.scalar(.uint), 0);
+        return l.b.add(.{ .op = .{ .access = .{ .base = obj, .indices = try l.arena.dupe(Ref, &.{idx}) } }, .ty = e.ty, .ptr = .node });
+    }
+
     fn lvalue(l: *Lowerer, e: *ast.Expr) Error!Ref {
+        if (l.s.resolution(e)) |r| if (r == .node_record) return l.nodeRecordPtr(e);
         const t = l.types();
         // A resource inside a global struct: its own global.
         if (e.kind == .member or e.kind == .index) if (l.uniformPath(e)) |up| if (layout.isOpaque(t, e.ty)) return l.leafGlobal(up.v, up.path, e.ty);
@@ -2421,6 +2454,97 @@ const Lowerer = struct {
         entry.patch_wrapper = wrapper;
     }
 
+    /// A node shader's properties: its attributes and its node object
+    /// parameters (inputs, then outputs, in parameter order).
+    fn nodeInfo(l: *Lowerer, f: *const semamod.Function) Error!ir.NodeInfo {
+        const eqi = std.ascii.eqlIgnoreCase;
+        var info: ir.NodeInfo = .{ .id = .{ .name = f.name } };
+        for (f.decl.attrs) |a| {
+            if (eqi(a.name, "nodelaunch") and a.args.len == 1 and a.args[0].kind == .string_lit) {
+                const v = try stringContents(l.arena, a.args[0].kind.string_lit);
+                if (eqi(v, "coalescing")) info.launch = .coalescing else if (eqi(v, "thread")) info.launch = .thread else info.launch = .broadcasting;
+            } else if (eqi(a.name, "nodeisprogramentry")) {
+                info.is_program_entry = true;
+            } else if (eqi(a.name, "nodeid")) {
+                if (try l.nodeId(a)) |id| info.id = id;
+            } else if (eqi(a.name, "nodelocalrootargumentstableindex") and a.args.len == 1) {
+                info.local_root_arguments_table_index = l.attrUint(a.args[0]);
+            } else if (eqi(a.name, "nodeshareinputof")) {
+                info.share_input_of = try l.nodeId(a);
+            } else if (eqi(a.name, "nodedispatchgrid") and a.args.len == 3) {
+                info.dispatch_grid = .{ l.attrUint(a.args[0]), l.attrUint(a.args[1]), l.attrUint(a.args[2]) };
+            } else if (eqi(a.name, "nodemaxdispatchgrid") and a.args.len == 3) {
+                info.max_dispatch_grid = .{ l.attrUint(a.args[0]), l.attrUint(a.args[1]), l.attrUint(a.args[2]) };
+            } else if (eqi(a.name, "nodemaxrecursiondepth") and a.args.len == 1) {
+                info.max_recursion_depth = l.attrUint(a.args[0]);
+            }
+        }
+        var inputs: std.ArrayList(ir.NodeIo) = .empty;
+        var outputs: std.ArrayList(ir.NodeIo) = .empty;
+        var out_names: std.ArrayList([]const u8) = .empty;
+        // MaxRecordsSharedWith names a later output too: resolved after.
+        var shared: std.ArrayList(struct { out: usize, name: []const u8 }) = .empty;
+        for (f.decl.params, f.params) |pd, p| {
+            const nt = switch (l.s.types.get(p.type)) {
+                .node => |x| x,
+                else => continue,
+            };
+            var io: ir.NodeIo = .{ .kind = nt.kind, .record = nt.elem };
+            if (pd.quals.globallycoherent) io.extra_flags |= 0x200;
+            if (nt.elem != TypeTable.void_type and l.trackRwInputSharing(nt.elem)) io.extra_flags |= 0x100;
+            if (!nt.kind.isInput()) io.output_id = .{ .name = pd.name };
+            for (pd.attrs) |a| {
+                if (eqi(a.name, "maxrecords") and a.args.len == 1) {
+                    io.max_records = l.attrUint(a.args[0]);
+                } else if (eqi(a.name, "nodeid")) {
+                    if (try l.nodeId(a)) |id| io.output_id = id;
+                } else if (eqi(a.name, "nodearraysize") and a.args.len == 1) {
+                    io.array_size = l.attrUint(a.args[0]);
+                } else if (eqi(a.name, "unboundedsparsenodes")) {
+                    io.array_size = std.math.maxInt(u32);
+                    io.allow_sparse_nodes = true;
+                } else if (eqi(a.name, "allowsparsenodes")) {
+                    io.allow_sparse_nodes = true;
+                } else if (eqi(a.name, "maxrecordssharedwith") and a.args.len == 1 and a.args[0].kind == .name) {
+                    try shared.append(l.arena, .{ .out = outputs.items.len, .name = a.args[0].kind.name.last() });
+                }
+            }
+            if (nt.kind.isInput()) {
+                try inputs.append(l.arena, io);
+            } else {
+                try outputs.append(l.arena, io);
+                try out_names.append(l.arena, pd.name);
+            }
+        }
+        for (shared.items) |sh| {
+            for (out_names.items, 0..) |n, k| if (std.mem.eql(u8, n, sh.name)) {
+                outputs.items[sh.out].max_records_shared_with = @intCast(k);
+            };
+        }
+        info.inputs = inputs.items;
+        info.outputs = outputs.items;
+        return info;
+    }
+
+    /// `[NodeID("name"[, index])]`, `[NodeShareInputOf(...)]`.
+    fn nodeId(l: *Lowerer, a: ast.Attribute) Error!?ir.NodeId {
+        if (a.args.len < 1 or a.args[0].kind != .string_lit) return null;
+        return .{ .name = try stringContents(l.arena, a.args[0].kind.string_lit), .index = if (a.args.len > 1) l.attrUint(a.args[1]) else 0 };
+    }
+
+    fn attrUint(l: *Lowerer, e: *const ast.Expr) u32 {
+        return @intCast(std.math.clamp(l.s.evalInt(e) orelse 0, 0, std.math.maxInt(u32)));
+    }
+
+    /// A record struct declared `[NodeTrackRWInputSharing]`.
+    fn trackRwInputSharing(l: *Lowerer, record: TypeId) bool {
+        const info = switch (l.s.types.get(record)) {
+            .@"struct" => |s| s,
+            else => return false,
+        };
+        return l.s.structHasAttr(info, "nodetrackrwinputsharing");
+    }
+
     fn buildEntry(l: *Lowerer, f: *const semamod.Function, main: u32, opts: Options) Error!void {
         const inits = try l.staticInits();
         var entry: ir.Entry = .{ .func = main, .name = opts.entry, .stage = opts.stage, .ext = try l.spirvExt(f.decl.attrs) };
@@ -2461,14 +2585,25 @@ const Lowerer = struct {
             }
         };
         if (opts.stage == .amplification) entry.mesh.payload = l.mesh_payload;
+        if (opts.stage == .node) entry.node = try l.nodeInfo(f);
         const tess = opts.stage == .hull or opts.stage == .domain;
         if (tess) l.tessAttributes(f, &entry);
         // Hull shaders: where the control point inputs start.
         var cp_first: ?u32 = null;
+        var node_in: u32 = 0;
+        var node_out: u32 = 0;
         for (f.decl.params, f.params, 0..) |pd, p, i| {
             if (l.s.types.get(p.type) == .stream) continue;
             n_args += 1;
             const q = pd.quals;
+            if (l.s.types.get(p.type) == .node) {
+                const output = !l.s.types.get(p.type).node.kind.isInput();
+                const index = if (output) node_out else node_in;
+                if (output) node_out += 1 else node_in += 1;
+                args[i] = try l.b.add(.{ .op = .{ .node_io = .{ .output = output, .index = index } }, .ty = p.type });
+                locals[i] = args[i];
+                continue;
+            }
             if (opts.stage == .mesh and (q.vertices or q.indices or q.primitives) and l.s.types.get(p.type) == .array) {
                 // Output arrays: stores through them write the outputs.
                 const arr = l.s.types.get(p.type).array;
@@ -2844,6 +2979,7 @@ fn signExtend(v: u64, bits: u8) i64 {
 /// Whether `e` designates storage (a variable, or a part of one) rather
 /// than a temporary such as an operator call's result.
 fn isAddressable(s: *const Sema, e: *const ast.Expr) bool {
+    if (s.resolution(e)) |r| if (r == .node_record) return true;
     return switch (e.kind) {
         .name, .this => true,
         .member => |m| isAddressable(s, m.base),

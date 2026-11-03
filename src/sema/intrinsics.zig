@@ -221,6 +221,7 @@ fn matchOne(sema: anytype, it: *const table.Intrinsic, object: ?TypeId, args: []
         .resource => |r| r.elem,
         .stream => |s| s.elem,
         .patch => |p| p.elem,
+        .node => |x| x.elem,
         else => TypeTable.error_type,
     } else TypeTable.error_type;
 
@@ -321,6 +322,12 @@ fn paramType(
 
     // Non-numeric classes.
     const base = if (cs.special == .none) cs.base else s.base;
+    // NodeOutput's Get{Thread,Group}NodeOutputRecords: records of the
+    // output's record type.
+    if (i == 0 and obj_elem != TypeTable.error_type) {
+        const records: ?types.NodeKind = if (std.mem.eql(u8, base, "ThreadNodeOutputRecords")) .thread_output_records else if (std.mem.eql(u8, base, "GroupNodeOutputRecords")) .group_output_records else null;
+        if (records) |k| return try t.intern(.{ .node = .{ .kind = k, .elem = obj_elem } });
+    }
     if (!std.mem.eql(u8, base, "void") and !isNumericClass(base)) {
         // Objects (samplers are checked) and classes zdxc does not model
         // (HitObject, node records, LinAlg...): unconstrained.
