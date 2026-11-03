@@ -15,6 +15,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const module = @import("module.zig");
+const stats = @import("../stats.zig");
 const promote = @import("promote.zig");
 
 const Value = module.Value;
@@ -33,6 +34,8 @@ const max_growth = 65536;
 
 /// Unrolls the qualifying loops of `func`, innermost first; true if any.
 pub fn run(a: Allocator, m: *module.Module, func: u32) Allocator.Error!bool {
+    const zone = stats.begin(.unroll);
+    defer zone.end();
     var budget: usize = max_growth;
     var tried: std.AutoHashMapUnmanaged(u32, void) = .empty;
     var any = false;

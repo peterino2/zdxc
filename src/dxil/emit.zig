@@ -25,6 +25,7 @@ const reflect = @import("reflect.zig");
 const rootsig = @import("rootsig.zig");
 const promote = @import("promote.zig");
 const unroll = @import("unroll.zig");
+const stats = @import("../stats.zig");
 const sccp = @import("sccp.zig");
 const opt = @import("../ir/opt.zig");
 
@@ -511,8 +512,10 @@ const Emitter = struct {
         try e.buildSignatures(entry);
         if (entry.stage == .amplification) e.findDispatchPayload();
         e.cur = try e.newBlock();
+        const zl = stats.begin(.dxil_lower);
         try e.createHandles();
         _ = try e.inlineCall(entry.wrapper, &.{});
+        zl.end();
         try e.finish(e.main_fn);
         if (entry.patch_wrapper) |pw| {
             // The patch constant function is a function of its own.
@@ -536,6 +539,7 @@ const Emitter = struct {
 
         if (e.optimize) e.inputUsage();
         if (e.optimize and e.profile.minor >= 6) try e.dropDeadResources();
+        for (e.dm.functions.items) |f| stats.add(.dxil_final, f.insts.items.len);
         const bitcode = try e.writeModule(entry);
         defer gpa.free(bitcode);
         return e.assemble(gpa, entry, bitcode);
@@ -1352,6 +1356,7 @@ const Emitter = struct {
     /// Assigns final instruction indices: prologue first, then blocks in
     /// creation order.
     fn finish(e: *Emitter, func: u32) Error!void {
+        const zf = stats.begin(.dxil_finish);
         if (e.lib_removable.count() > 0) try e.pruneProlog();
         const map = try e.arena.alloc(u32, e.next_id);
         var n: u32 = 0;
@@ -1375,6 +1380,7 @@ const Emitter = struct {
                 return out;
             }
         };
+        stats.add(.dxil_lowered, n);
         try f.insts.ensureUnusedCapacity(e.dm.allocator(), n);
         const all = [_][]const PInst{e.prologue.items};
         for (all) |items| for (items) |pi| try f.insts.append(e.dm.allocator(), try remapInst(e.arena, map, pi.inst, remap));
@@ -1384,6 +1390,7 @@ const Emitter = struct {
         while (it.next()) |kv| try ranges.put(e.arena, map[kv.key_ptr.*], kv.value_ptr.*);
         e.dyn_ranges.clearRetainingCapacity();
         e.array_pool.clearRetainingCapacity();
+        zf.end();
         if (e.optimize) {
             try promote.run(e.arena, &e.dm, func, &ranges);
             // Values only ever one constant (through loops too), and the
@@ -6578,6 +6585,8 @@ const Emitter = struct {
     }
 
     fn writeModule(e: *Emitter, entry: ir.Entry) Error![]u8 {
+        const zone = stats.begin(.bitcode);
+        defer zone.end();
         const dm = &e.dm;
         const mdI32 = struct {
             fn f(m: *module.Module, v: i64) !module.MdId {
@@ -6648,6 +6657,8 @@ const Emitter = struct {
     }
 
     fn assemble(e: *Emitter, gpa: Allocator, entry: ir.Entry, bitcode: []const u8) Error![]u8 {
+        const zone = stats.begin(.container);
+        defer zone.end();
         const dxil_part = try shader.programPart(gpa, e.profile, bitcode);
         defer gpa.free(dxil_part);
         var binds: std.ArrayList(shader.ResourceBind) = .empty;

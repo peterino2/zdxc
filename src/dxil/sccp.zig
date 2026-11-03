@@ -12,6 +12,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const module = @import("module.zig");
+const stats = @import("../stats.zig");
 const unroll = @import("unroll.zig");
 
 const Value = module.Value;
@@ -101,6 +102,8 @@ fn successors(term: Inst) Succs {
 
 /// Runs the propagation on `func`; true if it changed anything.
 pub fn run(a: Allocator, m: *module.Module, func: u32) Allocator.Error!bool {
+    const zone = stats.begin(.sccp);
+    defer zone.end();
     const f = &m.functions.items[func];
     const insts = f.insts.items;
     const n: u32 = @intCast(insts.len);

@@ -15,6 +15,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const module = @import("module.zig");
+const stats = @import("../stats.zig");
 
 const Value = module.Value;
 const Inst = module.Inst;
@@ -123,6 +124,9 @@ fn isScalar(m: *const module.Module, ty: TypeId) bool {
 /// `dyn` maps the dynamically indexed getelementptrs into locals to the
 /// components [lo, hi) they can reach; one missing from it can reach all.
 pub fn run(a: Allocator, m: *module.Module, func: u32, dyn: *const std.AutoHashMapUnmanaged(u32, [2]u32)) Allocator.Error!void {
+    const zone = stats.begin(.promote);
+    stats.add(.promote_runs, 1);
+    defer zone.end();
     const f = &m.functions.items[func];
     const insts = f.insts.items;
     const n: u32 = @intCast(insts.len);
