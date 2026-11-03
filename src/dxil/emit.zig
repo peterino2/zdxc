@@ -318,6 +318,10 @@ const Emitter = struct {
     struct_types: std.AutoHashMapUnmanaged(TypeId, DType) = .empty,
     /// Per type: see structComps, mixedSizes and mixedStorage.
     struct_comps: std.AutoHashMapUnmanaged(TypeId, []const TypeId) = .empty,
+    /// elementPtr's last pointer type, and its shared index slices (by the
+    /// index constant).
+    elem_ptr_ty: struct { elem: DType = std.math.maxInt(DType), space: u32 = 0, ty: DType = 0 } = .{},
+    zero_indexed: std.ArrayList([]const Value) = .empty,
     mixed_sizes: std.AutoHashMapUnmanaged(TypeId, bool) = .empty,
     mixed_storage: std.AutoHashMapUnmanaged(TypeId, bool) = .empty,
     /// Prologue instructions dropped again if unused (resource handles).
@@ -2826,7 +2830,7 @@ const Emitter = struct {
         const n = try e.flatCount(ty);
         const out = try e.arena.alloc(Value, n);
         for (out, 0..) |*o, c| {
-            if (ptr.offset_dyn == null) if (e.forwarded.get(.{ ptr.base, ptr.offset_const + @as(u32, @intCast(c)) })) |fw| if (fw.block == e.cur) {
+            if (ptr.offset_dyn == null and e.forwarded.count() > 0) if (e.forwarded.get(.{ ptr.base, ptr.offset_const + @as(u32, @intCast(c)) })) |fw| if (fw.block == e.cur) {
                 o.* = fw.v;
                 continue;
             };
@@ -2878,10 +2882,25 @@ const Emitter = struct {
     fn elementPtr(e: *Emitter, ptr: Ptr, c: u32) Error!Value {
         var idx = try e.i32Const(ptr.offset_const + c);
         if (ptr.offset_dyn) |d| idx = try e.add(try e.dm.intType(32), .{ .binop = .{ .op = .add, .lhs = d, .rhs = idx } });
-        const pt = try e.dm.getType(.{ .pointer = .{ .elem = ptr.scalar_ty, .addr_space = ptr.addr_space } });
-        const gep = try e.add(pt, .{ .gep = .{ .elem = ptr.array_ty, .ptr = ptr.base, .indices = try e.arena.dupe(Value, &.{ try e.i32Const(0), idx }) } });
+        if (e.elem_ptr_ty.elem != ptr.scalar_ty or e.elem_ptr_ty.space != ptr.addr_space) e.elem_ptr_ty = .{
+            .elem = ptr.scalar_ty,
+            .space = ptr.addr_space,
+            .ty = try e.dm.getType(.{ .pointer = .{ .elem = ptr.scalar_ty, .addr_space = ptr.addr_space } }),
+        };
+        const zero = try e.i32Const(0);
+        const gep = try e.add(e.elem_ptr_ty.ty, .{ .gep = .{ .elem = ptr.array_ty, .ptr = ptr.base, .indices = try e.zeroIndexed(zero, idx) } });
         if (ptr.offset_dyn != null) if (ptr.dyn_range) |r| try e.dyn_ranges.put(e.arena, gep.inst, r);
         return gep;
+    }
+
+    /// The indices `{ 0, idx }`, shared between getelementptrs with the
+    /// same constant `idx` (no pass writes operand slices).
+    fn zeroIndexed(e: *Emitter, zero: Value, idx: Value) Error![]const Value {
+        if (idx != .constant) return e.arena.dupe(Value, &.{ zero, idx });
+        const k = idx.constant;
+        if (k >= e.zero_indexed.items.len) try e.zero_indexed.appendNTimes(e.arena, &.{}, k + 1 - e.zero_indexed.items.len);
+        if (e.zero_indexed.items[k].len == 0) e.zero_indexed.items[k] = try e.arena.dupe(Value, &.{ zero, idx });
+        return e.zero_indexed.items[k];
     }
 
     fn convertScalar(e: *Emitter, v: Value, from: Scalar, to: Scalar) Error!Value {
