@@ -3109,9 +3109,11 @@ const Emitter = struct {
         for (vals, 0..) |v, c| {
             if (ptr.offset_dyn == null) {
                 const key = .{ ptr.base, ptr.offset_const + @as(u32, @intCast(c)) };
-                // (Constants too, in locals: ops such as linear algebra
-                // layouts need immediates passed through parameters.)
-                const forward = (v == .constant and ptr.addr_space == 0) or (e.status_vals.count() > 0 and e.status_vals.contains(v));
+                // (Every value stored to a local: later loads of it in the
+                // block need no instructions, and constants stay constants,
+                // as ops such as linear algebra layouts need immediates
+                // passed through parameters.)
+                const forward = ptr.addr_space == 0 or (e.status_vals.count() > 0 and e.status_vals.contains(v));
                 if (forward) {
                     try e.forwarded.put(e.arena, key, .{ .v = v, .block = e.cur });
                 } else if (e.forwarded.count() > 0) _ = e.forwarded.remove(key);
