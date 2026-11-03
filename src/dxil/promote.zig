@@ -845,6 +845,22 @@ fn foldConstantBranches(a: Allocator, m: *module.Module, insts: []Inst, block_st
     const edges_to = try a.alloc(u32, nb);
     @memset(edges_to, none);
     var kept: std.ArrayList(bool) = .empty;
+    // Edges into each block from reachable ones. A phi has an entry per
+    // edge, and folding only takes edges away: one with that many entries
+    // lost none.
+    const into = try a.alloc(u32, nb);
+    @memset(into, 0);
+    for (0..nb) |p| if (reach[p]) switch (insts[block_start[p + 1] - 1].op) {
+        .br => |br| {
+            into[br.then] += 1;
+            if (br.@"else") |e| into[e] += 1;
+        },
+        .@"switch" => |sw| {
+            into[sw.default] += 1;
+            for (sw.cases) |cs| into[cs.block] += 1;
+        },
+        else => {},
+    };
     for (0..nb) |b| {
         const t: u32 = @intCast(b);
         const last = block_start[b + 1] - 1;
@@ -855,6 +871,7 @@ fn foldConstantBranches(a: Allocator, m: *module.Module, insts: []Inst, block_st
         var i = block_start[b];
         while (i < last and insts[i].op == .phi) : (i += 1) {
             const old = insts[i].op.phi.incoming;
+            if (old.len == into[b]) continue;
             kept.clearRetainingCapacity();
             try kept.resize(a, old.len);
             edges.keeps(old, t, seen, edges_to, kept.items);
@@ -872,6 +889,7 @@ fn foldConstantBranches(a: Allocator, m: *module.Module, insts: []Inst, block_st
             // (Kept entries move down; each is checked against those
             // before it in the original order.)
             const ins = incoming[j];
+            if (ins.len == into[b]) continue;
             kept.clearRetainingCapacity();
             try kept.resize(a, ins.len);
             edges.keeps(ins, t, seen, edges_to, kept.items);
