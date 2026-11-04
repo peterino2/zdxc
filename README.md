@@ -29,7 +29,7 @@ signs its own DXIL, so there is no separate `dxil.dll` to ship.
 
 | Fast iteration | Small footprint | Easy to embed |
 | :--- | :--- | :--- |
-| About **14× faster compilation** in the Hyperion benchmark. | **4.2 MB** Windows drop-in, compared with **19.3 MB** for DXC plus its DXIL library. | A **static library** by default, with a C API and a native Zig module. |
+| About **15× faster compilation** in the Hyperion benchmark. | **4.2 MB** Windows drop-in, compared with **19.3 MB** for DXC plus its DXIL library. | A **static library** by default, with a C API and a native Zig module. |
 
 ## Quick start
 
@@ -70,9 +70,10 @@ Download Windows, Linux, and macOS bundles from a successful run's **Artifacts**
 section on [GitHub Actions](https://github.com/peterino2/zdxc/actions).
 Each bundle includes the CLI, static C library, header, and DXC drop-in.
 
-See the [Hyperion case study](https://zdxc.org/case-studies.html) for benchmark
-measurements and methodology. In that Windows DXIL workload, zdxc's compile
-step was **13.9× faster** and the complete shader cook was **2.5× faster**.
+See the [case studies](https://zdxc.org/case-studies.html) for benchmark
+measurements and methodology. In Hyperion's Windows DXIL cook, zdxc's compile
+step was **15.5× faster** and the complete shader cook was **2.5× faster**;
+Unreal Engine 5.8's editor compiled its 11,156 startup shaders **4.7× faster**.
 
 ## Status
 
