@@ -203,6 +203,9 @@ const Emitter = struct {
     spec_ids: std.AutoHashMapUnmanaged(u32, Id) = .empty,
     ext_imports: std.StringHashMapUnmanaged(Id) = .empty,
     string_ids: std.StringHashMapUnmanaged(Id) = .empty,
+    /// Reads of resource locals nothing assigns: the resource of the same
+    /// type each stands in with where it is used.
+    undef_resources: std.AutoHashMapUnmanaged(u32, Id) = .empty,
     /// Flattened resource arrays: a variable per element.
     flat_vars: std.AutoHashMapUnmanaged(u32, []const Id) = .empty,
     flat_iface: std.ArrayList(Id) = .empty,
@@ -843,6 +846,14 @@ const Emitter = struct {
         const op: Op = if (x.set != null) .ext_inst else @enumFromInt(@as(u16, @intCast(x.opcode)));
         try e.b.emit(.functions, op, words.items);
         return id;
+    }
+
+    /// A declared resource global of type `ty`.
+    fn anyGlobalOf(e: *Emitter, ty: TypeId) ?u32 {
+        for (e.m.globals.items, 0..) |g, gi| {
+            if (g.ty == ty and g.space == .resource and e.global_vars[gi] != 0) return @intCast(gi);
+        }
+        return null;
     }
 
     /// An OpString of `str` (made once).
@@ -2384,7 +2395,9 @@ const Emitter = struct {
     }
 
     fn val(e: *Emitter, r: Ref) Id {
-        return e.vals[r.index()];
+        const v = e.vals[r.index()];
+        if (v == 0) if (e.undef_resources.get(r.index())) |stand_in| return stand_in;
+        return v;
     }
 
     fn compOf(e: *Emitter, ty: TypeId) Scalar {
@@ -2449,7 +2462,28 @@ const Emitter = struct {
                         try e.indexed_loads.put(e.arena, @intCast(ri), .{ .global = il.global, .indices = idx, .types = il.index_types, .nonuniform = il.nonuniform });
                         return;
                     }
-                    if (e.val(p) == 0 and f.inst(p).op == .local_var) return e.unsupported("a resource local read before it is assigned", .{});
+                    if (e.val(p) == 0 and f.inst(p).op == .local_var) {
+                        // A resource local nothing assigns (a struct copied
+                        // with a resource member left unset, read where dxc's
+                        // legalization folds the read away): its value is
+                        // undefined, so any resource of its type will do.
+                        // An OpUndef pointer would break logical addressing.
+                        // Copies (`res = this`) pass the undefined value on
+                        // without assigning it; the first real use takes the
+                        // stand-in.
+                        const only_copies = for (f.insts.items) |x| {
+                            if (x.op != .store or x.op.store.ptr != p) continue;
+                            const v = f.inst(x.op.store.value);
+                            if (v.op != .load or f.inst(v.op.load).op != .local_var) break false;
+                        } else true;
+                        if (only_copies) if (e.anyGlobalOf(i.ty)) |g| {
+                            if (e.spv_minor >= 4) try e.useVar(e.global_vars[g]);
+                            e.vals[ri] = 0;
+                            try e.undef_resources.put(e.arena, @intCast(ri), e.global_vars[g]);
+                            return;
+                        };
+                        return e.unsupported("a resource local read before it is assigned", .{});
+                    }
                     e.vals[ri] = e.val(p);
                     return;
                 }
@@ -2486,6 +2520,8 @@ const Emitter = struct {
                     }
                     return;
                 }
+                // Copying an undefined resource assigns nothing.
+                if (target.op == .local_var and e.undef_resources.contains(s.value.index())) return;
                 if (target.op == .local_var and isResourceType(e.t, target.ty)) {
                     const old = e.vals[s.ptr.index()];
                     if (old != 0 and old != e.val(s.value)) return e.unsupported("assigning different resources to one variable is not supported yet", .{});
@@ -4289,12 +4325,20 @@ const Emitter = struct {
     }
 
     fn globalOf(e: *Emitter, r: Ref) ?u32 {
+        return e.globalOfDepth(r, 0);
+    }
+
+    /// (Copies between resource locals can form cycles: give up after
+    /// `max_depth` steps.)
+    fn globalOfDepth(e: *Emitter, r: Ref, depth: u32) ?u32 {
+        const max_depth = 256;
+        if (depth > max_depth) return null;
         const i = e.f.inst(r);
         return switch (i.op) {
             .global => |g| g,
-            .load => |p| e.globalOf(p),
+            .load => |p| e.globalOfDepth(p, depth + 1),
             .local_var => for (e.f.insts.items) |inst| {
-                if (inst.op == .store and inst.op.store.ptr == r) break e.globalOf(inst.op.store.value);
+                if (inst.op == .store and inst.op.store.ptr == r) break e.globalOfDepth(inst.op.store.value, depth + 1);
             } else null,
             // A specialized parameter: the global it is bound to.
             .param => |pi| blk: {
