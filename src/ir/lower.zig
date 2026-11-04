@@ -1565,6 +1565,16 @@ const Lowerer = struct {
                     };
                     return result;
                 }
+                // printf: NonSemantic.DebugPrintf's DebugPrintf (opcode 1)
+                // with the format as an OpString (SPIR-V only).
+                if (std.mem.eql(u8, name, "printf") and l.s.opts.spirv and args.len >= 1 and args[0].kind == .string_lit) {
+                    const p = try l.arena.create(ir.SpirvInst);
+                    const ops = try l.arena.alloc(@typeInfo(@TypeOf(p.operands)).pointer.child, args.len);
+                    ops[0] = .{ .string = try stringContents(l.arena, args[0].kind.string_lit) };
+                    for (ops[1..], args[1..]) |*o, a| o.* = .{ .value = try l.converted(a, try l.concrete(a.ty)) };
+                    p.* = .{ .opcode = 1, .set = "NonSemantic.DebugPrintf", .operands = ops, .extensions = try l.arena.dupe([]const u8, &.{"SPV_KHR_non_semantic_info"}) };
+                    return l.b.add(.{ .op = .{ .spirv_inst = p }, .ty = TypeTable.void_type });
+                }
                 if (std.mem.eql(u8, name, "DispatchMesh") and args.len == 4) {
                     // The payload goes by reference (a groupshared
                     // variable).

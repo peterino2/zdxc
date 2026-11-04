@@ -99,6 +99,10 @@ pub const Param = struct {
     type: TypeId,
     dir: enum { in, out, inout },
     has_default: bool,
+    /// A template instance's default argument that does not convert to
+    /// the parameter's type: an error only where a call uses it (C++
+    /// instantiates default arguments on use).
+    bad_default: bool = false,
     /// `groupshared` parameter (SM 6.8 groupshared arguments).
     groupshared: bool = false,
 };
@@ -2521,7 +2525,16 @@ pub const Sema = struct {
                 .has_default = p.init != null,
                 .groupshared = p.quals.groupshared,
             };
-            if (p.init) |init_e| _ = try s.checkInitializer(pt, init_e);
+            if (p.init) |init_e| {
+                if (s.instance_depth > 0) {
+                    const m = s.diags.mark();
+                    _ = try s.checkInitializer(pt, init_e);
+                    if (s.diags.error_count != m.errors) {
+                        s.diags.rollback(m);
+                        out.bad_default = true;
+                    }
+                } else _ = try s.checkInitializer(pt, init_e);
+            }
         }
         const func = try s.arena.create(Function);
         func.* = .{ .name = name, .decl = f, .loc = d.loc, .ret = ret, .params = params, .defined = f.body != null, .owner = owner };
@@ -3843,7 +3856,17 @@ pub const Sema = struct {
         var explicit: ?TypeId = null;
         if (template_args.len > 0) explicit = try s.typeArg(template_args[0]);
         const r = try s.intrinsic_db.resolve(s, e.loc, if (s.opts.spirv and isVkQualified(callee)) "VkIntrinsics" else "Intrinsics", name, null, arg_types, explicit);
-        if (r.ok) s.record(e, .{ .intrinsic = .{ .index = r.index, .params = r.params } });
+        if (r.ok) {
+            s.record(e, .{ .intrinsic = .{ .index = r.index, .params = r.params } });
+            // `dot(float4, float3)`: the longer argument is truncated.
+            for (arg_types, r.params[0..@min(arg_types.len, r.params.len)], 0..) |a, pt, i| {
+                const as = s.types.shape(a.ty) orelse continue;
+                const ps = s.types.shape(pt) orelse continue;
+                if (as.kind == .scalar or ps.kind == .scalar or (ps.rows >= as.rows and ps.cols >= as.cols)) continue;
+                const loc = if (e.kind == .call and i < e.kind.call.args.len) startLoc(e.kind.call.args[i]) else a.loc;
+                s.warn(loc, "conversion", "implicit truncation of vector type", .{});
+            }
+        }
         return rvalue(r.ret);
     }
 
@@ -3897,6 +3920,10 @@ pub const Sema = struct {
                 s.err(a.loc, "cannot bind non-lvalue argument to {s} parameter", .{if (f.params[i].dir == .out) "out" else "inout"});
             }
         }
+        for (f.params[@min(args.len, f.params.len)..]) |p| if (p.bad_default) {
+            s.err(callee.loc, "cannot initialize a parameter of type '{s}' with its default argument", .{s.typeName(p.type)});
+            return TypeTable.error_type;
+        };
         if (s.current_fn) |caller| caller.callees.append(s.arena, f) catch {};
         s.record(e, .{ .function = f });
         s.ensureBody(f) catch {};
@@ -4138,6 +4165,9 @@ pub fn parseIntLiteral(text: []const u8) ?i64 {
     if (digits.len > 2 and digits[0] == '0' and (digits[1] == 'x' or digits[1] == 'X')) {
         base = 16;
         body = digits[2..];
+    } else if (isBinaryLiteral(digits)) {
+        base = 2;
+        body = digits[2..];
     } else if (digits.len > 1 and digits[0] == '0') {
         base = 8;
         body = digits[1..];
@@ -4157,6 +4187,11 @@ pub fn parseFloatLiteral(text: []const u8) ?f64 {
 /// dxc's `.#INF`): where the suffix starts and whether it is floating.
 fn scanLiteral(text: []const u8) struct { end: usize, float: bool, inf: bool = false } {
     var i: usize = 0;
+    if (isBinaryLiteral(text)) {
+        i = 2;
+        while (i < text.len and (text[i] == '0' or text[i] == '1')) i += 1;
+        return .{ .end = i, .float = false };
+    }
     const hex = text.len > 1 and text[0] == '0' and (text[1] == 'x' or text[1] == 'X');
     if (hex) i = 2;
     const isDigit = struct {
@@ -4183,6 +4218,24 @@ fn scanLiteral(text: []const u8) struct { end: usize, float: bool, inf: bool = f
     }
     if (float and std.mem.startsWith(u8, text[i..], "#INF")) return .{ .end = i + 4, .float = true, .inf = true };
     return .{ .end = i, .float = float };
+}
+
+/// `0b101`: a binary integer literal (clang accepts them in HLSL).
+/// Where an expression's text starts (clang's getBeginLoc): `i` in `i.T`.
+fn startLoc(e: *const ast.Expr) Loc {
+    return switch (e.kind) {
+        .member => |m| startLoc(m.base),
+        .index => |x| startLoc(x.base),
+        .binary => |b| startLoc(b.lhs),
+        .assign => |b| startLoc(b.lhs),
+        .conditional => |c| startLoc(c.cond),
+        .call => |c| startLoc(c.callee),
+        else => e.loc,
+    };
+}
+
+fn isBinaryLiteral(text: []const u8) bool {
+    return text.len > 2 and text[0] == '0' and (text[1] == 'b' or text[1] == 'B') and (text[2] == '0' or text[2] == '1');
 }
 
 /// `f16` / `f32` / `f64` (any case) at the end of a float literal.

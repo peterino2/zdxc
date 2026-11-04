@@ -207,7 +207,7 @@ pub fn mapOp(a: Allocator, op: Op, ctx: anytype) Allocator.Error!Op {
             const ops = try a.dupe(@typeInfo(@TypeOf(x.operands)).pointer.child, x.operands);
             for (ops) |*o| switch (o.*) {
                 .value => |*v| v.* = ctx.map(v.*),
-                .literal, .type => {},
+                .literal, .type, .string => {},
             };
             const n = try a.create(ir.SpirvInst);
             n.* = x.*;
@@ -278,7 +278,7 @@ pub fn eachOperand(op: Op, ctx: anytype) void {
         .heap_resource => |h| ctx.use(h.index),
         .spirv_inst => |x| for (x.operands) |o| switch (o) {
             .value => |v| ctx.use(v),
-            .literal, .type => {},
+            .literal, .type, .string => {},
         },
         .patch_output => |x| ctx.use(x.value),
         .phi => |ps| for (ps) |pp| ctx.use(pp.value),

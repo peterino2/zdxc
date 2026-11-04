@@ -528,6 +528,7 @@ fn run(ctx: *Ctx, arena: std.mem.Allocator) !void {
             const zv = stats.begin(.spirv);
             defer if (opts.spirv) zv.end();
             if (opts.spirv) {
+                try zdxc.ir.inline_calls.runResourceReturns(m);
                 zdxc.ir.split_resources.run(arena, m, &diags) catch |err| switch (err) {
                     error.Unsupported => {
                         try diags.render(&sm, ctx.stderr, .{ .format = opts.diag_format, .color = false });
