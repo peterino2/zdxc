@@ -24,8 +24,10 @@ no `dxil.dll`: zdxc signs DXIL itself.
 
 | Class | Interfaces |
 |---|---|
-| `CLSID_DxcCompiler` | `IDxcCompiler3` (`Compile`), `IDxcVersionInfo` (reports 1.11) |
-| `CLSID_DxcUtils` (also reached as `CLSID_DxcLibrary`) | `IDxcUtils`: blob creation, `LoadFile`, `CreateDefaultIncludeHandler`, `GetBlobAsUtf8` / `GetBlobAsWide`, `GetDxilContainerPart` |
+| `CLSID_DxcCompiler` | `IDxcCompiler3` (`Compile`), `IDxcCompiler` (`Compile`, `Preprocess`), `IDxcCompiler2` (`CompileWithDebug`), `IDxcVersionInfo` (reports 1.11) |
+| `CLSID_DxcUtils` (also reached as `CLSID_DxcLibrary`) | `IDxcUtils`: blob creation, `LoadFile`, `CreateDefaultIncludeHandler`, `GetBlobAsUtf8` / `GetBlobAsWide`, `GetDxilContainerPart`, `CreateReflection` |
+| `CLSID_DxcContainerReflection` | `IDxcContainerReflection`: load and inspect container parts, `GetPartReflection` |
+| `CLSID_DxcContainerBuilder` | `IDxcContainerBuilder`: load, add/remove parts, serialize a signed container |
 
 `Compile` takes the same arguments as the command line and follows DXC:
 
@@ -44,13 +46,21 @@ no `dxil.dll`: zdxc signs DXIL itself.
 
 Classes and methods that are not implemented return `REGDB_E_CLASSNOTREG`
 or `E_NOTIMPL`. These include:
-- the legacy `IDxcCompiler` and `IDxcCompiler2` interfaces;
+
 - `Disassemble`;
-- `CreateReflection`, `BuildArguments` and `GetPDBContents`;
-- the validator, linker, container and PDB classes.
+- `BuildArguments` and `GetPDBContents`;
+- the validator, linker, and PDB classes.
 
-The result has no `DXC_OUT_REFLECTION` output (the reflection container
-that `CreateReflection` reads).
+DXIL results include `DXC_OUT_REFLECTION`. `CreateReflection` reads zdxc
+reflection blobs and exposes `ID3D12ShaderReflection` or
+`ID3D12LibraryReflection`. `CompileWithDebug` compiles the shader but returns
+no separate debug name or blob; zdxc does not write PDBs.
 
-Language support is zdxc's own: HLSL 2021, with `-HV 2021` as the only
-version.
+Language support is zdxc's own. HLSL 2021 is the default; pass `-HV 2018`
+for HLSL 2018's component-wise `&&`, `||`, and numeric `?:`, which evaluate
+both operands or branches. `-HV 2016` and `-HV 2017` use the same legacy
+operator semantics. These options apply to both executable and library calls.
+
+DXIL supports work graph node shaders compiled as `lib_6_8`, including
+node input/output records and the `broadcasting`, `coalescing`, and `thread`
+launch modes. Work graph nodes are not supported with `-spirv`.

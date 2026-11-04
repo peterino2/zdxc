@@ -1,5 +1,5 @@
 /*
- * zdxc: an HLSL 2021 to DXIL and SPIR-V compiler.
+ * zdxc: an HLSL 2018 / 2021 to DXIL and SPIR-V compiler.
  *
  * The C API. Link libzdxc statically (zig build -Dlinkage=static, the
  * default) or dynamically (-Dlinkage=dynamic); it needs nothing besides
