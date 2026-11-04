@@ -254,6 +254,44 @@ fn matchOne(sema: anytype, it: *const table.Intrinsic, object: ?TypeId, args: []
     }
 
     var bindings: Bindings = .{};
+    // A vector size (`c` of `numeric<c>`) shared by several arguments takes
+    // the widest of them, scalars splatting to it, as in dxc: `dot(1, v)`
+    // is a dot product of v's size, not v truncated to a scalar.
+    {
+        var syms: [8][]const u8 = undefined;
+        var widest: [8]u16 = undefined;
+        var ok: [8]bool = undefined;
+        var ns: usize = 0;
+        for (args[0..it.params.len], 1..) |a, i| {
+            const ls = if (specs[i].dims.len > 0) specs[i] else specs[layout_group[i]];
+            if (ls.any_layout or ls.dims.len != 1) continue;
+            const sym = ls.dims[0];
+            if (std.fmt.parseInt(u16, sym, 10)) |_| continue else |_| {}
+            const sh = t.shape(a.ty) orelse continue;
+            const len: u16 = switch (sh.kind) {
+                .scalar => 1,
+                .vector => sh.cols,
+                else => continue,
+            };
+            const k = for (syms[0..ns], 0..) |s, j| {
+                if (std.mem.eql(u8, s, sym)) break j;
+            } else blk: {
+                if (ns == syms.len) break :blk null;
+                syms[ns] = sym;
+                widest[ns] = len;
+                ok[ns] = true;
+                ns += 1;
+                break :blk ns - 1;
+            } orelse continue;
+            // (Vectors of two different sizes: left to the usual binding,
+            // which converts to the first.)
+            if (len != 1 and widest[k] != 1 and len != widest[k]) ok[k] = false;
+            widest[k] = @max(widest[k], len);
+        }
+        for (syms[0..ns], widest[0..ns], ok[0..ns]) |s, w, good| if (good and w > 1) {
+            _ = bindings.bind(s, w);
+        };
+    }
     for (args[0..it.params.len], 1..) |a, i| {
         // (Also arguments whose layout links to a `<>` one.)
         if (!specs[i].any_layout and !specs[layout_group[i]].any_layout) continue;
