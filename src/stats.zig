@@ -23,6 +23,9 @@ pub const Stage = enum {
     promote,
     sccp,
     unroll,
+    cse,
+    /// Block merging, bypassing and if-conversion (dxil/cfg.zig).
+    cfg,
     bitcode,
     container,
     spirv,

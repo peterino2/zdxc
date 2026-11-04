@@ -164,7 +164,17 @@ pub const Inst = struct {
 
 /// An instruction's metadata attachment: an index into Module.inst_mds,
 /// kept out of line (few instructions have one).
-pub const InstMd = enum(u32) { none = 0, _ };
+/// `unroll` is no attachment: it marks the back edge of an `[unroll]` loop
+/// for the unroller, and is not written.
+pub const InstMd = enum(u32) {
+    none = 0,
+    unroll = std.math.maxInt(u32),
+    _,
+
+    pub fn written(md: InstMd) bool {
+        return md != .none and md != .unroll;
+    }
+};
 
 pub const Function = struct {
     name: []const u8,
@@ -977,10 +987,10 @@ const Encoder = struct {
         }
         // METADATA_ATTACHMENT: [instruction index, (kind, node)...]
         var any_md = false;
-        for (f.insts.items) |inst| any_md = any_md or inst.md != .none;
+        for (f.insts.items) |inst| any_md = any_md or inst.md.written();
         if (any_md) {
             try w.enterBlock(block_metadata_attachment, 3);
-            for (f.insts.items, 0..) |inst, k| if (inst.md != .none) {
+            for (f.insts.items, 0..) |inst, k| if (inst.md.written()) {
                 const md = e.m.inst_mds.items[@backingInt(inst.md) - 1];
                 try e.ops.appendSlice(e.gpa(), &.{ k, md.kind, md.node });
                 try e.rec(11);

@@ -28,6 +28,8 @@ const promote = @import("promote.zig");
 const unroll = @import("unroll.zig");
 const stats = @import("../stats.zig");
 const sccp = @import("sccp.zig");
+const cfg = @import("cfg.zig");
+const cse = @import("cse.zig");
 const opt = @import("../ir/opt.zig");
 
 const TypeId = types.TypeId;
@@ -53,9 +55,18 @@ pub fn emit(gpa: Allocator, m: *const ir.Module, profile: shader.Profile, diags:
 pub const Output = struct { object: []u8, reflection: []u8 };
 
 pub fn emitWithReflection(gpa: Allocator, m: *const ir.Module, profile: shader.Profile, diags: *diag.Diagnostics, optimize: bool) Error!Output {
+    return emitWithReflectionAt(gpa, m, profile, diags, if (optimize) .full else .none);
+}
+
+/// How much `emitWithReflectionAt` optimizes: nothing (-zdxc-no-opt), as
+/// dxc's -Od does (locals promoted to SSA values and what that leaves
+/// dead removed, nothing else), or fully.
+pub const Optimize = enum { none, debug, full };
+
+pub fn emitWithReflectionAt(gpa: Allocator, m: *const ir.Module, profile: shader.Profile, diags: *diag.Diagnostics, level: Optimize) Error!Output {
     var arena_state: BumpArena = .init(gpa);
     defer arena_state.deinit();
-    var e: Emitter = .{ .arena = arena_state.allocator(), .dm = .init(gpa), .m = m, .t = m.types, .profile = profile, .diags = diags, .optimize = optimize };
+    var e: Emitter = .{ .arena = arena_state.allocator(), .dm = .init(gpa), .m = m, .t = m.types, .profile = profile, .diags = diags, .optimize = level == .full, .promote_only = level == .debug };
     defer e.dm.deinit();
     // Native 16-bit types are laid out at their own size.
     if (m.native_16bit) e.dm.datalayout = "e-m:e-p:32:32-i1:32-i8:8-i16:16-i32:32-i64:64-f16:16-f32:32-f64:64-n8:16:32:64";
@@ -337,6 +348,8 @@ const Emitter = struct {
     dyn_ranges: std.AutoHashMapUnmanaged(u32, [2]u32) = .empty,
     /// See `emit`.
     optimize: bool = true,
+    /// -Od: only promotion runs on the finished functions.
+    promote_only: bool = false,
     /// Arrays of inlined callees that have returned, by type, for later
     /// callees' locals of that type (per function).
     array_pool: std.AutoHashMapUnmanaged(TypeId, std.ArrayList(Ptr)) = .empty,
@@ -1553,6 +1566,17 @@ const Emitter = struct {
                 try promote.run(e.arena, &e.dm, func, &.empty);
                 if (e.dm.functions.items[func].insts.items.len == before) break;
             }
+            // Repeated computations, then blocks that only branch on:
+            // merged, bypassed, and if-converted.
+            // (What that leaves dead, or folds, and the blocks that leaves
+            // empty: again, until nothing changes.)
+            _ = try cse.run(e.arena, &e.dm, func);
+            var passes: u32 = 0;
+            while (passes < 3 and try cfg.run(e.arena, &e.dm, func)) : (passes += 1) {
+                try promote.run(e.arena, &e.dm, func, &.empty);
+            }
+        } else if (e.promote_only) {
+            try promote.run(e.arena, &e.dm, func, &ranges);
         }
     }
 
@@ -2147,7 +2171,16 @@ const Emitter = struct {
                     _ = try e.add(void_ty, .{ .br = .{ .then = cont } });
                 } else _ = try e.add(void_ty, .{ .ret = null });
             },
-            .br => |t| _ = try e.add(void_ty, .{ .br = .{ .then = try e.blockFor(frame, t.index()) } }),
+            .br => |t| {
+                const br = try e.add(void_ty, .{ .br = .{ .then = try e.blockFor(frame, t.index()) } });
+                // An `[unroll]` loop's back edge: marked for the unroller.
+                switch (f.blocks.items[t.index()].merge) {
+                    .loop => |l| if (l.unroll == .unroll and l.@"continue".index() == bi) {
+                        e.insts.at(br.inst).md = .unroll;
+                    },
+                    else => {},
+                }
+            },
             .cond_br => |c| {
                 const cond = (try e.scalars(frame, c.cond))[0];
                 if (frame.taken.len > 0) if (e.constIntOf(cond)) |k| {

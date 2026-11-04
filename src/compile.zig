@@ -563,7 +563,7 @@ fn run(ctx: *Ctx, arena: std.mem.Allocator) !void {
                 m.entries.items[0].root_signature = try rootSignatureMacroText(ctx, arena, opts, input, macro) orelse return error.CompileFailed;
             };
             const zd = stats.begin(.dxil);
-            const dxil_out = zdxc.dxil.emit.emitWithReflection(arena, m, profile.?, &diags, !opts.no_opt and opts.opt_level != .od) catch |err| switch (err) {
+            const dxil_out = zdxc.dxil.emit.emitWithReflectionAt(arena, m, profile.?, &diags, if (opts.no_opt) .none else if (opts.opt_level == .od) .debug else .full) catch |err| switch (err) {
                 error.Unsupported => {
                     try diags.render(&sm, ctx.stderr, .{ .format = opts.diag_format, .color = false });
                     return error.CompileFailed;
