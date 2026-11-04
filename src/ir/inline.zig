@@ -20,6 +20,7 @@ const Allocator = std.mem.Allocator;
 const ir = @import("ir.zig");
 const types = @import("../sema/types.zig");
 const opt = @import("opt.zig");
+const split_resources = @import("split_resources.zig");
 
 const Ref = ir.Ref;
 const BlockId = ir.BlockId;
@@ -57,6 +58,41 @@ pub fn run(m: *ir.Module) Error!void {
     // callee's own body, whose calls are inlined in turn as the scan
     // reaches the copied blocks; a function only gets expanded where it
     // ends up. Callees that stay functions are expanded as roots.
+    const done = try a.alloc(bool, n);
+    @memset(done, false);
+    var work: std.ArrayList(u32) = .empty;
+    for (m.entries.items) |e| {
+        try work.append(a, e.wrapper);
+        if (e.patch_wrapper) |pw| try work.append(a, pw);
+    }
+    try work.appendSlice(a, m.exports.items);
+    while (work.pop()) |fi| {
+        if (done[fi]) continue;
+        done[fi] = true;
+        try inlineCalls(m, m.functions.items[fi], shapes, &work);
+    }
+    try markDead(m);
+}
+
+/// Inlines only the calls of functions that return a resource or a struct
+/// holding one, in every kind of module (ray-tracing libraries included),
+/// before resources are split out of structs: what such a function
+/// returns can be an element of a resource array picked by an index it
+/// computes (`bindless[NonUniformResourceIndex(i)]`), which no function
+/// signature can pass back. dxc's legalization inlines everything.
+pub fn runResourceReturns(m: *ir.Module) Error!void {
+    const a = m.arena;
+    const n = m.functions.items.len;
+    const shapes = try a.alloc(?Shape, n);
+    var any = false;
+    for (m.functions.items, shapes) |f, *sh| {
+        sh.* = .keep;
+        if (!isResource(m.types, f.ret) and !split_resources.holdsResources(m.types, f.ret)) continue;
+        const shape = try shapeOf(a, m, f);
+        sh.* = shape;
+        if (shape != .keep) any = true;
+    }
+    if (!any) return;
     const done = try a.alloc(bool, n);
     @memset(done, false);
     var work: std.ArrayList(u32) = .empty;

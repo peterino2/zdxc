@@ -41,6 +41,8 @@ pub const Parser = struct {
     /// Name of the struct most recently parsed by parseStructDeclInto
     /// (synthesized for anonymous structs), for `typedef struct ...`.
     last_struct_name: []const u8 = "",
+    /// The last parseType read `const` after the type (`float const x`).
+    type_const: bool = false,
     /// The qualifier words read by the last parseQualifiers call.
     last_quals: []const ast.QualWord = &.{},
     /// Qualifier words for the next parseDeclaratorsInto call.
@@ -410,6 +412,8 @@ pub const Parser = struct {
 
     fn skipTypeAttrs(p: *const Parser, start: usize) usize {
         var i = start;
+        // `T const`: a type qualifier written after the type.
+        while (p.toks[i].isIdent("const")) i += 1;
         if (!(p.toks[i].kind == .l_square and p.toks[i + 1].kind == .l_square)) return i;
         var depth: u32 = 0;
         while (true) : (i += 1) {
@@ -565,7 +569,16 @@ pub const Parser = struct {
         t.pack_matrix = p.packMatrixAt(type_pos);
         if (norm != .none) t.norm = norm;
         if (words.items.len > 0) t.attr_words = words.items;
+        p.type_const = false;
+        while (p.eatIdent("const")) p.type_const = true;
         if (p.at(.l_square) and p.peek(1).kind == .l_square) t.attrs = try p.parseAttributes();
+        return t;
+    }
+
+    /// parseType for a declaration: `const` after the type joins `quals`.
+    fn parseDeclType(p: *Parser, quals: *ast.Qualifiers) Error!*ast.TypeRef {
+        const t = try p.parseType();
+        if (p.type_const) quals.@"const" = true;
         return t;
     }
 
@@ -835,9 +848,9 @@ pub const Parser = struct {
             return out.append(p.arena, d);
         }
 
-        const quals = p.parseQualifiers();
+        var quals = p.parseQualifiers();
         const words = p.last_quals;
-        const ty = try p.parseType();
+        const ty = try p.parseDeclType(&quals);
         p.decl_quals = words;
         const first = out.items.len;
         try p.parseDeclaratorsInto(out, attrs, quals, template_params, ty, ctx);
@@ -1299,9 +1312,9 @@ pub const Parser = struct {
         if (p.atIdent("void") and p.peek(1).kind == .r_paren) _ = p.advance();
         while (!p.at(.r_paren)) {
             const pattrs = try p.parseAttributes();
-            const pquals = p.parseQualifiers();
+            var pquals = p.parseQualifiers();
             const pwords = p.last_quals;
-            const pty = try p.parseType();
+            const pty = try p.parseDeclType(&pquals);
             var pname: []const u8 = "";
             var pname_loc = p.tok().loc;
             if (p.at(.identifier) and !isReserved(p.tok().text)) {
@@ -1507,8 +1520,8 @@ pub const Parser = struct {
     /// `expr`, or `T name = init` (C++ condition declaration).
     fn parseCondition(p: *Parser) Error!struct { decl: ?*ast.Decl, cond: *ast.Expr } {
         if (!p.startsLocalDecl()) return .{ .decl = null, .cond = try p.parseExpr() };
-        const quals = p.parseQualifiers();
-        const ty = try p.parseType();
+        var quals = p.parseQualifiers();
+        const ty = try p.parseDeclType(&quals);
         const name = try p.expectIdent("variable name");
         _ = try p.expect(.equal, "'='");
         const init_expr = try p.parseAssign();

@@ -197,6 +197,16 @@ const Bindings = struct {
         return null;
     }
 
+    /// Bind `name` to `v` unless it is bound to a smaller value.
+    fn lower(b: *Bindings, name: []const u8, v: u16) void {
+        if (std.fmt.parseInt(u16, name, 10)) |_| return else |_| {}
+        for (b.names[0..b.n], b.values[0..b.n]) |k, *old| if (std.mem.eql(u8, k, name)) {
+            old.* = @min(old.*, v);
+            return;
+        };
+        _ = b.bind(name, v);
+    }
+
     /// Bind or check; false on conflict.
     fn bind(b: *Bindings, name: []const u8, v: u16) bool {
         if (b.get(name)) |old| return old == v;
@@ -259,6 +269,22 @@ fn matchOne(sema: anytype, it: *const table.Intrinsic, object: ?TypeId, args: []
         if (!specs[i].any_layout and !specs[layout_group[i]].any_layout) continue;
         const sh = t.shape(a.ty) orelse continue;
         if (bindings.any_shape == null or sh.count() > bindings.any_shape.?.count()) bindings.any_shape = sh;
+    }
+    // A dimension shared by several arguments (`dot(numeric<c>,
+    // numeric<c>)`, mul's `numeric<r, c>` and `numeric<c>`) is the
+    // smallest one: dxc truncates the larger arguments (with a warning).
+    // Scalars splat and do not bind it.
+    for (args[0..it.params.len], 1..) |a, i| {
+        const ls = if (specs[i].dims.len > 0) specs[i] else specs[layout_group[i]];
+        const sh = t.shape(a.ty) orelse continue;
+        switch (ls.dims.len) {
+            1 => if (sh.kind == .vector) bindings.lower(ls.dims[0], sh.cols),
+            2 => if (sh.kind == .matrix) {
+                bindings.lower(ls.dims[0], sh.rows);
+                bindings.lower(ls.dims[1], sh.cols);
+            },
+            else => {},
+        }
     }
     var sum: u32 = 0;
     var worst: u32 = 0;

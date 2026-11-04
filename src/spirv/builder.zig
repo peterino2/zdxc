@@ -10,6 +10,7 @@ pub const Id = u32;
 pub const Op = enum(u16) {
     undef = 1,
     source = 3,
+    string = 7,
     name = 5,
     member_name = 6,
     extension = 10,
@@ -259,6 +260,8 @@ pub const Section = enum {
     memory_model,
     entry_points,
     execution_modes,
+    /// OpString (before OpSource and the names).
+    debug_strings,
     debug_names,
     annotations,
     types_globals,

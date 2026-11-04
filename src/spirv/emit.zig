@@ -202,6 +202,7 @@ const Emitter = struct {
     used_bindings: std.AutoHashMapUnmanaged(struct { u32, u32 }, void) = .empty,
     spec_ids: std.AutoHashMapUnmanaged(u32, Id) = .empty,
     ext_imports: std.StringHashMapUnmanaged(Id) = .empty,
+    string_ids: std.StringHashMapUnmanaged(Id) = .empty,
     /// Flattened resource arrays: a variable per element.
     flat_vars: std.AutoHashMapUnmanaged(u32, []const Id) = .empty,
     flat_iface: std.ArrayList(Id) = .empty,
@@ -837,9 +838,19 @@ const Emitter = struct {
             .value => |r| e.val(r),
             .literal => |w| w,
             .type => |t| try e.typeId(t),
+            .string => |str| try e.stringId(str),
         });
         const op: Op = if (x.set != null) .ext_inst else @enumFromInt(@as(u16, @intCast(x.opcode)));
         try e.b.emit(.functions, op, words.items);
+        return id;
+    }
+
+    /// An OpString of `str` (made once).
+    fn stringId(e: *Emitter, str: []const u8) Error!Id {
+        if (e.string_ids.get(str)) |id| return id;
+        const id = e.b.newId();
+        try e.b.emitWithString(.debug_strings, .string, &.{id}, str, &.{});
+        try e.string_ids.put(e.arena, str, id);
         return id;
     }
 
