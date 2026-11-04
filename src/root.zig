@@ -1,4 +1,4 @@
-//! zdxc: an HLSL 2021 compiler targeting DXIL and SPIR-V.
+//! zdxc: an HLSL 2018 / 2021 compiler targeting DXIL and SPIR-V.
 
 pub const diag = @import("diag.zig");
 pub const options = @import("options.zig");

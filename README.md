@@ -7,7 +7,7 @@
 </p>
 
 <p align="center">
-  HLSL 2021 → DXIL / SPIR-V · Written in Zig · No LLVM dependency
+  HLSL 2018 / 2021 → DXIL / SPIR-V · Written in Zig · No LLVM dependency
 </p>
 
 <p align="center">
@@ -19,9 +19,9 @@
 
 ---
 
-zdxc is an HLSL 2021 compiler written from scratch in Zig. It emits DXIL and
-SPIR-V, supports DXC-style command lines, and provides a DXC-compatible COM
-interface for existing engine integrations.
+zdxc is an HLSL compiler written from scratch in Zig. It supports HLSL 2018
+and 2021, emits DXIL and SPIR-V, supports DXC-style command lines, and
+provides a DXC-compatible COM interface for existing engine integrations.
 
 Use it as a development drop-in replacement for DXC, link its small C API directly,
 or import it as a Zig module. The compiler has no package dependencies and
@@ -77,8 +77,14 @@ Unreal Engine 5.8's editor compiled its 11,156 startup shaders **4.3× faster**.
 
 ## Status
 
-zdxc is **alpha software**, focused on HLSL 2021 (`-HV 2021`). DXC compatibility
-is still being developed; not every DXC interface or feature is implemented.
+zdxc is **alpha software**. HLSL 2021 is the default; use `-HV 2018` for
+HLSL 2018 shaders. DXIL supports work graph node shaders in `lib_6_8`
+libraries, SM 6.8 `Barrier()`, and `[WaveSize]` metadata. Work graph nodes
+are not supported by the SPIR-V backend. See the
+[command-line guide](docs/manual/03-command-line.md) for examples.
+
+DXC compatibility is still being developed; not every interface or feature
+is implemented.
 The [drop-in manual](https://zdxc.org/manual.html#section-dxc-drop-in) documents
 the current interface coverage.
 
