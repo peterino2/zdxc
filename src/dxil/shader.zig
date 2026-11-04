@@ -71,8 +71,16 @@ pub const ComputeInfo = struct {
     num_threads: [3]u32,
 };
 
-/// Validator version we claim in !dx.valver (matches the oracle dxc).
-const valver = .{ 1, 11 };
+/// The validator version zdxc writes for (!dx.valver; matches the oracle
+/// dxc). What its output looks like follows from it: PSVRuntimeInfo4 and
+/// RDAT's RuntimeDataFunctionInfo3 from 1.10. Testing with an older
+/// validator means changing only this.
+pub const validator: [2]u32 = .{ 1, 11 };
+
+/// Whether the validator is at least `major.minor`.
+pub fn validatorAtLeast(major: u32, minor: u32) bool {
+    return validator[0] > major or (validator[0] == major and validator[1] >= minor);
+}
 
 pub fn buildEmptyCompute(gpa: Allocator, info: ComputeInfo) ![]u8 {
     var m = Module.init(gpa);
@@ -86,7 +94,7 @@ pub fn buildEmptyCompute(gpa: Allocator, info: ComputeInfo) ![]u8 {
     // Metadata, in the same shape dxc emits.
     const ident = try m.mdNode(&.{try m.mdString("zdxc 0.0.0")});
     const version = try m.mdNode(&.{ try m.mdI32(1), try m.mdI32(info.profile.minor) });
-    const val_ver = try m.mdNode(&.{ try m.mdI32(valver[0]), try m.mdI32(valver[1]) });
+    const val_ver = try m.mdNode(&.{ try m.mdI32(validator[0]), try m.mdI32(validator[1]) });
     const sm = try m.mdNode(&.{ try m.mdString(info.profile.kind.profilePrefix()), try m.mdI32(info.profile.major), try m.mdI32(info.profile.minor) });
     const threads = try m.mdNode(&.{ try m.mdI32(info.num_threads[0]), try m.mdI32(info.num_threads[1]), try m.mdI32(info.num_threads[2]) });
     const props = try m.mdNode(&.{ try m.mdI32(4), threads }); // kDxilNumThreadsTag
@@ -143,6 +151,8 @@ pub const PsvInfo = struct {
     /// The stage-specific PSVRuntimeInfo0 union.
     stage_info: [16]u8 = @splat(0),
     num_threads: [3]u32 = .{ 0, 0, 0 },
+    /// Minimum and maximum expected wave lane counts (WaveSize).
+    wave_lanes: [2]u32 = .{ 0, 0xFFFFFFFF },
     resources: []const ResourceBind = &.{},
     inputs: []const signature.Element = &.{},
     outputs: []const signature.Element = &.{},
@@ -159,7 +169,7 @@ pub fn psvCompute(gpa: Allocator, entry: []const u8, num_threads: [3]u32, resour
     return psv(gpa, .{ .kind = .compute, .entry = entry, .num_threads = num_threads, .resources = resources });
 }
 
-/// PSV0 with PSVRuntimeInfo4 (60 bytes), as produced for validator 1.11.
+/// PSV0 with PSVRuntimeInfo4 (60 bytes; validator 1.10+) or 3 (52).
 pub fn psv(gpa: Allocator, info: PsvInfo) ![]u8 {
     var buf: std.ArrayList(u8) = .empty;
     errdefer buf.deinit(gpa);
@@ -169,11 +179,12 @@ pub fn psv(gpa: Allocator, info: PsvInfo) ![]u8 {
     for (&out_vectors, 0..) |*v, s| v.* = signature.vectorsUsed(info.outputs, @intCast(s));
     const pc_vectors = signature.vectorsUsed(info.patch_constants, 0);
 
-    try w(&buf, gpa, 60); // sizeof(PSVRuntimeInfo4)
+    const info4 = validatorAtLeast(1, 10);
+    try w(&buf, gpa, if (info4) 60 else 52); // sizeof(PSVRuntimeInfo4 / 3)
     // PSVRuntimeInfo0
     try buf.appendSlice(gpa, &info.stage_info);
-    try w(&buf, gpa, 0); // MinimumExpectedWaveLaneCount
-    try w(&buf, gpa, 0xFFFFFFFF); // MaximumExpectedWaveLaneCount
+    try w(&buf, gpa, info.wave_lanes[0]); // MinimumExpectedWaveLaneCount
+    try w(&buf, gpa, info.wave_lanes[1]); // MaximumExpectedWaveLaneCount
     // PSVRuntimeInfo1: stage, UsesViewID, MaxVertexCount, element counts,
     // vector counts.
     // (The MaxVertexCount union holds SigPatchConstOrPrimVectors for hull
@@ -221,7 +232,7 @@ pub fn psv(gpa: Allocator, info: PsvInfo) ![]u8 {
         try w(&records, gpa, idx_off);
         var cols_and_start: u8 = @intCast(e.cols);
         if (e.start_row != null) cols_and_start |= 0x40 | @as(u8, @intCast(e.start_col << 4));
-        try records.appendSlice(gpa, &.{ @intCast(e.rows), @intCast(e.start_row orelse 0), cols_and_start, @intFromEnum(e.kind), @intCast(e.comp.sigCompType()), @intFromEnum(e.interp), @intCast((e.stream & 3) << 4), 0 });
+        try records.appendSlice(gpa, &.{ @intCast(e.rows), @intCast(e.start_row orelse 0), cols_and_start, @backingInt(e.kind), @intCast(e.comp.sigCompType()), @backingInt(e.interp), @intCast((e.stream & 3) << 4), 0 });
     };
     const entry_off: u32 = @intCast(strings.items.len);
     try strings.appendSlice(gpa, info.entry);
@@ -230,9 +241,11 @@ pub fn psv(gpa: Allocator, info: PsvInfo) ![]u8 {
 
     // PSVRuntimeInfo3: EntryFunctionName
     try w(&buf, gpa, entry_off);
-    // PSVRuntimeInfo4
-    try w(&buf, gpa, info.groupshared_bytes); // NumBytesGroupSharedMemory
-    try w(&buf, gpa, @intFromBool(linalg != null)); // Flags: LinAlgRuntimeInfoPresent
+    if (info4) {
+        // PSVRuntimeInfo4
+        try w(&buf, gpa, info.groupshared_bytes); // NumBytesGroupSharedMemory
+        try w(&buf, gpa, @intFromBool(linalg != null)); // Flags: LinAlgRuntimeInfoPresent
+    }
 
     try w(&buf, gpa, @intCast(info.resources.len));
     if (info.resources.len > 0) {

@@ -23,14 +23,14 @@ const TypeId = module.TypeId;
 
 const none = std.math.maxInt(u32);
 
-const Role = enum { load_ptr, store_ptr, gep_base, other };
+pub const Role = enum { load_ptr, store_ptr, gep_base, other };
 
 const Edge = @typeInfo(@FieldType(@FieldType(@FieldType(Inst, "op"), "phi"), "incoming")).pointer.child;
 
 /// Visits each operand of `inst` (with the way it is used) through
 /// `ctx.visit(value, role) Value`. With `write`, the results replace the
 /// operands, in newly allocated slices where the operands are slices.
-fn operands(comptime write: bool, a: Allocator, inst: *Inst, ctx: anytype) Allocator.Error!void {
+pub fn operands(comptime write: bool, a: Allocator, inst: *Inst, ctx: anytype) Allocator.Error!void {
     const S = struct {
         fn one(c: anytype, v: *Value, role: Role) void {
             const r = c.visit(v.*, role);
@@ -1088,6 +1088,7 @@ fn simplify(m: *module.Module, f: *const module.Function, repl: []const ?Value, 
             return null;
         },
         .binop => |b| {
+            if (try foldFloat(m, repl, inst)) |v| return v;
             const w = S.intWidth(m, inst.ty) orelse return null;
             const l = resolve(repl, b.lhs);
             const r = resolve(repl, b.rhs);
@@ -1127,6 +1128,10 @@ fn simplify(m: *module.Module, f: *const module.Function, repl: []const ?Value, 
                 .@"and" => if (S.bits(x, w) == S.bits(-1, w)) return r,
                 else => {},
             };
+            if (b.op == .@"and" and w <= 64) {
+                if (rc) |y| return andKnown(m, f, repl, n, l, S.bits(y, w), w, inst.ty);
+                if (lc) |x| return andKnown(m, f, repl, n, r, S.bits(x, w), w, inst.ty);
+            }
             return null;
         },
         .cmp => |c| {
@@ -1159,25 +1164,50 @@ fn simplify(m: *module.Module, f: *const module.Function, repl: []const ?Value, 
                 return try m.constant(.{ .ty = inst.ty, .kind = .{ .int = @intFromBool(t) } });
             }
             if (c.pred < 32 or c.pred > 41) return null; // integer predicates
-            const w = S.intWidth(m, S.ty(m, f, n, phi_var, var_ty, l)) orelse return null;
-            const x = S.bits(constInt(m, l) orelse return null, w);
-            const y = S.bits(constInt(m, r) orelse return null, w);
-            const sx = S.stored(x, w);
-            const sy = S.stored(y, w);
-            const t = switch (c.pred) {
-                32 => x == y,
-                33 => x != y,
-                34 => x > y,
-                35 => x >= y,
-                36 => x < y,
-                37 => x <= y,
-                38 => sx > sy,
-                39 => sx >= sy,
-                40 => sx < sy,
-                else => sx <= sy,
+            // A bool widened and compared again: `zext i1 x != 0` and
+            // `zext i1 x == 1` are x.
+            if (c.pred == 32 or c.pred == 33) if (l == .inst and l.inst < n) {
+                const z = f.insts.items[l.inst].op;
+                if (z == .cast and z.cast.op == .zext) {
+                    const x = resolve(repl, z.cast.val);
+                    if (S.intWidth(m, S.ty(m, f, n, phi_var, var_ty, x)) == 1) {
+                        if (constInt(m, r)) |k| {
+                            if ((c.pred == 33 and k == 0) or (c.pred == 32 and k == 1)) return x;
+                        }
+                    }
+                }
             };
-            return try m.constant(.{ .ty = inst.ty, .kind = .{ .int = @intFromBool(t) } });
+            const w = S.intWidth(m, S.ty(m, f, n, phi_var, var_ty, l)) orelse return null;
+            // Each side's possible values: a constant, or selects and phis
+            // of constants (`(c ? 2 : 1) == 3` is false, as dxc's
+            // instcombine finds); the same answer for every pair folds.
+            var lv: Cands = .{};
+            var rv: Cands = .{};
+            if (!lv.add(m, f, repl, n, l, 2) or !rv.add(m, f, repl, n, r, 2)) return null;
+            var result: ?bool = null;
+            for (lv.vals[0..lv.len]) |lk| for (rv.vals[0..rv.len]) |rk| {
+                const x = S.bits(lk, w);
+                const y = S.bits(rk, w);
+                const sx = S.stored(x, w);
+                const sy = S.stored(y, w);
+                const t = switch (c.pred) {
+                    32 => x == y,
+                    33 => x != y,
+                    34 => x > y,
+                    35 => x >= y,
+                    36 => x < y,
+                    37 => x <= y,
+                    38 => sx > sy,
+                    39 => sx >= sy,
+                    40 => sx < sy,
+                    else => sx <= sy,
+                };
+                if (result) |prev| if (prev != t) return null;
+                result = t;
+            };
+            return try m.constant(.{ .ty = inst.ty, .kind = .{ .int = @intFromBool(result orelse return null) } });
         },
+        .call => return foldDxOp(m, repl, inst),
         .select => |sl| {
             const t = resolve(repl, sl.t);
             const fv = resolve(repl, sl.f);
@@ -1248,6 +1278,240 @@ fn edgePhi(m: *module.Module, insts: []const Inst, block_start: []const u32, rep
     }
     if (!known) return null;
     return try m.constant(.{ .ty = inst.ty, .kind = .{ .int = same orelse return null } });
+}
+
+/// The integer constants a value can be: itself if constant, or each arm
+/// of a select or input of a phi that is (`depth` levels deep).
+const Cands = struct {
+    vals: [8]i64 = undefined,
+    len: usize = 0,
+
+    fn add(c: *Cands, m: *const module.Module, f: *const module.Function, repl: []const ?Value, n: u32, v: Value, depth: u32) bool {
+        const x = resolve(repl, v);
+        if (constInt(m, x)) |k| {
+            for (c.vals[0..c.len]) |e| if (e == k) return true;
+            if (c.len == c.vals.len) return false;
+            c.vals[c.len] = k;
+            c.len += 1;
+            return true;
+        }
+        if (x != .inst or x.inst >= n or depth == 0) return false;
+        switch (f.insts.items[x.inst].op) {
+            .select => |sl| return c.add(m, f, repl, n, sl.t, depth - 1) and c.add(m, f, repl, n, sl.f, depth - 1),
+            .phi => |p| {
+                for (p.incoming) |in| {
+                    const y = resolve(repl, in.val);
+                    if (y == .inst and y.inst == x.inst) continue;
+                    if (!c.add(m, f, repl, n, y, depth - 1)) return false;
+                }
+                return c.len > 0;
+            },
+            else => return false,
+        }
+    }
+};
+
+/// The bits of the `w`-bit integer `v` known to be zero, from what
+/// computes it (`depth` levels deep): constants, masks, shifts by
+/// constants, widening, and the bitwise operations and selects of such.
+fn knownZero(m: *const module.Module, f: *const module.Function, repl: []const ?Value, n: u32, v: Value, w: u32, depth: u32) u64 {
+    const mask: u64 = if (w >= 64) ~@as(u64, 0) else (@as(u64, 1) << @intCast(w)) - 1;
+    const x = resolve(repl, v);
+    if (constInt(m, x)) |k| return ~@as(u64, @bitCast(k)) & mask;
+    if (x != .inst or x.inst >= n or depth == 0) return 0;
+    const inst = f.insts.items[x.inst];
+    const d = depth - 1;
+    return mask & switch (inst.op) {
+        .binop => |b| switch (b.op) {
+            .@"and" => knownZero(m, f, repl, n, b.lhs, w, d) | knownZero(m, f, repl, n, b.rhs, w, d),
+            .@"or", .xor => knownZero(m, f, repl, n, b.lhs, w, d) & knownZero(m, f, repl, n, b.rhs, w, d),
+            .shl => blk: {
+                const k = constInt(m, resolve(repl, b.rhs)) orelse break :blk 0;
+                if (k < 0 or k >= w) break :blk 0;
+                const sh: u6 = @intCast(k);
+                break :blk (knownZero(m, f, repl, n, b.lhs, w, d) << sh) | ((@as(u64, 1) << sh) - 1);
+            },
+            .lshr => blk: {
+                const k = constInt(m, resolve(repl, b.rhs)) orelse break :blk 0;
+                if (k < 0 or k >= w) break :blk 0;
+                const sh: u6 = @intCast(k);
+                break :blk (knownZero(m, f, repl, n, b.lhs, w, d) >> sh) | ~(mask >> sh);
+            },
+            else => 0,
+        },
+        .cast => |c| switch (c.op) {
+            .zext => blk: {
+                // (A phi promotion made has no instruction to read its
+                // type from yet.)
+                const src = resolve(repl, c.val);
+                if (src == .inst and src.inst >= n) break :blk 0;
+                const from = switch (m.types.items[typeOf(m, f, src)]) {
+                    .int => |iw| iw,
+                    else => break :blk 0,
+                };
+                const from_mask: u64 = if (from >= 64) ~@as(u64, 0) else (@as(u64, 1) << @intCast(from)) - 1;
+                break :blk knownZero(m, f, repl, n, c.val, from, d) | ~from_mask;
+            },
+            else => 0,
+        },
+        .select => |sl| knownZero(m, f, repl, n, sl.t, w, d) & knownZero(m, f, repl, n, sl.f, w, d),
+        else => 0,
+    };
+}
+
+/// `x & c` (`w` bits) when known bits decide it, as dxc's instcombine
+/// does: 0 if every bit `c` keeps is known zero in `x`; `x` if every bit
+/// it clears already is; and through `a | b` where `b` only has bits `c`
+/// clears and `a` only bits it keeps, `a`. (Flags packed into one integer
+/// with other fields, then tested.)
+fn andKnown(m: *module.Module, f: *const module.Function, repl: []const ?Value, n: u32, x: Value, c: u64, w: u32, ty: TypeId) Allocator.Error!?Value {
+    const mask: u64 = if (w >= 64) ~@as(u64, 0) else (@as(u64, 1) << @intCast(w)) - 1;
+    const kz = knownZero(m, f, repl, n, x, w, 6);
+    if (c & ~kz & mask == 0) return try m.constant(.{ .ty = ty, .kind = .{ .int = 0 } });
+    if (~c & ~kz & mask == 0) return resolve(repl, x);
+    const xr = resolve(repl, x);
+    if (xr == .inst and xr.inst < n) {
+        const inst = f.insts.items[xr.inst];
+        if (inst.op == .binop and inst.op.binop.op == .@"or") {
+            const o = inst.op.binop;
+            const sides = [2][2]Value{ .{ o.lhs, o.rhs }, .{ o.rhs, o.lhs } };
+            for (sides) |ab| {
+                const kb = knownZero(m, f, repl, n, ab[1], w, 6);
+                const ka = knownZero(m, f, repl, n, ab[0], w, 6);
+                if (c & ~kb & mask == 0 and ~c & ~ka & mask == 0) return resolve(repl, ab[0]);
+            }
+        }
+    }
+    return null;
+}
+
+/// A half, float or double constant of type `ty` with value `x` (rounded
+/// to the type).
+fn floatConst(m: *module.Module, ty: TypeId, x: f64) Allocator.Error!?Value {
+    const b: u64 = switch (m.types.items[ty]) {
+        .half => @as(u16, @bitCast(@as(f16, @floatCast(x)))),
+        .float => @as(u32, @bitCast(@as(f32, @floatCast(x)))),
+        .double => @bitCast(x),
+        else => return null,
+    };
+    return try m.constant(.{ .ty = ty, .kind = .{ .float_bits = b } });
+}
+
+/// `x op y` in `T`'s precision.
+fn floatOp(comptime T: type, op: module.BinOp, x: f64, y: f64) ?f64 {
+    const a: T = @floatCast(x);
+    const c: T = @floatCast(y);
+    return @floatCast(switch (op) {
+        .add => a + c,
+        .sub => a - c,
+        .mul => a * c,
+        .sdiv => a / c,
+        .srem => if (c == 0 or std.math.isInf(a) or std.math.isNan(a) or std.math.isNan(c)) std.math.nan(T) else @rem(a, c),
+        else => return null,
+    });
+}
+
+/// Floating-point arithmetic on two constants, and the identities exact
+/// in IEEE arithmetic (`x * 1`, `x / 1`, `x - 0`, `x + -0`), as dxc's
+/// constant folding and instcombine fold them.
+fn foldFloat(m: *module.Module, repl: []const ?Value, inst: Inst) Allocator.Error!?Value {
+    const b = inst.op.binop;
+    const is_float = switch (m.types.items[inst.ty]) {
+        .half, .float, .double => true,
+        else => false,
+    };
+    if (!is_float) return null;
+    const l = resolve(repl, b.lhs);
+    const r = resolve(repl, b.rhs);
+    const lc = constFloat(m, l);
+    const rc = constFloat(m, r);
+    if (lc != null and rc != null) {
+        const x = switch (m.types.items[inst.ty]) {
+            .half => floatOp(f16, b.op, lc.?, rc.?),
+            .float => floatOp(f32, b.op, lc.?, rc.?),
+            else => floatOp(f64, b.op, lc.?, rc.?),
+        } orelse return null;
+        return floatConst(m, inst.ty, x);
+    }
+    if (rc) |y| {
+        const neg_zero = y == 0 and std.math.signbit(y);
+        switch (b.op) {
+            .mul, .sdiv => if (y == 1) return l,
+            .sub => if (y == 0 and !neg_zero) return l,
+            .add => if (neg_zero) return l,
+            else => {},
+        }
+    }
+    if (lc) |x| switch (b.op) {
+        .mul => if (x == 1) return r,
+        .add => if (x == 0 and std.math.signbit(x)) return r,
+        else => {},
+    };
+    return null;
+}
+
+/// A dx.op call on constants, folded as dxc folds them (the operations
+/// whose result does not depend on the GPU's precision, and the min / max
+/// family).
+fn foldDxOp(m: *module.Module, repl: []const ?Value, inst: Inst) Allocator.Error!?Value {
+    const c = inst.op.call;
+    if (!std.mem.startsWith(u8, m.functions.items[c.callee].name, "dx.op.")) return null;
+    if (c.args.len < 2) return null;
+    const opc = constInt(m, c.args[0]) orelse return null;
+    switch (opc) {
+        // FAbs, Saturate, Round_ne, Round_ni, Round_pi, Round_z, Sqrt
+        6, 7, 24, 26, 27, 28, 29 => {
+            if (c.args.len != 2) return null;
+            const x = constFloat(m, resolve(repl, c.args[1])) orelse return null;
+            if (std.math.isNan(x)) return null;
+            const y: f64 = switch (opc) {
+                6 => @abs(x),
+                7 => @min(@max(x, 0), 1),
+                24 => if (x < 0) return null else switch (m.types.items[inst.ty]) {
+                    .half => @floatCast(@sqrt(@as(f16, @floatCast(x)))),
+                    .float => @floatCast(@sqrt(@as(f32, @floatCast(x)))),
+                    else => @sqrt(x),
+                },
+                // (Halves to even.)
+                26 => if (@abs(x - @trunc(x)) == 0.5) 2 * @round(x / 2) else @round(x),
+                27 => @floor(x),
+                28 => @ceil(x),
+                else => @trunc(x),
+            };
+            return floatConst(m, inst.ty, y);
+        },
+        // FMax, FMin
+        35, 36 => {
+            if (c.args.len != 3) return null;
+            const x = constFloat(m, resolve(repl, c.args[1])) orelse return null;
+            const y = constFloat(m, resolve(repl, c.args[2])) orelse return null;
+            if (std.math.isNan(x) or std.math.isNan(y)) return null;
+            return floatConst(m, inst.ty, if (opc == 35) @max(x, y) else @min(x, y));
+        },
+        // IMax, IMin, UMax, UMin
+        37, 38, 39, 40 => {
+            if (c.args.len != 3) return null;
+            const w: u32 = switch (m.types.items[inst.ty]) {
+                .int => |iw| iw,
+                else => return null,
+            };
+            const x = constInt(m, resolve(repl, c.args[1])) orelse return null;
+            const y = constInt(m, resolve(repl, c.args[2])) orelse return null;
+            // (Constants hold their value sign-extended: unsigned order is
+            // that of the w-bit patterns.)
+            const mask: u64 = if (w >= 64) ~@as(u64, 0) else (@as(u64, 1) << @intCast(w)) - 1;
+            const ux = @as(u64, @bitCast(x)) & mask;
+            const uy = @as(u64, @bitCast(y)) & mask;
+            const pick_x = switch (opc) {
+                37 => x >= y,
+                38 => x <= y,
+                39 => ux >= uy,
+                else => ux <= uy,
+            };
+            return if (pick_x) resolve(repl, c.args[1]) else resolve(repl, c.args[2]);
+        },
+        else => return null,
+    }
 }
 
 /// A half, float or double constant's value.

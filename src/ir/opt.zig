@@ -181,7 +181,7 @@ fn mapRefs(a: Allocator, xs: []const Ref, ctx: anytype) Allocator.Error![]const 
 /// `op` with every operand passed through `ctx.map`.
 pub fn mapOp(a: Allocator, op: Op, ctx: anytype) Allocator.Error!Op {
     return switch (op) {
-        .constant, .param, .global, .local_var, .input, .input_vertex, .emit, .cut, .patch_input, .output_vertex, .mesh_output, .mesh_payload, .ray_incoming, .spec_constant, .undef => op,
+        .constant, .param, .global, .local_var, .input, .input_vertex, .emit, .cut, .patch_input, .output_vertex, .mesh_output, .mesh_payload, .ray_incoming, .spec_constant, .undef, .node_io => op,
         .load => |p| .{ .load = ctx.map(p) },
         .store => |x| .{ .store = .{ .ptr = ctx.map(x.ptr), .value = ctx.map(x.value) } },
         .access => |x| .{ .access = .{ .base = ctx.map(x.base), .indices = try mapRefs(a, x.indices, ctx) } },
@@ -207,7 +207,7 @@ pub fn mapOp(a: Allocator, op: Op, ctx: anytype) Allocator.Error!Op {
             const ops = try a.dupe(@typeInfo(@TypeOf(x.operands)).pointer.child, x.operands);
             for (ops) |*o| switch (o.*) {
                 .value => |*v| v.* = ctx.map(v.*),
-                .literal, .type => {},
+                .literal, .type, .string => {},
             };
             const n = try a.create(ir.SpirvInst);
             n.* = x.*;
@@ -227,7 +227,7 @@ pub fn mapOp(a: Allocator, op: Op, ctx: anytype) Allocator.Error!Op {
 /// allocating.
 pub fn eachOperand(op: Op, ctx: anytype) void {
     switch (op) {
-        .constant, .param, .global, .local_var, .input, .input_vertex, .emit, .cut, .patch_input, .output_vertex, .mesh_output, .mesh_payload, .ray_incoming, .spec_constant, .undef => {},
+        .constant, .param, .global, .local_var, .input, .input_vertex, .emit, .cut, .patch_input, .output_vertex, .mesh_output, .mesh_payload, .ray_incoming, .spec_constant, .undef, .node_io => {},
         .load => |p| ctx.use(p),
         .store => |x| {
             ctx.use(x.ptr);
@@ -278,7 +278,7 @@ pub fn eachOperand(op: Op, ctx: anytype) void {
         .heap_resource => |h| ctx.use(h.index),
         .spirv_inst => |x| for (x.operands) |o| switch (o) {
             .value => |v| ctx.use(v),
-            .literal, .type => {},
+            .literal, .type, .string => {},
         },
         .patch_output => |x| ctx.use(x.value),
         .phi => |ps| for (ps) |pp| ctx.use(pp.value),

@@ -28,6 +28,8 @@ const promote = @import("promote.zig");
 const unroll = @import("unroll.zig");
 const stats = @import("../stats.zig");
 const sccp = @import("sccp.zig");
+const cfg = @import("cfg.zig");
+const cse = @import("cse.zig");
 const opt = @import("../ir/opt.zig");
 
 const TypeId = types.TypeId;
@@ -53,9 +55,18 @@ pub fn emit(gpa: Allocator, m: *const ir.Module, profile: shader.Profile, diags:
 pub const Output = struct { object: []u8, reflection: []u8 };
 
 pub fn emitWithReflection(gpa: Allocator, m: *const ir.Module, profile: shader.Profile, diags: *diag.Diagnostics, optimize: bool) Error!Output {
+    return emitWithReflectionAt(gpa, m, profile, diags, if (optimize) .full else .none);
+}
+
+/// How much `emitWithReflectionAt` optimizes: nothing (-zdxc-no-opt), as
+/// dxc's -Od does (locals promoted to SSA values and what that leaves
+/// dead removed, nothing else), or fully.
+pub const Optimize = enum { none, debug, full };
+
+pub fn emitWithReflectionAt(gpa: Allocator, m: *const ir.Module, profile: shader.Profile, diags: *diag.Diagnostics, level: Optimize) Error!Output {
     var arena_state: BumpArena = .init(gpa);
     defer arena_state.deinit();
-    var e: Emitter = .{ .arena = arena_state.allocator(), .dm = .init(gpa), .m = m, .t = m.types, .profile = profile, .diags = diags, .optimize = optimize };
+    var e: Emitter = .{ .arena = arena_state.allocator(), .dm = .init(gpa), .m = m, .t = m.types, .profile = profile, .diags = diags, .optimize = level == .full, .promote_only = level == .debug };
     defer e.dm.deinit();
     // Native 16-bit types are laid out at their own size.
     if (m.native_16bit) e.dm.datalayout = "e-m:e-p:32:32-i1:32-i8:8-i16:16-i32:32-i64:64-f16:16-f32:32-f64:64-n8:16:32:64";
@@ -89,6 +100,8 @@ const Lowered = union(enum) {
     /// A local assigned different elements of one resource array (index
     /// into Emitter.res_index_locals): it holds the element's index.
     res_index_local: u32,
+    /// A work graph node input or output, or a node's records.
+    node: NodeVal,
     /// A RayQuery local (index into Emitter.rq_locals) and a query handle.
     rq_local: u32,
     ray_query: Value,
@@ -120,6 +133,11 @@ const Lowered = union(enum) {
         mat: ?struct { ty: TypeId, row: Value, col: ?u32 = null } = null,
     },
 };
+
+/// A node object: its handle (%dx.types.NodeHandle for outputs,
+/// %dx.types.NodeRecordHandle for records), annotated with `flags`
+/// (NodeIOFlags) and the record's size.
+const NodeVal = struct { kind: types.NodeKind, handle: Value, record: TypeId, flags: u32, size: u32 };
 
 /// Pointer into a flattened local: alloca `base` of `[n x scalar]`, at
 /// component `offset_const` (+ `offset_dyn` if dynamic).
@@ -330,6 +348,8 @@ const Emitter = struct {
     dyn_ranges: std.AutoHashMapUnmanaged(u32, [2]u32) = .empty,
     /// See `emit`.
     optimize: bool = true,
+    /// -Od: only promotion runs on the finished functions.
+    promote_only: bool = false,
     /// Arrays of inlined callees that have returned, by type, for later
     /// callees' locals of that type (per function).
     array_pool: std.AutoHashMapUnmanaged(TypeId, std.ArrayList(Ptr)) = .empty,
@@ -727,6 +747,8 @@ const Emitter = struct {
         /// Graphics entries: signatures; entry properties of the stage.
         sigs: ?module.MdId = null,
         stage_props: []const ?module.MdId = &.{},
+        /// Groupshared memory the entry uses (bytes).
+        groupshared: u32 = 0,
     };
 
     /// Input qualifier (0 in, 1 out, 2 inout), component type and
@@ -750,6 +772,7 @@ const Emitter = struct {
             .callable => 12,
             .mesh => 13,
             .amplification => 14,
+            .node => 15,
         };
     }
 
@@ -779,7 +802,7 @@ const Emitter = struct {
         var units: std.ArrayList(Unit) = .empty;
         for (m.entries.items, 0..) |entry, k| {
             switch (entry.stage) {
-                .compute, .raygeneration, .intersection, .anyhit, .closesthit, .miss, .callable, .vertex, .pixel, .geometry, .hull, .domain, .mesh, .amplification => {},
+                .compute, .raygeneration, .intersection, .anyhit, .closesthit, .miss, .callable, .vertex, .pixel, .geometry, .hull, .domain, .mesh, .amplification, .node => {},
                 else => return e.unsupported("{s} shaders in libraries are not supported yet", .{@tagName(entry.stage)}),
             }
             try units.append(e.arena, .{ .order = m.functions.items[entry.func].decl_order, .kind = .entry, .index = @intCast(k) });
@@ -855,6 +878,7 @@ const Emitter = struct {
             try e.libHandles();
             _ = try e.inlineCall(entry.wrapper, &.{});
             try e.finish(lf.func);
+            lf.groupshared = e.groupshared_bytes;
             var pc_func: ?LibFunc = null;
             if (entry.patch_wrapper) |pw| {
                 // The patch constant function: a function of its own.
@@ -1390,7 +1414,7 @@ const Emitter = struct {
         switch (e.entry.stage) {
             // (Library functions record the use; their callers decide.)
             .pixel, .library => {},
-            .compute, .mesh, .amplification => if (e.profile.minor < 6) return e.unsupported("derivatives outside pixel shaders need shader model 6.6", .{}),
+            .compute, .mesh, .amplification, .node => if (e.profile.minor < 6) return e.unsupported("derivatives outside pixel shaders need shader model 6.6", .{}),
             else => return e.unsupported("derivatives are not available in {s} shaders", .{@tagName(e.entry.stage)}),
         }
         if (e.entry.stage == .mesh or e.entry.stage == .amplification) e.uses_mesh_derivatives = true;
@@ -1542,6 +1566,17 @@ const Emitter = struct {
                 try promote.run(e.arena, &e.dm, func, &.empty);
                 if (e.dm.functions.items[func].insts.items.len == before) break;
             }
+            // Repeated computations, then blocks that only branch on:
+            // merged, bypassed, and if-converted.
+            // (What that leaves dead, or folds, and the blocks that leaves
+            // empty: again, until nothing changes.)
+            _ = try cse.run(e.arena, &e.dm, func);
+            var passes: u32 = 0;
+            while (passes < 3 and try cfg.run(e.arena, &e.dm, func)) : (passes += 1) {
+                try promote.run(e.arena, &e.dm, func, &.empty);
+            }
+        } else if (e.promote_only) {
+            try promote.run(e.arena, &e.dm, func, &ranges);
         }
     }
 
@@ -2136,7 +2171,16 @@ const Emitter = struct {
                     _ = try e.add(void_ty, .{ .br = .{ .then = cont } });
                 } else _ = try e.add(void_ty, .{ .ret = null });
             },
-            .br => |t| _ = try e.add(void_ty, .{ .br = .{ .then = try e.blockFor(frame, t.index()) } }),
+            .br => |t| {
+                const br = try e.add(void_ty, .{ .br = .{ .then = try e.blockFor(frame, t.index()) } });
+                // An `[unroll]` loop's back edge: marked for the unroller.
+                switch (f.blocks.items[t.index()].merge) {
+                    .loop => |l| if (l.unroll == .unroll and l.@"continue".index() == bi) {
+                        e.insts.at(br.inst).md = .unroll;
+                    },
+                    else => {},
+                }
+            },
             .cond_br => |c| {
                 const cond = (try e.scalars(frame, c.cond))[0];
                 if (frame.taken.len > 0) if (e.constIntOf(cond)) |k| {
@@ -2233,6 +2277,7 @@ const Emitter = struct {
             .constant => |c| return e.list(&.{try e.constant(i.ty, c)}),
             .param => |p| return frame.params[p],
             .spec_constant => return e.unsupported("specialization constants outside SPIR-V", .{}),
+            .node_io => |x| return e.nodeIo(x),
             .spirv_inst => return e.unsupported("inline SPIR-V outside SPIR-V", .{}),
             .ray_incoming => |k| {
                 // The shader's payload / attribute / parameter argument.
@@ -2472,10 +2517,12 @@ const Emitter = struct {
                 if (frame.vals[s.ptr.index()] == .res_local) {
                     const slot = &e.res_locals.items[frame.vals[s.ptr.index()].res_local];
                     const h = frame.vals[s.value.index()];
-                    if (h != .handle and h != .res_array) return e.unsupported("resources not tied to a global are not supported yet", .{});
+                    if (h != .handle and h != .res_array and h != .node) return e.unsupported("resources not tied to a global are not supported yet", .{});
                     // Selecting between resources at run time has no
                     // handle-based lowering here; one assignment is fine.
-                    if (slot.*) |old| if (!std.meta.eql(old, h)) return e.unsupported("assigning different resources to one variable is not supported yet (in '{s}')", .{frame.f.name});
+                    // (Node objects: again, where every assignment is in
+                    // one block.)
+                    if (slot.*) |old| if (!std.meta.eql(old, h) and !(h == .node and storesInOneBlock(f, s.ptr))) return e.unsupported("assigning different resources to one variable is not supported yet (in '{s}')", .{frame.f.name});
                     slot.* = h;
                     return .none;
                 }
@@ -2515,6 +2562,17 @@ const Emitter = struct {
             },
             .access => |a| {
                 if (frame.vals[a.base.index()] == .mesh) return e.meshAccess(frame, frame.vals[a.base.index()].mesh, a.indices);
+                if (frame.vals[a.base.index()] == .node) {
+                    const nv = frame.vals[a.base.index()].node;
+                    const idx = (try e.scalars(frame, a.indices[0]))[0];
+                    if (nv.kind.outputElement()) |k| {
+                        if (a.indices.len > 1) return e.unsupported("indexing a node output", .{});
+                        return .{ .node = try e.nodeIndex(nv, k, idx) };
+                    }
+                    const tp = try e.nodeRecordPtr(nv, idx);
+                    if (a.indices.len == 1) return .{ .typed = tp };
+                    return .{ .typed = try e.typedAccess(frame, tp, a.indices[1..]) };
+                }
                 if (frame.vals[a.base.index()] == .typed) {
                     var tp = frame.vals[a.base.index()].typed;
                     var path: std.ArrayList(Value) = .empty;
@@ -2798,6 +2856,7 @@ const Emitter = struct {
     fn resCount(e: *Emitter, ty: TypeId) u32 {
         return switch (e.t.get(ty)) {
             .resource, .sampler => if (isRayQuery(e.t, ty)) 0 else 1,
+            .node => 1,
             .array => |a| a.len * e.resCount(a.elem),
             .@"struct" => |st| blk: {
                 var n: u32 = 0;
@@ -2844,7 +2903,7 @@ const Emitter = struct {
         return switch (v) {
             .agg => |a| a,
             .scalars => |vals| if (e.resCount(ty) == 0) .{ .vals = vals, .res = &.{} } else e.unsupported("this value with resources is not supported yet", .{}),
-            .handle, .res_array => .{ .vals = &.{}, .res = try e.arena.dupe(Lowered, &.{v}) },
+            .handle, .res_array, .node => .{ .vals = &.{}, .res = try e.arena.dupe(Lowered, &.{v}) },
             .none => .{ .vals = &.{}, .res = &.{} },
             else => e.unsupported("this value with resources is not supported yet", .{}),
         };
@@ -3274,6 +3333,34 @@ const Emitter = struct {
             _ = try e.callOp(fn_i, try e.voidTy(), &.{ try e.i32Const(168), (try e.scalars(frame, args[0]))[0], (try e.scalars(frame, args[1]))[0] });
             return .none;
         }
+        // SM 6.8's Barrier(memory types or a UAV, semantics): the
+        // arguments as they are (as dxc).
+        if (eq(u8, name, "GetRemainingRecursionLevels") and args.len == 0) {
+            const i32t = try e.dm.intType(32);
+            const fn_i = try e.dxOp("dx.op.getRemainingRecursionLevels", i32t, &.{i32t}, .nounwind_readonly);
+            return e.list(&.{try e.callOp(fn_i, i32t, &.{try e.i32Const(253)})});
+        }
+        if (eq(u8, name, "Barrier") and args.len == 2) {
+            const i32t = try e.dm.intType(32);
+            const sem = (try e.scalars(frame, args[1]))[0];
+            switch (frame.vals[args[0].index()]) {
+                .handle => |h| {
+                    const fn_i = try e.dxOp("dx.op.barrierByMemoryHandle", try e.voidTy(), &.{ i32t, e.handle_ty, i32t }, .noduplicate_nounwind);
+                    _ = try e.callOp(fn_i, try e.voidTy(), &.{ try e.i32Const(245), e.resources.items[h].handle, sem });
+                },
+                .scalars => |m| {
+                    const fn_i = try e.dxOp("dx.op.barrierByMemoryType", try e.voidTy(), &.{ i32t, i32t, i32t }, .noduplicate_nounwind);
+                    _ = try e.callOp(fn_i, try e.voidTy(), &.{ try e.i32Const(244), m[0], sem });
+                },
+                .node => |nv| {
+                    const nt = try e.nodeTypes();
+                    const fn_i = try e.dxOp("dx.op.barrierByNodeRecordHandle", try e.voidTy(), &.{ i32t, nt.record_handle, i32t }, .noduplicate_nounwind);
+                    _ = try e.callOp(fn_i, try e.voidTy(), &.{ try e.i32Const(246), nv.handle, sem });
+                },
+                else => return e.unsupported("Barrier on this object is not supported yet", .{}),
+            }
+            return .none;
+        }
         for (args) |x| if (frame.vals[x.index()] != .scalars) return e.unsupported("intrinsic '{s}' is not supported yet", .{name});
         var a: [4][]const Value = undefined;
         for (args, 0..) |x, k| a[k] = try e.scalars(frame, x);
@@ -3638,23 +3725,37 @@ const Emitter = struct {
     }
 
     /// Interlocked*(dest, value(s) [, out original]) on groupshared memory,
-    /// buffer elements and texels.
+    /// node records, buffer elements and texels. (The *FloatBitwise
+    /// compares: on the floats' bits.)
     fn atomic(e: *Emitter, frame: *Frame, name: []const u8, args: []const Ref) Error!Lowered {
         const eq = std.mem.eql;
         const op_name = name["Interlocked".len..];
         const dest_ty = frame.f.inst(args[0]).ty;
-        const dc = e.compOf(dest_ty);
+        const float_bits = std.mem.endsWith(u8, op_name, "FloatBitwise");
+        const dc: Scalar = if (float_bits and e.compOf(dest_ty) == .float) .uint else e.compOf(dest_ty);
         const wide = dc.size() == 8 and !dc.isFloat() and (frame.vals[args[0].index()] == .buf or frame.vals[args[0].index()] == .texel);
         if ((dc.size() != 4 and !wide) or dc.isFloat()) return e.unsupported("'{s}' on '{s}' is not supported yet", .{ name, try e.t.format(e.arena, dest_ty) });
         const i32t = try e.dm.intType(32);
         const is_cmp = std.mem.startsWith(u8, op_name, "Compare");
-        const has_orig = (is_cmp and eq(u8, op_name, "CompareExchange")) or (!is_cmp and args.len == 3);
-        const val = (try e.scalars(frame, args[if (is_cmp) 2 else 1]))[0];
-        const cmp = if (is_cmp) (try e.scalars(frame, args[1]))[0] else null;
+        const has_orig = (is_cmp and std.mem.startsWith(u8, op_name, "CompareExchange")) or (!is_cmp and args.len == 3);
+        const val = try e.atomicOperand(float_bits, (try e.scalars(frame, args[if (is_cmp) 2 else 1]))[0]);
+        const cmp = if (is_cmp) try e.atomicOperand(float_bits, (try e.scalars(frame, args[1]))[0]) else null;
         const orig: Value = switch (frame.vals[args[0].index()]) {
-            .ptr => |p| blk: {
-                if (p.addr_space != 3) return e.unsupported("'{s}' on this variable is not supported yet", .{name});
-                const ptr = try e.elementPtr(p, 0);
+            .ptr, .typed => blk: {
+                const tag = std.meta.activeTag(frame.vals[args[0].index()]);
+                var ptr = if (tag == .ptr) p: {
+                    const p = frame.vals[args[0].index()].ptr;
+                    if (p.addr_space != 3) return e.unsupported("'{s}' on this variable is not supported yet", .{name});
+                    break :p try e.elementPtr(p, 0);
+                } else p: {
+                    const tp = frame.vals[args[0].index()].typed;
+                    if (tp.addr_space != 6) return e.unsupported("'{s}' on this variable is not supported yet", .{name});
+                    break :p try e.typedScalarPtr(tp, &.{}, try e.scalarTy(memScalar(e.compOf(dest_ty))));
+                };
+                if (float_bits) {
+                    const as: u32 = if (tag == .ptr) 3 else 6;
+                    ptr = try e.add(try e.dm.getType(.{ .pointer = .{ .elem = i32t, .addr_space = as } }), .{ .cast = .{ .op = .bitcast, .val = ptr } });
+                }
                 if (cmp) |cv| {
                     const pair = try e.dm.getType(.{ .@"struct" = .{ .name = "", .elems = &.{ i32t, try e.dm.intType(1) } } });
                     const r = try e.add(pair, .{ .cmpxchg = .{ .ptr = ptr, .cmp = cv, .new = val } });
@@ -3679,8 +3780,23 @@ const Emitter = struct {
             },
             else => return e.unsupported("'{s}' on this destination is not supported yet", .{name}),
         };
-        if (has_orig) try e.storePtr(try e.outPtr(frame, args[args.len - 1]), &.{orig}, frame.f.inst(args[args.len - 1]).ty);
+        const out_ty = frame.f.inst(args[args.len - 1]).ty;
+        const orig_val = if (float_bits and e.compOf(out_ty) == .float) try e.add(try e.dm.getType(.float), .{ .cast = .{ .op = .bitcast, .val = orig } }) else orig;
+        if (has_orig) try e.storePtr(try e.outPtr(frame, args[args.len - 1]), &.{orig_val}, out_ty);
         return .none;
+    }
+
+    /// An atomic's value: a float's bits for the *FloatBitwise compares
+    /// (constants folded).
+    fn atomicOperand(e: *Emitter, float_bits: bool, v: Value) Error!Value {
+        if (!float_bits) return v;
+        const i32t = try e.dm.intType(32);
+        if (v == .constant) switch (e.dm.constants.items[v.constant].kind) {
+            .float_bits => |b| return e.i32Const(@as(i32, @bitCast(@as(u32, @truncate(b))))),
+            else => {},
+        };
+        if (e.dm.types.items[try e.valueType(v)] != .float) return v;
+        return e.add(i32t, .{ .cast = .{ .op = .bitcast, .val = v } });
     }
 
     /// dx.op.atomicBinOp / atomicCompareExchange at `coords` (padded with
@@ -4385,6 +4501,7 @@ const Emitter = struct {
     }
 
     fn method(e: *Emitter, frame: *Frame, name: []const u8, res_ref: Ref, arg_refs: []const Ref, ty: TypeId) Error!Lowered {
+        if (frame.vals[res_ref.index()] == .node) return e.nodeMethod(frame, frame.vals[res_ref.index()].node, name, arg_refs);
         if (frame.vals[res_ref.index()] == .ray_query) return e.rayQueryMethod(frame, frame.vals[res_ref.index()].ray_query, name, arg_refs, ty);
         const res = try e.resourceOf(frame, res_ref);
         const kind = e.resourceKind(res.*);
@@ -5343,7 +5460,7 @@ const Emitter = struct {
 
     fn inputAt(e: *Emitter, k: u32, ty: TypeId, vertex: ?u32) Error!Lowered {
         const entry = e.entry;
-        if (entry.stage == .compute or entry.stage == .mesh or entry.stage == .amplification) return e.computeInput(k, ty);
+        if (entry.stage == .compute or entry.stage == .mesh or entry.stage == .amplification or entry.stage == .node) return e.computeInput(k, ty);
         const el = entry.inputs.items[k];
         const se = if (e.in_elem[k]) |ei| &e.sig_in[ei] else return e.systemValueInput(el.semantic, ty);
         if (se.interpretation == .shadow) return e.systemValueInput(el.semantic, ty);
@@ -5783,6 +5900,252 @@ const Emitter = struct {
         }
     }
 
+    // ---- Work graph nodes ------------------------------------------------
+
+    const NodeTypes = struct { handle: DType, record_handle: DType, info: DType, record_info: DType };
+
+    fn nodeTypes(e: *Emitter) Error!NodeTypes {
+        const i8p = try e.dm.ptrType(try e.dm.intType(8));
+        const i32t = try e.dm.intType(32);
+        return .{
+            .handle = try e.dm.getType(.{ .@"struct" = .{ .name = "dx.types.NodeHandle", .elems = &.{i8p} } }),
+            .record_handle = try e.dm.getType(.{ .@"struct" = .{ .name = "dx.types.NodeRecordHandle", .elems = &.{i8p} } }),
+            .info = try e.dm.getType(.{ .@"struct" = .{ .name = "dx.types.NodeInfo", .elems = &.{ i32t, i32t } } }),
+            .record_info = try e.dm.getType(.{ .@"struct" = .{ .name = "dx.types.NodeRecordInfo", .elems = &.{ i32t, i32t } } }),
+        };
+    }
+
+    /// A record type's size and alignment (0, 0 for empty inputs and
+    /// outputs).
+    fn recordLayout(e: *Emitter, record: TypeId) Error![2]u32 {
+        if (record == TypeTable.void_type) return .{ 0, 0 };
+        return e.memLayout(record);
+    }
+
+    /// annotateNodeHandle / annotateNodeRecordHandle of `raw`.
+    fn annotateNode(e: *Emitter, nv: NodeVal, raw: Value) Error!Value {
+        const nt = try e.nodeTypes();
+        const i32t = try e.dm.intType(32);
+        // (Inputs, empty ones too, and output records: record handles.)
+        const outputs = !nv.kind.isInput() and !nv.kind.hasRecords();
+        const info_ty = if (outputs) nt.info else nt.record_info;
+        const hty = if (outputs) nt.handle else nt.record_handle;
+        const f0 = try e.dm.constant(.{ .ty = i32t, .kind = .{ .int = nv.flags } });
+        const f1 = try e.dm.constant(.{ .ty = i32t, .kind = .{ .int = nv.size } });
+        const props = try e.dm.constant(.{ .ty = info_ty, .kind = .{ .aggregate = try e.arena.dupe(module.ConstId, &.{ f0.constant, f1.constant }) } });
+        const fn_i = if (outputs)
+            try e.dxOp("dx.op.annotateNodeHandle", hty, &.{ i32t, hty, info_ty }, .nounwind_readnone)
+        else
+            try e.dxOp("dx.op.annotateNodeRecordHandle", hty, &.{ i32t, hty, info_ty }, .nounwind_readnone);
+        return e.callOp(fn_i, hty, &.{ try e.i32Const(if (outputs) 249 else 251), raw, props });
+    }
+
+    /// The node shader's input or output `x.index`: its handle, created
+    /// and annotated.
+    fn nodeIo(e: *Emitter, x: @FieldType(ir.Op, "node_io")) Error!Lowered {
+        const info = e.entry.node orelse return e.unsupported("node objects outside node shaders", .{});
+        const io = if (x.output) info.outputs[x.index] else info.inputs[x.index];
+        const nt = try e.nodeTypes();
+        const i32t = try e.dm.intType(32);
+        var nv: NodeVal = .{ .kind = io.kind, .handle = undefined, .record = io.record, .flags = io.kind.ioFlags() | io.extra_flags, .size = (try e.recordLayout(io.record))[0] };
+        const raw = if (x.output)
+            try e.callOp(try e.dxOp("dx.op.createNodeOutputHandle", nt.handle, &.{ i32t, i32t }, .nounwind_readnone), nt.handle, &.{ try e.i32Const(247), try e.i32Const(x.index) })
+        else
+            try e.callOp(try e.dxOp("dx.op.createNodeInputRecordHandle", nt.record_handle, &.{ i32t, i32t }, .nounwind_readnone), nt.record_handle, &.{ try e.i32Const(250), try e.i32Const(x.index) });
+        nv.handle = try e.annotateNode(nv, raw);
+        return .{ .node = nv };
+    }
+
+    /// Output `idx` of an outputs array (annotated as the array).
+    fn nodeIndex(e: *Emitter, nv: NodeVal, kind: types.NodeKind, idx: Value) Error!NodeVal {
+        const nt = try e.nodeTypes();
+        const i32t = try e.dm.intType(32);
+        const fn_i = try e.dxOp("dx.op.indexNodeHandle", nt.handle, &.{ i32t, nt.handle, i32t }, .nounwind_readnone);
+        const raw = try e.callOp(fn_i, nt.handle, &.{ try e.i32Const(248), nv.handle, idx });
+        var out = nv;
+        out.handle = try e.annotateNode(nv, raw);
+        out.kind = kind;
+        return out;
+    }
+
+    /// Record `idx` of a node object, in node record memory.
+    fn nodeRecordPtr(e: *Emitter, nv: NodeVal, idx: Value) Error!@FieldType(Lowered, "typed") {
+        if (nv.record == TypeTable.void_type) return e.unsupported("records of an empty node input or output", .{});
+        const nt = try e.nodeTypes();
+        const i32t = try e.dm.intType(32);
+        const dty = try e.memoryType(nv.record);
+        const sname = switch (e.dm.types.items[dty]) {
+            .@"struct" => |st| st.name,
+            else => return e.unsupported("node records of type '{s}'", .{try e.t.format(e.arena, nv.record)}),
+        };
+        const pty = try e.dm.getType(.{ .pointer = .{ .elem = dty, .addr_space = 6 } });
+        const fn_i = try e.dxOp(try std.fmt.allocPrint(e.arena, "dx.op.getNodeRecordPtr.{s}", .{sname}), pty, &.{ i32t, nt.record_handle, i32t }, .nounwind_readnone);
+        const base = try e.callOp(fn_i, pty, &.{ try e.i32Const(239), nv.handle, idx });
+        return .{ .base = base, .dty = dty, .addr_space = 6, .ty = nv.record };
+    }
+
+    /// Methods of node objects.
+    fn nodeMethod(e: *Emitter, frame: *Frame, nv: NodeVal, name: []const u8, arg_refs: []const Ref) Error!Lowered {
+        const eq = std.mem.eql;
+        const nt = try e.nodeTypes();
+        const i32t = try e.dm.intType(32);
+        const i1t = try e.dm.intType(1);
+        const void_ty = try e.voidTy();
+        if (eq(u8, name, "IsValid")) {
+            const fn_i = try e.dxOp("dx.op.nodeOutputIsValid", i1t, &.{ i32t, nt.handle }, .nounwind_readonly);
+            return e.list(&.{try e.callOp(fn_i, i1t, &.{ try e.i32Const(252), nv.handle })});
+        }
+        if (eq(u8, name, "GetThreadNodeOutputRecords") or eq(u8, name, "GetGroupNodeOutputRecords")) {
+            const per_thread = eq(u8, name, "GetThreadNodeOutputRecords");
+            const n = (try e.scalars(frame, arg_refs[0]))[0];
+            const fn_i = try e.dxOp("dx.op.allocateNodeOutputRecords", nt.record_handle, &.{ i32t, nt.handle, i32t, i1t }, .nounwind);
+            const pt = try e.dm.constant(.{ .ty = i1t, .kind = .{ .int = @intFromBool(per_thread) } });
+            const raw = try e.callOp(fn_i, nt.record_handle, &.{ try e.i32Const(238), nv.handle, n, pt });
+            const kind: types.NodeKind = if (per_thread) .thread_output_records else .group_output_records;
+            var out: NodeVal = .{ .kind = kind, .handle = undefined, .record = nv.record, .flags = kind.ioFlags(), .size = nv.size };
+            out.handle = try e.annotateNode(out, raw);
+            return .{ .node = out };
+        }
+        if (eq(u8, name, "GroupIncrementOutputCount") or eq(u8, name, "ThreadIncrementOutputCount")) {
+            const n = (try e.scalars(frame, arg_refs[0]))[0];
+            const fn_i = try e.dxOp("dx.op.incrementOutputCount", void_ty, &.{ i32t, nt.handle, i32t, i1t }, .nounwind);
+            const pt = try e.dm.constant(.{ .ty = i1t, .kind = .{ .int = @intFromBool(eq(u8, name, "ThreadIncrementOutputCount")) } });
+            _ = try e.callOp(fn_i, void_ty, &.{ try e.i32Const(240), nv.handle, n, pt });
+            return .none;
+        }
+        if (eq(u8, name, "OutputComplete")) {
+            const fn_i = try e.dxOp("dx.op.outputComplete", void_ty, &.{ i32t, nt.record_handle }, .nounwind);
+            _ = try e.callOp(fn_i, void_ty, &.{ try e.i32Const(241), nv.handle });
+            return .none;
+        }
+        if (eq(u8, name, "Count")) {
+            const fn_i = try e.dxOp("dx.op.getInputRecordCount", i32t, &.{ i32t, nt.record_handle }, .nounwind_readonly);
+            return e.list(&.{try e.callOp(fn_i, i32t, &.{ try e.i32Const(242), nv.handle })});
+        }
+        if (eq(u8, name, "FinishedCrossGroupSharing")) {
+            const fn_i = try e.dxOp("dx.op.finishedCrossGroupSharing", i1t, &.{ i32t, nt.record_handle }, .nounwind);
+            return e.list(&.{try e.callOp(fn_i, i1t, &.{ try e.i32Const(243), nv.handle })});
+        }
+        return e.unsupported("node method '{s}' is not supported yet", .{name});
+    }
+
+    /// A node shader's entry properties (before its thread group size),
+    /// in dxc's order.
+    fn nodeProps(e: *Emitter, entry: ir.Entry, n: ir.NodeInfo, props: *std.ArrayList(?module.MdId)) Error!void {
+        const dm = &e.dm;
+        const I = struct {
+            fn f(m: *module.Module, v: i64) !?module.MdId {
+                return try m.mdI32(v);
+            }
+        }.f;
+        const i1t = try dm.intType(1);
+        const mdTrue = try dm.mdValue(i1t, try dm.constant(.{ .ty = i1t, .kind = .{ .int = 1 } }));
+        try props.appendSlice(e.arena, &.{ try I(dm, 13), try I(dm, @backingInt(n.launch)) });
+        if (entry.wave_size[0] != 0) {
+            const ws = entry.wave_size;
+            if (e.profile.minor >= 8) {
+                try props.appendSlice(e.arena, &.{ try I(dm, 23), try dm.mdNode(&.{ try I(dm, ws[0]), try I(dm, ws[1]), try I(dm, ws[2]) }) });
+            } else try props.appendSlice(e.arena, &.{ try I(dm, 11), try dm.mdNode(&.{try I(dm, ws[0])}) });
+        }
+        if (n.is_program_entry) try props.appendSlice(e.arena, &.{ try I(dm, 14), mdTrue });
+        try props.appendSlice(e.arena, &.{ try I(dm, 15), try dm.mdNode(&.{ try dm.mdString(n.id.name), try I(dm, n.id.index) }) });
+        try props.appendSlice(e.arena, &.{ try I(dm, 16), try I(dm, if (n.local_root_arguments_table_index) |x| @as(i64, x) else -1) });
+        if (n.share_input_of) |s| try props.appendSlice(e.arena, &.{ try I(dm, 17), try dm.mdNode(&.{ try dm.mdString(s.name), try I(dm, s.index) }) });
+        const grid = struct {
+            fn f(m: *module.Module, g: ?[3]u32) !?module.MdId {
+                const v = g orelse return null;
+                if (v[0] == 0 and v[1] == 0 and v[2] == 0) return null;
+                return try m.mdNode(&.{ try m.mdI32(v[0]), try m.mdI32(v[1]), try m.mdI32(v[2]) });
+            }
+        }.f;
+        if (try grid(dm, n.dispatch_grid)) |g| try props.appendSlice(e.arena, &.{ try I(dm, 18), g });
+        if (try grid(dm, n.max_dispatch_grid)) |g| try props.appendSlice(e.arena, &.{ try I(dm, 22), g });
+        if (n.max_recursion_depth) |d| if (d != 0) try props.appendSlice(e.arena, &.{ try I(dm, 19), try I(dm, d) });
+        if (n.inputs.len > 0) {
+            var l: std.ArrayList(?module.MdId) = .empty;
+            for (n.inputs) |io| try l.append(e.arena, try e.nodeIoProps(io));
+            try props.appendSlice(e.arena, &.{ try I(dm, 20), try dm.mdNode(l.items) });
+        }
+        if (n.outputs.len > 0) {
+            var l: std.ArrayList(?module.MdId) = .empty;
+            for (n.outputs) |io| try l.append(e.arena, try e.nodeIoProps(io));
+            try props.appendSlice(e.arena, &.{ try I(dm, 21), try dm.mdNode(l.items) });
+        }
+    }
+
+    /// One node input's / output's properties.
+    fn nodeIoProps(e: *Emitter, io: ir.NodeIo) Error!?module.MdId {
+        const dm = &e.dm;
+        var l: std.ArrayList(?module.MdId) = .empty;
+        try l.appendSlice(e.arena, &.{ try dm.mdI32(1), try dm.mdI32(io.kind.ioFlags() | io.extra_flags) });
+        const lay = try e.recordLayout(io.record);
+        if (lay[0] != 0) {
+            var r: std.ArrayList(?module.MdId) = .empty;
+            try r.appendSlice(e.arena, &.{ try dm.mdI32(0), try dm.mdI32(lay[0]) });
+            if (try e.dispatchGridField(io.record, 0)) |g| {
+                try r.appendSlice(e.arena, &.{ try dm.mdI32(1), try dm.mdNode(&.{ try dm.mdI32(g.offset), try dm.mdI32(g.comp), try dm.mdI32(g.count) }) });
+            }
+            try r.appendSlice(e.arena, &.{ try dm.mdI32(2), try dm.mdI32(lay[1]) });
+            try l.appendSlice(e.arena, &.{ try dm.mdI32(2), try dm.mdNode(r.items) });
+        }
+        const i1t = try dm.intType(1);
+        if (!io.kind.isInput()) {
+            try l.appendSlice(e.arena, &.{ try dm.mdI32(3), try dm.mdI32(io.max_records orelse 0) });
+            if (io.array_size) |a| if (a != 0) try l.appendSlice(e.arena, &.{ try dm.mdI32(5), try dm.mdI32(@as(i32, @bitCast(a))) });
+            if (io.max_records_shared_with) |s| try l.appendSlice(e.arena, &.{ try dm.mdI32(4), try dm.mdI32(s) });
+            if (io.allow_sparse_nodes) try l.appendSlice(e.arena, &.{ try dm.mdI32(6), try dm.mdValue(i1t, try dm.constant(.{ .ty = i1t, .kind = .{ .int = 1 } })) });
+            if (io.output_id) |id| try l.appendSlice(e.arena, &.{ try dm.mdI32(0), try dm.mdNode(&.{ try dm.mdString(id.name), try dm.mdI32(id.index) }) });
+        } else if (io.max_records) |m| if (m != 0) try l.appendSlice(e.arena, &.{ try dm.mdI32(3), try dm.mdI32(m) });
+        return try dm.mdNode(l.items);
+    }
+
+    /// SV_DispatchGrid in a record: byte offset, component type (U32 5,
+    /// U16 3) and component count.
+    const DispatchGrid = struct { offset: u32, comp: u32, count: u32 };
+
+    fn dispatchGridField(e: *Emitter, ty: TypeId, base: u32) Error!?DispatchGrid {
+        const st = switch (e.t.get(ty)) {
+            .@"struct" => |s| s,
+            else => return null,
+        };
+        var off: u32 = 0;
+        for (st.fields.items) |fld| {
+            const fl = try e.memLayout(fld.type);
+            off = std.mem.alignForward(u32, off, fl[1]);
+            if (fld.semantic) |sem| if (std.ascii.eqlIgnoreCase(sem, "SV_DispatchGrid")) {
+                const count: u32 = switch (e.t.get(fld.type)) {
+                    .vector => |v| v.len,
+                    .array => |a| a.len,
+                    else => 1,
+                };
+                const scalar_size = fl[0] / count;
+                return .{ .offset = base + off, .comp = if (scalar_size == 2) 3 else 5, .count = count };
+            };
+            if (e.t.get(fld.type) == .@"struct") if (try e.dispatchGridField(fld.type, base + off)) |g| return g;
+            off += fl[0];
+        }
+        return null;
+    }
+
+    /// `tp` indexed by `indices` (struct members by constant index).
+    fn typedAccess(e: *Emitter, frame: *Frame, start: @FieldType(Lowered, "typed"), indices: []const Ref) Error!@FieldType(Lowered, "typed") {
+        var tp = start;
+        var path: std.ArrayList(Value) = .empty;
+        try path.appendSlice(e.arena, tp.path);
+        for (indices) |x| {
+            try path.append(e.arena, (try e.scalars(frame, x))[0]);
+            tp.ty = switch (e.t.get(tp.ty)) {
+                .@"struct" => |st| st.fields.items[@intCast(frame.f.inst(x).op.constant.int)].type,
+                .array => |arr| arr.elem,
+                .vector => |v| try e.t.scalar(v.elem),
+                .matrix => |mt| try e.t.vector(mt.elem, mt.cols),
+                else => return e.unsupported("indexing this member is not supported yet", .{}),
+            };
+        }
+        tp.path = path.items;
+        return tp;
+    }
+
     fn typedScalarPtr(e: *Emitter, tp: @FieldType(Lowered, "typed"), sub: []const Value, st: DType) Error!Value {
         const idx = try e.arena.alloc(Value, 1 + tp.path.len + sub.len);
         idx[0] = try e.i32Const(0);
@@ -6178,7 +6541,7 @@ const Emitter = struct {
         }.f;
         const ident = try dm.mdNode(&.{try dm.mdString("zdxc 0.0.0")});
         const version = try dm.mdNode(&.{ try mdI32(dm, 1), try mdI32(dm, e.profile.minor) });
-        const val_ver = try dm.mdNode(&.{ try mdI32(dm, 1), try mdI32(dm, 11) });
+        const val_ver = try dm.mdNode(&.{ try mdI32(dm, shader.validator[0]), try mdI32(dm, shader.validator[1]) });
         const sm = try dm.mdNode(&.{ try dm.mdString("lib"), try mdI32(dm, e.profile.major), try mdI32(dm, e.profile.minor) });
         const resources = try e.resourcesMd();
         const analysis = try e.libAnalysis(funcs);
@@ -6713,6 +7076,78 @@ const Emitter = struct {
         return @intCast(n);
     }
 
+    /// A node shader's RDAT NodeShaderInfo (as dxc's AddShaderNodeInfo).
+    fn rdatNode(e: *Emitter, b: *rdat.Builder, entry: ir.Entry, n: ir.NodeInfo, groupshared: u32) Error!u32 {
+        const rec = struct {
+            fn f(bb: *rdat.Builder, t: rdat.Ext, words: []const u32) !u32 {
+                return bb.record(t, std.mem.sliceAsBytes(words));
+            }
+        }.f;
+        var attrs: std.ArrayList(u32) = .empty;
+        // NodeFuncAttribKind: ID 1, NumThreads 2, ShareInputOf 3,
+        // DispatchGrid 4, MaxRecursionDepth 5, LocalRootArgumentsTableIndex
+        // 6, MaxDispatchGrid 7.
+        const id = try rec(b, .node_ids, &.{ try b.string(n.id.name), n.id.index });
+        try attrs.append(e.arena, try rec(b, .node_func_attribs, &.{ 1, id }));
+        const nt = entry.num_threads;
+        if (nt[0] != 0 or nt[1] != 0 or nt[2] != 0) try attrs.append(e.arena, try rec(b, .node_func_attribs, &.{ 2, try b.array(&nt) }));
+        if (n.local_root_arguments_table_index) |x| try attrs.append(e.arena, try rec(b, .node_func_attribs, &.{ 6, x }));
+        if (n.share_input_of) |s| {
+            const sid = try rec(b, .node_ids, &.{ try b.string(s.name), s.index });
+            try attrs.append(e.arena, try rec(b, .node_func_attribs, &.{ 3, sid }));
+        }
+        if (n.dispatch_grid) |g| if (g[0] != 0 or g[1] != 0 or g[2] != 0) try attrs.append(e.arena, try rec(b, .node_func_attribs, &.{ 4, try b.array(&g) }));
+        if (n.max_recursion_depth) |d| if (d != 0) try attrs.append(e.arena, try rec(b, .node_func_attribs, &.{ 5, d }));
+        if (n.max_dispatch_grid) |g| if (g[0] != 0 or g[1] != 0 or g[2] != 0) try attrs.append(e.arena, try rec(b, .node_func_attribs, &.{ 7, try b.array(&g) }));
+        const func_attrs = try b.array(attrs.items);
+        const inputs = try e.rdatIoNodes(b, n.inputs);
+        const outputs = try e.rdatIoNodes(b, n.outputs);
+        return rec(b, .node_shaders, &.{ @backingInt(n.launch), groupshared, func_attrs, outputs, inputs });
+    }
+
+    /// The IONode records of node inputs or outputs (an index array).
+    fn rdatIoNodes(e: *Emitter, b: *rdat.Builder, ios: []const ir.NodeIo) Error!u32 {
+        const rec = struct {
+            fn f(bb: *rdat.Builder, t: rdat.Ext, words: []const u32) !u32 {
+                return bb.record(t, std.mem.sliceAsBytes(words));
+            }
+        }.f;
+        var nodes: std.ArrayList(u32) = .empty;
+        for (ios) |io| {
+            // NodeAttribKind: OutputID 1, MaxRecords 2, MaxRecordsSharedWith
+            // 3, RecordSizeInBytes 4, RecordDispatchGrid 5, OutputArraySize
+            // 6, AllowSparseNodes 7, RecordAlignmentInBytes 8.
+            var attrs: std.ArrayList(u32) = .empty;
+            if (!io.kind.isInput()) {
+                const oid = io.output_id orelse ir.NodeId{ .name = "" };
+                const id = try rec(b, .node_ids, &.{ try b.string(oid.name), oid.index });
+                try attrs.append(e.arena, try rec(b, .node_io_attribs, &.{ 1, id }));
+                try attrs.append(e.arena, try rec(b, .node_io_attribs, &.{ 6, io.array_size orelse 0 }));
+                if (io.max_records orelse 0 != 0) {
+                    try attrs.append(e.arena, try rec(b, .node_io_attribs, &.{ 2, io.max_records.? }));
+                } else if (io.max_records_shared_with) |s| {
+                    try attrs.append(e.arena, try rec(b, .node_io_attribs, &.{ 3, s }));
+                }
+                if (io.allow_sparse_nodes) try attrs.append(e.arena, try rec(b, .node_io_attribs, &.{ 7, 1 }));
+            } else if (io.max_records orelse 0 != 0) {
+                try attrs.append(e.arena, try rec(b, .node_io_attribs, &.{ 2, io.max_records.? }));
+            }
+            const lay = try e.recordLayout(io.record);
+            if (lay[0] != 0) {
+                try attrs.append(e.arena, try rec(b, .node_io_attribs, &.{ 4, lay[0] }));
+                if (try e.dispatchGridField(io.record, 0)) |g| {
+                    // ByteOffset (u16), then components (bits 0..1) and
+                    // component type (from bit 2).
+                    try attrs.append(e.arena, try rec(b, .node_io_attribs, &.{ 5, g.offset | ((g.count & 3) | (g.comp << 2)) << 16 }));
+                }
+                if (lay[1] != 0) try attrs.append(e.arena, try rec(b, .node_io_attribs, &.{ 8, lay[1] }));
+            }
+            const arr = try b.array(attrs.items);
+            try nodes.append(e.arena, try rec(b, .io_nodes, &.{ io.kind.ioFlags() | io.extra_flags, arr }));
+        }
+        return b.array(nodes.items);
+    }
+
     /// The library container: feature info, runtime data (RDAT) and the
     /// program.
     fn assembleLibrary(e: *Emitter, gpa: Allocator, funcs: []const LibFunc, bitcode: []const u8) Error![]u8 {
@@ -6770,6 +7205,12 @@ const Emitter = struct {
                 .cbuffers = func_cbuffers.items,
             });
             const resources = if (used.items.len > 0) try b.array(used.items) else rdat.null_ref;
+            var shader_flags: u16 = 0;
+            const node_info = if (lf.stage == .node) blk: {
+                const n = lf.entry.node.?;
+                if (n.is_program_entry) shader_flags |= 1;
+                break :blk try e.rdatNode(&b, lf.entry, n, lf.groupshared);
+            } else rdat.null_ref;
             const props = if (e.uses_linalg) try linalg_info.rdatProperties(e.arena, &b, &try linalg_info.functionInfo(e.arena, &e.dm, mats, lf.func)) else rdat.null_ref;
             const kind = shaderKind(lf.stage);
             try b.addFunction(.{
@@ -6783,6 +7224,11 @@ const Emitter = struct {
                 .feature_info2 = @truncate(libinfo.featureInfo(info.flags) >> 32),
                 .shader_stage_flag = if (lf.stage == .library) info.mask & 0xffff else info.mask & (@as(u32, 1) << @intCast(kind)),
                 .min_shader_target = (kind << 16) | (6 << 4) | libinfo.minMinor(info, if (lf.stage == .library) null else kind),
+                // (RDAT: 0 where none is specified.)
+                .min_wave_lanes = @intCast(lf.entry.wave_size[0]),
+                .max_wave_lanes = @intCast(if (lf.entry.wave_size[1] != 0) lf.entry.wave_size[1] else lf.entry.wave_size[0]),
+                .shader_flags = shader_flags,
+                .raw_shader_ref = node_info,
                 .extended_properties = props,
             });
         }
@@ -6838,6 +7284,14 @@ const Emitter = struct {
         });
     }
 
+    /// The wave lane counts PSV and RDAT give: WaveSize's minimum, and its
+    /// maximum (a range) or the minimum again; with none, 0 and maxInt.
+    fn waveLanes(entry: ir.Entry) [2]u32 {
+        const ws = entry.wave_size;
+        if (ws[0] == 0) return .{ 0, std.math.maxInt(u32) };
+        return .{ ws[0], if (ws[1] != 0) ws[1] else ws[0] };
+    }
+
     /// Entry properties of the stage: thread group size and the GS / HS /
     /// DS / MS / AS state.
     fn stageProps(e: *Emitter, entry: ir.Entry, props: *std.ArrayList(?module.MdId)) Error!void {
@@ -6848,7 +7302,20 @@ const Emitter = struct {
             }
         }.f;
         const threads = try dm.mdNode(&.{ try mdI32(dm, entry.num_threads[0]), try mdI32(dm, entry.num_threads[1]), try mdI32(dm, entry.num_threads[2]) });
+        if (entry.node) |n| {
+            try e.nodeProps(entry, n, props);
+            try props.appendSlice(e.arena, &.{ try mdI32(dm, 4), threads });
+            return;
+        }
         if (entry.stage == .compute) try props.appendSlice(e.arena, &.{ try mdI32(dm, 4), threads });
+        // WaveSize: a value (tag 11) before SM 6.8, a range with a
+        // preferred size after (tag 23; zeros where not given).
+        if (entry.wave_size[0] != 0) {
+            const ws = entry.wave_size;
+            if (e.profile.minor >= 8) {
+                try props.appendSlice(e.arena, &.{ try mdI32(dm, 23), try dm.mdNode(&.{ try mdI32(dm, ws[0]), try mdI32(dm, ws[1]), try mdI32(dm, ws[2]) }) });
+            } else try props.appendSlice(e.arena, &.{ try mdI32(dm, 11), try dm.mdNode(&.{try mdI32(dm, ws[0])}) });
+        }
         const payload_size: u32 = if (entry.mesh.payload) |p| try e.payloadSize(p) else 0;
         if (entry.stage == .mesh) {
             // MS state: thread group, max vertices, max primitives,
@@ -6914,7 +7381,7 @@ const Emitter = struct {
 
         const ident = try dm.mdNode(&.{try dm.mdString("zdxc 0.0.0")});
         const version = try dm.mdNode(&.{ try mdI32(dm, 1), try mdI32(dm, e.profile.minor) });
-        const val_ver = try dm.mdNode(&.{ try mdI32(dm, 1), try mdI32(dm, 11) });
+        const val_ver = try dm.mdNode(&.{ try mdI32(dm, shader.validator[0]), try mdI32(dm, shader.validator[1]) });
         const sm = try dm.mdNode(&.{ try dm.mdString(e.profile.kind.profilePrefix()), try mdI32(dm, e.profile.major), try mdI32(dm, e.profile.minor) });
 
         const resources = try e.resourcesMd();
@@ -7064,6 +7531,7 @@ const Emitter = struct {
             .entry = entry.name,
             .stage_info = stage_info,
             .num_threads = if (threaded) entry.num_threads else .{ 0, 0, 0 },
+            .wave_lanes = waveLanes(entry),
             .mesh_topology = if (entry.stage == .mesh) @backingInt(entry.mesh.topology) else 0,
             .uses_view_id = e.uses_view_id,
             .resources = binds.items,
@@ -7150,14 +7618,28 @@ fn gsTopology(g: ir.GeometryInfo) u32 {
     return 1;
 }
 
+/// Resources, samplers and (handles too) work graph node objects.
 fn isResourceType(t: *TypeTable, ty: TypeId) bool {
     return switch (t.get(ty)) {
-        .resource, .sampler => true,
+        .resource, .sampler, .node => true,
         else => false,
     };
 }
 
 const isRayQuery = @import("../ir/lower.zig").isRayQuery;
+
+/// Whether the stores to local `ptr` are all in one block of `f`.
+fn storesInOneBlock(f: *const ir.Function, ptr: Ref) bool {
+    var found: ?usize = null;
+    for (f.blocks.items, 0..) |blk, bi| for (blk.insts.items) |r| switch (f.inst(r).op) {
+        .store => |x| if (x.ptr == ptr) {
+            if (found) |b| if (b != bi) return false;
+            found = bi;
+        },
+        else => {},
+    };
+    return true;
+}
 
 fn reachableBlocks(a: Allocator, f: *const ir.Function) Allocator.Error![]bool {
     return reachableBlocksTaken(a, f, &.{});

@@ -112,6 +112,8 @@ const IID_IDxcIncludeHandler = GUID.parse("7f61fc7d-950d-467f-b3e3-3c02fb49187c"
 const IID_IDxcOperationResult = GUID.parse("cedb484a-d4e9-445a-b991-ca21ca157dc2");
 const IID_IDxcResult = GUID.parse("58346cda-dde7-4497-9461-6f87af5e0659");
 const IID_IDxcCompiler3 = GUID.parse("228b4687-5a6a-4730-900c-9702b2203f54");
+const IID_IDxcCompiler = GUID.parse("8c210bf3-011f-4422-8d70-6f9acb8db617");
+const IID_IDxcCompiler2 = GUID.parse("a005a9d9-b8bb-4594-b5c9-0e633bec4d37");
 const IID_IDxcUtils = GUID.parse("4605c4cb-2019-492a-ada4-65f20bb7d67f");
 const IID_IDxcVersionInfo = GUID.parse("b04f5b50-2059-4f12-a8ff-a1e0cde1cc7e");
 
@@ -739,6 +741,18 @@ const Compiler3Vtbl = extern struct {
     Disassemble: *const fn (This, ?*const Buffer, *const GUID, ?Out) callconv(cc) HRESULT,
 };
 
+const DxcDefine = extern struct { Name: ?[*:0]const WCHAR, Value: ?[*:0]const WCHAR };
+
+/// IDxcCompiler and IDxcCompiler2 (hassle-rs and other older clients):
+/// entry point, profile and defines as parameters, the source as a blob.
+const Compiler2Vtbl = extern struct {
+    unknown: UnknownVtbl,
+    Compile: *const fn (This, ?*anyopaque, ?[*:0]const WCHAR, ?[*:0]const WCHAR, ?[*:0]const WCHAR, ?[*]const ?[*:0]const WCHAR, u32, ?[*]const DxcDefine, u32, ?*anyopaque, ?Out) callconv(cc) HRESULT,
+    Preprocess: *const fn (This, ?*anyopaque, ?[*:0]const WCHAR, ?[*]const ?[*:0]const WCHAR, u32, ?[*]const DxcDefine, u32, ?*anyopaque, ?Out) callconv(cc) HRESULT,
+    Disassemble: *const fn (This, ?*anyopaque, ?Out) callconv(cc) HRESULT,
+    CompileWithDebug: *const fn (This, ?*anyopaque, ?[*:0]const WCHAR, ?[*:0]const WCHAR, ?[*:0]const WCHAR, ?[*]const ?[*:0]const WCHAR, u32, ?[*]const DxcDefine, u32, ?*anyopaque, ?Out, ?*?[*:0]WCHAR, ?Out) callconv(cc) HRESULT,
+};
+
 const VersionInfoVtbl = extern struct {
     unknown: UnknownVtbl,
     GetVersion: *const fn (This, ?*u32, ?*u32) callconv(cc) HRESULT,
@@ -748,7 +762,16 @@ const VersionInfoVtbl = extern struct {
 const Compiler = struct {
     compiler: Iface(Compiler3Vtbl) = .{ .vtbl = &compiler_vtbl },
     version: Iface(VersionInfoVtbl) = .{ .vtbl = &version_vtbl },
+    legacy: Iface(Compiler2Vtbl) = .{ .vtbl = &legacy_vtbl },
     rc: RefCount = .{},
+
+    const legacy_vtbl: Compiler2Vtbl = .{
+        .unknown = .{ .QueryInterface = legacyQueryInterface, .AddRef = legacyAddRef, .Release = legacyRelease },
+        .Compile = legacyCompile,
+        .Preprocess = legacyPreprocess,
+        .Disassemble = legacyDisassemble,
+        .CompileWithDebug = legacyCompileWithDebug,
+    };
 
     const compiler_vtbl: Compiler3Vtbl = .{
         .unknown = .{ .QueryInterface = queryInterface, .AddRef = addRef, .Release = release },
@@ -770,6 +793,8 @@ const Compiler = struct {
             &c.compiler
         else if (iid.eql(IID_IDxcVersionInfo))
             &c.version
+        else if (iid.eql(IID_IDxcCompiler) or iid.eql(IID_IDxcCompiler2))
+            &c.legacy
         else
             null;
         if (p == null) {
@@ -834,6 +859,85 @@ const Compiler = struct {
         _ = put(out, null);
         return E_NOTIMPL;
     }
+
+    fn legacyOf(this: This) *Compiler {
+        return parent(Compiler, "legacy", this);
+    }
+    fn legacyQueryInterface(this: This, iid: *const GUID, out: ?Out) callconv(cc) HRESULT {
+        return legacyOf(this).query(iid, out);
+    }
+    fn legacyAddRef(this: This) callconv(cc) ULONG {
+        return legacyOf(this).rc.addRef();
+    }
+    fn legacyRelease(this: This) callconv(cc) ULONG {
+        return release(&legacyOf(this).compiler);
+    }
+
+    fn legacyCompile(_: This, source: ?*anyopaque, name: ?[*:0]const WCHAR, entry: ?[*:0]const WCHAR, profile: ?[*:0]const WCHAR, args: ?[*]const ?[*:0]const WCHAR, count: u32, defines: ?[*]const DxcDefine, define_count: u32, include: ?*anyopaque, out: ?Out) callconv(cc) HRESULT {
+        const p = profile orelse {
+            _ = put(out, null);
+            return E_INVALIDARG;
+        };
+        return legacyRun(source, name, .{ .compile = .{ .entry = entry, .profile = p } }, args, count, defines, define_count, include, out);
+    }
+    fn legacyCompileWithDebug(this: This, source: ?*anyopaque, name: ?[*:0]const WCHAR, entry: ?[*:0]const WCHAR, profile: ?[*:0]const WCHAR, args: ?[*]const ?[*:0]const WCHAR, count: u32, defines: ?[*]const DxcDefine, define_count: u32, include: ?*anyopaque, out: ?Out, debug_name: ?*?[*:0]WCHAR, debug_blob: ?Out) callconv(cc) HRESULT {
+        // No separate debug blob (zdxc writes no PDBs).
+        if (debug_name) |d| d.* = null;
+        if (debug_blob) |d| d.* = null;
+        return legacyCompile(this, source, name, entry, profile, args, count, defines, define_count, include, out);
+    }
+    fn legacyPreprocess(_: This, source: ?*anyopaque, name: ?[*:0]const WCHAR, args: ?[*]const ?[*:0]const WCHAR, count: u32, defines: ?[*]const DxcDefine, define_count: u32, include: ?*anyopaque, out: ?Out) callconv(cc) HRESULT {
+        return legacyRun(source, name, .preprocess, args, count, defines, define_count, include, out);
+    }
+    fn legacyDisassemble(_: This, _: ?*anyopaque, out: ?Out) callconv(cc) HRESULT {
+        _ = put(out, null);
+        return E_NOTIMPL;
+    }
+
+    const LegacyMode = union(enum) {
+        compile: struct { entry: ?[*:0]const WCHAR, profile: [*:0]const WCHAR },
+        preprocess,
+    };
+
+    /// The legacy calls as IDxcCompiler3 arguments: `-E entry -T profile`
+    /// (or `-P`), the arguments, then `-D name=value` per define.
+    fn legacyRun(source: ?*anyopaque, name: ?[*:0]const WCHAR, mode: LegacyMode, args: ?[*]const ?[*:0]const WCHAR, count: u32, defines: ?[*]const DxcDefine, define_count: u32, include: ?*anyopaque, out: ?Out) HRESULT {
+        const o = out orelse return E_POINTER;
+        o.* = null;
+        const blob = source orelse return E_INVALIDARG;
+        if ((count > 0 and args == null) or (define_count > 0 and defines == null)) return E_INVALIDARG;
+        const r = runLegacy(blob, name, mode, if (args) |a| a[0..count] else &.{}, if (defines) |d| d[0..define_count] else &.{}, include) catch |e| return switch (e) {
+            error.OutOfMemory => E_OUTOFMEMORY,
+            error.InvalidArgument => E_INVALIDARG,
+        };
+        o.* = &r.iface;
+        return S_OK;
+    }
+
+    fn runLegacy(blob: *anyopaque, name: ?[*:0]const WCHAR, mode: LegacyMode, wargs: []const ?[*:0]const WCHAR, defines: []const DxcDefine, include: ?*anyopaque) error{ OutOfMemory, InvalidArgument }!*Result {
+        if (thread_arena == null) thread_arena = .init(gpa);
+        const arena = &thread_arena.?;
+        defer _ = arena.reset(.{ .retain_with_limit = retain_limit });
+        const a = arena.allocator();
+        var args: std.ArrayList([]const u8) = .empty;
+        switch (mode) {
+            .compile => |c| {
+                if (c.entry) |e| try args.appendSlice(a, &.{ "-E", try fromWide(a, e) });
+                try args.appendSlice(a, &.{ "-T", try fromWide(a, c.profile) });
+            },
+            .preprocess => try args.append(a, "-P"),
+        }
+        for (wargs) |w| try args.append(a, try fromWide(a, w orelse return error.InvalidArgument));
+        for (defines) |d| {
+            const n = try fromWide(a, d.Name orelse continue);
+            try args.appendSlice(a, &.{ "-D", if (d.Value) |v| try std.fmt.allocPrint(a, "{s}={s}", .{ n, try fromWide(a, v) }) else n });
+        }
+        const text = Utils.blobText(a, blob) catch |e| return switch (e) {
+            error.OutOfMemory => error.OutOfMemory,
+            else => error.InvalidArgument,
+        };
+        return runText(a, args.items, text, if (name) |n| try fromWide(a, n) else null, include);
+    }
 };
 
 /// Each thread's compile arena, kept between calls. Freeing it per call
@@ -851,11 +955,17 @@ fn run(source: *const Buffer, wargs: []const ?[*:0]const WCHAR, include: ?*anyop
     const args = try a.alloc([]const u8, wargs.len);
     for (args, wargs) |*d, w| d.* = try fromWide(a, w orelse return error.InvalidArgument);
     const bytes: []const u8 = if (source.ptr) |p| p[0..source.size] else &.{};
+    return runText(a, args, try decodeText(a, bytes, source.encoding), null, include);
+}
+
+/// A compile of `text` (in the caller's thread arena).
+fn runText(a: std.mem.Allocator, args: []const []const u8, text: []const u8, source_name: ?[]const u8, include: ?*anyopaque) error{ OutOfMemory, InvalidArgument }!*Result {
     var client: ClientFs = undefined;
     var threaded: std.Io.Threaded = .init_single_threaded;
     var req: compile.Request = .{
         .args = args,
-        .source = try decodeText(a, bytes, source.encoding),
+        .source = text,
+        .source_name = source_name,
         .io = threaded.io(),
         .fs = NoFs.fileSystem(),
         .compat_notes = false,

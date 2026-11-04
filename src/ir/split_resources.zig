@@ -189,6 +189,8 @@ const Pass = struct {
         if (info.done) return;
         info.done = true;
         const f = p.m.functions.items[fi];
+        // (Inlined everywhere: not emitted.)
+        if (f.dead) return;
         // Callees first: their returns may be resources.
         for (f.insts.items) |inst| if (inst.op == .call) try p.function(inst.op.call.func);
 
@@ -209,7 +211,10 @@ const Pass = struct {
         const n_old = f.insts.items.len;
         const ret_holds = holdsResources(p.t, f.ret) or isOpaque(p.t, f.ret);
 
-        for (f.blocks.items, 0..) |*blk, bi| {
+        // Definitions before uses: inlining leaves a call's continuation
+        // ahead of the callee's blocks.
+        for (try reversePostorder(p.a, f)) |bi| {
+            const blk = &f.blocks.items[bi];
             var out: std.ArrayList(Ref) = .empty;
             for (blk.insts.items) |r| {
                 const old = f.insts.items[r.index()];
@@ -421,7 +426,6 @@ const Pass = struct {
                 .@"switch" => |sw| blk.term = .{ .@"switch" = .{ .value = mp.map(sw.value), .default = sw.default, .cases = sw.cases } },
                 else => {},
             }
-            _ = bi;
         }
         _ = n_old;
         // What each out / inout resource holds when the function returns:
@@ -479,6 +483,42 @@ const Pass = struct {
         return null;
     }
 };
+
+/// `f`'s blocks in reverse postorder from the entry (each block after its
+/// dominators), then any unreachable ones in list order.
+fn reversePostorder(a: Allocator, f: *const ir.Function) Allocator.Error![]const u32 {
+    const n = f.blocks.items.len;
+    const seen = try a.alloc(bool, n);
+    @memset(seen, false);
+    var post: std.ArrayList(u32) = try .initCapacity(a, n);
+    // (block, whether its successors were pushed)
+    var stack: std.ArrayList(struct { b: u32, expanded: bool }) = .empty;
+    if (n > 0) try stack.append(a, .{ .b = 0, .expanded = false });
+    while (stack.pop()) |it| {
+        if (it.expanded) {
+            post.appendAssumeCapacity(it.b);
+            continue;
+        }
+        if (seen[it.b]) continue;
+        seen[it.b] = true;
+        try stack.append(a, .{ .b = it.b, .expanded = true });
+        const succs: []const ir.BlockId = switch (f.blocks.items[it.b].term) {
+            .br => |t| &.{t},
+            .cond_br => |c| &.{ c.@"else", c.then },
+            .@"switch" => |sw| blk: {
+                const out = try a.alloc(ir.BlockId, sw.cases.len + 1);
+                for (sw.cases, 0..) |c, i| out[sw.cases.len - 1 - i] = c.block;
+                out[sw.cases.len] = sw.default;
+                break :blk out;
+            },
+            else => &.{},
+        };
+        for (succs) |sb| if (sb != .none and !seen[sb.index()]) try stack.append(a, .{ .b = @intCast(sb.index()), .expanded = false });
+    }
+    std.mem.reverse(u32, post.items);
+    for (0..n) |bi| if (!seen[bi]) post.appendAssumeCapacity(@intCast(bi));
+    return post.items;
+}
 
 /// Splits every function's resource-holding aggregates (SPIR-V only).
 pub fn run(a: Allocator, m: *ir.Module, diags: *diag.Diagnostics) Error!void {

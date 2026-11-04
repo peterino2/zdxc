@@ -73,11 +73,21 @@ pub fn lowerUnit(arena: Allocator, s: *Sema, opts: Options) Error!ir.Module {
 /// The stage a `[shader("...")]` attribute names.
 fn stageNamed(name: []const u8) ?ir.Stage {
     const names = [_]struct { []const u8, ir.Stage }{
-        .{ "vertex", .vertex },               .{ "pixel", .pixel },           .{ "geometry", .geometry },
-        .{ "hull", .hull },                   .{ "domain", .domain },         .{ "compute", .compute },
-        .{ "mesh", .mesh },                   .{ "amplification", .amplification }, .{ "raygeneration", .raygeneration },
-        .{ "intersection", .intersection },   .{ "anyhit", .anyhit },         .{ "closesthit", .closesthit },
-        .{ "miss", .miss },                   .{ "callable", .callable },
+        .{ "node", .node },
+        .{ "vertex", .vertex },
+        .{ "pixel", .pixel },
+        .{ "geometry", .geometry },
+        .{ "hull", .hull },
+        .{ "domain", .domain },
+        .{ "compute", .compute },
+        .{ "mesh", .mesh },
+        .{ "amplification", .amplification },
+        .{ "raygeneration", .raygeneration },
+        .{ "intersection", .intersection },
+        .{ "anyhit", .anyhit },
+        .{ "closesthit", .closesthit },
+        .{ "miss", .miss },
+        .{ "callable", .callable },
     };
     for (names) |t| if (std.ascii.eqlIgnoreCase(name, t[0])) return t[1];
     return null;
@@ -318,10 +328,10 @@ const Lowerer = struct {
     fn subobjects(l: *Lowerer) Error!void {
         const Kind = ir.Subobject.Kind;
         const kinds = [_]struct { []const u8, Kind }{
-            .{ "StateObjectConfig", .state_object_config },                       .{ "GlobalRootSignature", .global_root_signature },
-            .{ "LocalRootSignature", .local_root_signature },                     .{ "SubobjectToExportsAssociation", .subobject_to_exports_association },
-            .{ "RaytracingShaderConfig", .raytracing_shader_config },             .{ "RaytracingPipelineConfig", .raytracing_pipeline_config },
-            .{ "TriangleHitGroup", .hit_group },                                  .{ "ProceduralPrimitiveHitGroup", .hit_group },
+            .{ "StateObjectConfig", .state_object_config },                 .{ "GlobalRootSignature", .global_root_signature },
+            .{ "LocalRootSignature", .local_root_signature },               .{ "SubobjectToExportsAssociation", .subobject_to_exports_association },
+            .{ "RaytracingShaderConfig", .raytracing_shader_config },       .{ "RaytracingPipelineConfig", .raytracing_pipeline_config },
+            .{ "TriangleHitGroup", .hit_group },                            .{ "ProceduralPrimitiveHitGroup", .hit_group },
             .{ "RaytracingPipelineConfig1", .raytracing_pipeline_config1 },
         };
         // (Builtin objects are static globals.)
@@ -1070,6 +1080,13 @@ const Lowerer = struct {
                     const idx = try l.indexValue(x.index, bt.resource.kind.indexDims());
                     return l.b.add(.{ .op = .{ .res_load = .{ .res = res, .index = idx } }, .ty = try l.concrete(e.ty) });
                 }
+                if (bt == .node) {
+                    if (bt.node.kind.isArray()) return l.b.load(try l.nodeRecordPtr(e));
+                    // An output of an outputs array: the node object.
+                    const obj = try l.rvalue(x.base);
+                    const idx = try l.converted(x.index, try t.scalar(.uint));
+                    return l.b.add(.{ .op = .{ .access = .{ .base = obj, .indices = try l.arena.dupe(Ref, &.{idx}) } }, .ty = e.ty });
+                }
                 if (isAddressable(l.s, x.base)) return l.b.load(try l.lvalue(e));
                 const base = try l.rvalue(x.base);
                 if (l.s.evalInt(x.index)) |k| return l.b.add(.{ .op = .{ .extract = .{ .agg = base, .index = @intCast(k) } }, .ty = try l.concrete(e.ty) });
@@ -1377,6 +1394,7 @@ const Lowerer = struct {
     fn call(l: *Lowerer, e: *ast.Expr, callee: *ast.Expr, args: []const *ast.Expr) Error!Ref {
         const r = l.s.resolution(e) orelse return l.fail(e, "this call");
         const ret_ty = try l.concrete(e.ty);
+        if (r == .node_record) return l.b.load(try l.nodeRecordPtr(e));
         switch (r) {
             .function => |f| {
                 if (!f.defined and hasAttr(f.decl.attrs, "vk::ext_instruction")) return l.spirvInstCall(e, f, args, ret_ty);
@@ -1412,49 +1430,49 @@ const Lowerer = struct {
     /// A call to `f` with `base_expr` as the object of a method (null:
     /// the current `this`, or no object).
     fn methodCall(l: *Lowerer, f: *const semamod.Function, fi: u32, base_expr: ?*ast.Expr, args: []const *ast.Expr, ret_ty: TypeId) Error!Ref {
-            var object: ?Ref = null;
-            var write_back: ?Ref = null;
-            const owner_ty = if (isMethod(f)) try l.s.types.intern(.{ .@"struct" = f.owner.? }) else TypeTable.void_type;
-            if (base_expr) |base| {
-                const direct = if (isAddressable(l.s, base)) try l.lvalue(base) else null;
-                const plain = if (direct) |p| l.b.f.inst(p).op == .local_var or l.b.f.inst(p).op == .param else false;
-                if (direct != null and plain and base.ty == owner_ty) {
-                    object = direct;
-                } else {
-                    // Through a function-local copy of the method's own
-                    // struct (a base prefix of derived objects), written
-                    // back afterwards to writable storage.
-                    const tmp = try l.b.add(.{ .op = .local_var, .ty = owner_ty, .ptr = .function });
-                    var whole = if (direct) |p| try l.b.load(p) else try l.rvalue(base);
-                    var whole_ty = base.ty;
-                    if (l.s.types.get(base.ty) == .resource) {
-                        // A method of ConstantBuffer<S>'s S: on a copy of S.
-                        whole_ty = l.s.types.get(base.ty).resource.elem;
-                        whole = try l.convert(whole, whole_ty);
-                    }
-                    try l.b.store(tmp, try l.basePrefix(whole, whole_ty, owner_ty));
-                    object = tmp;
-                    if (direct) |p| switch (l.b.f.inst(p).ptr) {
-                        .function, .private, .groupshared => write_back = p,
-                        else => {},
-                    };
+        var object: ?Ref = null;
+        var write_back: ?Ref = null;
+        const owner_ty = if (isMethod(f)) try l.s.types.intern(.{ .@"struct" = f.owner.? }) else TypeTable.void_type;
+        if (base_expr) |base| {
+            const direct = if (isAddressable(l.s, base)) try l.lvalue(base) else null;
+            const plain = if (direct) |p| l.b.f.inst(p).op == .local_var or l.b.f.inst(p).op == .param else false;
+            if (direct != null and plain and base.ty == owner_ty) {
+                object = direct;
+            } else {
+                // Through a function-local copy of the method's own
+                // struct (a base prefix of derived objects), written
+                // back afterwards to writable storage.
+                const tmp = try l.b.add(.{ .op = .local_var, .ty = owner_ty, .ptr = .function });
+                var whole = if (direct) |p| try l.b.load(p) else try l.rvalue(base);
+                var whole_ty = base.ty;
+                if (l.s.types.get(base.ty) == .resource) {
+                    // A method of ConstantBuffer<S>'s S: on a copy of S.
+                    whole_ty = l.s.types.get(base.ty).resource.elem;
+                    whole = try l.convert(whole, whole_ty);
+                }
+                try l.b.store(tmp, try l.basePrefix(whole, whole_ty, owner_ty));
+                object = tmp;
+                if (direct) |p| switch (l.b.f.inst(p).ptr) {
+                    .function, .private, .groupshared => write_back = p,
+                    else => {},
+                };
+            }
+        }
+        const res = try l.userCall(f, fi, args, ret_ty, object);
+        if (write_back) |p| {
+            const updated = try l.b.load(object.?);
+            if (base_expr.?.ty == owner_ty) {
+                try l.b.store(p, updated);
+            } else {
+                // Only the base's fields.
+                for (l.s.types.get(owner_ty).@"struct".fields.items, 0..) |fld, k| {
+                    const idx = try l.b.constInt(try l.types().scalar(.uint), @intCast(k));
+                    const fp = try l.b.add(.{ .op = .{ .access = .{ .base = p, .indices = try l.arena.dupe(Ref, &.{idx}) } }, .ty = fld.type, .ptr = l.b.f.inst(p).ptr });
+                    try l.b.store(fp, try l.b.add(.{ .op = .{ .extract = .{ .agg = updated, .index = @intCast(k) } }, .ty = fld.type }));
                 }
             }
-            const res = try l.userCall(f, fi, args, ret_ty, object);
-            if (write_back) |p| {
-                const updated = try l.b.load(object.?);
-                if (base_expr.?.ty == owner_ty) {
-                    try l.b.store(p, updated);
-                } else {
-                    // Only the base's fields.
-                    for (l.s.types.get(owner_ty).@"struct".fields.items, 0..) |fld, k| {
-                        const idx = try l.b.constInt(try l.types().scalar(.uint), @intCast(k));
-                        const fp = try l.b.add(.{ .op = .{ .access = .{ .base = p, .indices = try l.arena.dupe(Ref, &.{idx}) } }, .ty = fld.type, .ptr = l.b.f.inst(p).ptr });
-                        try l.b.store(fp, try l.b.add(.{ .op = .{ .extract = .{ .agg = updated, .index = @intCast(k) } }, .ty = fld.type }));
-                    }
-                }
-            }
-            return res;
+        }
+        return res;
     }
 
     /// An overloaded operator: a method call on the first operand.
@@ -1546,6 +1564,16 @@ const Lowerer = struct {
                         try l.storeTo(a, try l.convert(try l.b.load(vals[i]), a.ty));
                     };
                     return result;
+                }
+                // printf: NonSemantic.DebugPrintf's DebugPrintf (opcode 1)
+                // with the format as an OpString (SPIR-V only).
+                if (std.mem.eql(u8, name, "printf") and l.s.opts.spirv and args.len >= 1 and args[0].kind == .string_lit) {
+                    const p = try l.arena.create(ir.SpirvInst);
+                    const ops = try l.arena.alloc(@typeInfo(@TypeOf(p.operands)).pointer.child, args.len);
+                    ops[0] = .{ .string = try stringContents(l.arena, args[0].kind.string_lit) };
+                    for (ops[1..], args[1..]) |*o, a| o.* = .{ .value = try l.converted(a, try l.concrete(a.ty)) };
+                    p.* = .{ .opcode = 1, .set = "NonSemantic.DebugPrintf", .operands = ops, .extensions = try l.arena.dupe([]const u8, &.{"SPV_KHR_non_semantic_info"}) };
+                    return l.b.add(.{ .op = .{ .spirv_inst = p }, .ty = TypeTable.void_type });
                 }
                 if (std.mem.eql(u8, name, "DispatchMesh") and args.len == 4) {
                     // The payload goes by reference (a groupshared
@@ -1754,7 +1782,22 @@ const Lowerer = struct {
         return l.b.add(.{ .op = .{ .global = g }, .ty = glob.ty, .ptr = glob.space });
     }
 
+    /// A node record: `obj.Get()`, `obj.Get(i)` or `obj[i]` (an element
+    /// of the node object, in node record memory).
+    fn nodeRecordPtr(l: *Lowerer, e: *ast.Expr) Error!Ref {
+        const t = l.types();
+        const obj_expr, const index: ?*ast.Expr = switch (e.kind) {
+            .call => |c| .{ c.callee.kind.member.base, if (c.args.len > 0) c.args[0] else null },
+            .index => |x| .{ x.base, x.index },
+            else => return l.fail(e, "this node record"),
+        };
+        const obj = try l.rvalue(obj_expr);
+        const idx = if (index) |i| try l.converted(i, try t.scalar(.uint)) else try l.b.constInt(try t.scalar(.uint), 0);
+        return l.b.add(.{ .op = .{ .access = .{ .base = obj, .indices = try l.arena.dupe(Ref, &.{idx}) } }, .ty = e.ty, .ptr = .node });
+    }
+
     fn lvalue(l: *Lowerer, e: *ast.Expr) Error!Ref {
+        if (l.s.resolution(e)) |r| if (r == .node_record) return l.nodeRecordPtr(e);
         const t = l.types();
         // A resource inside a global struct: its own global.
         if (e.kind == .member or e.kind == .index) if (l.uniformPath(e)) |up| if (layout.isOpaque(t, e.ty)) return l.leafGlobal(up.v, up.path, e.ty);
@@ -2421,6 +2464,97 @@ const Lowerer = struct {
         entry.patch_wrapper = wrapper;
     }
 
+    /// A node shader's properties: its attributes and its node object
+    /// parameters (inputs, then outputs, in parameter order).
+    fn nodeInfo(l: *Lowerer, f: *const semamod.Function) Error!ir.NodeInfo {
+        const eqi = std.ascii.eqlIgnoreCase;
+        var info: ir.NodeInfo = .{ .id = .{ .name = f.name } };
+        for (f.decl.attrs) |a| {
+            if (eqi(a.name, "nodelaunch") and a.args.len == 1 and a.args[0].kind == .string_lit) {
+                const v = try stringContents(l.arena, a.args[0].kind.string_lit);
+                if (eqi(v, "coalescing")) info.launch = .coalescing else if (eqi(v, "thread")) info.launch = .thread else info.launch = .broadcasting;
+            } else if (eqi(a.name, "nodeisprogramentry")) {
+                info.is_program_entry = true;
+            } else if (eqi(a.name, "nodeid")) {
+                if (try l.nodeId(a)) |id| info.id = id;
+            } else if (eqi(a.name, "nodelocalrootargumentstableindex") and a.args.len == 1) {
+                info.local_root_arguments_table_index = l.attrUint(a.args[0]);
+            } else if (eqi(a.name, "nodeshareinputof")) {
+                info.share_input_of = try l.nodeId(a);
+            } else if (eqi(a.name, "nodedispatchgrid") and a.args.len == 3) {
+                info.dispatch_grid = .{ l.attrUint(a.args[0]), l.attrUint(a.args[1]), l.attrUint(a.args[2]) };
+            } else if (eqi(a.name, "nodemaxdispatchgrid") and a.args.len == 3) {
+                info.max_dispatch_grid = .{ l.attrUint(a.args[0]), l.attrUint(a.args[1]), l.attrUint(a.args[2]) };
+            } else if (eqi(a.name, "nodemaxrecursiondepth") and a.args.len == 1) {
+                info.max_recursion_depth = l.attrUint(a.args[0]);
+            }
+        }
+        var inputs: std.ArrayList(ir.NodeIo) = .empty;
+        var outputs: std.ArrayList(ir.NodeIo) = .empty;
+        var out_names: std.ArrayList([]const u8) = .empty;
+        // MaxRecordsSharedWith names a later output too: resolved after.
+        var shared: std.ArrayList(struct { out: usize, name: []const u8 }) = .empty;
+        for (f.decl.params, f.params) |pd, p| {
+            const nt = switch (l.s.types.get(p.type)) {
+                .node => |x| x,
+                else => continue,
+            };
+            var io: ir.NodeIo = .{ .kind = nt.kind, .record = nt.elem };
+            if (pd.quals.globallycoherent) io.extra_flags |= 0x200;
+            if (nt.elem != TypeTable.void_type and l.trackRwInputSharing(nt.elem)) io.extra_flags |= 0x100;
+            if (!nt.kind.isInput()) io.output_id = .{ .name = pd.name };
+            for (pd.attrs) |a| {
+                if (eqi(a.name, "maxrecords") and a.args.len == 1) {
+                    io.max_records = l.attrUint(a.args[0]);
+                } else if (eqi(a.name, "nodeid")) {
+                    if (try l.nodeId(a)) |id| io.output_id = id;
+                } else if (eqi(a.name, "nodearraysize") and a.args.len == 1) {
+                    io.array_size = l.attrUint(a.args[0]);
+                } else if (eqi(a.name, "unboundedsparsenodes")) {
+                    io.array_size = std.math.maxInt(u32);
+                    io.allow_sparse_nodes = true;
+                } else if (eqi(a.name, "allowsparsenodes")) {
+                    io.allow_sparse_nodes = true;
+                } else if (eqi(a.name, "maxrecordssharedwith") and a.args.len == 1 and a.args[0].kind == .name) {
+                    try shared.append(l.arena, .{ .out = outputs.items.len, .name = a.args[0].kind.name.last() });
+                }
+            }
+            if (nt.kind.isInput()) {
+                try inputs.append(l.arena, io);
+            } else {
+                try outputs.append(l.arena, io);
+                try out_names.append(l.arena, pd.name);
+            }
+        }
+        for (shared.items) |sh| {
+            for (out_names.items, 0..) |n, k| if (std.mem.eql(u8, n, sh.name)) {
+                outputs.items[sh.out].max_records_shared_with = @intCast(k);
+            };
+        }
+        info.inputs = inputs.items;
+        info.outputs = outputs.items;
+        return info;
+    }
+
+    /// `[NodeID("name"[, index])]`, `[NodeShareInputOf(...)]`.
+    fn nodeId(l: *Lowerer, a: ast.Attribute) Error!?ir.NodeId {
+        if (a.args.len < 1 or a.args[0].kind != .string_lit) return null;
+        return .{ .name = try stringContents(l.arena, a.args[0].kind.string_lit), .index = if (a.args.len > 1) l.attrUint(a.args[1]) else 0 };
+    }
+
+    fn attrUint(l: *Lowerer, e: *const ast.Expr) u32 {
+        return @intCast(std.math.clamp(l.s.evalInt(e) orelse 0, 0, std.math.maxInt(u32)));
+    }
+
+    /// A record struct declared `[NodeTrackRWInputSharing]`.
+    fn trackRwInputSharing(l: *Lowerer, record: TypeId) bool {
+        const info = switch (l.s.types.get(record)) {
+            .@"struct" => |s| s,
+            else => return false,
+        };
+        return l.s.structHasAttr(info, "nodetrackrwinputsharing");
+    }
+
     fn buildEntry(l: *Lowerer, f: *const semamod.Function, main: u32, opts: Options) Error!void {
         const inits = try l.staticInits();
         var entry: ir.Entry = .{ .func = main, .name = opts.entry, .stage = opts.stage, .ext = try l.spirvExt(f.decl.attrs) };
@@ -2428,6 +2562,9 @@ const Lowerer = struct {
         for (f.decl.attrs) |a| {
             if (std.ascii.eqlIgnoreCase(a.name, "numthreads") and a.args.len == 3) {
                 for (a.args, 0..) |arg, i| entry.num_threads[i] = @intCast(@max(1, l.s.evalInt(arg) orelse 1));
+            }
+            if (std.ascii.eqlIgnoreCase(a.name, "wavesize") and a.args.len >= 1 and a.args.len <= 3) {
+                for (a.args, 0..) |arg, i| entry.wave_size[i] = @intCast(@max(0, l.s.evalInt(arg) orelse 0));
             }
             if (std.ascii.eqlIgnoreCase(a.name, "maxvertexcount") and a.args.len == 1) entry.geometry.max_vertex_count = @intCast(@max(1, l.s.evalInt(a.args[0]) orelse 1));
             if (std.ascii.eqlIgnoreCase(a.name, "instance") and a.args.len == 1) entry.geometry.instance_count = @intCast(@max(1, l.s.evalInt(a.args[0]) orelse 1));
@@ -2458,14 +2595,25 @@ const Lowerer = struct {
             }
         };
         if (opts.stage == .amplification) entry.mesh.payload = l.mesh_payload;
+        if (opts.stage == .node) entry.node = try l.nodeInfo(f);
         const tess = opts.stage == .hull or opts.stage == .domain;
         if (tess) l.tessAttributes(f, &entry);
         // Hull shaders: where the control point inputs start.
         var cp_first: ?u32 = null;
+        var node_in: u32 = 0;
+        var node_out: u32 = 0;
         for (f.decl.params, f.params, 0..) |pd, p, i| {
             if (l.s.types.get(p.type) == .stream) continue;
             n_args += 1;
             const q = pd.quals;
+            if (l.s.types.get(p.type) == .node) {
+                const output = !l.s.types.get(p.type).node.kind.isInput();
+                const index = if (output) node_out else node_in;
+                if (output) node_out += 1 else node_in += 1;
+                args[i] = try l.b.add(.{ .op = .{ .node_io = .{ .output = output, .index = index } }, .ty = p.type });
+                locals[i] = args[i];
+                continue;
+            }
             if (opts.stage == .mesh and (q.vertices or q.indices or q.primitives) and l.s.types.get(p.type) == .array) {
                 // Output arrays: stores through them write the outputs.
                 const arr = l.s.types.get(p.type).array;
@@ -2708,11 +2856,11 @@ fn packOffset(v: *const Variable) ?u32 {
 fn imageFormatNamed(name: ?[]const u8) ?u32 {
     const n = name orelse return null;
     const names = [_][]const u8{
-        "unknown",     "rgba32f",     "rgba16f",   "r32f",       "rgba8",      "rgba8snorm",  "rg32f",    "rg16f",
-        "r11g11b10f",  "r16f",        "rgba16",    "rgb10a2",    "rg16",       "rg8",         "r16",      "r8",
-        "rgba16snorm", "rg16snorm",   "rg8snorm",  "r16snorm",   "r8snorm",    "rgba32i",     "rgba16i",  "rgba8i",
-        "r32i",        "rg32i",       "rg16i",     "rg8i",       "r16i",       "r8i",         "rgba32ui", "rgba16ui",
-        "rgba8ui",     "r32ui",       "rgb10a2ui", "rg32ui",     "rg16ui",     "rg8ui",       "r16ui",    "r8ui",
+        "unknown",     "rgba32f",   "rgba16f",   "r32f",     "rgba8",   "rgba8snorm", "rg32f",    "rg16f",
+        "r11g11b10f",  "r16f",      "rgba16",    "rgb10a2",  "rg16",    "rg8",        "r16",      "r8",
+        "rgba16snorm", "rg16snorm", "rg8snorm",  "r16snorm", "r8snorm", "rgba32i",    "rgba16i",  "rgba8i",
+        "r32i",        "rg32i",     "rg16i",     "rg8i",     "r16i",    "r8i",        "rgba32ui", "rgba16ui",
+        "rgba8ui",     "r32ui",     "rgb10a2ui", "rg32ui",   "rg16ui",  "rg8ui",      "r16ui",    "r8ui",
         "r64ui",       "r64i",
     };
     for (names, 0..) |x, k| if (std.ascii.eqlIgnoreCase(x, n)) return @intCast(k);
@@ -2747,7 +2895,6 @@ pub fn isObject(t: *TypeTable, ty: TypeId) bool {
         else => false,
     };
 }
-
 
 fn semanticOf(sems: []const ast.Semantic) ?[]const u8 {
     for (sems) |sem| if (sem.kind == .semantic) return sem.values[0];
@@ -2842,6 +2989,7 @@ fn signExtend(v: u64, bits: u8) i64 {
 /// Whether `e` designates storage (a variable, or a part of one) rather
 /// than a temporary such as an operator call's result.
 fn isAddressable(s: *const Sema, e: *const ast.Expr) bool {
+    if (s.resolution(e)) |r| if (r == .node_record) return true;
     return switch (e.kind) {
         .name, .this => true,
         .member => |m| isAddressable(s, m.base),

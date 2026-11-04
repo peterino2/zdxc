@@ -31,6 +31,9 @@ const none = std.math.maxInt(u32);
 const max_trips = 256;
 const max_loop_growth = 300;
 const max_growth = 65536;
+/// For `[unroll]` loops: dxc's limit on their iterations (its
+/// DxilLoopUnroll), and no limit on their size but the function's.
+const max_marked_trips = 1024;
 
 /// Unrolls the qualifying loops of `func`, innermost first; true if any.
 pub fn run(a: Allocator, m: *module.Module, func: u32) Allocator.Error!bool {
@@ -495,6 +498,10 @@ fn unrollOne(a: Allocator, m: *module.Module, func: u32, budget: *usize, tried: 
         // Innermost: no other loop's header inside.
         for (loops.items) |other| if (other.h != h and lp.body.has(other.h)) continue :candidates;
         try tried.put(a, h, {});
+        // `[unroll]` (its back edge marked by the emitter).
+        const marked_loop = for (lp.latches) |l| {
+            if (insts[cfg.block_start[l + 1] - 1].md == .unroll) break true;
+        } else false;
 
         // One way out: a conditional branch from one block, to one block.
         var exiting: u32 = none;
@@ -547,7 +554,7 @@ fn unrollOne(a: Allocator, m: *module.Module, func: u32, budget: *usize, tried: 
         while (true) {
             const c = eval(m, f, &state, xcond, 0) orelse continue :candidates;
             if ((c & 1) != stay_on) break;
-            if (states.items.len >= max_trips) continue :candidates;
+            if (states.items.len >= @as(usize, if (marked_loop) max_marked_trips else max_trips)) continue :candidates;
             try states.append(a, try state.clone(a));
             // Next values: what every latch passes back (the same).
             var next: std.AutoHashMapUnmanaged(u32, i64) = .empty;
@@ -570,7 +577,7 @@ fn unrollOne(a: Allocator, m: *module.Module, func: u32, budget: *usize, tried: 
         }
         const trips = states.items.len;
         const growth = (trips + 1) * size;
-        if (growth > max_loop_growth or growth > budget.*) continue;
+        if ((!marked_loop and growth > max_loop_growth) or growth > budget.*) continue;
         budget.* -= growth;
         try states.append(a, state); // the last pass, up to the exit
 

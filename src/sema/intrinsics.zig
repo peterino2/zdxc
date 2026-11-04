@@ -197,6 +197,16 @@ const Bindings = struct {
         return null;
     }
 
+    /// Bind `name` to `v` unless it is bound to a smaller value.
+    fn lower(b: *Bindings, name: []const u8, v: u16) void {
+        if (std.fmt.parseInt(u16, name, 10)) |_| return else |_| {}
+        for (b.names[0..b.n], b.values[0..b.n]) |k, *old| if (std.mem.eql(u8, k, name)) {
+            old.* = @min(old.*, v);
+            return;
+        };
+        _ = b.bind(name, v);
+    }
+
     /// Bind or check; false on conflict.
     fn bind(b: *Bindings, name: []const u8, v: u16) bool {
         if (b.get(name)) |old| return old == v;
@@ -221,6 +231,7 @@ fn matchOne(sema: anytype, it: *const table.Intrinsic, object: ?TypeId, args: []
         .resource => |r| r.elem,
         .stream => |s| s.elem,
         .patch => |p| p.elem,
+        .node => |x| x.elem,
         else => TypeTable.error_type,
     } else TypeTable.error_type;
 
@@ -253,11 +264,65 @@ fn matchOne(sema: anytype, it: *const table.Intrinsic, object: ?TypeId, args: []
     }
 
     var bindings: Bindings = .{};
+    // A vector size (`c` of `numeric<c>`) shared by several arguments takes
+    // the widest of them, scalars splatting to it, as in dxc: `dot(1, v)`
+    // is a dot product of v's size, not v truncated to a scalar.
+    {
+        var syms: [8][]const u8 = undefined;
+        var widest: [8]u16 = undefined;
+        var ok: [8]bool = undefined;
+        var ns: usize = 0;
+        for (args[0..it.params.len], 1..) |a, i| {
+            const ls = if (specs[i].dims.len > 0) specs[i] else specs[layout_group[i]];
+            if (ls.any_layout or ls.dims.len != 1) continue;
+            const sym = ls.dims[0];
+            if (std.fmt.parseInt(u16, sym, 10)) |_| continue else |_| {}
+            const sh = t.shape(a.ty) orelse continue;
+            const len: u16 = switch (sh.kind) {
+                .scalar => 1,
+                .vector => sh.cols,
+                else => continue,
+            };
+            const k = for (syms[0..ns], 0..) |s, j| {
+                if (std.mem.eql(u8, s, sym)) break j;
+            } else blk: {
+                if (ns == syms.len) break :blk null;
+                syms[ns] = sym;
+                widest[ns] = len;
+                ok[ns] = true;
+                ns += 1;
+                break :blk ns - 1;
+            } orelse continue;
+            // (Vectors of two different sizes: left to the usual binding,
+            // which converts to the first.)
+            if (len != 1 and widest[k] != 1 and len != widest[k]) ok[k] = false;
+            widest[k] = @max(widest[k], len);
+        }
+        for (syms[0..ns], widest[0..ns], ok[0..ns]) |s, w, good| if (good and w > 1) {
+            _ = bindings.bind(s, w);
+        };
+    }
     for (args[0..it.params.len], 1..) |a, i| {
         // (Also arguments whose layout links to a `<>` one.)
         if (!specs[i].any_layout and !specs[layout_group[i]].any_layout) continue;
         const sh = t.shape(a.ty) orelse continue;
         if (bindings.any_shape == null or sh.count() > bindings.any_shape.?.count()) bindings.any_shape = sh;
+    }
+    // A dimension shared by several arguments (`dot(numeric<c>,
+    // numeric<c>)`, mul's `numeric<r, c>` and `numeric<c>`) is the
+    // smallest one: dxc truncates the larger arguments (with a warning).
+    // Scalars splat and do not bind it.
+    for (args[0..it.params.len], 1..) |a, i| {
+        const ls = if (specs[i].dims.len > 0) specs[i] else specs[layout_group[i]];
+        const sh = t.shape(a.ty) orelse continue;
+        switch (ls.dims.len) {
+            1 => if (sh.kind == .vector) bindings.lower(ls.dims[0], sh.cols),
+            2 => if (sh.kind == .matrix) {
+                bindings.lower(ls.dims[0], sh.rows);
+                bindings.lower(ls.dims[1], sh.cols);
+            },
+            else => {},
+        }
     }
     var sum: u32 = 0;
     var worst: u32 = 0;
@@ -321,6 +386,12 @@ fn paramType(
 
     // Non-numeric classes.
     const base = if (cs.special == .none) cs.base else s.base;
+    // NodeOutput's Get{Thread,Group}NodeOutputRecords: records of the
+    // output's record type.
+    if (i == 0 and obj_elem != TypeTable.error_type) {
+        const records: ?types.NodeKind = if (std.mem.eql(u8, base, "ThreadNodeOutputRecords")) .thread_output_records else if (std.mem.eql(u8, base, "GroupNodeOutputRecords")) .group_output_records else null;
+        if (records) |k| return try t.intern(.{ .node = .{ .kind = k, .elem = obj_elem } });
+    }
     if (!std.mem.eql(u8, base, "void") and !isNumericClass(base)) {
         // Objects (samplers are checked) and classes zdxc does not model
         // (HitObject, node records, LinAlg...): unconstrained.

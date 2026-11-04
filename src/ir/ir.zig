@@ -38,7 +38,8 @@ pub const BlockId = enum(u32) {
 };
 
 /// Where a pointer points.
-pub const Space = enum { none, function, private, groupshared, resource, input, output, cbuffer, mesh, ray };
+/// (`node`: a work graph node record.)
+pub const Space = enum { none, function, private, groupshared, resource, input, output, cbuffer, mesh, ray, node };
 
 /// Ray tracing shader storage an entry receives: the incoming payload,
 /// the hit attributes and the incoming callable data.
@@ -72,6 +73,9 @@ pub const Constant = union(enum) {
 pub const Op = union(enum) {
     /// A scalar constant (or a vector of one constant, splatted).
     constant: Constant,
+    /// A node shader's input (`output` false) or its output `index`: the
+    /// node object (Entry.node's inputs / outputs).
+    node_io: struct { output: bool, index: u32 },
     /// The function's `n`th parameter (a pointer for out / inout).
     param: u32,
     /// Pointer to a module global (resource, groupshared, static).
@@ -356,6 +360,8 @@ pub const Stage = enum {
     mesh,
     amplification,
     library,
+    /// Work graph nodes (SM 6.8 libraries).
+    node,
     raygeneration,
     intersection,
     anyhit,
@@ -409,6 +415,45 @@ pub const OutputTopology = enum(u8) { point = 1, line = 2, triangle_cw = 3, tria
 
 pub const MeshOutput = enum { vertices, primitives, indices };
 
+/// A node shader's properties (`[Shader("node")]`), from its attributes.
+pub const NodeInfo = struct {
+    launch: Launch = .broadcasting,
+    is_program_entry: bool = false,
+    /// `[NodeID("name", index)]`; by default the function's name, 0.
+    id: NodeId,
+    local_root_arguments_table_index: ?u32 = null,
+    share_input_of: ?NodeId = null,
+    dispatch_grid: ?[3]u32 = null,
+    max_dispatch_grid: ?[3]u32 = null,
+    max_recursion_depth: ?u32 = null,
+    inputs: []const NodeIo = &.{},
+    outputs: []const NodeIo = &.{},
+
+    /// NodeLaunchType.
+    pub const Launch = enum(u32) { broadcasting = 1, coalescing = 2, thread = 3 };
+};
+
+pub const NodeId = struct { name: []const u8, index: u32 = 0 };
+
+/// One node input or output: a parameter of a node object type.
+pub const NodeIo = struct {
+    kind: types.NodeKind,
+    /// The record type (void for empty inputs / outputs).
+    record: TypeId,
+    /// I/O flags beyond the kind: TrackRWInputSharing 0x100,
+    /// GloballyCoherent 0x200.
+    extra_flags: u32 = 0,
+    /// Outputs: `[NodeID]`, by default the parameter's name, 0.
+    output_id: ?NodeId = null,
+    max_records: ?u32 = null,
+    /// Outputs: the index of the output whose records these share.
+    max_records_shared_with: ?u32 = null,
+    /// Output arrays: `[NodeArraySize(n)]`, or maxInt for
+    /// `[UnboundedSparseNodes]`.
+    array_size: ?u32 = null,
+    allow_sparse_nodes: bool = false,
+};
+
 pub const MeshInfo = struct {
     max_vertices: u32 = 0,
     max_primitives: u32 = 0,
@@ -436,9 +481,14 @@ pub const Entry = struct {
     name: []const u8,
     stage: Stage,
     num_threads: [3]u32 = .{ 1, 1, 1 },
+    /// `[WaveSize(min[, max[, preferred]])]`: zeros where not given (no
+    /// attribute: min 0).
+    wave_size: [3]u32 = .{ 0, 0, 0 },
     geometry: GeometryInfo = .{},
     tess: TessInfo = .{},
     mesh: MeshInfo = .{},
+    /// Node shaders.
+    node: ?NodeInfo = null,
     inputs: std.ArrayList(SigElement) = .empty,
     outputs: std.ArrayList(SigElement) = .empty,
     /// Patch constants: written by the hull shader's patch constant
@@ -483,8 +533,9 @@ pub const SpirvExt = struct {
 pub const SpirvInst = struct {
     opcode: u32,
     set: ?[]const u8 = null,
-    /// Values, pointers (`[[vk::ext_reference]]`) or literal words.
-    operands: []const union(enum) { value: Ref, literal: u32, type: TypeId },
+    /// Values, pointers (`[[vk::ext_reference]]`), literal words, types,
+    /// or the id of an OpString (printf's format).
+    operands: []const union(enum) { value: Ref, literal: u32, type: TypeId, string: []const u8 },
     capabilities: []const u32 = &.{},
     extensions: []const []const u8 = &.{},
 };
@@ -658,6 +709,7 @@ fn dumpInst(m: *const Module, f: *const Function, r: Ref, w: *std.Io.Writer) !vo
             .float => |v| try w.print("const {d}", .{v}),
         },
         .param => |p| try w.print("param {d}", .{p}),
+        .node_io => |x| try w.print("node_{s} {d}", .{ if (x.output) "output" else "input", x.index }),
         .global => |g| try w.print("global @{d}", .{g}),
         .local_var => try w.writeAll("local_var"),
         .load => |p| try w.print("load %{d}", .{p.index()}),
