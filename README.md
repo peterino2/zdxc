@@ -73,7 +73,7 @@ Each bundle includes the CLI, static C library, header, and DXC drop-in.
 See the [case studies](https://zdxc.org/case-studies.html) for benchmark
 measurements and methodology. In Hyperion's Windows DXIL cook, zdxc's compile
 step was **15.5× faster** and the complete shader cook was **2.5× faster**;
-Unreal Engine 5.8's editor compiled its 11,156 startup shaders **4.7× faster**.
+Unreal Engine 5.8's editor compiled its 11,156 startup shaders **4.3× faster**.
 
 ## Status
 
