@@ -213,6 +213,14 @@ const Emitter = struct {
     /// Image types by (sampled type, dim, arrayed, ms, sampled, format).
     image_types: std.AutoHashMapUnmanaged([6]u32, Id) = .empty,
     sampled_image_types: std.AutoHashMapUnmanaged(Id, Id) = .empty,
+    /// [[vk::combinedImageSampler]] pairs, by global: the texture and the
+    /// sampler that share its descriptor set and binding.
+    combined_with: []?u32 = &.{},
+    /// Their variables: each combined texture's (a sampled image) to its
+    /// sampler's stand-in, an id with no variable (the sampler lives in
+    /// the texture's descriptor).
+    combined_vars: std.AutoHashMapUnmanaged(Id, Id) = .empty,
+    combined_samplers: std.AutoHashMapUnmanaged(Id, void) = .empty,
     sampler_type: Id = 0,
     accel_type: Id = 0,
     ray_query_type: Id = 0,
@@ -851,7 +859,7 @@ const Emitter = struct {
     /// A declared resource global of type `ty`.
     fn anyGlobalOf(e: *Emitter, ty: TypeId) ?u32 {
         for (e.m.globals.items, 0..) |g, gi| {
-            if (g.ty == ty and g.space == .resource and e.global_vars[gi] != 0) return @intCast(gi);
+            if (g.ty == ty and g.space == .resource and e.global_vars[gi] != 0 and !e.combined_samplers.contains(e.global_vars[gi])) return @intCast(gi);
         }
         return null;
     }
@@ -1087,7 +1095,7 @@ const Emitter = struct {
         }
         if (e.spv_minor >= 4) {
             // (Shader record buffers only where used: at most one each.)
-            for (e.global_vars, e.m.globals.items) |v, g| if (v != 0 and !g.shader_record and !g.push_constant) try out.put(e.arena, v, {});
+            for (e.global_vars, e.m.globals.items) |v, g| if (v != 0 and !g.shader_record and !g.push_constant and !e.combined_samplers.contains(v)) try out.put(e.arena, v, {});
             for (e.counter_vars) |v| if (v != 0) try out.put(e.arena, v, {});
             for (e.flat_iface.items) |v| try out.put(e.arena, v, {});
         }
@@ -1204,6 +1212,7 @@ const Emitter = struct {
 
         try e.findCounterGlobals();
         try e.assignBindings();
+        try e.pairCombined();
         for (m.globals.items, 0..) |g, gi| {
             switch (g.space) {
                 .resource, .cbuffer => if (ownStorage(g)) |sc| {
@@ -1246,9 +1255,15 @@ const Emitter = struct {
                         continue;
                     }
                     const var_id = e.b.newId();
+                    if (e.combined_with[gi] != null and e.t.get(g.ty) == .sampler) {
+                        // In its texture's descriptor: no variable.
+                        e.global_vars[gi] = var_id;
+                        continue;
+                    }
                     e.format_override = g.image_format;
-                    const p = try e.resourcePointee(g.ty);
+                    var p = try e.resourcePointee(g.ty);
                     e.format_override = null;
+                    if (e.combined_with[gi] != null) p.ty = try e.sampledImageType(p.ty);
                     try e.b.emit(.types_globals, .variable, &.{ try e.pointerType(p.sc, p.ty), var_id, @backingInt(p.sc) });
                     const slot = try e.slotOf(@intCast(gi), false);
                     try e.b.emit(.annotations, .decorate, &.{ var_id, 34, slot.set }); // DescriptorSet
@@ -1298,6 +1313,12 @@ const Emitter = struct {
                 else => return e.unsupported("global '{s}' is not supported yet", .{g.name}),
             }
             if (e.global_vars[gi] != 0) try e.applyExt(e.global_vars[gi], g.ext);
+        }
+        for (e.combined_with, 0..) |pair, gi| {
+            const other = pair orelse continue;
+            if (e.t.get(m.globals.items[gi].ty) == .sampler) continue;
+            try e.combined_vars.put(e.arena, e.global_vars[gi], e.global_vars[other]);
+            try e.combined_samplers.put(e.arena, e.global_vars[other], {});
         }
 
         // Descriptor heaps: the next free bindings of set 0 (resources,
@@ -1358,6 +1379,43 @@ const Emitter = struct {
     }
 
     const Slot = struct { set: u32, binding: u32 };
+
+    /// [[vk::combinedImageSampler]]: the texture and the sampler at each
+    /// descriptor set and binding become one sampled image variable, as
+    /// dxc's (spirv-opt's --convert-to-sampled-image). Arrays stay apart,
+    /// as there.
+    fn pairCombined(e: *Emitter) Error!void {
+        const m = e.m;
+        e.combined_with = try e.arena.alloc(?u32, m.globals.items.len);
+        @memset(e.combined_with, null);
+        const Pair = struct { texture: ?u32 = null, sampler: ?u32 = null };
+        var pairs: std.AutoArrayHashMapUnmanaged(Slot, Pair) = .empty;
+        for (m.binding_decls.items) |bd| {
+            if (!bd.combined) continue;
+            const gi = bd.global orelse continue;
+            const slot = e.slots[gi] orelse continue;
+            const gop = try pairs.getOrPut(e.arena, slot);
+            if (!gop.found_existing) gop.value_ptr.* = .{};
+            const ty = m.globals.items[gi].ty;
+            const side = switch (e.t.get(ty)) {
+                .sampler => &gop.value_ptr.sampler,
+                .resource => |r| if (texture.shape(r.kind)) |sh| if (!sh.rw and !sh.combined and sh.dim != .buffer) &gop.value_ptr.texture else continue else continue,
+                else => continue,
+            };
+            if (side.* != null) return e.unsupported("more than one {s} with [[vk::combinedImageSampler]] for descriptor set and binding: {d}, {d}", .{ if (side == &gop.value_ptr.sampler) "sampler" else "texture", slot.set, slot.binding });
+            side.* = gi;
+        }
+        var it = pairs.iterator();
+        while (it.next()) |kv| {
+            const p = kv.value_ptr.*;
+            if (p.texture == null or p.sampler == null) {
+                _ = e.diags.report(.{ .severity = .fatal, .loc = .none }, "Texture or Sampler with [[vk::combinedImageSampler]] attribute is missing for descriptor set and binding: {d}, {d}", .{ kv.key_ptr.set, kv.key_ptr.binding });
+                return error.Unsupported;
+            }
+            e.combined_with[p.texture.?] = p.sampler.?;
+            e.combined_with[p.sampler.?] = p.texture.?;
+        }
+    }
 
     /// Descriptor set and binding of every resource and counter, as dxc
     /// numbers them: [[vk::binding]] (and [[vk::counter_binding]]) first,
@@ -3806,7 +3864,7 @@ const Emitter = struct {
     }
 
     fn loadImage(e: *Emitter, r: Ref) Error!Id {
-        if (texture.shape(e.resourceInfo(r).kind)) |sh| if (sh.combined) {
+        if (texture.shape(e.resourceInfo(r).kind)) |sh| if (sh.combined or e.combined_vars.contains(e.val(r))) {
             // A combined image sampler: its image.
             const si = try e.opRaw(.load, try e.sampledImageType(try e.imageTypeOf(r)), &.{e.val(r)});
             if (e.nonuniform_ids.contains(e.val(r))) try e.markNonUniform(si, e.f.inst(r).ty);
@@ -3941,7 +3999,10 @@ const Emitter = struct {
 
         if (call.op.implicitLod()) try e.checkDerivatives();
         const s = try e.texelScalar(r.elem);
-        const img = try e.loadImage(res);
+        // A combined image sampler ([[vk::combinedImageSampler]] too)
+        // samples as itself: its image is taken out only where needed.
+        const combined = sh.combined or e.combined_vars.contains(e.val(res));
+        const img = if (combined and call.op != .load) 0 else try e.loadImage(res);
         const coord = e.val(args[call.coord]);
         // Image operands, in operand-mask bit order.
         var mask: u32 = 0;
@@ -4029,15 +4090,19 @@ const Emitter = struct {
             return e.texelResult(v, s, ty);
         }
         if (call.op == .sample_position) return e.unsupported("GetSamplePosition is not supported yet", .{});
-        const si = if (sh.combined) blk: {
+        const own_sampler = sh.combined or e.combined_vars.get(e.val(res)) == e.val(args[call.sampler.?]);
+        const si = if (own_sampler) blk: {
             const v = try e.opRaw(.load, try e.sampledImageType(try e.imageTypeOf(res)), &.{e.val(res)});
             if (e.nonuniform_ids.contains(e.val(res))) try e.markNonUniform(v, e.f.inst(res).ty);
             break :blk v;
         } else blk: {
-            const smp = try e.opRaw(.load, try e.samplerType(), &.{e.val(args[call.sampler.?])});
-            if (e.nonuniform_ids.contains(e.val(args[call.sampler.?]))) try e.markNonUniform(smp, e.f.inst(args[call.sampler.?]).ty);
-            const v = try e.opRaw(.sampled_image, try e.sampledImageType(try e.imageTypeOf(res)), &.{ img, smp });
-            if (e.nonuniform_ids.contains(img) or e.nonuniform_ids.contains(smp)) try e.markNonUniform(v, e.f.inst(res).ty);
+            const smp_var = e.val(args[call.sampler.?]);
+            if (e.combined_samplers.contains(smp_var)) return e.unsupported("a sampler with [[vk::combinedImageSampler]] can sample only the texture at its descriptor set and binding", .{});
+            const image = if (img != 0) img else try e.loadImage(res);
+            const smp = try e.opRaw(.load, try e.samplerType(), &.{smp_var});
+            if (e.nonuniform_ids.contains(smp_var)) try e.markNonUniform(smp, e.f.inst(args[call.sampler.?]).ty);
+            const v = try e.opRaw(.sampled_image, try e.sampledImageType(try e.imageTypeOf(res)), &.{ image, smp });
+            if (e.nonuniform_ids.contains(image) or e.nonuniform_ids.contains(smp)) try e.markNonUniform(v, e.f.inst(res).ty);
             break :blk v;
         };
         if (call.op == .calc_lod or call.op == .calc_lod_unclamped) {
