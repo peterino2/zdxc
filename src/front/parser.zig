@@ -1811,18 +1811,23 @@ pub const Parser = struct {
         }
     }
 
+    /// A number token. HLSL allows swizzles on literals (`0x04.xxx`,
+    /// `1.0.xxxx`, and chained, `1.0f.r.r`); the lexer reads them as one
+    /// pp-number.
+    fn numberExpr(p: *Parser, loc: Loc, text: []const u8) Error!*ast.Expr {
+        if (splitLiteralSwizzle(text)) |split| {
+            const base = try p.numberExpr(loc, split.literal);
+            return p.mkExpr(loc, .{ .member = .{ .base = base, .name = split.swizzle, .name_loc = loc.advance(@intCast(split.literal.len + 1)) } });
+        }
+        return p.mkExpr(loc, if (isFloatLiteral(text)) .{ .float_lit = text } else .{ .int_lit = text });
+    }
+
     fn parsePrimary(p: *Parser) Error!*ast.Expr {
         const t = p.tok();
         switch (t.kind) {
             .number => {
                 _ = p.advance();
-                // HLSL allows swizzles on literals (`0x04.xxx`, `1.0.xxxx`);
-                // the lexer reads them as one pp-number.
-                if (splitLiteralSwizzle(t.text)) |split| {
-                    const lit = try p.mkExpr(t.loc, if (isFloatLiteral(split.literal)) .{ .float_lit = split.literal } else .{ .int_lit = split.literal });
-                    return p.mkExpr(t.loc, .{ .member = .{ .base = lit, .name = split.swizzle, .name_loc = t.loc.advance(@intCast(split.literal.len + 1)) } });
-                }
-                return p.mkExpr(t.loc, if (isFloatLiteral(t.text)) .{ .float_lit = t.text } else .{ .int_lit = t.text });
+                return p.numberExpr(t.loc, t.text);
             },
             .string => {
                 _ = p.advance();
@@ -1907,7 +1912,8 @@ fn describe(t: Token) []const u8 {
     return if (t.kind == .eof) "end of file" else t.text;
 }
 
-/// `0x04.xxx` -> literal `0x04`, swizzle `xxx`; `1.0.xy` -> `1.0`, `xy`.
+/// `0x04.xxx` -> literal `0x04`, swizzle `xxx`; `1.0.xy` -> `1.0`, `xy`;
+/// `1.0f.r.r` -> `1.0f.r`, `r` (itself split again).
 fn splitLiteralSwizzle(text: []const u8) ?struct { literal: []const u8, swizzle: []const u8 } {
     const dot = std.mem.lastIndexOfScalar(u8, text, '.') orelse return null;
     const sw = text[dot + 1 ..];
@@ -1918,7 +1924,9 @@ fn splitLiteralSwizzle(text: []const u8) ?struct { literal: []const u8, swizzle:
     // `1.xx`: the literal must not end in an exponent marker.
     if (std.ascii.isAlphabetic(lit[lit.len - 1]) and !(lit.len > 1 and lit[0] == '0' and (lit[1] == 'x' or lit[1] == 'X'))) {
         const last = lit[lit.len - 1];
-        if (last != 'f' and last != 'F' and last != 'h' and last != 'H' and last != 'u' and last != 'U' and last != 'l' and last != 'L') return null;
+        if (last != 'f' and last != 'F' and last != 'h' and last != 'H' and last != 'u' and last != 'U' and last != 'l' and last != 'L'
+            // (or end in a swizzle of its own)
+        and splitLiteralSwizzle(lit) == null) return null;
     }
     return .{ .literal = lit, .swizzle = sw };
 }
