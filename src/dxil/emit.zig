@@ -6736,6 +6736,7 @@ const Emitter = struct {
         };
         counted = &.{};
         const alive = try e.liveResources();
+        if (!e.lib) try e.packUnbound(alive);
         var counts: [4]u32 = .{ 0, 0, 0, 0 };
         var k: usize = 0;
         for (e.resources.items, alive) |r, live| {
@@ -6749,6 +6750,75 @@ const Emitter = struct {
             k += 1;
         }
         e.resources.shrinkRetainingCapacity(k);
+    }
+
+    /// dxc gives unbound resources their registers once dead code is gone,
+    /// so the live ones are packed from 0 (and Unreal sizes its tables by
+    /// the highest register: a sampler at s38 counts as 39 of its 32).
+    /// Registers were chosen before the code was; move each live unbound
+    /// resource into the lowest register free around the explicit ones,
+    /// rewriting its handles' bindings. Those whose handles' indices are
+    /// not their register as a constant (arrays indexed in code) stay.
+    fn packUnbound(e: *Emitter, alive: []const bool) Error!void {
+        const n = e.resources.items.len;
+        const movable = try e.arena.alloc(bool, n);
+        for (e.resources.items, alive, movable) |r, live, *m| {
+            m.* = live and !r.view and r.count == 1 and !e.binding(r).explicit;
+        }
+        const Site = struct { f: u32, i: u32, ri: u32 };
+        var sites: std.ArrayList(Site) = .empty;
+        for (e.dm.functions.items, 0..) |*f, fi| for (f.insts.items, 0..) |inst, i| {
+            const c = switch (inst.op) {
+                .call => |c| c,
+                else => continue,
+            };
+            if (!std.mem.eql(u8, e.dm.functions.items[c.callee].name, "dx.op.createHandleFromBinding")) continue;
+            const ri = e.handleResource(f, .{ .inst = @intCast(i) }) orelse continue;
+            if (!movable[ri]) continue;
+            if (e.constInt(c.args[2]) != e.binding(e.resources.items[ri]).index) {
+                movable[ri] = false;
+                continue;
+            }
+            try sites.append(e.arena, .{ .f = @intCast(fi), .i = @intCast(i), .ri = ri });
+        };
+        const Reg = struct { u8, u32, u32 };
+        var used: std.AutoHashMapUnmanaged(Reg, void) = .empty;
+        for (e.resources.items, alive, movable) |r, live, m| {
+            if (!live or r.view or m) continue;
+            const b = e.binding(r);
+            if (b.index == std.math.maxInt(u32)) continue;
+            const span: u32 = if (r.count == std.math.maxInt(u32)) 64 else r.count;
+            for (0..span) |k| try used.put(e.arena, .{ @backingInt(r.class), b.space, b.index + @as(u32, @intCast(k)) }, {});
+        }
+        const new_index = try e.arena.alloc(u32, n);
+        for (e.resources.items, movable, new_index) |r, m, *ni| {
+            if (!m) continue;
+            const space = e.binding(r).space;
+            var i: u32 = 0;
+            while (used.contains(.{ @backingInt(r.class), space, i })) i += 1;
+            try used.put(e.arena, .{ @backingInt(r.class), space, i }, {});
+            ni.* = i;
+        }
+        const i32t = try e.dm.intType(32);
+        for (sites.items) |s| {
+            if (!movable[s.ri]) continue;
+            const c = &e.dm.functions.items[s.f].insts.items[s.i].op.call;
+            const old = switch (c.args[1]) {
+                .constant => |k| e.dm.constants.items[k],
+                else => unreachable,
+            };
+            const fields = try e.arena.dupe(module.ConstId, old.kind.aggregate);
+            const at = try e.dm.constant(.{ .ty = i32t, .kind = .{ .int = new_index[s.ri] } });
+            fields[0] = at.constant;
+            fields[1] = at.constant;
+            const args = try e.arena.dupe(Value, c.args);
+            args[1] = try e.dm.constant(.{ .ty = old.ty, .kind = .{ .aggregate = fields } });
+            args[2] = at;
+            c.args = args;
+        }
+        for (e.resources.items, movable, new_index) |r, m, ni| {
+            if (m) @constCast(&e.m.globals.items[r.global]).binding.index = ni;
+        }
     }
 
     /// The resources a handle is still made for once dead code is gone
