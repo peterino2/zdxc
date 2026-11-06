@@ -36,6 +36,11 @@ pub const Request = struct {
     /// drop-in leaves them out: its clients read any diagnostic text as a
     /// warning.)
     compat_notes: bool = true,
+    /// Diagnostics without a source location (code generation's) name the
+    /// main file at 1:1. (The DXC drop-in: Unreal reads only diagnostics
+    /// that start with `file:line:col:` as errors, and calls a failure
+    /// with none an internal error.)
+    place_unplaced: bool = false,
 };
 
 pub const Status = enum(u8) {
@@ -294,7 +299,10 @@ fn parseArgs(ctx: *Ctx, arena: std.mem.Allocator, args: []const []const u8) !?Op
                         }.f;
                         try opts.vk.bind_register.append(arena, .{ .class = reg[0], .index = try num(ctx, reg[1..]), .space = try num(ctx, a.values[1]), .binding = try num(ctx, a.values[2]), .set = try num(ctx, a.values[3]) });
                     },
-                    .auto_binding_space => opts.vk.auto_binding_space = std.fmt.parseInt(u32, v, 10) catch return ctx.fail("invalid -auto-binding-space '{s}'", .{v}),
+                    .auto_binding_space => {
+                        opts.vk.auto_binding_space = std.fmt.parseInt(u32, v, 10) catch return ctx.fail("invalid -auto-binding-space '{s}'", .{v});
+                        opts.vk.auto_binding_given = true;
+                    },
                     .fvk_auto_shift_bindings => opts.vk.auto_shift = true,
                     .fspv_flatten_resource_arrays => opts.vk.flatten_arrays = true,
                     .fspv_use_legacy_buffer_matrix_order => opts.vk.legacy_matrix_order = true,
@@ -511,7 +519,7 @@ fn run(ctx: *Ctx, arena: std.mem.Allocator) !void {
             }
         }
         const color = opts.color orelse ctx.req.color;
-        try diags.render(&sm, ctx.stderr, .{ .format = opts.diag_format, .color = color });
+        try diags.render(&sm, ctx.stderr, .{ .format = opts.diag_format, .color = color, .unplaced = if (ctx.req.place_unplaced) opts.input else null });
         // An unreadable input is an I/O error, as in dxc.
         if (!opened) return error.Fatal;
         if (diags.hasErrors()) return error.CompileFailed;
@@ -531,7 +539,7 @@ fn run(ctx: *Ctx, arena: std.mem.Allocator) !void {
                 try zdxc.ir.inline_calls.runResourceReturns(m);
                 zdxc.ir.split_resources.run(arena, m, &diags) catch |err| switch (err) {
                     error.Unsupported => {
-                        try diags.render(&sm, ctx.stderr, .{ .format = opts.diag_format, .color = false });
+                        try diags.render(&sm, ctx.stderr, .{ .format = opts.diag_format, .color = false, .unplaced = if (ctx.req.place_unplaced) opts.input else null });
                         return error.CompileFailed;
                     },
                     else => |x| return x,
@@ -550,7 +558,7 @@ fn run(ctx: *Ctx, arena: std.mem.Allocator) !void {
             if (opts.spirv) {
                 const bytes = zdxc.spirv.emit.emit(arena, m, &diags, zdxc.spirv.emit.TargetEnv.parse(opts.target_env) orelse return ctx.fail("unknown SPIR-V target environment '{s}'", .{opts.target_env})) catch |err| switch (err) {
                     error.Unsupported => {
-                        try diags.render(&sm, ctx.stderr, .{ .format = opts.diag_format, .color = false });
+                        try diags.render(&sm, ctx.stderr, .{ .format = opts.diag_format, .color = false, .unplaced = if (ctx.req.place_unplaced) opts.input else null });
                         return error.CompileFailed;
                     },
                     else => |x| return x,
@@ -566,7 +574,7 @@ fn run(ctx: *Ctx, arena: std.mem.Allocator) !void {
             const zd = stats.begin(.dxil);
             const dxil_out = zdxc.dxil.emit.emitWithReflectionAt(arena, m, profile.?, &diags, if (opts.no_opt) .none else if (opts.opt_level == .od) .debug else .full) catch |err| switch (err) {
                 error.Unsupported => {
-                    try diags.render(&sm, ctx.stderr, .{ .format = opts.diag_format, .color = false });
+                    try diags.render(&sm, ctx.stderr, .{ .format = opts.diag_format, .color = false, .unplaced = if (ctx.req.place_unplaced) opts.input else null });
                     return error.CompileFailed;
                 },
                 else => |x| return x,
@@ -632,7 +640,7 @@ fn rootSignatureMacroText(ctx: *Ctx, arena: std.mem.Allocator, opts: Options, in
     }
     if (!any and !diags.hasErrors()) _ = diags.report(.{ .severity = .@"error", .loc = .none }, "root signature macro '{s}' is not defined", .{macro});
     if (diags.hasErrors()) {
-        try diags.render(&sm, ctx.stderr, .{ .format = opts.diag_format, .color = false });
+        try diags.render(&sm, ctx.stderr, .{ .format = opts.diag_format, .color = false, .unplaced = if (ctx.req.place_unplaced) opts.input else null });
         return null;
     }
     return parts.items;

@@ -1777,9 +1777,34 @@ const Lowerer = struct {
             },
             else => {},
         }
+        if (l.staticResourceInit(v)) |init_e| {
+            // A static resource with an initializer (`static const
+            // Texture2D T = ResourceDescriptorHeap[i];`, as Unreal declares
+            // bindless resources): not a resource of its own but the
+            // initializer's, evaluated where it is used, as a local holding
+            // it. (A resource does not change, so each evaluation is the
+            // same resource.)
+            const val = try l.converted(init_e, v.type);
+            const local = try l.b.add(.{ .op = .local_var, .ty = try l.concrete(v.type), .ptr = .function });
+            try l.b.store(local, val);
+            return local;
+        }
         const g = try l.globalIndex(v);
         const glob = l.m.globals.items[g];
         return l.b.add(.{ .op = .{ .global = g }, .ty = glob.ty, .ptr = glob.space });
+    }
+
+    /// The initializer of file-scope static resource `v`, if it has one
+    /// that gives it its value (not a state object's init list).
+    fn staticResourceInit(l: *Lowerer, v: *const Variable) ?*ast.Expr {
+        if (v.storage != .global_static and v.storage != .constant) return null;
+        const init_e = v.init orelse return null;
+        if (init_e.kind == .init_list or !isObject(&l.s.types, v.type)) return null;
+        switch (l.s.types.get(v.type)) {
+            .resource => |r| if (r.kind == .other) return null,
+            else => {},
+        }
+        return init_e;
     }
 
     /// A node record: `obj.Get()`, `obj.Get(i)` or `obj[i]` (an element

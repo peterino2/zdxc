@@ -969,6 +969,7 @@ fn runText(a: std.mem.Allocator, args: []const []const u8, text: []const u8, sou
         .io = threaded.io(),
         .fs = NoFs.fileSystem(),
         .compat_notes = false,
+        .place_unplaced = true,
     };
     if (include) |h| {
         // Our own disk handler reads directly; a client's is called with
