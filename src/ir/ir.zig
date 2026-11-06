@@ -251,6 +251,10 @@ pub const VkOptions = struct {
     shifts: [4]std.ArrayList(struct { shift: u32, set: ?u32 }) = .{ .empty, .empty, .empty, .empty },
     bind_globals: ?[2]u32 = null,
     auto_binding_space: u32 = 0,
+    /// -auto-binding-space was given: DXIL libraries bind their unbound
+    /// resources in that space (without it they stay unbound until
+    /// linked).
+    auto_binding_given: bool = false,
     /// -fvk-auto-shift-bindings: implicit bindings start at their class's
     /// shift too.
     auto_shift: bool = false,

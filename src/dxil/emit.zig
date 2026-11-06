@@ -141,6 +141,9 @@ const NodeVal = struct { kind: types.NodeKind, handle: Value, record: TypeId, fl
 
 /// Pointer into a flattened local: alloca `base` of `[n x scalar]`, at
 /// component `offset_const` (+ `offset_dyn` if dynamic).
+/// Where a texel copy came from (Emitter.texel_copies).
+const TexelCopy = struct { res: u32, coords: []const Value, ty: TypeId, copy: Ptr };
+
 const Ptr = struct {
     base: Value,
     array_ty: DType,
@@ -302,8 +305,8 @@ const Emitter = struct {
     private_globals: std.AutoHashMapUnmanaged(u32, Ptr) = .empty,
     private_typed: std.AutoHashMapUnmanaged(u32, @FieldType(Lowered, "typed")) = .empty,
     /// Locals holding a copy of a texel read through an index (see the
-    /// `access` op): writes through them would not reach the texture.
-    texel_copies: ValueMap(void) = .empty,
+    /// `access` op): a write through one writes the texel back.
+    texel_copies: ValueMap(TexelCopy) = .empty,
     /// Static globals holding resources (as locals: Emitter.aggLocal).
     private_aggs: std.AutoHashMapUnmanaged(u32, Lowered) = .empty,
     res_locals: std.ArrayList(?Lowered) = .empty,
@@ -917,6 +920,12 @@ const Emitter = struct {
                 return x.func < y.func;
             }
         }.lt);
+        // Resources no function makes a handle for any more: gone, as dxc
+        // removes them (a library's handles name their globals, so the
+        // others can be numbered again at any shader model); then
+        // -auto-binding-space binds the rest.
+        if (e.optimize) try e.dropDeadResources();
+        try e.autoBindLibrary();
         try promote.pruneGlobals(e.arena, &e.dm);
         if (try promote.pruneDeclarations(e.arena, &e.dm)) |index| for (funcs.items) |*lf| {
             lf.func = index[lf.func];
@@ -1324,7 +1333,45 @@ const Emitter = struct {
                 e.resources.items[ri].has_counter = true;
             };
         };
-        // Unbound resources take the next free register of their class.
+        if (e.lib) {
+            // Libraries leave them unbound (-1) until linked, or with
+            // -auto-binding-space until the dead ones are gone
+            // (autoBindLibrary).
+            for (e.resources.items) |res| {
+                const g = &e.m.globals.items[res.global];
+                if (g.binding.explicit) continue;
+                @constCast(g).binding.index = std.math.maxInt(u32);
+                if (!e.m.vk.auto_binding_given) @constCast(g).binding.space = std.math.maxInt(u32);
+            }
+            return;
+        }
+        try e.assignUnbound();
+    }
+
+    /// -auto-binding-space for a library: its live unbound resources take
+    /// registers in that space (or the space they name), as dxc binds them
+    /// once dead code is gone. (Library handles name their resource's
+    /// global, not its register, so the code needs no change.)
+    fn autoBindLibrary(e: *Emitter) Error!void {
+        if (!e.m.vk.auto_binding_given) return;
+        for (e.resources.items) |res| {
+            if (res.view) continue;
+            const g = &e.m.globals.items[res.global];
+            if (g.binding.explicit or g.binding.space_given) continue;
+            // (dxc leaves `$Globals` in space 0.)
+            if (g.space == .cbuffer and std.mem.eql(u8, g.name, "$Globals")) {
+                @constCast(g).binding.space = 0;
+                continue;
+            }
+            @constCast(g).binding.space = e.m.vk.auto_binding_space;
+        }
+        try e.assignUnbound();
+    }
+
+    /// Unbound resources take the next free register of their class.
+    /// (Views, made from the descriptor heap as code is emitted, have no
+    /// global and no register.)
+    fn assignUnbound(e: *Emitter) Error!void {
         var used: std.AutoHashMapUnmanaged(struct { u8, u32, u32 }, void) = .empty;
         // (Unsized ranges are taken to hold 64 registers here.)
         const span = struct {
@@ -1333,18 +1380,14 @@ const Emitter = struct {
             }
         }.f;
         for (e.resources.items) |res| {
+            if (res.view) continue;
             const b = e.m.globals.items[res.global].binding;
             if (b.explicit) for (0..span(res.count)) |k| try used.put(e.arena, .{ @backingInt(res.class), b.space, b.index + @as(u32, @intCast(k)) }, {});
         }
         for (e.resources.items) |res| {
+            if (res.view) continue;
             const g = &e.m.globals.items[res.global];
             if (g.binding.explicit) continue;
-            if (e.lib) {
-                // Libraries leave them unbound (-1) until linked.
-                @constCast(g).binding.index = std.math.maxInt(u32);
-                @constCast(g).binding.space = std.math.maxInt(u32);
-                continue;
-            }
             var i: u32 = 0;
             while (true) : (i += 1) {
                 const free = for (0..span(res.count)) |k| {
@@ -2645,7 +2688,7 @@ const Emitter = struct {
                         const vals = if (res.kind == 10) try e.typedBufferLoad(res, tx.coords[0], ety) else try e.textureLoad(res, mip, tx.coords, null, ety);
                         const copy = try e.alloca(ety);
                         try e.storePtr(copy, vals, ety);
-                        try e.texel_copies.put(e.arena, copy.base, {});
+                        try e.texel_copies.put(e.arena, copy.base, .{ .res = tx.res, .coords = tx.coords, .ty = ety, .copy = copy });
                         break :blk copy;
                     },
                     else => |v| return e.unsupported("access into this storage is not supported yet ({s} from '{s}' in '{s}')", .{ @tagName(v), @tagName(f.inst(a.base).op), frame.f.name }),
@@ -3128,6 +3171,7 @@ const Emitter = struct {
         }
         const n = try e.flatCount(ty);
         var first: ?Scalar = null;
+        var first_raw: ?Scalar = null;
         var mixed = false;
         for (0..n) |k| {
             const c = e.compOf(try e.componentType(ty, @intCast(k)));
@@ -3135,8 +3179,11 @@ const Emitter = struct {
             if (mc.size() != 4) {
                 if (first != null and first.? != mc) return e.unsupported("structs mixing 32-bit and other component sizes are not supported yet", .{});
             }
-            if (first != null and first.? != mc) mixed = true;
+            // bool next to int is mixed too: both are stored as i32, but
+            // only the bools convert (zext on store, != 0 on load).
+            if (first_raw != null and first_raw.? != c) mixed = true;
             if (first == null) first = mc;
+            if (first_raw == null) first_raw = c;
         }
         return mixed;
     }
@@ -3163,7 +3210,19 @@ const Emitter = struct {
     }
 
     fn storePtr(e: *Emitter, ptr: Ptr, vals: []const Value, ty: TypeId) Error!void {
-        if (e.texel_copies.contains(ptr.base)) return e.unsupported("writing one component of a texel through an index is not supported yet", .{});
+        try e.storePtrLocal(ptr, vals, ty);
+        // A component of a texel (`T[p][i] = v`): the whole texel, with it
+        // changed, goes back to the texture.
+        if (e.texel_copies.count() > 0) if (e.texel_copies.get(ptr.base)) |tc| {
+            const texel = (try e.loadPtr(tc.copy, tc.ty)).scalars;
+            const res = e.resources.items[tc.res];
+            if (res.kind == 10) {
+                try e.bufferStoreVals(res, tc.coords[0], texel, tc.ty);
+            } else try e.textureStore(res, tc.coords, texel, tc.ty);
+        };
+    }
+
+    fn storePtrLocal(e: *Emitter, ptr: Ptr, vals: []const Value, ty: TypeId) Error!void {
         const void_ty = try e.voidTy();
         for (vals, 0..) |v, c| {
             if (ptr.offset_dyn == null) {
@@ -5200,7 +5259,12 @@ const Emitter = struct {
         const vals = try e.scalars(frame, value_ref);
         if (res.kind == 12) return e.structuredStore(res.*, idx, 0, null, e.m.row_major, frame.f.inst(value_ref).ty, vals);
         if (res.kind == 11 and !try e.simpleRaw(frame.f.inst(value_ref).ty)) return e.rawStore(res.*, idx, frame.f.inst(value_ref).ty, vals);
-        const vt = frame.f.inst(value_ref).ty;
+        return e.bufferStoreVals(res.*, idx, vals, frame.f.inst(value_ref).ty);
+    }
+
+    /// A store of `vals` (of type `vt`) at `idx` of a typed or simple
+    /// byte-address buffer.
+    fn bufferStoreVals(e: *Emitter, res: Resource, idx: Value, vals: []const Value, vt: TypeId) Error!void {
         const c = try e.uniformScalar(vt);
         const mem_c = if (c == .bool) Scalar.uint else c;
         const st = try e.scalarTy(mem_c);
@@ -7161,7 +7225,14 @@ const Emitter = struct {
         // Resources: CBVs, samplers, SRVs, UAVs.
         var res_index: std.AutoHashMapUnmanaged(u32, u32) = .empty;
         var count: u32 = 0;
-        for ([_]Resource.Class{ .cbuffer, .sampler, .srv, .uav }) |cls| for (e.resources.items) |r| if (r.class == cls and !r.view) {
+        // Reflection lists the live resources only (reflectResources): each
+        // RDAT resource's index there.
+        const alive = try e.liveResources();
+        var refl_of: std.ArrayList(?u32) = .empty;
+        var refl_count: u32 = 0;
+        for ([_]Resource.Class{ .cbuffer, .sampler, .srv, .uav }) |cls| for (e.resources.items, 0..) |r, ri| if (r.class == cls and !r.view) {
+            try refl_of.append(e.arena, if (alive[ri]) refl_count else null);
+            if (alive[ri]) refl_count += 1;
             const bd = e.binding(r);
             const upper: u32 = if (r.count == std.math.maxInt(u32)) std.math.maxInt(u32) else bd.index +% (r.count - 1);
             const rdat_class: u32 = switch (r.class) {
@@ -7195,13 +7266,17 @@ const Emitter = struct {
             }
             std.mem.sort(u32, used.items, {}, std.sort.asc(u32));
             // Reflection lists resources in the same order as RDAT.
+            var func_binds: std.ArrayList(u32) = .empty;
             var func_cbuffers: std.ArrayList(u32) = .empty;
-            for (used.items) |ri| if (refl.cbuffer_of[ri]) |ci| try func_cbuffers.append(e.arena, ci);
+            for (used.items) |ri| if (refl_of.items[ri]) |bi| {
+                try func_binds.append(e.arena, bi);
+                if (refl.cbuffer_of[bi]) |ci| try func_cbuffers.append(e.arena, ci);
+            };
             try refl_funcs.append(e.arena, .{
                 .name = lf.name,
                 .version = reflect.version(reflect.programType(@tagName(lf.stage)), e.profile.major, e.profile.minor),
                 .requires = libinfo.featureInfo(info.flags) & reflect.required_features,
-                .binds = try e.arena.dupe(u32, used.items),
+                .binds = func_binds.items,
                 .cbuffers = func_cbuffers.items,
             });
             const resources = if (used.items.len > 0) try b.array(used.items) else rdat.null_ref;

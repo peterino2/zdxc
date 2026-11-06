@@ -219,6 +219,8 @@ pub const Style = struct {
     color: bool = false,
     /// Show source lines, carets and fix-its.
     snippets: bool = true,
+    /// The file diagnostics without a location name, at 1:1 (null: none).
+    unplaced: ?[]const u8 = null,
 };
 
 const Renderer = struct {
@@ -321,7 +323,11 @@ const Renderer = struct {
                 .msvc => try w.print("{s}({d},{d}): ", .{ p.file, p.line, col }),
                 .vi => try w.print("{s} +{d}:{d}: ", .{ p.file, p.line, col }),
             }
-        }
+        } else if (r.style.unplaced) |file| switch (r.style.format) {
+            .clang => try w.print("{s}:1:1: ", .{file}),
+            .msvc => try w.print("{s}(1,1): ", .{file}),
+            .vi => try w.print("{s} +1:1: ", .{file}),
+        };
         try r.color(sevColor(sev));
         try w.print("{s}: ", .{sev.label()});
         try r.color(reset);

@@ -171,7 +171,10 @@ pub fn analyze(m: *const module.Module, f: *const module.Function, o: Options) I
             62, 63 => if (code == 63 and clampArg(m, code, args)) {
                 lod_clamp = true;
             },
-            68, 66 => if (handleRes(m, f, o, args[1])) |r| if (r.uav and r.typed_multi) {
+            68, 66 => if (handleRes(m, f, o, args[1])) |r| {
+                if (r.uav and r.typed_multi) fl |= bit.typed_uav_load;
+            } else if (annotatedTypedMulti(m, f, args[1])) {
+                // A handle from the descriptor heap: its annotation.
                 fl |= bit.typed_uav_load;
             },
             218 => {
@@ -301,6 +304,26 @@ fn annotateIsUav(m: *const module.Module, props: module.Value) bool {
     if (c.kind != .aggregate or c.kind.aggregate.len == 0) return false;
     const basic = m.constants.items[c.kind.aggregate[0]];
     return basic.kind == .int and basic.kind.int & 0x1000 != 0;
+}
+
+/// Whether handle `h` is annotated (annotateHandle) as a typed UAV of more
+/// than one component: ResourceProperties' first word has the UAV bit
+/// (0x1000) and the kind (low byte; not raw or structured buffers), the
+/// second the component count (bits 8..15).
+fn annotatedTypedMulti(m: *const module.Module, f: *const module.Function, h: module.Value) bool {
+    if (h != .inst) return false;
+    const c = switch (f.insts.items[h.inst].op) {
+        .call => |c| c,
+        else => return false,
+    };
+    if (c.args.len < 3 or constInt(m, c.args[0]) != 216 or c.args[2] != .constant) return false;
+    const props = m.constants.items[c.args[2].constant];
+    if (props.kind != .aggregate or props.kind.aggregate.len < 2) return false;
+    const w0 = m.constants.items[props.kind.aggregate[0]];
+    const w1 = m.constants.items[props.kind.aggregate[1]];
+    if (w0.kind != .int or w1.kind != .int) return false;
+    const kind = w0.kind.int & 0xff;
+    return w0.kind.int & 0x1000 != 0 and kind != 11 and kind != 12 and (w1.kind.int >> 8) & 0xff > 1;
 }
 
 /// The resource global behind a handle made by createHandleForLib (of a
