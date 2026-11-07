@@ -1564,7 +1564,12 @@ const Lowerer = struct {
                 try l.b.store(tmp, try l.basePrefix(whole, whole_ty, owner_ty));
                 object = tmp;
                 if (direct) |p| switch (l.b.f.inst(p).ptr) {
-                    .function, .private, .groupshared => write_back = p,
+                    // (Not after a method that only reads its object: the
+                    // store would keep a copy of a read-only buffer element
+                    // from being read in place, see dxil bufLocals.)
+                    .function, .private, .groupshared => if (l.methodWritesThis(f, 0)) {
+                        write_back = p;
+                    },
                     // An element of a writable buffer (`buf[i].store(v)`):
                     // written back when the method writes its object, as
                     // dxc's `this` is the element itself. (Only then: a
@@ -2710,6 +2715,7 @@ const Lowerer = struct {
             if (std.ascii.eqlIgnoreCase(a.name, "wavesize") and a.args.len >= 1 and a.args.len <= 3) {
                 for (a.args, 0..) |arg, i| entry.wave_size[i] = @intCast(@max(0, l.s.evalInt(arg) orelse 0));
             }
+            if (std.ascii.eqlIgnoreCase(a.name, "earlydepthstencil")) entry.early_depth_stencil = true;
             if (std.ascii.eqlIgnoreCase(a.name, "maxvertexcount") and a.args.len == 1) entry.geometry.max_vertex_count = @intCast(@max(1, l.s.evalInt(a.args[0]) orelse 1));
             if (std.ascii.eqlIgnoreCase(a.name, "instance") and a.args.len == 1) entry.geometry.instance_count = @intCast(@max(1, l.s.evalInt(a.args[0]) orelse 1));
             if (std.ascii.eqlIgnoreCase(a.name, "RootSignature") and a.args.len == 1 and a.args[0].kind == .string_lit) entry.root_signature = try stringContents(l.arena, a.args[0].kind.string_lit);
