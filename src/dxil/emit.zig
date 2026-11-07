@@ -213,6 +213,8 @@ const Frame = struct {
     /// inlineCallFresh).
     taken: []u32 = &.{},
     live: []bool = &.{},
+    /// Each block's place in the order blocks are emitted in (emitOrder).
+    order_pos: []u32 = &.{},
     /// When optimizing: paramCopies of the function (loads of such a local
     /// are the argument itself).
     copies: []const u32 = &.{},
@@ -1855,6 +1857,18 @@ const Emitter = struct {
         return false;
     }
 
+    /// Whether `f` has locals the emitter follows as it emits, rather than
+    /// keeping in memory: resources, RayQuery objects, structs holding
+    /// resources. Their blocks must be emitted in an order execution can
+    /// take (emitOrder); other functions keep index order, and with it the
+    /// block layout.
+    fn tracksLocals(e: *Emitter, f: *const ir.Function) bool {
+        for (f.insts.items) |i| if (i.op == .local_var) {
+            if (isRayQuery(e.t, i.ty) or isResourceType(e.t, i.ty) or e.isResourceArray(i.ty) or e.holdsResources(i.ty)) return true;
+        };
+        return false;
+    }
+
     fn inlineCallFresh(e: *Emitter, fi: u32, args: []const Lowered, aliases: []const ?Lowered) Error![]const Value {
         const f = e.m.functions.items[fi];
         var frame: Frame = .{
@@ -1886,7 +1900,10 @@ const Emitter = struct {
         @memset(frame.taken, std.math.maxInt(u32));
         const emitted = try e.arena.alloc(bool, f.blocks.items.len);
         @memset(emitted, false);
-        for (f.blocks.items, 0..) |_, bi| {
+        frame.order_pos = try e.arena.alloc(u32, f.blocks.items.len);
+        const order = if (e.tracksLocals(f)) try emitOrder(e.arena, f) else try indexOrder(e.arena, f);
+        for (order, 0..) |bi, k| frame.order_pos[bi] = @intCast(k);
+        for (order) |bi| {
             if (!frame.live[bi]) continue;
             e.cur = try e.blockFor(&frame, @intCast(bi));
             try e.emitBlock(&frame, @intCast(bi));
@@ -2564,8 +2581,11 @@ const Emitter = struct {
                     // Selecting between resources at run time has no
                     // handle-based lowering here; one assignment is fine.
                     // (Node objects: again, where every assignment is in
-                    // one block.)
-                    if (slot.*) |old| if (!std.meta.eql(old, h) and !(h == .node and storesInOneBlock(f, s.ptr))) return e.unsupported("assigning different resources to one variable is not supported yet (in '{s}')", .{frame.f.name});
+                    // one block.) A later assignment that every read after
+                    // it sees, once branches on constants are folded, is
+                    // fine too: `S = A; if (bFar) S = B;` inlined with
+                    // bFar true.
+                    if (slot.*) |old| if (!std.meta.eql(old, h) and !(h == .node and storesInOneBlock(f, s.ptr)) and !try overwriteSeenByAll(e.arena, f, frame, s.ptr, r)) return e.unsupported("assigning different resources to one variable is not supported yet (in '{s}')", .{frame.f.name});
                     slot.* = h;
                     return .none;
                 }
@@ -7784,6 +7804,167 @@ fn storesInOneBlock(f: *const ir.Function, ptr: Ref) bool {
         else => {},
     };
     return true;
+}
+
+/// Whether store `store` to resource local `ptr`, replacing what an earlier
+/// store put there, is what every read of the local sees from then on, with
+/// the blocks emitted in the frame's order (emitOrder), over the blocks
+/// still live given the branches on constants (see inlineCallFresh): the
+/// store's block is in no loop, every read the store reaches is emitted
+/// after it and reached only through it (the block dominates the read's),
+/// and every other read was emitted already.
+fn overwriteSeenByAll(a: Allocator, f: *const ir.Function, frame: *const Frame, ptr: Ref, store: Ref) Allocator.Error!bool {
+    const live = frame.live;
+    const taken = frame.taken;
+    const pos = frame.order_pos;
+    if (live.len != f.blocks.items.len or pos.len != f.blocks.items.len) return false;
+    const sb: u32 = for (f.blocks.items, 0..) |blk, bi| {
+        if (std.mem.indexOfScalar(Ref, blk.insts.items, store) != null) break @intCast(bi);
+    } else return false;
+    // Blocks after the store (reachable from its block's successors), and
+    // blocks reachable from the entry without passing through its block.
+    const after = try reachFrom(a, f, live, taken, sb, null);
+    if (after[sb]) return false;
+    const around = try reachFrom(a, f, live, taken, null, sb);
+    const Reads = struct {
+        ptr: Ref,
+        found: bool = false,
+        pub fn use(c: *@This(), x: Ref) void {
+            if (x == c.ptr) c.found = true;
+        }
+    };
+    for (f.blocks.items, 0..) |blk, bi| {
+        if (!live[bi] or bi == sb) continue;
+        var reads: Reads = .{ .ptr = ptr };
+        for (blk.insts.items) |x| {
+            const op = f.inst(x).op;
+            // (Stores to the local are checked when emitted.)
+            if (op == .store and op.store.ptr == ptr and op.store.value != ptr) continue;
+            opt.eachOperand(op, &reads);
+        }
+        if (!reads.found) continue;
+        if (after[bi]) {
+            if (pos[bi] < pos[sb] or around[bi]) return false;
+        } else if (pos[bi] > pos[sb]) return false;
+    }
+    return true;
+}
+
+/// The live blocks reachable from the successors of block `from` (or from
+/// the entry, when null), not passing through block `avoid`, following only
+/// the branch `taken` where a branch was folded.
+fn reachFrom(a: Allocator, f: *const ir.Function, live: []const bool, taken: []const u32, from: ?u32, avoid: ?u32) Allocator.Error![]bool {
+    const seen = try a.alloc(bool, f.blocks.items.len);
+    @memset(seen, false);
+    var stack: std.ArrayList(u32) = .empty;
+    const Succ = struct {
+        fn push(s: *std.ArrayList(u32), al: Allocator, fun: *const ir.Function, tk: []const u32, b: u32) Allocator.Error!void {
+            if (tk.len > 0 and tk[b] != std.math.maxInt(u32)) return s.append(al, tk[b]);
+            switch (fun.blocks.items[b].term) {
+                .br => |t| try s.append(al, t.index()),
+                .cond_br => |c| try s.appendSlice(al, &.{ c.then.index(), c.@"else".index() }),
+                .@"switch" => |sw| {
+                    try s.append(al, sw.default.index());
+                    for (sw.cases) |c| try s.append(al, c.block.index());
+                },
+                else => {},
+            }
+        }
+    };
+    if (from) |b| try Succ.push(&stack, a, f, taken, b) else try stack.append(a, 0);
+    while (stack.pop()) |b| {
+        if (seen[b] or !live[b] or (avoid != null and b == avoid.?)) continue;
+        seen[b] = true;
+        try Succ.push(&stack, a, f, taken, b);
+    }
+    return seen;
+}
+
+/// The order to emit a function's blocks in: each after every block that
+/// branches to it (but over a loop's back edge), the lowest index first of
+/// those ready, so index order wherever that is one already. (Lowering puts
+/// an `else` after its selection's merge, and what the emitter tracks as
+/// it goes, such as the resource a local holds, needs the `else`'s stores
+/// before the merge's reads.) Blocks the entry does not reach go last.
+fn indexOrder(a: Allocator, f: *const ir.Function) Allocator.Error![]u32 {
+    const order = try a.alloc(u32, f.blocks.items.len);
+    for (order, 0..) |*o, k| o.* = @intCast(k);
+    return order;
+}
+
+fn emitOrder(a: Allocator, f: *const ir.Function) Allocator.Error![]u32 {
+    const n = f.blocks.items.len;
+    const order = try a.alloc(u32, n);
+    if (n == 0) return order;
+    const succs = try a.alloc([]u32, n);
+    const back = try a.alloc([]bool, n);
+    for (f.blocks.items, succs, back) |blk, *s, *bk| {
+        var l: std.ArrayList(u32) = .empty;
+        switch (blk.term) {
+            .br => |t| try l.append(a, t.index()),
+            .cond_br => |c| try l.appendSlice(a, &.{ c.then.index(), c.@"else".index() }),
+            .@"switch" => |sw| {
+                try l.append(a, sw.default.index());
+                for (sw.cases) |c| try l.append(a, c.block.index());
+            },
+            else => {},
+        }
+        s.* = l.items;
+        bk.* = try a.alloc(bool, l.items.len);
+        @memset(bk.*, false);
+    }
+    // Back edges (to a block on the depth-first path) and the count of
+    // forward edges into each block.
+    const state = try a.alloc(u8, n); // 0 unseen, 1 on the path, 2 done
+    @memset(state, 0);
+    const preds = try a.alloc(u32, n);
+    @memset(preds, 0);
+    var stack: std.ArrayList(struct { b: u32, k: u32 }) = .empty;
+    try stack.append(a, .{ .b = 0, .k = 0 });
+    state[0] = 1;
+    while (stack.items.len > 0) {
+        const top = &stack.items[stack.items.len - 1];
+        const b = top.b;
+        if (top.k == succs[b].len) {
+            state[b] = 2;
+            _ = stack.pop();
+            continue;
+        }
+        const k = top.k;
+        top.k += 1;
+        const v = succs[b][k];
+        if (state[v] == 1) {
+            back[b][k] = true;
+            continue;
+        }
+        preds[v] += 1;
+        if (state[v] == 0) {
+            state[v] = 1;
+            try stack.append(a, .{ .b = v, .k = 0 });
+        }
+    }
+    const Ready = std.PriorityQueue(u32, void, struct {
+        fn lt(_: void, x: u32, y: u32) std.math.Order {
+            return std.math.order(x, y);
+        }
+    }.lt);
+    var ready: Ready = .empty;
+    try ready.push(a, 0);
+    var len: usize = 0;
+    while (ready.pop()) |b| {
+        order[len] = b;
+        len += 1;
+        for (succs[b], back[b]) |v, bk| if (!bk) {
+            preds[v] -= 1;
+            if (preds[v] == 0) try ready.push(a, v);
+        };
+    }
+    for (state, 0..) |st, b| if (st == 0) {
+        order[len] = @intCast(b);
+        len += 1;
+    };
+    std.debug.assert(len == n);
+    return order;
 }
 
 fn reachableBlocks(a: Allocator, f: *const ir.Function) Allocator.Error![]bool {
