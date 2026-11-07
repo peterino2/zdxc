@@ -6395,6 +6395,35 @@ const Emitter = struct {
         return .{ .wave = wave, .int64 = int64, .typed_uav_load = typed_uav_load };
     }
 
+    /// Unreal's dxc (its "Check for derivative ops (in compute)" change)
+    /// reports, in a PRIV part, whether a compute shader uses derivatives:
+    /// implicit-LOD sampling, ddx / ddy, CalculateLOD, quad operations or
+    /// sampler feedback. Unreal reads it to let Nanite rasterize and shade
+    /// a material's clusters in compute (software raster, pixel binning);
+    /// without it every material counts as using derivatives.
+    fn computeDerivativeOps(e: *Emitter) bool {
+        if (e.entry.stage != .compute) return false;
+        for (e.dm.functions.items) |f| for (f.insts.items) |inst| switch (inst.op) {
+            .call => |c| {
+                if (c.args.len == 0 or c.args[0] != .constant) continue;
+                if (!std.mem.startsWith(u8, e.dm.functions.items[c.callee].name, "dx.op.")) continue;
+                const op = switch (e.dm.constants.items[c.args[0].constant].kind) {
+                    .int => |x| x,
+                    else => continue,
+                };
+                switch (op) {
+                    // Sample, SampleBias, SampleCmp, CalculateLOD,
+                    // DerivCoarseX/Y, DerivFineX/Y, QuadReadLaneAt, QuadOp,
+                    // WriteSamplerFeedback(Bias), QuadVote, SampleCmpBias.
+                    60, 61, 64, 81, 83, 84, 85, 86, 122, 123, 174, 175, 222, 255 => return true,
+                    else => {},
+                }
+            },
+            else => {},
+        };
+        return false;
+    }
+
     fn shaderFlags(e: *Emitter) u64 {
         var flags: u64 = 0;
         const live = e.liveUses();
@@ -7422,10 +7451,15 @@ const Emitter = struct {
             },
         }, &.{.{ .fourcc = container.fourcc("SFI0"), .data = &sfi0 }});
         errdefer if (e.reflection) |r| gpa.free(r);
+        // (Unreal's dxc's PRIV part, as for shaders: a library is not a
+        // compute shader, so its derivatives bit is clear.)
+        var priv: [16]u8 = @splat(0);
+        std.mem.writeInt(u32, priv[0..4], container.fourcc("SFI0"), .little);
         return container.assemble(gpa, &.{
             .{ .fourcc = container.fourcc("SFI0"), .data = &sfi0 },
             .{ .fourcc = container.fourcc("RDAT"), .data = rdat_part },
             .{ .fourcc = container.fourcc("DXIL"), .data = dxil_part },
+            .{ .fourcc = container.fourcc("PRIV"), .data = &priv },
         });
     }
 
@@ -7741,6 +7775,14 @@ const Emitter = struct {
             try parts.append(e.arena, .{ .fourcc = container.fourcc("RTS0"), .data = try e.compileRootSignature(text, .global) });
         };
         try parts.append(e.arena, .{ .fourcc = container.fourcc("DXIL"), .data = dxil_part });
+        // Last, as Unreal's dxc writes it: { 'SFI0', (padding), the
+        // optional feature info: OptFeatureInfo_UsesDerivatives (bit 40)
+        // for a compute shader that uses derivatives }.
+        const priv = try e.arena.alloc(u8, 16);
+        @memset(priv, 0);
+        std.mem.writeInt(u32, priv[0..4], container.fourcc("SFI0"), .little);
+        std.mem.writeInt(u64, priv[8..16], if (e.computeDerivativeOps()) @as(u64, 1) << 40 else 0, .little);
+        try parts.append(e.arena, .{ .fourcc = container.fourcc("PRIV"), .data = priv });
         return container.assemble(gpa, parts.items);
     }
 };
