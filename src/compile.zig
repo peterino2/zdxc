@@ -569,7 +569,10 @@ fn run(ctx: *Ctx, arena: std.mem.Allocator) !void {
             }
             // -rootsig-define: the macro's root signature for the entry.
             if (opts.rootsig_define) |macro| if (m.entries.items.len == 1) {
-                m.entries.items[0].root_signature = try rootSignatureMacroText(ctx, arena, opts, input, macro) orelse return error.CompileFailed;
+                // (Not defined, or #undef'd, at the end of the file: no
+                // root signature from it, as dxc.)
+                const text = try rootSignatureMacroText(ctx, arena, opts, input, macro, false) orelse return error.CompileFailed;
+                if (text.len > 0) m.entries.items[0].root_signature = text;
             };
             const zd = stats.begin(.dxil);
             const dxil_out = zdxc.dxil.emit.emitWithReflectionAt(arena, m, profile.?, &diags, if (opts.no_opt) .none else if (opts.opt_level == .od) .debug else .full) catch |err| switch (err) {
@@ -608,8 +611,10 @@ fn run(ctx: *Ctx, arena: std.mem.Allocator) !void {
 }
 
 /// The text of the root signature macro `macro` defines in `input` (its
-/// string literals concatenated), or null after reporting an error.
-fn rootSignatureMacroText(ctx: *Ctx, arena: std.mem.Allocator, opts: Options, input: []const u8, macro: []const u8) !?[]const u8 {
+/// string literals concatenated), or null after reporting an error. A
+/// macro not defined at the end of `input` is an error when `required`,
+/// else empty text.
+fn rootSignatureMacroText(ctx: *Ctx, arena: std.mem.Allocator, opts: Options, input: []const u8, macro: []const u8, required: bool) !?[]const u8 {
     const text = try ctx.read(arena, input);
     var sm = front.source.SourceManager.init(arena, ctx.fs);
     var diags = zdxc.Diagnostics.init(arena);
@@ -631,6 +636,7 @@ fn rootSignatureMacroText(ctx: *Ctx, arena: std.mem.Allocator, opts: Options, in
             seen = t.kind == .identifier and std.mem.eql(u8, t.text, marker);
             continue;
         }
+        if (!any and !required and t.kind == .identifier and std.mem.eql(u8, t.text, macro)) return "";
         if (t.kind != .string) {
             _ = diags.report(.{ .severity = .@"error", .loc = t.loc }, "root signature macro '{s}' must expand to string literals", .{macro});
             break;
@@ -647,7 +653,7 @@ fn rootSignatureMacroText(ctx: *Ctx, arena: std.mem.Allocator, opts: Options, in
 }
 
 fn compileRootSignatureMacro(ctx: *Ctx, arena: std.mem.Allocator, opts: Options, input: []const u8, macro: []const u8, version: zdxc.dxil.rootsig.Version, flags: zdxc.dxil.rootsig.CompilationFlags) !?[]const u8 {
-    const text = try rootSignatureMacroText(ctx, arena, opts, input, macro) orelse return null;
+    const text = try rootSignatureMacroText(ctx, arena, opts, input, macro, true) orelse return null;
     var d: zdxc.dxil.rootsig.Diagnostic = .{};
     return try zdxc.dxil.rootsig.compileWithOptions(arena, text, .{ .version = version, .flags = flags }, &d) orelse {
         try ctx.stderr.print("{s}: error: root signature error - {s}\n", .{ input, d.message() });

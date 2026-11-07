@@ -123,8 +123,10 @@ pub const BinOp = enum(u32) { add = 0, sub = 1, mul = 2, udiv = 3, sdiv = 4, ure
 pub const RmwOp = enum(u32) { xchg = 0, add = 1, sub = 2, @"and" = 3, nand = 4, @"or" = 5, xor = 6, max = 7, min = 8, umax = 9, umin = 10 };
 
 /// A module-level variable (groupshared memory: address space 3),
-/// declared without an initializer as dxc does.
-pub const GlobalVar = struct { name: []const u8, ty: TypeId, addr_space: u32, ptr_ty: TypeId, constant: bool = false };
+/// declared without an initializer as dxc does; or, with `init`, an
+/// internal constant (a static const table, as dxc's
+/// `@T.v.1dim = internal constant [n x float] [...]`).
+pub const GlobalVar = struct { name: []const u8, ty: TypeId, addr_space: u32, ptr_ty: TypeId, constant: bool = false, init: ?ConstId = null };
 
 pub const CastOp = enum(u32) { trunc = 0, zext = 1, sext = 2, fptoui = 3, fptosi = 4, uitofp = 5, sitofp = 6, fptrunc = 7, fpext = 8, ptrtoint = 9, inttoptr = 10, bitcast = 11 };
 
@@ -305,6 +307,61 @@ pub const Module = struct {
         return @fromBackingInt(@intCast(m.inst_mds.items.len));
     }
 
+    /// Drops the internal constants (globals with an initializer) nothing
+    /// reads any more, as the validator rejects unused internal
+    /// declarations: a table whose reads unrolling or folding made
+    /// constant.
+    fn pruneGlobals(m: *Module) !void {
+        const a = m.allocator();
+        const n = m.globals.items.len;
+        var any_init = false;
+        for (m.globals.items) |g| any_init = any_init or g.init != null;
+        if (!any_init) return;
+        const used = try a.alloc(bool, n);
+        defer a.free(used);
+        @memset(used, false);
+        const Mark = struct {
+            used: []bool,
+            fn map(w: *@This(), v: Value) Value {
+                if (v == .global) w.used[v.global] = true;
+                return v;
+            }
+        };
+        var mark: Mark = .{ .used = used };
+        for (m.functions.items) |f| for (f.insts.items) |inst| {
+            var copy = inst;
+            try mapOperands(a, &copy, &mark);
+        };
+        for (m.metadata.items) |md| if (md == .value) {
+            _ = mark.map(md.value.val);
+        };
+        const new_id = try a.alloc(u32, n);
+        defer a.free(new_id);
+        var kept: u32 = 0;
+        for (m.globals.items, 0..) |g, i| {
+            if (g.init != null and !used[i]) {
+                new_id[i] = std.math.maxInt(u32);
+                continue;
+            }
+            new_id[i] = kept;
+            m.globals.items[kept] = g;
+            kept += 1;
+        }
+        if (kept == n) return;
+        m.globals.shrinkRetainingCapacity(kept);
+        const Remap = struct {
+            new_id: []const u32,
+            fn map(r: @This(), v: Value) Value {
+                return if (v == .global) .{ .global = r.new_id[v.global] } else v;
+            }
+        };
+        const remap: Remap = .{ .new_id = new_id };
+        for (m.functions.items) |*f| for (f.insts.items) |*inst| try mapOperands(a, inst, remap);
+        for (m.metadata.items) |*md| if (md.* == .value) {
+            md.value.val = remap.map(md.value.val);
+        };
+    }
+
     /// Drops the constants nothing uses, and numbers the rest in order of
     /// first use (functions' instructions, then metadata), grouped by type,
     /// with aggregates last, after their elements. The output then depends
@@ -347,6 +404,9 @@ pub const Module = struct {
         };
         for (m.metadata.items) |md| if (md == .value) {
             _ = walk.map(md.value.val);
+        };
+        for (m.globals.items) |g| if (g.init) |c| {
+            _ = walk.map(.{ .constant = c });
         };
         if (walk.failed) return error.OutOfMemory;
 
@@ -399,6 +459,9 @@ pub const Module = struct {
         for (m.functions.items) |*f| for (f.insts.items) |*inst| try mapOperands(a, inst, remap);
         for (m.metadata.items) |*md| if (md.* == .value) {
             md.value.val = remap.map(md.value.val);
+        };
+        for (m.globals.items) |*g| if (g.init) |*c| {
+            c.* = new_id[c.*];
         };
         m.constants = kept;
         // (Constants made from here on start a new index.)
@@ -465,6 +528,7 @@ pub const Module = struct {
 
     /// Encode the module as raw LLVM bitcode (starting with 'BC' 0xC0DE).
     pub fn writeBitcode(m: *Module, gpa: Allocator) ![]u8 {
+        try m.pruneGlobals();
         try m.pruneConstants();
         var enc: Encoder = .{ .m = m, .w = .init(gpa) };
         defer enc.w.deinit();
@@ -647,9 +711,12 @@ const Encoder = struct {
         try w.recordString(2, &.{}, e.m.triple);
         try w.recordString(3, &.{}, e.m.datalayout);
         for (e.m.globals.items) |g| {
-            // GLOBALVAR: [type, addrspace << 2 | explicit type, init (none),
-            //             linkage (external), align 4, section]
-            try e.ops.appendSlice(e.gpa(), &.{ g.ty, (@as(u64, g.addr_space) << 2) | 2 | @intFromBool(g.constant), 0, 0, 3, 0 });
+            // GLOBALVAR: [type, addrspace << 2 | explicit type | constant,
+            //             init (value ID + 1, 0 for none), linkage (external,
+            //             or internal with an initializer), align 4, section]
+            const init: u64 = if (g.init) |c| @as(u64, e.valueId(null, .{ .constant = c })) + 1 else 0;
+            const linkage: u64 = if (g.init != null) 3 else 0;
+            try e.ops.appendSlice(e.gpa(), &.{ g.ty, (@as(u64, g.addr_space) << 2) | 2 | @intFromBool(g.constant), init, linkage, 3, 0 });
             try e.rec(7);
         }
         for (e.m.functions.items) |f| {
