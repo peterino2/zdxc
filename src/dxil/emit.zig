@@ -113,7 +113,17 @@ const Lowered = union(enum) {
     /// A place in a constant buffer: byte offset plus a dynamic register
     /// offset; with `dyn_comp`, the component of the `vec` vector at
     /// `offset` that index picks at run time.
-    cbuf: struct { res: u32, offset: u32 = 0, dyn_regs: ?Value = null, row_major: bool = false, dyn_comp: ?Value = null, vec: TypeId = 0 },
+    cbuf: struct {
+        res: u32,
+        offset: u32 = 0,
+        dyn_regs: ?Value = null,
+        row_major: bool = false,
+        dyn_comp: ?Value = null,
+        vec: TypeId = 0,
+        /// A row of the matrix of type `ty` at `offset` (column-major,
+        /// or a dynamic row): loaded whole, then picked.
+        mat: ?struct { ty: TypeId, row: Value, col: ?u32 = null } = null,
+    },
     /// A place in a mesh shader output array: the vertex / primitive index
     /// and a flattened component offset within it.
     mesh: struct { kind: ir.MeshOutput, index: ?Value = null, offset: u32 = 0, ty: TypeId },
@@ -303,6 +313,12 @@ const Emitter = struct {
     resources: std.ArrayList(Resource) = .empty,
     resource_of_global: std.AutoHashMapUnmanaged(u32, u32) = .empty,
     private_globals: std.AutoHashMapUnmanaged(u32, Ptr) = .empty,
+    /// Static globals that are module constants (findConstGlobals): their
+    /// initializer function, then (once used) their storage, and the
+    /// components of each such DXIL global by global index.
+    const_global_init: std.AutoHashMapUnmanaged(u32, u32) = .empty,
+    const_globals: std.AutoHashMapUnmanaged(u32, Ptr) = .empty,
+    const_global_vals: std.AutoHashMapUnmanaged(u32, []const Value) = .empty,
     private_typed: std.AutoHashMapUnmanaged(u32, @FieldType(Lowered, "typed")) = .empty,
     /// Locals holding a copy of a texel read through an index (see the
     /// `access` op): a write through one writes the texel back.
@@ -645,6 +661,7 @@ const Emitter = struct {
         e.handle_ty = try e.dm.getType(.{ .@"struct" = .{ .name = "dx.types.Handle", .elems = &.{i8p} } });
 
         try e.collectResources();
+        try e.findConstGlobals();
         try e.buildSignatures(entry);
         if (entry.stage == .amplification) e.findDispatchPayload();
         e.cur = try e.newBlock();
@@ -2363,6 +2380,7 @@ const Emitter = struct {
                     }
                     return .{ .typed = .{ .base = gop.value_ptr.base, .dty = gop.value_ptr.array_ty, .addr_space = 3, .ty = e.m.globals.items[g].ty } };
                 }
+                if (e.const_global_init.contains(g)) return .{ .ptr = try e.constGlobal(g) };
                 // Static globals live in the entry function (everything is
                 // inlined into it).
                 if (e.m.globals.items[g].space == .private) {
@@ -2493,6 +2511,26 @@ const Emitter = struct {
                     return .{ .scalars = try e.textureLoad(res, mip, tx.coords, null, i.ty) };
                 },
                 .cbuf => |c| {
+                    if (c.mat) |mat| {
+                        const m = e.t.get(mat.ty).matrix;
+                        const whole = (try e.cbufferLoad(c.res, c.offset, c.dyn_regs, c.row_major, mat.ty)).scalars;
+                        const row = try e.arena.alloc(Value, m.cols);
+                        for (row, 0..) |*o, col| {
+                            if (e.constIntOf(mat.row)) |rk| {
+                                o.* = whole[@as(u32, @intCast(rk)) * m.cols + col];
+                                continue;
+                            }
+                            var v = whole[col];
+                            for (1..m.rows) |rk| {
+                                const is_r = try e.add(try e.dm.intType(1), .{ .cmp = .{ .pred = 32, .lhs = mat.row, .rhs = try e.i32Const(@intCast(rk)) } });
+                                v = try e.select(is_r, whole[rk * m.cols + col], v, try e.valueType(v));
+                            }
+                            o.* = v;
+                        }
+                        if (mat.col) |col| return .{ .scalars = try e.arena.dupe(Value, &.{row[col]}) };
+                        if (c.dyn_comp) |dc| return .{ .scalars = try e.arena.dupe(Value, &.{try e.pickComponent(row, dc, i.ty)}) };
+                        return .{ .scalars = row };
+                    }
                     if (c.dyn_comp == null) try frame.load_srcs.put(e.arena, r.index(), .{ .src = .{ .cbuf = c }, .block = e.cur, .writes = e.writes });
                     const dc = c.dyn_comp orelse return e.cbufferLoad(c.res, c.offset, c.dyn_regs, c.row_major, i.ty);
                     const whole = (try e.cbufferLoad(c.res, c.offset, c.dyn_regs, c.row_major, c.vec)).scalars;
@@ -2532,6 +2570,8 @@ const Emitter = struct {
                 else => |v| return e.unsupported("internal: load from a non-pointer ({s} from %{d} '{s}' in '{s}')", .{ @tagName(v), p.index(), @tagName(frame.f.inst(p).op), frame.f.name }),
             },
             .store => |s| {
+                // (A module constant's initializer: in the global already.)
+                if (frame.vals[s.ptr.index()] == .ptr and frame.vals[s.ptr.index()].ptr.base == .global and e.const_global_vals.contains(frame.vals[s.ptr.index()].ptr.base.global)) return .none;
                 // (The values a local kept as values holds.)
                 if (frame.vals[s.ptr.index()] == .regs) {
                     frame.vals[s.ptr.index()] = .{ .regs = .{ .vals = try e.scalars(frame, s.value) } };
@@ -3188,10 +3228,152 @@ const Emitter = struct {
         return mixed;
     }
 
+    /// Static globals to make module constants, as dxc makes a
+    /// `static const` table an `internal constant` global: written only by
+    /// their initializer, which is constants, and read through a dynamic
+    /// index somewhere (read at constant indices only, a static folds to
+    /// its constants as a local does). Copied into a local first, such a
+    /// table costs a store per component at the start of every invocation.
+    fn findConstGlobals(e: *Emitter) Error!void {
+        const m = e.m;
+        const ng = m.globals.items.len;
+        if (ng == 0) return;
+        const nothing = std.math.maxInt(u32);
+        const init_of = try e.arena.alloc(u32, ng);
+        @memset(init_of, nothing);
+        const bad = try e.arena.alloc(bool, ng);
+        @memset(bad, false);
+        const dynamic = try e.arena.alloc(bool, ng);
+        @memset(dynamic, false);
+        var refs: std.ArrayList(ir.Ref) = .empty;
+        for (m.functions.items) |f| {
+            // The global each pointer is into.
+            const root = try e.arena.alloc(u32, f.insts.items.len);
+            @memset(root, nothing);
+            for (f.insts.items, 0..) |inst, i| switch (inst.op) {
+                .global => |g| root[i] = g,
+                .access => |acc| if (root[acc.base.index()] != nothing) {
+                    root[i] = root[acc.base.index()];
+                    for (acc.indices) |x| if (f.inst(x).op != .constant) {
+                        dynamic[root[i]] = true;
+                    };
+                },
+                else => {},
+            };
+            for (f.insts.items) |inst| switch (inst.op) {
+                .global => {},
+                .access => |acc| for (acc.indices) |x| if (root[x.index()] != nothing) {
+                    bad[root[x.index()]] = true;
+                },
+                .load => {},
+                .store => |st| {
+                    if (root[st.value.index()] != nothing) bad[root[st.value.index()]] = true;
+                    const g = root[st.ptr.index()];
+                    if (g == nothing) continue;
+                    const v = f.inst(st.value);
+                    if (f.inst(st.ptr).op == .global and v.op == .call and v.op.call.args.len == 0 and init_of[g] == nothing) {
+                        init_of[g] = v.op.call.func;
+                    } else bad[g] = true;
+                },
+                else => {
+                    refs.clearRetainingCapacity();
+                    try collectRefs(e.arena, inst.op, &refs);
+                    for (refs.items) |r| if (r != .none and r.index() < root.len and root[r.index()] != nothing) {
+                        bad[root[r.index()]] = true;
+                    };
+                },
+            };
+        }
+        for (0..ng) |g| {
+            const gl = m.globals.items[g];
+            if (gl.space != .private or bad[g] or !dynamic[g] or init_of[g] == nothing) continue;
+            if (e.holdsResources(gl.ty) or e.containsLinAlg(gl.ty)) continue;
+            if (try e.mixedSizes(gl.ty) or try e.mixedStorage(gl.ty)) continue;
+            if (try e.constGlobalValues(init_of[g], gl.ty) == null) continue;
+            try e.const_global_init.put(e.arena, @intCast(g), init_of[g]);
+        }
+    }
+
+    /// The Refs among `op`'s operands.
+    fn collectRefs(a: Allocator, op: ir.Op, out: *std.ArrayList(ir.Ref)) Allocator.Error!void {
+        switch (op) {
+            inline else => |payload| try collectRefsIn(a, @TypeOf(payload), payload, out),
+        }
+    }
+
+    fn collectRefsIn(a: Allocator, comptime T: type, v: T, out: *std.ArrayList(ir.Ref)) Allocator.Error!void {
+        if (T == ir.Ref) return out.append(a, v);
+        switch (@typeInfo(T)) {
+            .pointer => |p| if (p.size == .slice) for (v) |x| try collectRefsIn(a, p.child, x, out),
+            .@"struct" => |st| inline for (st.field_names, st.field_types) |name, FT| try collectRefsIn(a, FT, @field(v, name), out),
+            .optional => |o| if (v) |x| try collectRefsIn(a, o.child, x, out),
+            .array => |arr| for (v) |x| try collectRefsIn(a, arr.child, x, out),
+            else => {},
+        }
+    }
+
+    /// The components of static initializer function `fi`'s value, as
+    /// stored (bools as i32), when they are all constants.
+    fn constGlobalValues(e: *Emitter, fi: u32, ty: TypeId) Error!?[]const Value {
+        const f = e.m.functions.items[fi];
+        if (f.blocks.items.len != 1) return null;
+        const r = switch (f.blocks.items[0].term) {
+            .ret => |x| x,
+            else => return null,
+        };
+        var out: std.ArrayList(Value) = .empty;
+        if (!try e.constParts(f, r, &out)) return null;
+        if (out.items.len != try e.flatCount(ty)) return null;
+        if ((try e.uniformScalar(ty)) == .bool) {
+            for (out.items) |*v| v.* = try e.i32Const(@intFromBool((e.constIntOf(v.*) orelse return null) != 0));
+        }
+        return out.items;
+    }
+
+    fn constParts(e: *Emitter, f: *const ir.Function, r: ir.Ref, out: *std.ArrayList(Value)) Error!bool {
+        const inst = f.inst(r);
+        switch (inst.op) {
+            .constant => |c| {
+                const v = try e.constant(inst.ty, c);
+                for (0..try e.flatCount(inst.ty)) |_| try out.append(e.arena, v);
+            },
+            .construct => |xs| for (xs) |x| if (!try e.constParts(f, x, out)) return false,
+            else => return false,
+        }
+        return true;
+    }
+
+    /// The storage of module-constant static `g` (findConstGlobals).
+    fn constGlobal(e: *Emitter, g: u32) Error!Ptr {
+        const gop = try e.const_globals.getOrPut(e.arena, g);
+        if (gop.found_existing) return gop.value_ptr.*;
+        const gl = e.m.globals.items[g];
+        const vals = (try e.constGlobalValues(e.const_global_init.get(g).?, gl.ty)).?;
+        const c = try e.uniformScalar(gl.ty);
+        const st = try e.scalarTy(if (c == .bool) Scalar.int else c);
+        const arr = try e.dm.getType(.{ .array = .{ .len = vals.len, .elem = st } });
+        const ids = try e.arena.alloc(module.ConstId, vals.len);
+        for (vals, ids) |v, *id| id.* = v.constant;
+        const init = try e.dm.constant(.{ .ty = arr, .kind = .{ .aggregate = ids } });
+        const gv = try e.dm.addGlobal(try std.fmt.allocPrint(e.arena, "{s}.v.1dim", .{gl.name}), arr, 0);
+        e.dm.globals.items[gv.global].constant = true;
+        e.dm.globals.items[gv.global].init = init.constant;
+        try e.const_global_vals.put(e.arena, gv.global, vals);
+        gop.value_ptr.* = .{ .base = gv, .array_ty = arr, .scalar_ty = st, .bool_storage = c == .bool };
+        return gop.value_ptr.*;
+    }
+
     fn loadPtr(e: *Emitter, ptr: Ptr, ty: TypeId) Error!Lowered {
         const n = try e.flatCount(ty);
         const out = try e.arena.alloc(Value, n);
+        // A module constant at a constant index: its value.
+        const konst: ?[]const Value = if (ptr.offset_dyn == null and ptr.base == .global) e.const_global_vals.get(ptr.base.global) else null;
         for (out, 0..) |*o, c| {
+            if (konst) |kv| {
+                const v = kv[ptr.offset_const + @as(u32, @intCast(c))];
+                o.* = if (ptr.bool_storage) try e.dm.constant(.{ .ty = try e.dm.intType(1), .kind = .{ .int = @intFromBool(e.constIntOf(v).? != 0) } }) else v;
+                continue;
+            }
             if (ptr.offset_dyn == null and e.forwarded.count() > 0) if (e.forwarded.get(.{ ptr.base, ptr.offset_const + @as(u32, @intCast(c)) })) |fw| if (fw.block == e.cur) {
                 o.* = fw.v;
                 continue;
@@ -4202,12 +4384,25 @@ const Emitter = struct {
                         c.vec = try e.t.vector(v.elem, v.len);
                         continue;
                     }
+                    if (c.mat) |*mr| {
+                        mr.col = @intCast(xi.op.constant.int);
+                        continue;
+                    }
                     c.offset += @as(u32, @intCast(xi.op.constant.int)) * storageScalar(v.elem).size();
                 },
                 .matrix => |mt| {
-                    if (xi.op != .constant) return e.unsupported("dynamic indexing of constant buffer matrices", .{});
-                    if (!c.row_major) return e.unsupported("row access into column-major constant buffer matrices", .{});
-                    c.offset += @as(u32, @intCast(xi.op.constant.int)) * 16;
+                    if (!c.row_major) {
+                        // A column-major row is a component of every
+                        // column's register: the matrix is loaded, the row
+                        // picked.
+                        c.mat = .{ .ty = cur, .row = (try e.scalars(frame, x))[0] };
+                    } else if (xi.op == .constant) {
+                        c.offset += @as(u32, @intCast(xi.op.constant.int)) * 16;
+                    } else {
+                        // A row-major row is a register.
+                        const idx = (try e.scalars(frame, x))[0];
+                        c.dyn_regs = if (c.dyn_regs) |d| try e.add(try e.dm.intType(32), .{ .binop = .{ .op = .add, .lhs = d, .rhs = idx } }) else idx;
+                    }
                     cur = try e.t.vector(mt.elem, mt.cols);
                 },
                 else => return e.unsupported("indexing this constant buffer member", .{}),
@@ -5165,7 +5360,7 @@ const Emitter = struct {
 
     /// A templated byte-address Load: one raw load per component.
     fn rawLoad(e: *Emitter, res: Resource, base: Value, ty: TypeId) Error![]const Value {
-        if (e.profile.minor < 2) return e.unsupported("templated loads of '{s}' need shader model 6.2", .{try e.t.format(e.arena, ty)});
+        if (e.profile.minor < 2) return e.rawLoadLegacy(res, base, ty);
         const i32t = try e.dm.intType(32);
         const i8t = try e.dm.intType(8);
         const undef_i32 = try e.dm.constant(.{ .ty = i32t, .kind = .undef });
@@ -5226,8 +5421,91 @@ const Emitter = struct {
         return .{ lo, try e.add(i32t, .{ .cast = .{ .op = .trunc, .val = sh } }) };
     }
 
+    /// Runs of components of a templated byte-address access that one
+    /// bufferLoad / bufferStore covers (shader model 6.0 and 6.1, without
+    /// raw buffer operations): up to four 32-bit words of one type, back
+    /// to back, as dxc gives each member one; a 64-bit component is two
+    /// words of its own.
+    const RawRun = struct { first: u32, len: u32, offset: u32, c: Scalar, mem: Scalar };
+
+    fn rawRuns(e: *Emitter, ty: TypeId) Error![]const RawRun {
+        var runs: std.ArrayList(RawRun) = .empty;
+        const n = try e.flatCount(ty);
+        var k: u32 = 0;
+        while (k < n) {
+            const c = e.compOf(try e.componentType(ty, k));
+            const mem = if (c == .bool) Scalar.uint else storageScalar(c);
+            if (mem.size() == 2) return e.unsupported("16-bit byte-address buffer accesses need shader model 6.2", .{});
+            const off = try e.rawOffset(ty, k);
+            var len: u32 = 1;
+            if (mem.size() == 4) {
+                while (k + len < n and len < 4) : (len += 1) {
+                    const c2 = e.compOf(try e.componentType(ty, k + len));
+                    if (c2 != c or try e.rawOffset(ty, k + len) != off + 4 * len) break;
+                }
+            }
+            try runs.append(e.arena, .{ .first = k, .len = len, .offset = off, .c = c, .mem = mem });
+            k += len;
+        }
+        return runs.items;
+    }
+
+    fn rawLoadLegacy(e: *Emitter, res: Resource, base: Value, ty: TypeId) Error![]const Value {
+        const i32t = try e.dm.intType(32);
+        const undef_i32 = try e.dm.constant(.{ .ty = i32t, .kind = .undef });
+        const out = try e.arena.alloc(Value, try e.flatCount(ty));
+        for (try e.rawRuns(ty)) |rr| {
+            const addr = try e.intArith(.add, base, try e.i32Const(rr.offset));
+            const wide = rr.mem.size() == 8;
+            const lt: Scalar = if (wide or !rr.mem.isFloat()) .uint else rr.mem;
+            const st = try e.scalarTy(lt);
+            const ret_ty = try e.resRetType(st);
+            const fn_i = try e.dxOp(try std.fmt.allocPrint(e.arena, "dx.op.bufferLoad.{s}", .{e.overloadName(st)}), ret_ty, &.{ i32t, e.handle_ty, i32t, i32t }, .nounwind_readonly);
+            const call = try e.callOp(fn_i, ret_ty, &.{ try e.i32Const(68), res.handle, addr, undef_i32 });
+            if (wide) {
+                const lo = try e.add(st, .{ .extractvalue = .{ .agg = call, .index = 0 } });
+                const hi = try e.add(st, .{ .extractvalue = .{ .agg = call, .index = 1 } });
+                out[rr.first] = try e.joinWords(lo, hi, rr.mem);
+                continue;
+            }
+            for (0..rr.len) |j| {
+                const v = try e.add(st, .{ .extractvalue = .{ .agg = call, .index = @intCast(j) } });
+                out[rr.first + j] = if (rr.c == .bool) try e.convertScalar(v, .uint, .bool) else v;
+            }
+        }
+        return out;
+    }
+
+    fn rawStoreLegacy(e: *Emitter, res: Resource, base: Value, ty: TypeId, vals: []const Value) Error!void {
+        const i32t = try e.dm.intType(32);
+        const i8t = try e.dm.intType(8);
+        const void_ty = try e.voidTy();
+        const undef_i32 = try e.dm.constant(.{ .ty = i32t, .kind = .undef });
+        for (try e.rawRuns(ty)) |rr| {
+            const addr = try e.intArith(.add, base, try e.i32Const(rr.offset));
+            const wide = rr.mem.size() == 8;
+            const lt: Scalar = if (wide or !rr.mem.isFloat()) .uint else rr.mem;
+            const st = try e.scalarTy(lt);
+            const undef_v = try e.dm.constant(.{ .ty = st, .kind = .undef });
+            var w: [4]Value = .{ undef_v, undef_v, undef_v, undef_v };
+            var count: u32 = rr.len;
+            if (wide) {
+                const words = try e.splitWords(vals[rr.first], rr.mem);
+                w[0] = words[0];
+                w[1] = words[1];
+                count = 2;
+            } else for (0..rr.len) |j| {
+                const v = vals[rr.first + j];
+                w[j] = if (rr.c == .bool) try e.convertScalar(v, .bool, .uint) else v;
+            }
+            const fn_i = try e.dxOp(try std.fmt.allocPrint(e.arena, "dx.op.bufferStore.{s}", .{e.overloadName(st)}), void_ty, &.{ i32t, e.handle_ty, i32t, i32t, st, st, st, st, i8t }, .nounwind);
+            const mask = try e.dm.constInt(8, (@as(i64, 1) << @intCast(count)) - 1);
+            _ = try e.callOp(fn_i, void_ty, &.{ try e.i32Const(69), res.handle, addr, undef_i32, w[0], w[1], w[2], w[3], mask });
+        }
+    }
+
     fn rawStore(e: *Emitter, res: Resource, base: Value, ty: TypeId, vals: []const Value) Error!void {
-        if (e.profile.minor < 2) return e.unsupported("templated stores of '{s}' need shader model 6.2", .{try e.t.format(e.arena, ty)});
+        if (e.profile.minor < 2) return e.rawStoreLegacy(res, base, ty, vals);
         const i32t = try e.dm.intType(32);
         const i8t = try e.dm.intType(8);
         const void_ty = try e.voidTy();
@@ -6366,6 +6644,15 @@ const Emitter = struct {
 
     /// Whether wave operations and 64-bit integers are still in the code
     /// once dead code is gone (the validator wants flags to match).
+    fn is64BitInt(e: *Emitter, f: *const module.Function, v: Value) bool {
+        const ty = switch (v) {
+            .inst => |i| f.insts.items[i].ty,
+            .constant => |c| e.dm.constants.items[c].ty,
+            else => return false,
+        };
+        return e.dm.types.items[ty] == .int and e.dm.types.items[ty].int == 64;
+    }
+
     fn liveUses(e: *Emitter) struct { wave: bool, int64: bool, typed_uav_load: bool } {
         var wave = false;
         var int64 = false;
@@ -6382,11 +6669,13 @@ const Emitter = struct {
                             if (r.class == .uav and r.kind != 11 and r.kind != 12 and (e.flatCount(r.elem) catch 1) > 1) typed_uav_load = true;
                         } else typed_uav_load = true;
                     }
-                    for (c.args) |arg| if (arg == .inst and e.dm.types.items[f.insts.items[arg.inst].ty] == .int and e.dm.types.items[f.insts.items[arg.inst].ty].int == 64) {
+                    // (Constants too, as the validator counts them: a
+                    // 64-bit store of a value folding made constant.)
+                    for (c.args) |arg| if (e.is64BitInt(&f, arg)) {
                         int64 = true;
                     };
                 },
-                .store => |x| if (x.val == .inst and e.dm.types.items[f.insts.items[x.val.inst].ty] == .int and e.dm.types.items[f.insts.items[x.val.inst].ty].int == 64) {
+                .store => |x| if (e.is64BitInt(&f, x.val)) {
                     int64 = true;
                 },
                 else => {},

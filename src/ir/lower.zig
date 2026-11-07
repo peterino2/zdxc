@@ -1427,6 +1427,117 @@ const Lowerer = struct {
         }
     }
 
+    /// Whether pointer `p` is into a writable resource (a UAV's element).
+    fn writableRoot(l: *Lowerer, p: Ref) bool {
+        var cur = p;
+        while (true) {
+            const inst = l.b.f.inst(cur);
+            switch (inst.op) {
+                .access => |a| cur = a.base,
+                else => {
+                    const t = l.s.types.get(inst.ty);
+                    return t == .resource and t.resource.kind.isWritable();
+                },
+            }
+        }
+    }
+
+    /// Whether method `f` may write its object: assigns to, increments or
+    /// passes as an out / inout argument a member of `this`, or calls a
+    /// method of its own that does (when unsure: true).
+    fn methodWritesThis(l: *Lowerer, f: *const semamod.Function, depth: u32) bool {
+        if (depth > 16) return true;
+        const body = f.decl.body orelse return true;
+        return l.stmtWritesThis(body, depth);
+    }
+
+    fn stmtWritesThis(l: *Lowerer, st: *const ast.Stmt, depth: u32) bool {
+        return switch (st.kind) {
+            .compound => |xs| for (xs) |x| {
+                if (l.stmtWritesThis(x, depth)) break true;
+            } else false,
+            .decl => |ds| for (ds) |d| switch (d.kind) {
+                .@"var" => |v| if (v.init) |e| if (l.exprWritesThis(e, depth)) break true,
+                else => {},
+            } else false,
+            .expr => |e| l.exprWritesThis(e, depth),
+            .@"if" => |x| l.exprWritesThis(x.cond, depth) or l.stmtWritesThis(x.then, depth) or (if (x.@"else") |e| l.stmtWritesThis(e, depth) else false),
+            .@"for" => |x| (if (x.init) |i| l.stmtWritesThis(i, depth) else false) or (if (x.cond) |c| l.exprWritesThis(c, depth) else false) or (if (x.inc) |i| l.exprWritesThis(i, depth) else false) or l.stmtWritesThis(x.body, depth),
+            .@"while" => |x| l.exprWritesThis(x.cond, depth) or l.stmtWritesThis(x.body, depth),
+            .do_while => |x| l.exprWritesThis(x.cond, depth) or l.stmtWritesThis(x.body, depth),
+            .@"switch" => |x| l.exprWritesThis(x.cond, depth) or l.stmtWritesThis(x.body, depth),
+            .case => |x| l.stmtWritesThis(x.stmt, depth),
+            .default => |x| l.stmtWritesThis(x, depth),
+            .@"return" => |x| if (x) |e| l.exprWritesThis(e, depth) else false,
+            .empty, .@"break", .@"continue", .discard => false,
+        };
+    }
+
+    /// Whether `e` names (a part of) the object: a member named without
+    /// `this.`, or `this` and what is reached from it.
+    fn refersToThis(l: *Lowerer, e: *const ast.Expr) bool {
+        return switch (e.kind) {
+            .this => true,
+            .name => if (l.s.resolution(e)) |r| (r == .this_field or r == .this_bitfield) else false,
+            .member => |m| l.refersToThis(m.base),
+            .index => |x| l.refersToThis(x.base),
+            .cast => |c| l.refersToThis(c.operand),
+            else => false,
+        };
+    }
+
+    fn exprWritesThis(l: *Lowerer, e: *const ast.Expr, depth: u32) bool {
+        switch (e.kind) {
+            .assign => |a| return l.refersToThis(a.lhs) or l.exprWritesThis(a.lhs, depth) or l.exprWritesThis(a.rhs, depth),
+            .unary => |u| return ((u.op == .pre_inc or u.op == .pre_dec or u.op == .post_inc or u.op == .post_dec) and l.refersToThis(u.operand)) or l.exprWritesThis(u.operand, depth),
+            .binary => |b| return l.exprWritesThis(b.lhs, depth) or l.exprWritesThis(b.rhs, depth),
+            .conditional => |c| return l.exprWritesThis(c.cond, depth) or l.exprWritesThis(c.then, depth) or l.exprWritesThis(c.@"else", depth),
+            .construct => |c| {
+                for (c.args) |a| if (l.exprWritesThis(a, depth)) return true;
+                return false;
+            },
+            .cast => |c| return l.exprWritesThis(c.operand, depth),
+            .member => |m| return l.exprWritesThis(m.base, depth),
+            .index => |x| return l.exprWritesThis(x.base, depth) or l.exprWritesThis(x.index, depth),
+            .init_list => |xs| {
+                for (xs) |a| if (l.exprWritesThis(a, depth)) return true;
+                return false;
+            },
+            .call => |c| {
+                for (c.args) |a| if (l.exprWritesThis(a, depth)) return true;
+                if (l.exprWritesThis(c.callee, depth)) return true;
+                const r = l.s.resolution(e) orelse return true;
+                switch (r) {
+                    .function => |g| {
+                        // Its own method, on `this` (named alone or as
+                        // `this.m()` / `member.m()`).
+                        const on_this = switch (c.callee.kind) {
+                            .name => g.owner != null,
+                            .member => |m| l.refersToThis(m.base),
+                            else => false,
+                        };
+                        if (on_this and l.methodWritesThis(g, depth + 1)) return true;
+                        for (g.params, 0..) |p, i| {
+                            if (i < c.args.len and p.dir != .in and l.refersToThis(c.args[i])) return true;
+                        }
+                        return false;
+                    },
+                    .intrinsic => |it| {
+                        const spec = table.intrinsics[it.index];
+                        for (c.args, 0..) |a, i| {
+                            if (i < spec.params.len and spec.params[i].qual != .in and l.refersToThis(a)) return true;
+                        }
+                        // (A method of a member object: on a resource, it
+                        // writes the resource, not the struct.)
+                        return false;
+                    },
+                    else => return true,
+                }
+            },
+            else => return false,
+        }
+    }
+
     /// A call to `f` with `base_expr` as the object of a method (null:
     /// the current `this`, or no object).
     fn methodCall(l: *Lowerer, f: *const semamod.Function, fi: u32, base_expr: ?*ast.Expr, args: []const *ast.Expr, ret_ty: TypeId) Error!Ref {
@@ -1454,6 +1565,14 @@ const Lowerer = struct {
                 object = tmp;
                 if (direct) |p| switch (l.b.f.inst(p).ptr) {
                     .function, .private, .groupshared => write_back = p,
+                    // An element of a writable buffer (`buf[i].store(v)`):
+                    // written back when the method writes its object, as
+                    // dxc's `this` is the element itself. (Only then: a
+                    // store of what a read-only method left unchanged
+                    // would race other threads' writes.)
+                    .resource => if (l.writableRoot(p) and l.methodWritesThis(f, 0)) {
+                        write_back = p;
+                    },
                     else => {},
                 };
             }
