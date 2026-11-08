@@ -5,9 +5,17 @@
 //! that starts false and is passed back unchanged through a loop, or a loop
 //! whose first test already fails, as dxc's optimizer finds them.)
 //!
+//! A value may also be found to be one of a few constants (a flag picked
+//! by `c ? 1 : 0`, or a phi of such): arithmetic, casts and compares work
+//! on each, a compare every one of them decides is a constant, and a
+//! switch goes only to the cases they can take. (Unreal's MegaLights sets
+//! a shading model `ID = valid ? 1 : 0` and switches on it over every
+//! shading model's BRDF; dxc keeps only the first.)
+//!
 //! The results go into the function as constants: the uses of values found
-//! constant, and the conditions of branches found to go one way; promotion
-//! then drops what that leaves dead or unreachable.
+//! constant, the conditions of branches found to go one way, and the cases
+//! a switch cannot take; promotion then drops what that leaves dead or
+//! unreachable.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -20,28 +28,91 @@ const Inst = module.Inst;
 
 const none = std.math.maxInt(u32);
 
-/// Not yet known (optimistically anything), one constant, or varying.
+/// The most constants a value is followed as being one of.
+const max_set = 8;
+
+/// A few distinct constants, in order (the rest of `v` zero).
+const Vals = struct {
+    len: u8 = 0,
+    v: [max_set]i64 = @splat(0),
+
+    fn slice(s: *const Vals) []const i64 {
+        return s.v[0..s.len];
+    }
+
+    /// Adds `x`; false if that makes too many.
+    fn add(s: *Vals, x: i64) bool {
+        var k: usize = 0;
+        while (k < s.len and s.v[k] < x) : (k += 1) {}
+        if (k < s.len and s.v[k] == x) return true;
+        if (s.len == max_set) return false;
+        var j: usize = s.len;
+        while (j > k) : (j -= 1) s.v[j] = s.v[j - 1];
+        s.v[k] = x;
+        s.len += 1;
+        return true;
+    }
+
+    fn lat(s: Vals) Lat {
+        return switch (s.len) {
+            0 => .top,
+            1 => .{ .k = s.v[0] },
+            else => .{ .set = s },
+        };
+    }
+};
+
+/// Not yet known (optimistically anything), one constant, one of a few,
+/// or varying.
 const Lat = union(enum) {
     top,
     k: i64,
+    set: Vals,
     bot,
 
-    fn meet(x: Lat, y: Lat) Lat {
+    /// The constants it may be (for `k` and `set`).
+    fn vals(x: Lat) ?Vals {
         return switch (x) {
-            .top => y,
-            .bot => .bot,
-            .k => |a| switch (y) {
-                .top => x,
-                .bot => .bot,
-                .k => |b| if (a == b) x else .bot,
+            .k => |a| blk: {
+                var s: Vals = .{};
+                _ = s.add(a);
+                break :blk s;
             },
+            .set => |s| s,
+            else => null,
         };
+    }
+
+    fn known(x: Lat) bool {
+        return x == .k or x == .set;
+    }
+
+    fn meet(x: Lat, y: Lat) Lat {
+        if (x == .top) return y;
+        if (y == .top) return x;
+        var s = x.vals() orelse return .bot;
+        const t = y.vals() orelse return .bot;
+        for (t.slice()) |b| if (!s.add(b)) return .bot;
+        return s.lat();
     }
 
     fn eql(x: Lat, y: Lat) bool {
         return std.meta.eql(x, y);
     }
 };
+
+/// `f` of each pair of constants `l` and `r` may be: null if `f` cannot
+/// say for one, or that gives too many.
+fn lift2(l: Lat, r: Lat, ctx: anytype, comptime f: fn (@TypeOf(ctx), i64, i64) ?i64) Lat {
+    const ls = l.vals().?;
+    const rs = r.vals().?;
+    var out: Vals = .{};
+    for (ls.slice()) |x| for (rs.slice()) |y| {
+        const z = f(ctx, x, y) orelse return .bot;
+        if (!out.add(z)) return .bot;
+    };
+    return out.lat();
+}
 
 fn intWidth(m: *const module.Module, ty: module.TypeId) ?u32 {
     return switch (m.types.items[ty]) {
@@ -91,6 +162,18 @@ const Succs = struct {
         return s.br[k];
     }
 };
+
+const Switch = @FieldType(@FieldType(Inst, "op"), "switch");
+const Case = @typeInfo(@FieldType(Switch, "cases")).pointer.child;
+
+/// The block a switch goes to for the value `x`.
+fn caseTarget(ev: anytype, sw: Switch, x: i64) u32 {
+    for (sw.cases) |cs| {
+        const v = ev.of(cs.val);
+        if (v == .k and v.k == x) return cs.block;
+    }
+    return sw.default;
+}
 
 fn successors(term: Inst) Succs {
     return switch (term.op) {
@@ -154,6 +237,54 @@ pub fn run(a: Allocator, m: *module.Module, func: u32) Allocator.Error!bool {
             };
         }
 
+        const Bin = struct { op: @FieldType(@FieldType(@FieldType(Inst, "op"), "binop"), "op"), w: u32 };
+
+        fn bin(b: Bin, lk: i64, rk: i64) ?i64 {
+            const w = b.w;
+            const x = bitsOf(lk, w);
+            const y = bitsOf(rk, w);
+            const sx = stored(x, w);
+            const sy = stored(y, w);
+            const p: u64 = switch (b.op) {
+                .add => x +% y,
+                .sub => x -% y,
+                .mul => x *% y,
+                .@"and" => x & y,
+                .@"or" => x | y,
+                .xor => x ^ y,
+                .shl => if (y < w) x << @intCast(y) else return null,
+                .lshr => if (y < w) x >> @intCast(y) else return null,
+                .ashr => if (y < w) @bitCast(sx >> @intCast(y)) else return null,
+                .udiv => if (y != 0) x / y else return null,
+                .urem => if (y != 0) x % y else return null,
+                .sdiv => if (sy != 0 and !(sy == -1 and sx == std.math.minInt(i64))) @bitCast(@divTrunc(sx, sy)) else return null,
+                .srem => if (sy != 0 and sy != -1) @bitCast(@rem(sx, sy)) else return null,
+            };
+            return stored(bitsOf(@bitCast(p), w), w);
+        }
+
+        const Cmp = struct { pred: u32, w: u32 };
+
+        fn cmp(c: Cmp, lk: i64, rk: i64) ?i64 {
+            const x = bitsOf(lk, c.w);
+            const y = bitsOf(rk, c.w);
+            const sx = stored(x, c.w);
+            const sy = stored(y, c.w);
+            const t = switch (c.pred) {
+                32 => x == y,
+                33 => x != y,
+                34 => x > y,
+                35 => x >= y,
+                36 => x < y,
+                37 => x <= y,
+                38 => sx > sy,
+                39 => sx >= sy,
+                40 => sx < sy,
+                else => sx <= sy,
+            };
+            return @intFromBool(t);
+        }
+
         fn inst(s: @This(), i: u32) Lat {
             const in = s.f.insts.items[i];
             const w = intWidth(s.m, in.ty) orelse return .bot;
@@ -168,38 +299,23 @@ pub fn run(a: Allocator, m: *module.Module, func: u32) Allocator.Error!bool {
                         return .bot;
                     }
                     if (l == .top or r == .top) return .top;
-                    const x = bitsOf(l.k, w);
-                    const y = bitsOf(r.k, w);
-                    const sx = stored(x, w);
-                    const sy = stored(y, w);
-                    const p: u64 = switch (b.op) {
-                        .add => x +% y,
-                        .sub => x -% y,
-                        .mul => x *% y,
-                        .@"and" => x & y,
-                        .@"or" => x | y,
-                        .xor => x ^ y,
-                        .shl => if (y < w) x << @intCast(y) else return .bot,
-                        .lshr => if (y < w) x >> @intCast(y) else return .bot,
-                        .ashr => if (y < w) @bitCast(sx >> @intCast(y)) else return .bot,
-                        .udiv => if (y != 0) x / y else return .bot,
-                        .urem => if (y != 0) x % y else return .bot,
-                        .sdiv => if (sy != 0 and !(sy == -1 and sx == std.math.minInt(i64))) @bitCast(@divTrunc(sx, sy)) else return .bot,
-                        .srem => if (sy != 0 and sy != -1) @bitCast(@rem(sx, sy)) else return .bot,
-                    };
-                    return .{ .k = stored(bitsOf(@bitCast(p), w), w) };
+                    return lift2(l, r, Bin{ .op = b.op, .w = w }, bin);
                 },
                 .cast => |c| {
                     if (c.op != .zext and c.op != .sext and c.op != .trunc) return .bot;
                     const from = intWidth(s.m, typeOf(s.m, s.f, c.val) orelse return .bot) orelse return .bot;
                     const v = s.of(c.val);
-                    if (v != .k) return v;
-                    const x = bitsOf(v.k, from);
-                    const out: u64 = switch (c.op) {
-                        .sext => if (from == 1) (if (x & 1 != 0) ~@as(u64, 0) else 0) else @bitCast(stored(x, from)),
-                        else => x,
-                    };
-                    return .{ .k = stored(bitsOf(@bitCast(out), w), w) };
+                    const vs = v.vals() orelse return v;
+                    var out: Vals = .{};
+                    for (vs.slice()) |k| {
+                        const x = bitsOf(k, from);
+                        const o: u64 = switch (c.op) {
+                            .sext => if (from == 1) (if (x & 1 != 0) ~@as(u64, 0) else 0) else @bitCast(stored(x, from)),
+                            else => x,
+                        };
+                        if (!out.add(stored(bitsOf(@bitCast(o), w), w))) return .bot;
+                    }
+                    return out.lat();
                 },
                 .cmp => |c| {
                     if (c.pred < 32 or c.pred > 41) return .bot;
@@ -208,30 +324,14 @@ pub fn run(a: Allocator, m: *module.Module, func: u32) Allocator.Error!bool {
                     const r = s.of(c.rhs);
                     if (l == .bot or r == .bot) return .bot;
                     if (l == .top or r == .top) return .top;
-                    const x = bitsOf(l.k, cw);
-                    const y = bitsOf(r.k, cw);
-                    const sx = stored(x, cw);
-                    const sy = stored(y, cw);
-                    const t = switch (c.pred) {
-                        32 => x == y,
-                        33 => x != y,
-                        34 => x > y,
-                        35 => x >= y,
-                        36 => x < y,
-                        37 => x <= y,
-                        38 => sx > sy,
-                        39 => sx >= sy,
-                        40 => sx < sy,
-                        else => sx <= sy,
-                    };
-                    return .{ .k = @intFromBool(t) };
+                    return lift2(l, r, Cmp{ .pred = c.pred, .w = cw }, cmp);
                 },
                 .select => |sel| {
                     const c = s.of(sel.cond);
                     return switch (c) {
                         .top => .top,
                         .k => |x| s.of(if (x & 1 != 0) sel.t else sel.f),
-                        .bot => s.of(sel.t).meet(s.of(sel.f)),
+                        .set, .bot => s.of(sel.t).meet(s.of(sel.f)),
                     };
                 },
                 else => return .bot,
@@ -300,7 +400,7 @@ pub fn run(a: Allocator, m: *module.Module, func: u32) Allocator.Error!bool {
                         const targets: [2]?u32 = if (br.cond) |c| switch (ev.of(c)) {
                             .top => .{ null, null },
                             .k => |x| .{ if (x & 1 != 0) br.then else br.@"else", null },
-                            .bot => .{ br.then, br.@"else" },
+                            .set, .bot => .{ br.then, br.@"else" },
                         } else .{ br.then, null };
                         for (targets) |t| if (t) |tb| {
                             const gop = try edges.getOrPut(a, S.key(b, tb));
@@ -314,15 +414,11 @@ pub fn run(a: Allocator, m: *module.Module, func: u32) Allocator.Error!bool {
                     .@"switch" => |sw| {
                         const c = ev.of(sw.cond);
                         if (c == .top) continue;
-                        var taken: ?u32 = null;
-                        if (c == .k) {
-                            taken = sw.default;
-                            for (sw.cases) |cs| if (ev.of(cs.val) == .k and ev.of(cs.val).k == c.k) {
-                                taken = cs.block;
-                            };
-                        }
                         var list: std.ArrayList(u32) = .empty;
-                        if (taken) |t| try list.append(a, t) else {
+                        if (c.vals()) |vs| {
+                            // Where each value it may be goes.
+                            for (vs.slice()) |x| try list.append(a, caseTarget(ev, sw, x));
+                        } else {
                             try list.append(a, sw.default);
                             for (sw.cases) |cs| try list.append(a, cs.block);
                         }
@@ -370,6 +466,159 @@ pub fn run(a: Allocator, m: *module.Module, func: u32) Allocator.Error!bool {
     };
     var mapper: Mapper = .{ .repl = repl, .any = &any };
     const ma = m.allocator();
+
+    // Switches on one of a few constants: the cases none of them takes
+    // dropped, or a branch where they all go one way. (Only edges go:
+    // promotion drops the phis' inputs from them, and what no path
+    // reaches any more.)
+    for (insts, 0..) |*inst, i| {
+        if (inst.op != .@"switch" or !exec[block_of[i]]) continue;
+        const sw = inst.op.@"switch";
+        const c = ev.of(sw.cond);
+        if (c != .set) continue;
+        const vs = c.set;
+        const first = caseTarget(ev, sw, vs.v[0]);
+        var one_way = true;
+        for (vs.slice()[1..]) |x| {
+            if (caseTarget(ev, sw, x) != first) one_way = false;
+        }
+        if (one_way) {
+            inst.op = .{ .br = .{ .then = first } };
+            any = true;
+            continue;
+        }
+        var keep: std.ArrayList(Case) = .empty;
+        for (sw.cases) |cs| {
+            const v = ev.of(cs.val);
+            if (v == .k and std.mem.indexOfScalar(i64, vs.slice(), v.k) != null) try keep.append(ma, cs);
+        }
+        if (keep.items.len == sw.cases.len) continue;
+        inst.op.@"switch".cases = keep.items;
+        any = true;
+    }
+
     for (insts) |*inst| try unroll.operandsMap(ma, inst, &mapper);
     return any;
+}
+
+/// A function `i32 f(i32 %a)` for the tests: block 0 computes
+/// `%c = %a != 0` and `%s = select %c, k1, k2`, and goes to block 1 if %c,
+/// else to block 2; block 1 goes to block 2; block 2 starts with
+/// `%p = phi [k0, 0], [%s, 1]` and ends with `tail` (then `ret %a` for
+/// each further block it may go to).
+const TestFn = struct {
+    m: module.Module,
+    func: u32,
+    i32_ty: module.TypeId,
+
+    fn init(gpa: Allocator, k: [3]i64, extra_blocks: u32) !TestFn {
+        var t: TestFn = .{ .m = .init(gpa), .func = 0, .i32_ty = 0 };
+        const m = &t.m;
+        const i32_ty = try m.intType(32);
+        t.i32_ty = i32_ty;
+        const i1_ty = try m.intType(1);
+        const void_ty = try m.getType(.void);
+        t.func = try m.addFunction(.{ .name = "f", .ty = try m.fnType(i32_ty, &.{i32_ty}), .num_blocks = 3 + extra_blocks });
+        const a: Value = .{ .arg = 0 };
+        const c = try m.addInst(t.func, .{ .ty = i1_ty, .op = .{ .cmp = .{ .pred = 33, .lhs = a, .rhs = try m.constInt(32, 0) } } });
+        const s = try m.addInst(t.func, .{ .ty = i32_ty, .op = .{ .select = .{ .cond = c, .t = try m.constInt(32, k[1]), .f = try m.constInt(32, k[2]) } } });
+        _ = try m.addInst(t.func, .{ .ty = void_ty, .op = .{ .br = .{ .then = 1, .@"else" = 2, .cond = c } } });
+        _ = try m.addInst(t.func, .{ .ty = void_ty, .op = .{ .br = .{ .then = 2 } } });
+        const ins = try m.allocator().dupe(@typeInfo(@FieldType(@FieldType(@FieldType(Inst, "op"), "phi"), "incoming")).pointer.child, &.{
+            .{ .val = try m.constInt(32, k[0]), .block = 0 },
+            .{ .val = s, .block = 1 },
+        });
+        _ = try m.addInst(t.func, .{ .ty = i32_ty, .op = .{ .phi = .{ .incoming = ins } } });
+        return t;
+    }
+
+    /// `%p`, the phi starting block 2.
+    const p: Value = .{ .inst = 4 };
+
+    fn add(t: *TestFn, inst: Inst) !Value {
+        return t.m.addInst(t.func, inst);
+    }
+
+    fn finish(t: *TestFn, extra_blocks: u32) !void {
+        const void_ty = try t.m.getType(.void);
+        for (0..extra_blocks) |_| _ = try t.add(.{ .ty = void_ty, .op = .{ .ret = .{ .arg = 0 } } });
+    }
+
+    fn term(t: *TestFn, b: usize) Inst {
+        var seen: usize = 0;
+        for (t.m.functions.items[t.func].insts.items) |inst| if (isTerminator(inst)) {
+            if (seen == b) return inst;
+            seen += 1;
+        };
+        unreachable;
+    }
+
+    fn cases(m: *module.Module, ks: []const [2]i64) ![]const Case {
+        const out = try m.allocator().alloc(Case, ks.len);
+        for (ks, out) |kb, *o| o.* = .{ .val = try m.constInt(32, kb[0]), .block = @intCast(kb[1]) };
+        return out;
+    }
+};
+
+test "a switch on one of a few constants keeps only the cases they take" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    // %p is 0 or 1: of `switch %p [1, 2, 5]` only case 1 and default can run.
+    var t = try TestFn.init(std.testing.allocator, .{ 0, 1, 0 }, 4);
+    defer t.m.deinit();
+    const void_ty = try t.m.getType(.void);
+    _ = try t.add(.{ .ty = void_ty, .op = .{ .@"switch" = .{ .cond = TestFn.p, .default = 3, .cases = try TestFn.cases(&t.m, &.{ .{ 1, 4 }, .{ 2, 5 }, .{ 5, 6 } }) } } });
+    try t.finish(4);
+    try std.testing.expect(try run(arena.allocator(), &t.m, t.func));
+    const sw = t.term(2).op.@"switch";
+    try std.testing.expectEqual(@as(u32, 3), sw.default);
+    try std.testing.expectEqual(@as(usize, 1), sw.cases.len);
+    try std.testing.expectEqual(@as(u32, 4), sw.cases[0].block);
+}
+
+test "a switch every value it may be takes one way is a branch there" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    // %p is 2 or 3, both case 3's block.
+    var t = try TestFn.init(std.testing.allocator, .{ 2, 3, 3 }, 3);
+    defer t.m.deinit();
+    const void_ty = try t.m.getType(.void);
+    _ = try t.add(.{ .ty = void_ty, .op = .{ .@"switch" = .{ .cond = TestFn.p, .default = 5, .cases = try TestFn.cases(&t.m, &.{ .{ 2, 3 }, .{ 3, 3 }, .{ 4, 4 } }) } } });
+    try t.finish(3);
+    try std.testing.expect(try run(arena.allocator(), &t.m, t.func));
+    const br = t.term(2).op.br;
+    try std.testing.expectEqual(@as(u32, 3), br.then);
+    try std.testing.expectEqual(@as(?u32, null), br.@"else");
+}
+
+test "a compare every value decides is a constant" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    // %p is 0 or 1 (through `* 4 + 1`: 1 or 5); `== 2` is never true and
+    // `u< 6` always.
+    var t = try TestFn.init(std.testing.allocator, .{ 0, 1, 0 }, 2);
+    defer t.m.deinit();
+    const void_ty = try t.m.getType(.void);
+    const i1_ty = try t.m.intType(1);
+    const mul = try t.add(.{ .ty = t.i32_ty, .op = .{ .binop = .{ .op = .mul, .lhs = TestFn.p, .rhs = try t.m.constInt(32, 4) } } });
+    const q = try t.add(.{ .ty = t.i32_ty, .op = .{ .binop = .{ .op = .add, .lhs = mul, .rhs = try t.m.constInt(32, 1) } } });
+    const eq = try t.add(.{ .ty = i1_ty, .op = .{ .cmp = .{ .pred = 32, .lhs = q, .rhs = try t.m.constInt(32, 2) } } });
+    const lt = try t.add(.{ .ty = i1_ty, .op = .{ .cmp = .{ .pred = 36, .lhs = q, .rhs = try t.m.constInt(32, 6) } } });
+    const both = try t.add(.{ .ty = i1_ty, .op = .{ .binop = .{ .op = .@"or", .lhs = eq, .rhs = lt } } });
+    _ = try t.add(.{ .ty = void_ty, .op = .{ .br = .{ .then = 3, .@"else" = 4, .cond = both } } });
+    try t.finish(2);
+    try std.testing.expect(try run(arena.allocator(), &t.m, t.func));
+    const br = t.term(2).op.br;
+    const cond = br.cond.?;
+    try std.testing.expect(cond == .constant);
+    try std.testing.expectEqual(@as(i64, 1), t.m.constants.items[cond.constant].kind.int);
+}
+
+test "more constants than are followed are varying" {
+    var x: Lat = .top;
+    for (0..max_set) |k| x = x.meet(.{ .k = @intCast(k * 3) });
+    try std.testing.expect(x == .set);
+    try std.testing.expectEqual(@as(u8, max_set), x.set.len);
+    try std.testing.expect(x.meet(.{ .k = 1 }) == .bot);
+    try std.testing.expect(x.meet(.{ .k = 3 }).eql(x));
 }
