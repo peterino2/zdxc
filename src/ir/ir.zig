@@ -488,6 +488,9 @@ pub const Entry = struct {
     /// `[WaveSize(min[, max[, preferred]])]`: zeros where not given (no
     /// attribute: min 0).
     wave_size: [3]u32 = .{ 0, 0, 0 },
+    /// `[earlydepthstencil]` (pixel shaders): depth and stencil tests run
+    /// before the shader.
+    early_depth_stencil: bool = false,
     geometry: GeometryInfo = .{},
     tess: TessInfo = .{},
     mesh: MeshInfo = .{},

@@ -11,6 +11,14 @@
 //! values computed from themselves. Its blocks are copied once per
 //! iteration, and once more up to the exit, after the function's last
 //! block; the original blocks are left unreachable for promotion to drop.
+//!
+//! An `[unroll]` loop may also hold other loops (tried first; what is left
+//! of them is copied with it) and leave from other blocks too (`break`s):
+//! each copy keeps those edges, and the phis where they arrive take one
+//! value per copy. (dxc unrolls such loops: Unreal's Nanite rasterizer
+//! has two, around its whole per-triangle and per-vertex work.) Values
+//! read after such a loop other than through those phis get phis of their
+//! own first, where its ways out join (no loop qualifies otherwise).
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -349,6 +357,29 @@ fn eval(m: *const module.Module, f: *const module.Function, state: *const std.Au
     }
 }
 
+/// The header phis' values in the next iteration: what every latch passes
+/// back (the same), for the phis `state` follows.
+fn nextState(a: Allocator, m: *const module.Module, f: *const module.Function, state: *const std.AutoHashMapUnmanaged(u32, i64), phis: []const u32, pre: u32) Allocator.Error!std.AutoHashMapUnmanaged(u32, i64) {
+    const insts = f.insts.items;
+    var next: std.AutoHashMapUnmanaged(u32, i64) = .empty;
+    for (phis) |pi| {
+        if (!state.contains(pi)) continue;
+        var val: ?i64 = null;
+        var ok = true;
+        for (insts[pi].op.phi.incoming) |in| {
+            if (in.block == pre) continue;
+            const v = eval(m, f, state, in.val, 0) orelse {
+                ok = false;
+                break;
+            };
+            if (val != null and val.? != v) ok = false;
+            val = v;
+        }
+        if (ok) if (val) |v| try next.put(a, pi, v);
+    }
+    return next;
+}
+
 fn typeOf(m: *const module.Module, f: *const module.Function, v: Value) ?module.TypeId {
     return switch (v) {
         .inst => |i| f.insts.items[i].ty,
@@ -492,287 +523,552 @@ fn unrollOne(a: Allocator, m: *module.Module, func: u32, budget: *usize, tried: 
         return true;
     }
 
-    candidates: for (loops.items) |lp| {
-        const h = lp.h;
-        if (tried.contains(h)) continue;
-        // Innermost: no other loop's header inside.
-        for (loops.items) |other| if (other.h != h and lp.body.has(other.h)) continue :candidates;
-        try tried.put(a, h, {});
-        // `[unroll]` (its back edge marked by the emitter).
-        const marked_loop = for (lp.latches) |l| {
-            if (insts[cfg.block_start[l + 1] - 1].md == .unroll) break true;
-        } else false;
-
-        // One way out: a conditional branch from one block, to one block.
-        var exiting: u32 = none;
-        var exit: u32 = none;
-        var size: usize = 0;
-        var body_blocks: std.ArrayList(u32) = .empty;
-        for (lp.body.blocks) |bb| {
-            try body_blocks.append(a, bb);
-            size += cfg.block_start[bb + 1] - cfg.block_start[bb];
-            const term = insts[cfg.block_start[bb + 1] - 1].op;
-            if (term == .@"switch") {
-                for (cfg.succs[bb]) |s| if (!lp.body.has(s)) continue :candidates;
-            }
-            for (cfg.succs[bb]) |s| if (!lp.body.has(s)) {
-                if (exiting != none) continue :candidates;
-                exiting = bb;
-                exit = s;
+    // `[unroll]` loops (their back edges marked by the emitter).
+    const unroll_marked = try a.alloc(bool, loops.items.len);
+    for (loops.items, unroll_marked) |lp, *mk| mk.* = for (lp.latches) |l| {
+        if (insts[cfg.block_start[l + 1] - 1].md == .unroll) break true;
+    } else false;
+    // Innermost loops first; then `[unroll]` loops whose `[unroll]` loops
+    // inside have been tried.
+    for (0..2) |pass| {
+        candidates: for (loops.items, unroll_marked) |lp, marked_loop| {
+            const h = lp.h;
+            if (tried.contains(h)) continue;
+            for (loops.items, unroll_marked) |other, other_marked| if (other.h != h and lp.body.has(other.h)) {
+                if (pass == 0 or !marked_loop) continue :candidates;
+                if (other_marked and !tried.contains(other.h)) continue :candidates;
             };
-        }
-        if (exiting == none) continue;
-        const xterm = insts[cfg.block_start[exiting + 1] - 1].op;
-        if (xterm != .br or xterm.br.@"else" == null) continue;
-        const stay = if (xterm.br.then == exit) xterm.br.@"else".? else xterm.br.then;
-        if (!lp.body.has(stay) or stay == exit) continue;
-        for (lp.latches) |l| if (!cfg.dominates(exiting, l)) continue :candidates;
-        // One way in.
-        var pre: u32 = none;
-        for (cfg.preds[h]) |p| if (!lp.body.has(p)) {
-            if (pre != none) continue :candidates;
-            pre = p;
-        };
-        if (pre == none) continue;
+            try tried.put(a, h, {});
 
-        // The header's phis: the integer ones whose values can be followed.
-        var phis: std.ArrayList(u32) = .empty;
-        {
-            var i = cfg.block_start[h];
-            while (insts[i].op == .phi) : (i += 1) try phis.append(a, i);
-        }
-        var state: std.AutoHashMapUnmanaged(u32, i64) = .empty;
-        for (phis.items) |pi| {
-            if (intWidth(m, insts[pi].ty) == null) continue;
-            for (insts[pi].op.phi.incoming) |in| if (in.block == pre) {
-                if (constInt(m, in.val)) |c| try state.put(a, pi, c);
+            // Ways out: blocks branching out of the loop. Without `[unroll]`,
+            // one (a conditional branch, to one block).
+            var exits: std.ArrayList(u32) = .empty;
+            var size: usize = 0;
+            var body_blocks: std.ArrayList(u32) = .empty;
+            for (lp.body.blocks) |bb| {
+                try body_blocks.append(a, bb);
+                size += cfg.block_start[bb + 1] - cfg.block_start[bb];
+                const leaves = for (cfg.succs[bb]) |s| {
+                    if (!lp.body.has(s)) break true;
+                } else false;
+                if (!leaves) continue;
+                if (insts[cfg.block_start[bb + 1] - 1].op != .br) continue :candidates;
+                try exits.append(a, bb);
+            }
+            if (exits.items.len == 0 or (exits.items.len > 1 and !marked_loop)) continue;
+            // One way in.
+            var pre: u32 = none;
+            for (cfg.preds[h]) |p| if (!lp.body.has(p)) {
+                if (pre != none) continue :candidates;
+                pre = p;
             };
-        }
-        const xcond = xterm.br.cond.?;
-        const stay_on: i64 = if (xterm.br.then == stay) 1 else 0;
-        var states: std.ArrayList(std.AutoHashMapUnmanaged(u32, i64)) = .empty;
-        while (true) {
-            const c = eval(m, f, &state, xcond, 0) orelse continue :candidates;
-            if ((c & 1) != stay_on) break;
-            if (states.items.len >= @as(usize, if (marked_loop) max_marked_trips else max_trips)) continue :candidates;
-            try states.append(a, try state.clone(a));
-            // Next values: what every latch passes back (the same).
-            var next: std.AutoHashMapUnmanaged(u32, i64) = .empty;
-            for (phis.items) |pi| {
-                if (!state.contains(pi)) continue;
-                var val: ?i64 = null;
-                var ok = true;
-                for (insts[pi].op.phi.incoming) |in| {
-                    if (in.block == pre) continue;
-                    const v = eval(m, f, &state, in.val, 0) orelse {
-                        ok = false;
-                        break;
-                    };
-                    if (val != null and val.? != v) ok = false;
-                    val = v;
-                }
-                if (ok) if (val) |v| try next.put(a, pi, v);
-            }
-            state = next;
-        }
-        const trips = states.items.len;
-        const growth = (trips + 1) * size;
-        if ((!marked_loop and growth > max_loop_growth) or growth > budget.*) continue;
-        budget.* -= growth;
-        try states.append(a, state); // the last pass, up to the exit
+            if (pre == none) continue;
 
-        // Copies: block `body_blocks[j]` of copy `k` is block
-        // `nb + k * nbody + j`.
-        const nbody: u32 = @intCast(body_blocks.items.len);
-        const index_in = try a.alloc(u32, nb);
-        @memset(index_in, none);
-        for (body_blocks.items, 0..) |bb, j| index_in[bb] = @intCast(j);
-        const n0: u32 = @intCast(insts.len);
-        const copies: u32 = @intCast(trips + 1);
-        // Value maps per copy (original instruction -> value).
-        const maps = try a.alloc(std.AutoHashMapUnmanaged(u32, Value), copies);
-        for (maps) |*mp| mp.* = .empty;
-        const S = struct {
-            fn block(nb_: u32, nbody_: u32, idx: []const u32, k: u32, b: u32) u32 {
-                return nb_ + k * nbody_ + idx[b];
+            // The header's phis: the integer ones whose values can be followed.
+            var phis: std.ArrayList(u32) = .empty;
+            {
+                var i = cfg.block_start[h];
+                while (insts[i].op == .phi) : (i += 1) try phis.append(a, i);
             }
-        };
-
-        var out: std.ArrayList(Inst) = .empty;
-        const ma = m.allocator();
-        // New instruction indices come after the existing ones.
-        var next_index: u32 = n0;
-        // First pass: give every copied instruction its index (phis of
-        // later copies refer back, latch values refer forward to the next
-        // copy's header).
-        const new_index = try a.alloc([]u32, copies);
-        for (0..copies) |k| {
-            new_index[k] = try a.alloc(u32, n0);
-            @memset(new_index[k], none);
-            for (body_blocks.items) |bb| {
-                var i = cfg.block_start[bb];
-                while (i < cfg.block_start[bb + 1]) : (i += 1) {
-                    new_index[k][i] = next_index;
-                    next_index += 1;
-                }
-            }
-        }
-        // Header phis: a constant where followed, else the value from the
-        // copy before (or from the preheader).
-        for (0..copies) |k| {
+            var start: std.AutoHashMapUnmanaged(u32, i64) = .empty;
             for (phis.items) |pi| {
-                if (states.items[k].get(pi)) |c| {
-                    try maps[k].put(a, pi, try m.constant(.{ .ty = insts[pi].ty, .kind = .{ .int = c } }));
-                    continue;
+                if (intWidth(m, insts[pi].ty) == null) continue;
+                for (insts[pi].op.phi.incoming) |in| if (in.block == pre) {
+                    if (constInt(m, in.val)) |c| try start.put(a, pi, c);
+                };
+            }
+            // The exit the counter decides: a conditional branch, one arm out
+            // of the loop and one in, from a block every latch is reached
+            // through, on a condition the header phis decide. Any other way
+            // out is a side exit (`[unroll]` loops only).
+            var exiting: u32 = none;
+            var exit: u32 = none;
+            var stay: u32 = none;
+            var state: std.AutoHashMapUnmanaged(u32, i64) = .empty;
+            var states: std.ArrayList(std.AutoHashMapUnmanaged(u32, i64)) = .empty;
+            counted: for (exits.items) |xb| {
+                const xbr = insts[cfg.block_start[xb + 1] - 1].op.br;
+                const xelse = xbr.@"else" orelse continue;
+                const out_then = !lp.body.has(xbr.then);
+                if (out_then == !lp.body.has(xelse)) continue;
+                for (lp.latches) |l| if (!cfg.dominates(xb, l)) continue :counted;
+                const st = if (out_then) xelse else xbr.then;
+                const stay_on: i64 = if (xbr.then == st) 1 else 0;
+                state = try start.clone(a);
+                states.clearRetainingCapacity();
+                while (true) {
+                    const c = eval(m, f, &state, xbr.cond.?, 0) orelse continue :counted;
+                    if ((c & 1) != stay_on) break;
+                    if (states.items.len >= @as(usize, if (marked_loop) max_marked_trips else max_trips)) continue :candidates;
+                    try states.append(a, try state.clone(a));
+                    state = try nextState(a, m, f, &state, phis.items, pre);
                 }
-                if (k == 0) {
-                    for (insts[pi].op.phi.incoming) |in| if (in.block == pre) try maps[0].put(a, pi, in.val);
+                exiting = xb;
+                exit = if (out_then) xbr.then else xelse;
+                stay = st;
+                break;
+            }
+            if (exiting == none) continue;
+            // With side exits, the loop's values are read after it only
+            // through the phis of the blocks its edges reach (a value per
+            // copy); elsewhere a copy's value might not be the one that ran.
+            // Values read elsewhere get such phis first, when every way out
+            // leads to one block that comes before those reads.
+            if (exits.items.len > 1) {
+                if (try exitPhis(a, m, func, &cfg, &lp.body)) |inserted| {
+                    if (!inserted) continue;
+                    _ = tried.remove(h);
+                    return true;
                 }
             }
-        }
-        const Mapper = struct {
-            maps: []std.AutoHashMapUnmanaged(u32, Value),
-            new_index: [][]u32,
-            k: u32,
-            fn val(c: @This(), v: Value) Value {
-                if (v != .inst) return v;
-                if (c.maps[c.k].get(v.inst)) |x| return x;
-                if (v.inst < c.new_index[c.k].len and c.new_index[c.k][v.inst] != none) return .{ .inst = c.new_index[c.k][v.inst] };
-                return v;
+            const trips = states.items.len;
+            const growth = (trips + 1) * size;
+            if ((!marked_loop and growth > max_loop_growth) or growth > budget.*) continue;
+            budget.* -= growth;
+            try states.append(a, state); // the last pass, up to the exit
+
+            // Copies: block `body_blocks[j]` of copy `k` is block
+            // `nb + k * nbody + j`.
+            const nbody: u32 = @intCast(body_blocks.items.len);
+            const index_in = try a.alloc(u32, nb);
+            @memset(index_in, none);
+            for (body_blocks.items, 0..) |bb, j| index_in[bb] = @intCast(j);
+            const n0: u32 = @intCast(insts.len);
+            const copies: u32 = @intCast(trips + 1);
+            // Value maps per copy (original instruction -> value).
+            const maps = try a.alloc(std.AutoHashMapUnmanaged(u32, Value), copies);
+            for (maps) |*mp| mp.* = .empty;
+            const S = struct {
+                fn block(nb_: u32, nbody_: u32, idx: []const u32, k: u32, b: u32) u32 {
+                    return nb_ + k * nbody_ + idx[b];
+                }
+            };
+
+            var out: std.ArrayList(Inst) = .empty;
+            const ma = m.allocator();
+            // New instruction indices come after the existing ones.
+            var next_index: u32 = n0;
+            // First pass: give every copied instruction its index (phis of
+            // later copies refer back, latch values refer forward to the next
+            // copy's header).
+            const new_index = try a.alloc([]u32, copies);
+            for (0..copies) |k| {
+                new_index[k] = try a.alloc(u32, n0);
+                @memset(new_index[k], none);
+                for (body_blocks.items) |bb| {
+                    var i = cfg.block_start[bb];
+                    while (i < cfg.block_start[bb + 1]) : (i += 1) {
+                        new_index[k][i] = next_index;
+                        next_index += 1;
+                    }
+                }
             }
-            fn visit(c: *@This(), v: Value, _: anytype) Value {
-                return c.val(v);
+            // Header phis: a constant where followed, else the value from the
+            // copy before (or from the preheader).
+            for (0..copies) |k| {
+                for (phis.items) |pi| {
+                    if (states.items[k].get(pi)) |c| {
+                        try maps[k].put(a, pi, try m.constant(.{ .ty = insts[pi].ty, .kind = .{ .int = c } }));
+                        continue;
+                    }
+                    if (k == 0) {
+                        for (insts[pi].op.phi.incoming) |in| if (in.block == pre) try maps[0].put(a, pi, in.val);
+                    }
+                }
             }
-        };
-        for (0..copies) |kk| {
-            const k: u32 = @intCast(kk);
-            for (body_blocks.items) |bb| {
-                var i = cfg.block_start[bb];
-                while (i < cfg.block_start[bb + 1]) : (i += 1) {
-                    var inst = insts[i];
-                    var mapper: Mapper = .{ .maps = maps, .new_index = new_index, .k = k };
-                    if (bb == h and inst.op == .phi) {
-                        if (maps[k].get(i)) |v| {
-                            // Folded away: a phi of that value on every
-                            // edge keeps the numbering (promotion drops it).
+            const Mapper = struct {
+                maps: []std.AutoHashMapUnmanaged(u32, Value),
+                new_index: [][]u32,
+                k: u32,
+                fn val(c: @This(), v: Value) Value {
+                    if (v != .inst) return v;
+                    if (c.maps[c.k].get(v.inst)) |x| return x;
+                    if (v.inst < c.new_index[c.k].len and c.new_index[c.k][v.inst] != none) return .{ .inst = c.new_index[c.k][v.inst] };
+                    return v;
+                }
+                fn visit(c: *@This(), v: Value, _: anytype) Value {
+                    return c.val(v);
+                }
+            };
+            for (0..copies) |kk| {
+                const k: u32 = @intCast(kk);
+                for (body_blocks.items) |bb| {
+                    var i = cfg.block_start[bb];
+                    while (i < cfg.block_start[bb + 1]) : (i += 1) {
+                        var inst = insts[i];
+                        var mapper: Mapper = .{ .maps = maps, .new_index = new_index, .k = k };
+                        if (bb == h and inst.op == .phi) {
+                            if (maps[k].get(i)) |v| {
+                                // Folded away: a phi of that value on every
+                                // edge keeps the numbering (promotion drops it).
+                                var edges: std.ArrayList(Edge) = .empty;
+                                if (k == 0) {
+                                    try edges.append(ma, .{ .val = v, .block = pre });
+                                } else for (lp.latches) |l| try edges.append(ma, .{ .val = v, .block = S.block(nb, nbody, index_in, k - 1, l) });
+                                try out.append(ma, .{ .ty = inst.ty, .op = .{ .phi = .{ .incoming = edges.items } } });
+                                continue;
+                            }
+                            // From the latches of the copy before.
                             var edges: std.ArrayList(Edge) = .empty;
+                            for (inst.op.phi.incoming) |in| {
+                                if (in.block == pre or k == 0) continue;
+                                const prev: Mapper = .{ .maps = maps, .new_index = new_index, .k = k - 1 };
+                                try edges.append(ma, .{ .val = prev.val(in.val), .block = S.block(nb, nbody, index_in, k - 1, in.block) });
+                            }
                             if (k == 0) {
-                                try edges.append(ma, .{ .val = v, .block = pre });
-                            } else for (lp.latches) |l| try edges.append(ma, .{ .val = v, .block = S.block(nb, nbody, index_in, k - 1, l) });
+                                // (Not followed and no preheader value mapped:
+                                // the preheader's incoming.)
+                                for (inst.op.phi.incoming) |in| if (in.block == pre) try edges.append(ma, .{ .val = in.val, .block = pre });
+                            }
                             try out.append(ma, .{ .ty = inst.ty, .op = .{ .phi = .{ .incoming = edges.items } } });
                             continue;
                         }
-                        // From the latches of the copy before.
+                        if (inst.op == .phi) {
+                            const edges = try ma.alloc(Edge, inst.op.phi.incoming.len);
+                            for (inst.op.phi.incoming, edges) |in, *e| e.* = .{ .val = mapper.val(in.val), .block = if (index_in[in.block] != none) S.block(nb, nbody, index_in, k, in.block) else in.block };
+                            inst.op = .{ .phi = .{ .incoming = edges } };
+                            try out.append(ma, inst);
+                            continue;
+                        }
+                        try operandsMap(ma, &inst, &mapper);
+                        // Branches: within the copy; back to the header: the
+                        // next copy; out of the exiting block: per copy.
+                        switch (inst.op) {
+                            .br => |*br| {
+                                if (bb == exiting) {
+                                    const target = if (k + 1 < copies) stay else exit;
+                                    const tb = if (target == exit) exit else S.block(nb, nbody, index_in, k, target);
+                                    br.* = .{ .then = tb };
+                                } else {
+                                    br.then = mapBlock(br.then, h, k, copies, nb, nbody, index_in);
+                                    if (br.@"else") |*e| e.* = mapBlock(e.*, h, k, copies, nb, nbody, index_in);
+                                }
+                            },
+                            .@"switch" => |*sw| {
+                                sw.default = mapBlock(sw.default, h, k, copies, nb, nbody, index_in);
+                                const cs = try ma.alloc(@typeInfo(@TypeOf(sw.cases)).pointer.child, sw.cases.len);
+                                for (sw.cases, cs) |c, *o| o.* = .{ .val = c.val, .block = mapBlock(c.block, h, k, copies, nb, nbody, index_in) };
+                                sw.cases = cs;
+                            },
+                            else => {},
+                        }
+                        // Integer values the counter decides: constants.
+                        if (inst.op == .binop or inst.op == .cast or inst.op == .cmp or inst.op == .select) {
+                            if (eval(m, f, &states.items[k], .{ .inst = i }, 0)) |c| {
+                                if (intWidth(m, inst.ty) != null) try maps[k].put(a, i, try m.constant(.{ .ty = inst.ty, .kind = .{ .int = c } }));
+                            }
+                        }
+                        try out.append(ma, inst);
+                    }
+                }
+            }
+
+            // The preheader enters the first copy; the exit's phis and the
+            // code after the loop see the last copy's values.
+            const last: Mapper = .{ .maps = maps, .new_index = new_index, .k = copies - 1 };
+            const in_body = try a.alloc(bool, n0);
+            for (0..nb) |bb| for (cfg.block_start[bb]..cfg.block_start[bb + 1]) |i| {
+                in_body[i] = lp.body.has(@intCast(bb));
+            };
+            const Outside = struct {
+                last: Mapper,
+                in_body: []const bool,
+                fn visit(c: *@This(), v: Value, _: anytype) Value {
+                    if (v == .inst and v.inst < c.in_body.len and c.in_body[v.inst]) return c.last.val(v);
+                    return v;
+                }
+            };
+            var outside: Outside = .{ .last = last, .in_body = in_body };
+            for (0..nb) |bb| {
+                if (lp.body.has(@intCast(bb))) {
+                    // The originals: unreachable now.
+                    insts[cfg.block_start[bb + 1] - 1].op = .@"unreachable";
+                    continue;
+                }
+                for (cfg.block_start[bb]..cfg.block_start[bb + 1]) |i| {
+                    var inst = &insts[i];
+                    if (inst.op == .phi) {
+                        // The counted exit leaves from the last copy; a side
+                        // exit from every copy, with that copy's value.
                         var edges: std.ArrayList(Edge) = .empty;
                         for (inst.op.phi.incoming) |in| {
-                            if (in.block == pre or k == 0) continue;
-                            const prev: Mapper = .{ .maps = maps, .new_index = new_index, .k = k - 1 };
-                            try edges.append(ma, .{ .val = prev.val(in.val), .block = S.block(nb, nbody, index_in, k - 1, in.block) });
-                        }
-                        if (k == 0) {
-                            // (Not followed and no preheader value mapped:
-                            // the preheader's incoming.)
-                            for (inst.op.phi.incoming) |in| if (in.block == pre) try edges.append(ma, .{ .val = in.val, .block = pre });
-                        }
-                        try out.append(ma, .{ .ty = inst.ty, .op = .{ .phi = .{ .incoming = edges.items } } });
-                        continue;
-                    }
-                    if (inst.op == .phi) {
-                        const edges = try ma.alloc(Edge, inst.op.phi.incoming.len);
-                        for (inst.op.phi.incoming, edges) |in, *e| e.* = .{ .val = mapper.val(in.val), .block = if (index_in[in.block] != none) S.block(nb, nbody, index_in, k, in.block) else in.block };
-                        inst.op = .{ .phi = .{ .incoming = edges } };
-                        try out.append(ma, inst);
-                        continue;
-                    }
-                    try operandsMap(ma, &inst, &mapper);
-                    // Branches: within the copy; back to the header: the
-                    // next copy; out of the exiting block: per copy.
-                    switch (inst.op) {
-                        .br => |*br| {
-                            if (bb == exiting) {
-                                const target = if (k + 1 < copies) stay else exit;
-                                const tb = if (target == exit) exit else S.block(nb, nbody, index_in, k, target);
-                                br.* = .{ .then = tb };
-                            } else {
-                                br.then = mapBlock(br.then, h, k, copies, nb, nbody, index_in);
-                                if (br.@"else") |*e| e.* = mapBlock(e.*, h, k, copies, nb, nbody, index_in);
+                            if (!lp.body.has(in.block)) {
+                                try edges.append(ma, .{ .val = outside.visit(in.val, {}), .block = in.block });
+                            } else if (in.block == exiting and bb == exit) {
+                                try edges.append(ma, .{ .val = outside.visit(in.val, {}), .block = S.block(nb, nbody, index_in, copies - 1, exiting) });
+                            } else for (0..copies) |kk| {
+                                const ck: Mapper = .{ .maps = maps, .new_index = new_index, .k = @intCast(kk) };
+                                try edges.append(ma, .{ .val = ck.val(in.val), .block = S.block(nb, nbody, index_in, @intCast(kk), in.block) });
                             }
+                        }
+                        inst.op = .{ .phi = .{ .incoming = edges.items } };
+                        continue;
+                    }
+                    try operandsMap(ma, inst, &outside);
+                    if (bb == pre) switch (inst.op) {
+                        .br => |*br| {
+                            if (br.then == h) br.then = S.block(nb, nbody, index_in, 0, h);
+                            if (br.@"else") |*e| if (e.* == h) {
+                                e.* = S.block(nb, nbody, index_in, 0, h);
+                            };
                         },
                         .@"switch" => |*sw| {
-                            sw.default = mapBlock(sw.default, h, k, copies, nb, nbody, index_in);
+                            if (sw.default == h) sw.default = S.block(nb, nbody, index_in, 0, h);
                             const cs = try ma.alloc(@typeInfo(@TypeOf(sw.cases)).pointer.child, sw.cases.len);
-                            for (sw.cases, cs) |c, *o| o.* = .{ .val = c.val, .block = mapBlock(c.block, h, k, copies, nb, nbody, index_in) };
+                            for (sw.cases, cs) |c, *o| o.* = .{ .val = c.val, .block = if (c.block == h) S.block(nb, nbody, index_in, 0, h) else c.block };
                             sw.cases = cs;
                         },
                         else => {},
-                    }
-                    // Integer values the counter decides: constants.
-                    if (inst.op == .binop or inst.op == .cast or inst.op == .cmp or inst.op == .select) {
-                        if (eval(m, f, &states.items[k], .{ .inst = i }, 0)) |c| {
-                            if (intWidth(m, inst.ty) != null) try maps[k].put(a, i, try m.constant(.{ .ty = inst.ty, .kind = .{ .int = c } }));
-                        }
-                    }
-                    try out.append(ma, inst);
-                }
-            }
-        }
-
-        // The preheader enters the first copy; the exit's phis and the
-        // code after the loop see the last copy's values.
-        const last: Mapper = .{ .maps = maps, .new_index = new_index, .k = copies - 1 };
-        const in_body = try a.alloc(bool, n0);
-        for (0..nb) |bb| for (cfg.block_start[bb]..cfg.block_start[bb + 1]) |i| {
-            in_body[i] = lp.body.has(@intCast(bb));
-        };
-        const Outside = struct {
-            last: Mapper,
-            in_body: []const bool,
-            fn visit(c: *@This(), v: Value, _: anytype) Value {
-                if (v == .inst and v.inst < c.in_body.len and c.in_body[v.inst]) return c.last.val(v);
-                return v;
-            }
-        };
-        var outside: Outside = .{ .last = last, .in_body = in_body };
-        for (0..nb) |bb| {
-            if (lp.body.has(@intCast(bb))) {
-                // The originals: unreachable now.
-                insts[cfg.block_start[bb + 1] - 1].op = .@"unreachable";
-                continue;
-            }
-            for (cfg.block_start[bb]..cfg.block_start[bb + 1]) |i| {
-                var inst = &insts[i];
-                if (inst.op == .phi) {
-                    const edges = try ma.alloc(Edge, inst.op.phi.incoming.len);
-                    for (inst.op.phi.incoming, edges) |in, *e| e.* = .{
-                        .val = outside.visit(in.val, {}),
-                        .block = if (in.block == exiting and bb == exit) S.block(nb, nbody, index_in, copies - 1, exiting) else in.block,
                     };
-                    inst.op = .{ .phi = .{ .incoming = edges } };
-                    continue;
                 }
-                try operandsMap(ma, inst, &outside);
-                if (bb == pre) switch (inst.op) {
-                    .br => |*br| {
-                        if (br.then == h) br.then = S.block(nb, nbody, index_in, 0, h);
-                        if (br.@"else") |*e| if (e.* == h) {
-                            e.* = S.block(nb, nbody, index_in, 0, h);
-                        };
-                    },
-                    .@"switch" => |*sw| {
-                        if (sw.default == h) sw.default = S.block(nb, nbody, index_in, 0, h);
-                        const cs = try ma.alloc(@typeInfo(@TypeOf(sw.cases)).pointer.child, sw.cases.len);
-                        for (sw.cases, cs) |c, *o| o.* = .{ .val = c.val, .block = if (c.block == h) S.block(nb, nbody, index_in, 0, h) else c.block };
-                        sw.cases = cs;
-                    },
-                    else => {},
-                };
             }
+            try f.insts.appendSlice(ma, out.items);
+            f.num_blocks = nb + copies * nbody;
+            return true;
         }
-        try f.insts.appendSlice(ma, out.items);
-        f.num_blocks = nb + copies * nbody;
-        return true;
     }
     return false;
+}
+
+/// For a loop with several ways out: null when nothing after the loop reads
+/// its values except through the phis where its edges arrive. Otherwise,
+/// when every way out goes to one block, the join, directly or through a
+/// block entered from the loop only that branches there (as a `break`
+/// does), every read after the loop is in such a block or comes after the
+/// join, and each value read is computed before every way out: gives those
+/// blocks phis of the values (the join's take the forwarding blocks' phis
+/// on their edges), makes the reads read them, and returns true; else
+/// false.
+fn exitPhis(a: Allocator, m: *module.Module, func: u32, cfg: *const Cfg, body: *const Body) Allocator.Error!?bool {
+    const f = &m.functions.items[func];
+    const insts = f.insts.items;
+    const nb = cfg.nb;
+    const n0: u32 = @intCast(insts.len);
+    const block_of_inst = try a.alloc(u32, n0);
+    for (0..nb) |bb| @memset(block_of_inst[cfg.block_start[bb]..cfg.block_start[bb + 1]], @intCast(bb));
+
+    // Forwarding blocks: entered from the loop only, no phis, ending in a
+    // branch to one block.
+    const fwd = try a.alloc(bool, nb);
+    @memset(fwd, false);
+    var join: u32 = none;
+    var one = true;
+    for (body.blocks) |bb| for (cfg.succs[bb]) |s| if (!body.has(s)) {
+        const term = insts[cfg.block_start[s + 1] - 1];
+        const forwards = insts[cfg.block_start[s]].op != .phi and term.op == .br and term.op.br.cond == null and for (cfg.preds[s]) |p| {
+            if (!body.has(p)) break false;
+        } else true;
+        const to = if (forwards) term.op.br.then else s;
+        if (forwards) fwd[s] = true;
+        if (join != none and join != to) one = false;
+        join = to;
+    };
+    if (join != none) for (cfg.preds[join]) |p| if (!body.has(p) and !fwd[p]) {
+        one = false;
+    };
+    if (!one or (join != none and body.has(join))) join = none;
+
+    // The loop's values read after the join (`late`), and those read in a
+    // forwarding block or that the join's phis take through one
+    // (`through`).
+    const Check = struct {
+        body: *const Body,
+        block_of_inst: []const u32,
+        cfg: *const Cfg,
+        join: u32,
+        late: []bool,
+        at: u32 = 0,
+        any: bool = false,
+        bad: bool = false,
+        pub fn visit(c: *@This(), v: Value, _: anytype) Value {
+            if (v == .inst and v.inst < c.block_of_inst.len and c.body.has(c.block_of_inst[v.inst])) {
+                c.late[v.inst] = true;
+                c.any = true;
+                if (c.join == none or !c.cfg.dominates(c.join, c.at)) c.bad = true;
+            }
+            return v;
+        }
+    };
+    const late = try a.alloc(bool, n0);
+    @memset(late, false);
+    const through = try a.alloc(bool, n0);
+    @memset(through, false);
+    var check: Check = .{ .body = body, .block_of_inst = block_of_inst, .cfg = cfg, .join = join, .late = late };
+    for (0..nb) |bb| {
+        if (body.has(@intCast(bb))) continue;
+        for (cfg.block_start[bb]..cfg.block_start[bb + 1]) |i| {
+            if (insts[i].op == .phi) {
+                for (insts[i].op.phi.incoming) |in| {
+                    if (body.has(in.block)) continue;
+                    if (bb == join and fwd[in.block]) {
+                        if (in.val == .inst and in.val.inst < n0 and body.has(block_of_inst[in.val.inst])) {
+                            through[in.val.inst] = true;
+                            check.any = true;
+                        }
+                        continue;
+                    }
+                    check.at = in.block;
+                    _ = check.visit(in.val, {});
+                }
+                continue;
+            }
+            var copy = insts[i];
+            if (fwd[bb]) {
+                var in_fwd: Check = .{ .body = body, .block_of_inst = block_of_inst, .cfg = cfg, .join = join, .late = through };
+                try operandsMap(a, &copy, &in_fwd);
+                if (in_fwd.any) check.any = true;
+                continue;
+            }
+            check.at = @intCast(bb);
+            try operandsMap(a, &copy, &check);
+        }
+    }
+    if (!check.any) return null;
+    if (check.bad or join == none) return false;
+
+    // A value read after the join needs computing before every edge out of
+    // the loop. (One read in a forwarding block is computed before it; the
+    // other forwarding blocks' phis of it, never read, take undef where it
+    // is not.)
+    for (0..n0) |v| if (late[v]) {
+        for (body.blocks) |bb| for (cfg.succs[bb]) |s| if (!body.has(s)) {
+            if (!cfg.dominates(block_of_inst[v], bb)) return false;
+        };
+    };
+
+    // The join's phi edges: as its phis list them, else its predecessors.
+    var join_from: std.ArrayList(u32) = .empty;
+    {
+        const first = insts[cfg.block_start[join]];
+        if (first.op == .phi) {
+            for (first.op.phi.incoming) |in| try join_from.append(a, in.block);
+        } else try join_from.appendSlice(a, cfg.preds[join]);
+    }
+
+    // New numbering: each block's new phis, then its instructions.
+    // `fwd_phi[v]` / `join_phi[v]`: value v's phi in the forwarding block
+    // being numbered / in the join (new numbers).
+    const new_of = try a.alloc(u32, n0);
+    const fwd_first = try a.alloc(u32, nb);
+    @memset(fwd_first, none);
+    var join_first: u32 = none;
+    var n_late: u32 = 0;
+    var n_fwd: u32 = 0;
+    for (0..n0) |v| {
+        if (late[v]) n_late += 1;
+        if (late[v] or through[v]) n_fwd += 1;
+    }
+    {
+        var next: u32 = 0;
+        for (0..nb) |bb| {
+            if (fwd[bb]) {
+                fwd_first[bb] = next;
+                next += n_fwd;
+            }
+            if (bb == join) {
+                join_first = next;
+                next += n_late;
+            }
+            for (cfg.block_start[bb]..cfg.block_start[bb + 1]) |i| {
+                new_of[i] = next;
+                next += 1;
+            }
+        }
+    }
+    // Value v's position among the forwarded / late values.
+    const fwd_slot = try a.alloc(u32, n0);
+    const late_slot = try a.alloc(u32, n0);
+    {
+        var j: u32 = 0;
+        var k: u32 = 0;
+        for (0..n0) |v| {
+            fwd_slot[v] = j;
+            late_slot[v] = k;
+            if (late[v] or through[v]) j += 1;
+            if (late[v]) k += 1;
+        }
+    }
+    const Renumber = struct {
+        new_of: []const u32,
+        n0: u32,
+        /// For reads after the join: the join's phis.
+        late: ?[]const bool = null,
+        late_slot: []const u32 = &.{},
+        join_first: u32 = 0,
+        pub fn visit(c: *@This(), v: Value, _: anytype) Value {
+            if (v != .inst or v.inst >= c.n0) return v;
+            if (c.late) |l| if (l[v.inst]) return .{ .inst = c.join_first + c.late_slot[v.inst] };
+            return .{ .inst = c.new_of[v.inst] };
+        }
+    };
+    var plain: Renumber = .{ .new_of = new_of, .n0 = n0 };
+    var after: Renumber = .{ .new_of = new_of, .n0 = n0, .late = late, .late_slot = late_slot, .join_first = join_first };
+    // In forwarding block b: its own phis.
+    const InFwd = struct {
+        new_of: []const u32,
+        n0: u32,
+        body: *const Body,
+        block_of_inst: []const u32,
+        first: u32,
+        slot: []const u32,
+        pub fn visit(c: *@This(), v: Value, _: anytype) Value {
+            if (v != .inst or v.inst >= c.n0) return v;
+            if (c.body.has(c.block_of_inst[v.inst])) return .{ .inst = c.first + c.slot[v.inst] };
+            return .{ .inst = c.new_of[v.inst] };
+        }
+    };
+
+    const ma = m.allocator();
+    var out: std.ArrayList(Inst) = .empty;
+    var n_fwd_blocks: u32 = 0;
+    for (fwd) |x| n_fwd_blocks += @intFromBool(x);
+    try out.ensureTotalCapacity(ma, n0 + n_late + n_fwd * n_fwd_blocks);
+    for (0..nb) |bb| {
+        if (fwd[bb]) for (0..n0) |v| if (late[v] or through[v]) {
+            const edges = try ma.alloc(Edge, cfg.preds[bb].len);
+            for (cfg.preds[bb], edges) |p, *e| e.* = .{
+                .val = if (cfg.dominates(block_of_inst[v], p)) .{ .inst = new_of[v] } else try m.constant(.{ .ty = insts[v].ty, .kind = .undef }),
+                .block = p,
+            };
+            out.appendAssumeCapacity(.{ .ty = insts[v].ty, .op = .{ .phi = .{ .incoming = edges } } });
+        };
+        if (bb == join) for (0..n0) |v| if (late[v]) {
+            const edges = try ma.alloc(Edge, join_from.items.len);
+            for (join_from.items, edges) |p, *e| e.* = .{
+                .val = .{ .inst = if (fwd[p]) fwd_first[p] + fwd_slot[v] else new_of[v] },
+                .block = p,
+            };
+            out.appendAssumeCapacity(.{ .ty = insts[v].ty, .op = .{ .phi = .{ .incoming = edges } } });
+        };
+        const in_loop = body.has(@intCast(bb));
+        for (cfg.block_start[bb]..cfg.block_start[bb + 1]) |i| {
+            var inst = insts[i];
+            if (inst.op == .phi and !in_loop) {
+                // Edges from the loop keep their values; the join's from a
+                // forwarding block take its phis; others read after the join.
+                const edges = try ma.alloc(Edge, inst.op.phi.incoming.len);
+                for (inst.op.phi.incoming, edges) |in, *e| {
+                    const v = in.val;
+                    const is_body = v == .inst and v.inst < n0 and body.has(block_of_inst[v.inst]);
+                    e.* = .{ .block = in.block, .val = if (body.has(in.block))
+                        plain.visit(v, {})
+                    else if (bb == join and fwd[in.block] and is_body)
+                        .{ .inst = fwd_first[in.block] + fwd_slot[v.inst] }
+                    else
+                        after.visit(v, {}) };
+                }
+                inst.op = .{ .phi = .{ .incoming = edges } };
+            } else if (in_loop) {
+                try operandsMap(ma, &inst, &plain);
+            } else if (fwd[bb]) {
+                var in_fwd: InFwd = .{ .new_of = new_of, .n0 = n0, .body = body, .block_of_inst = block_of_inst, .first = fwd_first[bb], .slot = fwd_slot };
+                try operandsMap(ma, &inst, &in_fwd);
+            } else try operandsMap(ma, &inst, &after);
+            out.appendAssumeCapacity(inst);
+        }
+    }
+    f.insts = out;
+    return true;
 }
 
 /// A branch target in copy `k`: the copy's own block, or (the header) the

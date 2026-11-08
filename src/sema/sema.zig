@@ -126,6 +126,10 @@ pub const Function = struct {
     /// A method of a class template instance: its body, checked when the
     /// method is first called (as C++ instantiates members).
     pending: ?*const PendingBody = null,
+    /// A call to it has been checked. A method defined out of line after
+    /// that call has its body checked at the definition: no later call
+    /// may come to check a pending one.
+    called: bool = false,
 };
 
 pub const PendingBody = struct { f: *const ast.FuncDecl, scope: *Scope, strct: ?*types.StructInfo };
@@ -2565,7 +2569,11 @@ pub const Sema = struct {
             } else if (e.ret != func.ret and e.ret != TypeTable.error_type and func.ret != TypeTable.error_type) {
                 s.err(d.loc, "functions that differ only in their return type cannot be overloaded", .{});
             }
-            if (func.defined) e.* = func.*;
+            if (func.defined) {
+                const called = e.called;
+                e.* = func.*;
+                e.called = called;
+            }
         } else {
             try set.funcs.append(s.arena, func);
             try s.all_functions.append(s.arena, func);
@@ -2673,7 +2681,7 @@ pub const Sema = struct {
     }
 
     fn funcBody(s: *Sema, func: *Function, f: *const ast.FuncDecl) Allocator.Error!void {
-        if (f.body != null and func.owner != null and s.instance_depth > 0 and s.current_fn == null) {
+        if (f.body != null and func.owner != null and s.instance_depth > 0 and s.current_fn == null and !func.called) {
             const p = try s.arena.create(PendingBody);
             p.* = .{ .f = f, .scope = s.scope, .strct = s.current_struct };
             func.pending = p;
@@ -3926,6 +3934,7 @@ pub const Sema = struct {
         };
         if (s.current_fn) |caller| caller.callees.append(s.arena, f) catch {};
         s.record(e, .{ .function = f });
+        f.called = true;
         s.ensureBody(f) catch {};
         return f.ret;
     }

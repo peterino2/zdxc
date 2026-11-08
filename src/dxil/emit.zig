@@ -113,7 +113,17 @@ const Lowered = union(enum) {
     /// A place in a constant buffer: byte offset plus a dynamic register
     /// offset; with `dyn_comp`, the component of the `vec` vector at
     /// `offset` that index picks at run time.
-    cbuf: struct { res: u32, offset: u32 = 0, dyn_regs: ?Value = null, row_major: bool = false, dyn_comp: ?Value = null, vec: TypeId = 0 },
+    cbuf: struct {
+        res: u32,
+        offset: u32 = 0,
+        dyn_regs: ?Value = null,
+        row_major: bool = false,
+        dyn_comp: ?Value = null,
+        vec: TypeId = 0,
+        /// A row of the matrix of type `ty` at `offset` (column-major,
+        /// or a dynamic row): loaded whole, then picked.
+        mat: ?struct { ty: TypeId, row: Value, col: ?u32 = null } = null,
+    },
     /// A place in a mesh shader output array: the vertex / primitive index
     /// and a flattened component offset within it.
     mesh: struct { kind: ir.MeshOutput, index: ?Value = null, offset: u32 = 0, ty: TypeId },
@@ -196,6 +206,8 @@ const Frame = struct {
     f: *const ir.Function,
     /// For inlined calls: Emitter.regsLocals of `f`.
     regs: []const bool = &.{},
+    /// Emitter.bufLocals of `f`.
+    buf_locals: []const bool = &.{},
     vals: []Lowered,
     params: []const Lowered,
     blocks: []?u32,
@@ -213,6 +225,8 @@ const Frame = struct {
     /// inlineCallFresh).
     taken: []u32 = &.{},
     live: []bool = &.{},
+    /// Each block's place in the order blocks are emitted in (emitOrder).
+    order_pos: []u32 = &.{},
     /// When optimizing: paramCopies of the function (loads of such a local
     /// are the argument itself).
     copies: []const u32 = &.{},
@@ -303,6 +317,12 @@ const Emitter = struct {
     resources: std.ArrayList(Resource) = .empty,
     resource_of_global: std.AutoHashMapUnmanaged(u32, u32) = .empty,
     private_globals: std.AutoHashMapUnmanaged(u32, Ptr) = .empty,
+    /// Static globals that are module constants (findConstGlobals): their
+    /// initializer function, then (once used) their storage, and the
+    /// components of each such DXIL global by global index.
+    const_global_init: std.AutoHashMapUnmanaged(u32, u32) = .empty,
+    const_globals: std.AutoHashMapUnmanaged(u32, Ptr) = .empty,
+    const_global_vals: std.AutoHashMapUnmanaged(u32, []const Value) = .empty,
     private_typed: std.AutoHashMapUnmanaged(u32, @FieldType(Lowered, "typed")) = .empty,
     /// Locals holding a copy of a texel read through an index (see the
     /// `access` op): a write through one writes the texel back.
@@ -361,6 +381,7 @@ const Emitter = struct {
     /// paramCopies per IR function.
     param_copies: std.AutoHashMapUnmanaged(u32, []const u32) = .empty,
     regs_locals: std.AutoHashMapUnmanaged(u32, []const bool) = .empty,
+    buf_locals: std.AutoHashMapUnmanaged(u32, []const bool) = .empty,
     uses_barycentrics: bool = false,
     uses_sampler_heap: bool = false,
     /// The shader's reflection (reflect.zig), made with the object; owned
@@ -497,7 +518,53 @@ const Emitter = struct {
 
     fn compOf(e: *Emitter, ty: TypeId) Scalar {
         if (e.t.get(ty) == .array) return e.compOf(e.t.get(ty).array.elem);
-        return storageScalar(e.t.component(ty) orelse .int);
+        return e.valueScalar(e.t.component(ty) orelse .int);
+    }
+
+    /// The scalar values of HLSL scalar `s` are computed as: min16float and
+    /// min10float at minimum precision (DXIL half: the driver may compute
+    /// in 16 bits), as dxc does without -enable-16bit-types. (With it,
+    /// they stay 32-bit here.)
+    fn valueScalar(e: *Emitter, s: Scalar) Scalar {
+        if ((s == .min16float or s == .min10float) and e.minPrecision()) return .float16;
+        return storageScalar(s);
+    }
+
+    /// Minimum precision mode: 16-bit types are not native.
+    fn minPrecision(e: *Emitter) bool {
+        return !e.m.native_16bit;
+    }
+
+    /// A minimum-precision half: in buffer memory, 32 bits wide.
+    fn minPrecHalf(e: *Emitter, c: Scalar) bool {
+        return c == .float16 and e.minPrecision();
+    }
+
+    /// The scalar a component of value scalar `c` is read and written as
+    /// in a structured or byte-address buffer: bools as uint, a
+    /// minimum-precision half as a float (converted), as dxc 1.9 reads
+    /// every minimum-precision resource (only sampling, gathers and
+    /// texture stores keep 16-bit overloads: drivers can return what a
+    /// 16-bit load of a 32-bit or typed view gets wrong).
+    fn bufScalar(e: *Emitter, c: Scalar) Scalar {
+        if (c == .bool) return .uint;
+        if (e.minPrecHalf(c)) return .float;
+        return c;
+    }
+
+    /// The scalar a structured or byte-address buffer store writes value
+    /// scalar `c` as: as bufScalar, but a minimum-precision half before
+    /// raw buffer operations (SM 6.0, 6.1) as a half (bufferStore.f16), as
+    /// dxc 1.9 stores it.
+    fn bufStoreScalar(e: *Emitter, c: Scalar) Scalar {
+        if (e.minPrecHalf(c) and e.profile.minor < 2) return c;
+        return e.bufScalar(c);
+    }
+
+    /// Bytes a buffer component of memory scalar `m` takes (a
+    /// minimum-precision half: 4).
+    fn bufStride(e: *Emitter, m: Scalar) u32 {
+        return if (e.minPrecHalf(m)) 4 else m.size();
     }
 
     /// Number of flattened scalar components of `ty`.
@@ -584,7 +651,7 @@ const Emitter = struct {
     /// The single scalar type all components of `ty` share.
     fn uniformScalar(e: *Emitter, ty: TypeId) Error!Scalar {
         return switch (e.t.get(ty)) {
-            .scalar, .vector, .matrix, .@"enum" => storageScalar(e.t.component(ty).?),
+            .scalar, .vector, .matrix, .@"enum" => e.valueScalar(e.t.component(ty).?),
             .array => |a| e.uniformScalar(a.elem),
             .@"struct" => |s| blk: {
                 var first: ?Scalar = null;
@@ -645,6 +712,7 @@ const Emitter = struct {
         e.handle_ty = try e.dm.getType(.{ .@"struct" = .{ .name = "dx.types.Handle", .elems = &.{i8p} } });
 
         try e.collectResources();
+        try e.findConstGlobals();
         try e.buildSignatures(entry);
         if (entry.stage == .amplification) e.findDispatchPayload();
         e.cur = try e.newBlock();
@@ -1855,6 +1923,18 @@ const Emitter = struct {
         return false;
     }
 
+    /// Whether `f` has locals the emitter follows as it emits, rather than
+    /// keeping in memory: resources, RayQuery objects, structs holding
+    /// resources. Their blocks must be emitted in an order execution can
+    /// take (emitOrder); other functions keep index order, and with it the
+    /// block layout.
+    fn tracksLocals(e: *Emitter, f: *const ir.Function) bool {
+        for (f.insts.items) |i| if (i.op == .local_var) {
+            if (isRayQuery(e.t, i.ty) or isResourceType(e.t, i.ty) or e.isResourceArray(i.ty) or e.holdsResources(i.ty)) return true;
+        };
+        return false;
+    }
+
     fn inlineCallFresh(e: *Emitter, fi: u32, args: []const Lowered, aliases: []const ?Lowered) Error![]const Value {
         const f = e.m.functions.items[fi];
         var frame: Frame = .{
@@ -1872,6 +1952,7 @@ const Emitter = struct {
         @memset(frame.blocks, null);
         if (e.optimize and args.len > 0) frame.copies = try e.paramCopies(fi);
         if (e.optimize) frame.regs = try e.regsLocals(fi);
+        if (e.optimize) frame.buf_locals = try e.bufLocals(fi);
         const is_entry = e.cur == 0 and e.blocks.items[0].items.len == 0 and (fi == e.entry.wrapper or fi == e.entry.patch_wrapper);
         if (!is_entry) frame.cont = try e.newBlock();
         // The callee's entry continues the current block.
@@ -1886,7 +1967,10 @@ const Emitter = struct {
         @memset(frame.taken, std.math.maxInt(u32));
         const emitted = try e.arena.alloc(bool, f.blocks.items.len);
         @memset(emitted, false);
-        for (f.blocks.items, 0..) |_, bi| {
+        frame.order_pos = try e.arena.alloc(u32, f.blocks.items.len);
+        const order = if (e.tracksLocals(f)) try emitOrder(e.arena, f) else try indexOrder(e.arena, f);
+        for (order, 0..) |bi, k| frame.order_pos[bi] = @intCast(k);
+        for (order) |bi| {
             if (!frame.live[bi]) continue;
             e.cur = try e.blockFor(&frame, @intCast(bi));
             try e.emitBlock(&frame, @intCast(bi));
@@ -2056,6 +2140,112 @@ const Emitter = struct {
             };
         };
         gop.value_ptr.* = out;
+        return out;
+    }
+
+    /// For each instruction of IR function `fi`: whether it is a local that
+    /// only ever holds a copy of a read-only structured buffer's element
+    /// (stored once, whole, from a `res_load`, the store before every other
+    /// use in its block and its block dominating theirs; otherwise only
+    /// read) and is read through a dynamic index: it is the element itself
+    /// (Lowered.buf), as dxc reads such a copy. (Copied, a meshlet of 192
+    /// words went to scratch memory for the 3 words a shader then read.)
+    fn bufLocals(e: *Emitter, fi: u32) Error![]const bool {
+        const gop = try e.buf_locals.getOrPut(e.arena, fi);
+        if (gop.found_existing) return gop.value_ptr.*;
+        const none = std.math.maxInt(u32);
+        const f = e.m.functions.items[fi];
+        const regs = try e.regsLocals(fi);
+        const n = f.insts.items.len;
+        const out = try e.arena.alloc(bool, n);
+        @memset(out, false);
+        gop.value_ptr.* = out;
+        const root = try e.arena.alloc(u32, n);
+        @memset(root, none);
+        var dynamic = false;
+        for (f.insts.items, 0..) |inst, k| switch (inst.op) {
+            .local_var => root[k] = @intCast(k),
+            .access => |x| if (root[x.base.index()] != none) {
+                root[k] = root[x.base.index()];
+                for (x.indices) |ix| if (f.inst(ix).op != .constant) {
+                    dynamic = true;
+                };
+            },
+            else => {},
+        };
+        if (!dynamic) return out;
+        const stores = try e.arena.alloc(u32, n);
+        @memset(stores, 0);
+        const bad = try e.arena.alloc(bool, n);
+        @memset(bad, false);
+        const has_dyn = try e.arena.alloc(bool, n);
+        @memset(has_dyn, false);
+        const Use = struct {
+            root: []const u32,
+            bad: []bool,
+            pub fn map(u: @This(), x: Ref) Ref {
+                if (x != .none and u.root[x.index()] != none) u.bad[u.root[x.index()]] = true;
+                return x;
+            }
+        };
+        const use: Use = .{ .root = root, .bad = bad };
+        for (f.insts.items, 0..) |inst, k| switch (inst.op) {
+            .local_var, .load => {},
+            .access => |x| for (x.indices) |ix| {
+                _ = use.map(ix);
+                if (root[k] != none and f.inst(ix).op != .constant) has_dyn[root[k]] = true;
+            },
+            .store => |x| {
+                _ = use.map(x.value);
+                const l = root[x.ptr.index()];
+                if (l == none) continue;
+                if (x.ptr.index() != l) bad[l] = true;
+                stores[l] += 1;
+            },
+            else => _ = try opt.mapOp(e.arena, inst.op, use),
+        };
+        // The store: before any other use in its block, and its block
+        // dominating every block that uses the local.
+        const nb = f.blocks.items.len;
+        if (nb == 0) return out;
+        const block_of = try e.arena.alloc(u32, n);
+        @memset(block_of, none);
+        const pos = try e.arena.alloc(u32, n);
+        for (f.blocks.items, 0..) |blk, bi| for (blk.insts.items, 0..) |r, j| {
+            block_of[r.index()] = @intCast(bi);
+            pos[r.index()] = @intCast(j);
+        };
+        const idom = try irDominators(e.arena, f);
+        const store_at = try e.arena.alloc(u32, n);
+        @memset(store_at, none);
+        for (f.insts.items, 0..) |inst, k| if (inst.op == .store) {
+            const l = root[inst.op.store.ptr.index()];
+            if (l != none and stores[l] == 1) store_at[l] = @intCast(k);
+        };
+        for (f.insts.items, 0..) |inst, k| {
+            const l = switch (inst.op) {
+                .load => |p| root[p.index()],
+                .access => root[k],
+                else => continue,
+            };
+            if (l == none or store_at[l] == none) continue;
+            const sb = block_of[store_at[l]];
+            const ub = block_of[k];
+            if (sb == none or ub == none) continue;
+            if (ub == sb) {
+                if (pos[k] < pos[store_at[l]]) bad[l] = true;
+            } else if (!irDominates(idom, sb, ub)) bad[l] = true;
+        }
+        for (0..n) |l| {
+            if (store_at[l] == none or bad[l] or !has_dyn[l] or (regs.len > 0 and regs[l])) continue;
+            const v = f.inst(f.insts.items[store_at[l]].op.store.value);
+            if (v.op != .res_load) continue;
+            const rt = e.t.get(f.inst(v.op.res_load.res).ty);
+            if (rt != .resource or rt.resource.kind != .structured_buffer) continue;
+            const ty = f.insts.items[l].ty;
+            if (isResourceType(e.t, ty) or e.holdsResources(ty) or e.containsLinAlg(ty)) continue;
+            out[l] = true;
+        }
         return out;
     }
 
@@ -2363,6 +2553,7 @@ const Emitter = struct {
                     }
                     return .{ .typed = .{ .base = gop.value_ptr.base, .dty = gop.value_ptr.array_ty, .addr_space = 3, .ty = e.m.globals.items[g].ty } };
                 }
+                if (e.const_global_init.contains(g)) return .{ .ptr = try e.constGlobal(g) };
                 // Static globals live in the entry function (everything is
                 // inlined into it).
                 if (e.m.globals.items[g].space == .private) {
@@ -2415,6 +2606,9 @@ const Emitter = struct {
                 // once from a value before any use, never written again:
                 // those values (no alloca, no stores, no loads). Its store
                 // sets them.
+                // (A copy of a read-only buffer element: the element, set by
+                // its store.)
+                if (frame.buf_locals.len > 0 and frame.buf_locals[r.index()]) return .none;
                 if (frame.regs.len > 0 and frame.regs[r.index()]) {
                     const k = if (frame.copies.len > 0) frame.copies[r.index()] else std.math.maxInt(u32);
                     if (k == std.math.maxInt(u32)) return .{ .regs = .{ .vals = &.{} } };
@@ -2493,6 +2687,26 @@ const Emitter = struct {
                     return .{ .scalars = try e.textureLoad(res, mip, tx.coords, null, i.ty) };
                 },
                 .cbuf => |c| {
+                    if (c.mat) |mat| {
+                        const m = e.t.get(mat.ty).matrix;
+                        const whole = (try e.cbufferLoad(c.res, c.offset, c.dyn_regs, c.row_major, mat.ty)).scalars;
+                        const row = try e.arena.alloc(Value, m.cols);
+                        for (row, 0..) |*o, col| {
+                            if (e.constIntOf(mat.row)) |rk| {
+                                o.* = whole[@as(u32, @intCast(rk)) * m.cols + col];
+                                continue;
+                            }
+                            var v = whole[col];
+                            for (1..m.rows) |rk| {
+                                const is_r = try e.add(try e.dm.intType(1), .{ .cmp = .{ .pred = 32, .lhs = mat.row, .rhs = try e.i32Const(@intCast(rk)) } });
+                                v = try e.select(is_r, whole[rk * m.cols + col], v, try e.valueType(v));
+                            }
+                            o.* = v;
+                        }
+                        if (mat.col) |col| return .{ .scalars = try e.arena.dupe(Value, &.{row[col]}) };
+                        if (c.dyn_comp) |dc| return .{ .scalars = try e.arena.dupe(Value, &.{try e.pickComponent(row, dc, i.ty)}) };
+                        return .{ .scalars = row };
+                    }
                     if (c.dyn_comp == null) try frame.load_srcs.put(e.arena, r.index(), .{ .src = .{ .cbuf = c }, .block = e.cur, .writes = e.writes });
                     const dc = c.dyn_comp orelse return e.cbufferLoad(c.res, c.offset, c.dyn_regs, c.row_major, i.ty);
                     const whole = (try e.cbufferLoad(c.res, c.offset, c.dyn_regs, c.row_major, c.vec)).scalars;
@@ -2532,6 +2746,18 @@ const Emitter = struct {
                 else => |v| return e.unsupported("internal: load from a non-pointer ({s} from %{d} '{s}' in '{s}')", .{ @tagName(v), p.index(), @tagName(frame.f.inst(p).op), frame.f.name }),
             },
             .store => |s| {
+                // A copy of a read-only buffer element (bufLocals): the
+                // element itself (else, after all, storage).
+                if (frame.buf_locals.len > 0 and frame.buf_locals[s.ptr.index()] and frame.vals[s.ptr.index()] == .none) {
+                    const src = f.inst(s.value).op.res_load;
+                    if (frame.vals[src.res.index()] == .handle) {
+                        frame.vals[s.ptr.index()] = .{ .buf = .{ .res = frame.vals[src.res.index()].handle, .index = (try e.scalars(frame, src.index))[0], .row_major = e.m.row_major } };
+                        return .none;
+                    }
+                    frame.vals[s.ptr.index()] = .{ .ptr = try e.alloca(f.inst(s.ptr).ty) };
+                }
+                // (A module constant's initializer: in the global already.)
+                if (frame.vals[s.ptr.index()] == .ptr and frame.vals[s.ptr.index()].ptr.base == .global and e.const_global_vals.contains(frame.vals[s.ptr.index()].ptr.base.global)) return .none;
                 // (The values a local kept as values holds.)
                 if (frame.vals[s.ptr.index()] == .regs) {
                     frame.vals[s.ptr.index()] = .{ .regs = .{ .vals = try e.scalars(frame, s.value) } };
@@ -2564,8 +2790,11 @@ const Emitter = struct {
                     // Selecting between resources at run time has no
                     // handle-based lowering here; one assignment is fine.
                     // (Node objects: again, where every assignment is in
-                    // one block.)
-                    if (slot.*) |old| if (!std.meta.eql(old, h) and !(h == .node and storesInOneBlock(f, s.ptr))) return e.unsupported("assigning different resources to one variable is not supported yet (in '{s}')", .{frame.f.name});
+                    // one block.) A later assignment that every read after
+                    // it sees, once branches on constants are folded, is
+                    // fine too: `S = A; if (bFar) S = B;` inlined with
+                    // bFar true.
+                    if (slot.*) |old| if (!std.meta.eql(old, h) and !(h == .node and storesInOneBlock(f, s.ptr)) and !try overwriteSeenByAll(e.arena, f, frame, s.ptr, r)) return e.unsupported("assigning different resources to one variable is not supported yet (in '{s}')", .{frame.f.name});
                     slot.* = h;
                     return .none;
                 }
@@ -3188,10 +3417,152 @@ const Emitter = struct {
         return mixed;
     }
 
+    /// Static globals to make module constants, as dxc makes a
+    /// `static const` table an `internal constant` global: written only by
+    /// their initializer, which is constants, and read through a dynamic
+    /// index somewhere (read at constant indices only, a static folds to
+    /// its constants as a local does). Copied into a local first, such a
+    /// table costs a store per component at the start of every invocation.
+    fn findConstGlobals(e: *Emitter) Error!void {
+        const m = e.m;
+        const ng = m.globals.items.len;
+        if (ng == 0) return;
+        const nothing = std.math.maxInt(u32);
+        const init_of = try e.arena.alloc(u32, ng);
+        @memset(init_of, nothing);
+        const bad = try e.arena.alloc(bool, ng);
+        @memset(bad, false);
+        const dynamic = try e.arena.alloc(bool, ng);
+        @memset(dynamic, false);
+        var refs: std.ArrayList(ir.Ref) = .empty;
+        for (m.functions.items) |f| {
+            // The global each pointer is into.
+            const root = try e.arena.alloc(u32, f.insts.items.len);
+            @memset(root, nothing);
+            for (f.insts.items, 0..) |inst, i| switch (inst.op) {
+                .global => |g| root[i] = g,
+                .access => |acc| if (root[acc.base.index()] != nothing) {
+                    root[i] = root[acc.base.index()];
+                    for (acc.indices) |x| if (f.inst(x).op != .constant) {
+                        dynamic[root[i]] = true;
+                    };
+                },
+                else => {},
+            };
+            for (f.insts.items) |inst| switch (inst.op) {
+                .global => {},
+                .access => |acc| for (acc.indices) |x| if (root[x.index()] != nothing) {
+                    bad[root[x.index()]] = true;
+                },
+                .load => {},
+                .store => |st| {
+                    if (root[st.value.index()] != nothing) bad[root[st.value.index()]] = true;
+                    const g = root[st.ptr.index()];
+                    if (g == nothing) continue;
+                    const v = f.inst(st.value);
+                    if (f.inst(st.ptr).op == .global and v.op == .call and v.op.call.args.len == 0 and init_of[g] == nothing) {
+                        init_of[g] = v.op.call.func;
+                    } else bad[g] = true;
+                },
+                else => {
+                    refs.clearRetainingCapacity();
+                    try collectRefs(e.arena, inst.op, &refs);
+                    for (refs.items) |r| if (r != .none and r.index() < root.len and root[r.index()] != nothing) {
+                        bad[root[r.index()]] = true;
+                    };
+                },
+            };
+        }
+        for (0..ng) |g| {
+            const gl = m.globals.items[g];
+            if (gl.space != .private or bad[g] or !dynamic[g] or init_of[g] == nothing) continue;
+            if (e.holdsResources(gl.ty) or e.containsLinAlg(gl.ty)) continue;
+            if (try e.mixedSizes(gl.ty) or try e.mixedStorage(gl.ty)) continue;
+            if (try e.constGlobalValues(init_of[g], gl.ty) == null) continue;
+            try e.const_global_init.put(e.arena, @intCast(g), init_of[g]);
+        }
+    }
+
+    /// The Refs among `op`'s operands.
+    fn collectRefs(a: Allocator, op: ir.Op, out: *std.ArrayList(ir.Ref)) Allocator.Error!void {
+        switch (op) {
+            inline else => |payload| try collectRefsIn(a, @TypeOf(payload), payload, out),
+        }
+    }
+
+    fn collectRefsIn(a: Allocator, comptime T: type, v: T, out: *std.ArrayList(ir.Ref)) Allocator.Error!void {
+        if (T == ir.Ref) return out.append(a, v);
+        switch (@typeInfo(T)) {
+            .pointer => |p| if (p.size == .slice) for (v) |x| try collectRefsIn(a, p.child, x, out),
+            .@"struct" => |st| inline for (st.field_names, st.field_types) |name, FT| try collectRefsIn(a, FT, @field(v, name), out),
+            .optional => |o| if (v) |x| try collectRefsIn(a, o.child, x, out),
+            .array => |arr| for (v) |x| try collectRefsIn(a, arr.child, x, out),
+            else => {},
+        }
+    }
+
+    /// The components of static initializer function `fi`'s value, as
+    /// stored (bools as i32), when they are all constants.
+    fn constGlobalValues(e: *Emitter, fi: u32, ty: TypeId) Error!?[]const Value {
+        const f = e.m.functions.items[fi];
+        if (f.blocks.items.len != 1) return null;
+        const r = switch (f.blocks.items[0].term) {
+            .ret => |x| x,
+            else => return null,
+        };
+        var out: std.ArrayList(Value) = .empty;
+        if (!try e.constParts(f, r, &out)) return null;
+        if (out.items.len != try e.flatCount(ty)) return null;
+        if ((try e.uniformScalar(ty)) == .bool) {
+            for (out.items) |*v| v.* = try e.i32Const(@intFromBool((e.constIntOf(v.*) orelse return null) != 0));
+        }
+        return out.items;
+    }
+
+    fn constParts(e: *Emitter, f: *const ir.Function, r: ir.Ref, out: *std.ArrayList(Value)) Error!bool {
+        const inst = f.inst(r);
+        switch (inst.op) {
+            .constant => |c| {
+                const v = try e.constant(inst.ty, c);
+                for (0..try e.flatCount(inst.ty)) |_| try out.append(e.arena, v);
+            },
+            .construct => |xs| for (xs) |x| if (!try e.constParts(f, x, out)) return false,
+            else => return false,
+        }
+        return true;
+    }
+
+    /// The storage of module-constant static `g` (findConstGlobals).
+    fn constGlobal(e: *Emitter, g: u32) Error!Ptr {
+        const gop = try e.const_globals.getOrPut(e.arena, g);
+        if (gop.found_existing) return gop.value_ptr.*;
+        const gl = e.m.globals.items[g];
+        const vals = (try e.constGlobalValues(e.const_global_init.get(g).?, gl.ty)).?;
+        const c = try e.uniformScalar(gl.ty);
+        const st = try e.scalarTy(if (c == .bool) Scalar.int else c);
+        const arr = try e.dm.getType(.{ .array = .{ .len = vals.len, .elem = st } });
+        const ids = try e.arena.alloc(module.ConstId, vals.len);
+        for (vals, ids) |v, *id| id.* = v.constant;
+        const init = try e.dm.constant(.{ .ty = arr, .kind = .{ .aggregate = ids } });
+        const gv = try e.dm.addGlobal(try std.fmt.allocPrint(e.arena, "{s}.v.1dim", .{gl.name}), arr, 0);
+        e.dm.globals.items[gv.global].constant = true;
+        e.dm.globals.items[gv.global].init = init.constant;
+        try e.const_global_vals.put(e.arena, gv.global, vals);
+        gop.value_ptr.* = .{ .base = gv, .array_ty = arr, .scalar_ty = st, .bool_storage = c == .bool };
+        return gop.value_ptr.*;
+    }
+
     fn loadPtr(e: *Emitter, ptr: Ptr, ty: TypeId) Error!Lowered {
         const n = try e.flatCount(ty);
         const out = try e.arena.alloc(Value, n);
+        // A module constant at a constant index: its value.
+        const konst: ?[]const Value = if (ptr.offset_dyn == null and ptr.base == .global) e.const_global_vals.get(ptr.base.global) else null;
         for (out, 0..) |*o, c| {
+            if (konst) |kv| {
+                const v = kv[ptr.offset_const + @as(u32, @intCast(c))];
+                o.* = if (ptr.bool_storage) try e.dm.constant(.{ .ty = try e.dm.intType(1), .kind = .{ .int = @intFromBool(e.constIntOf(v).? != 0) } }) else v;
+                continue;
+            }
             if (ptr.offset_dyn == null and e.forwarded.count() > 0) if (e.forwarded.get(.{ ptr.base, ptr.offset_const + @as(u32, @intCast(c)) })) |fw| if (fw.block == e.cur) {
                 o.* = fw.v;
                 continue;
@@ -4202,12 +4573,25 @@ const Emitter = struct {
                         c.vec = try e.t.vector(v.elem, v.len);
                         continue;
                     }
+                    if (c.mat) |*mr| {
+                        mr.col = @intCast(xi.op.constant.int);
+                        continue;
+                    }
                     c.offset += @as(u32, @intCast(xi.op.constant.int)) * storageScalar(v.elem).size();
                 },
                 .matrix => |mt| {
-                    if (xi.op != .constant) return e.unsupported("dynamic indexing of constant buffer matrices", .{});
-                    if (!c.row_major) return e.unsupported("row access into column-major constant buffer matrices", .{});
-                    c.offset += @as(u32, @intCast(xi.op.constant.int)) * 16;
+                    if (!c.row_major) {
+                        // A column-major row is a component of every
+                        // column's register: the matrix is loaded, the row
+                        // picked.
+                        c.mat = .{ .ty = cur, .row = (try e.scalars(frame, x))[0] };
+                    } else if (xi.op == .constant) {
+                        c.offset += @as(u32, @intCast(xi.op.constant.int)) * 16;
+                    } else {
+                        // A row-major row is a register.
+                        const idx = (try e.scalars(frame, x))[0];
+                        c.dyn_regs = if (c.dyn_regs) |d| try e.add(try e.dm.intType(32), .{ .binop = .{ .op = .add, .lhs = d, .rhs = idx } }) else idx;
+                    }
                     cur = try e.t.vector(mt.elem, mt.cols);
                 },
                 else => return e.unsupported("indexing this constant buffer member", .{}),
@@ -4227,9 +4611,12 @@ const Emitter = struct {
         for (out, 0..) |*o, k| {
             const comp_ty = try e.componentType(ty, @intCast(k));
             const c = e.compOf(comp_ty);
-            const mem_c: Scalar = if (c == .bool) .uint else c;
+            // A minimum-precision half: cbufferLoadLegacy.f16 of 4, a 32-bit
+            // slot each (as dxc); in a tbuffer, a float, converted.
+            const mp = e.minPrecHalf(c);
+            const mem_c: Scalar = if (c == .bool) .uint else if (mp and res.kind == 15) .float else c;
             // A register holds 16 bytes: 4 32-bit, 2 64-bit or 8 16-bit values.
-            const sz = mem_c.size();
+            const sz: u32 = if (mp) 4 else mem_c.size();
             const off = offset + (e.componentOffset(ty, row_major, @intCast(k), .dx_legacy) catch return e.unsupported("constant buffer member types", .{}));
             const reg = off / 16;
             const st = try e.scalarTy(mem_c);
@@ -4247,7 +4634,9 @@ const Emitter = struct {
                 }
                 const it = try e.scalarTy(.uint);
                 const w0 = try e.add(it, .{ .extractvalue = .{ .agg = cache_val, .index = (off % 16) / 4 } });
-                const v = if (sz == 8)
+                const v = if (mp)
+                    try e.convertScalar(try e.add(st, .{ .cast = .{ .op = .bitcast, .val = w0 } }), .float, .float16)
+                else if (sz == 8)
                     try e.joinWords(w0, try e.add(it, .{ .extractvalue = .{ .agg = cache_val, .index = (off % 16) / 4 + 1 } }), mem_c)
                 else if (mem_c.isFloat())
                     try e.add(st, .{ .cast = .{ .op = .bitcast, .val = w0 } })
@@ -4257,7 +4646,7 @@ const Emitter = struct {
                 continue;
             }
             if (cache_reg == null or cache_reg.? != reg or cache_st != st) {
-                const ret_name = try std.fmt.allocPrint(e.arena, "dx.types.CBufRet.{s}{s}", .{ e.overloadName(st), if (sz == 2) ".8" else "" });
+                const ret_name = try std.fmt.allocPrint(e.arena, "dx.types.CBufRet.{s}{s}", .{ e.overloadName(st), if (mem_c.size() == 2 and !mp) ".8" else "" });
                 const elems: []const DType = switch (sz) {
                     8 => &.{ st, st },
                     2 => &.{ st, st, st, st, st, st, st, st },
@@ -4451,6 +4840,12 @@ const Emitter = struct {
     }
 
     /// The scalar a texture's ResRet carries for elements of `elem`.
+    /// The overload a typed load reads texel scalar `via` with: a
+    /// minimum-precision half as a float (see bufScalar).
+    fn loadScalar(e: *Emitter, via: Scalar) Scalar {
+        return if (e.minPrecHalf(via)) .float else via;
+    }
+
     fn texelScalar(e: *Emitter, elem: TypeId) Error!Scalar {
         const c = e.compOf(elem);
         return switch (c) {
@@ -4500,7 +4895,7 @@ const Emitter = struct {
     }
 
     fn typedBufferLoad(e: *Emitter, res: Resource, idx: Value, ty: TypeId) Error![]const Value {
-        const via = try e.texelScalar(res.elem);
+        const via = e.loadScalar(try e.texelScalar(res.elem));
         const st = try e.scalarTy(via);
         const ret_ty = try e.resRetType(st);
         const i32t = try e.dm.intType(32);
@@ -4512,7 +4907,7 @@ const Emitter = struct {
     }
 
     fn textureLoad(e: *Emitter, res: Resource, mip: Value, coords: []const Value, offset: ?[]const Value, ty: TypeId) Error![]const Value {
-        const via = try e.texelScalar(res.elem);
+        const via = e.loadScalar(try e.texelScalar(res.elem));
         const st = try e.scalarTy(via);
         const ret_ty = try e.resRetType(st);
         const i32t = try e.dm.intType(32);
@@ -4982,14 +5377,14 @@ const Emitter = struct {
         var k: u32 = 0;
         while (k < n) {
             const c0 = e.compOf(try e.componentType(ty, k));
-            const mem: Scalar = if (c0 == .bool) .uint else c0;
+            const mem = e.bufScalar(c0);
             const off0 = e.componentOffset(ty, row_major, k, .dx_packed) catch return e.unsupported("buffer element types", .{});
             var count: u32 = 1;
             while (k + count < n and count < 4) : (count += 1) {
                 const cn = e.compOf(try e.componentType(ty, k + count));
-                const mn: Scalar = if (cn == .bool) .uint else cn;
+                const mn = e.bufScalar(cn);
                 const on = e.componentOffset(ty, row_major, k + count, .dx_packed) catch break;
-                if (mn != mem or on != off0 + count * mem.size()) break;
+                if (mn != mem or cn != c0 or on != off0 + count * e.bufStride(mem)) break;
             }
             const st = try e.scalarTy(mem);
             const ret_ty = try e.resRetType(st);
@@ -5026,7 +5421,7 @@ const Emitter = struct {
             for (0..count) |j| {
                 const v = try e.add(st, .{ .extractvalue = .{ .agg = call, .index = @intCast(j) } });
                 const cj = e.compOf(try e.componentType(ty, k + @as(u32, @intCast(j))));
-                out[k + j] = if (cj == .bool) try e.convertScalar(v, .uint, .bool) else v;
+                out[k + j] = if (cj == .bool) try e.convertScalar(v, .uint, .bool) else if (cj != mem) try e.convertScalar(v, mem, cj) else v;
             }
             k += count;
         }
@@ -5041,14 +5436,14 @@ const Emitter = struct {
         var k: u32 = 0;
         while (k < n) {
             const c0 = e.compOf(try e.componentType(ty, k));
-            const mem: Scalar = if (c0 == .bool) .uint else c0;
+            const mem = e.bufStoreScalar(c0);
             const off0 = e.componentOffset(ty, row_major, k, .dx_packed) catch return e.unsupported("buffer element types", .{});
             var count: u32 = 1;
             while (k + count < n and count < 4) : (count += 1) {
                 const cn = e.compOf(try e.componentType(ty, k + count));
-                const mn: Scalar = if (cn == .bool) .uint else cn;
+                const mn = e.bufStoreScalar(cn);
                 const on = e.componentOffset(ty, row_major, k + count, .dx_packed) catch break;
-                if (mn != mem or on != off0 + count * mem.size()) break;
+                if (mn != mem or cn != c0 or on != off0 + count * e.bufStride(mem)) break;
             }
             const st = try e.scalarTy(mem);
             if (e.profile.minor < 3 and mem.size() == 8) {
@@ -5078,7 +5473,7 @@ const Emitter = struct {
             var comps: [4]Value = .{ undef_v, undef_v, undef_v, undef_v };
             for (0..count) |j| {
                 const cj = e.compOf(try e.componentType(ty, k + @as(u32, @intCast(j))));
-                comps[j] = if (cj == .bool) try e.convertScalar(vals[k + j], .bool, .uint) else vals[k + j];
+                comps[j] = if (cj == .bool) try e.convertScalar(vals[k + j], .bool, .uint) else if (cj != mem) try e.convertScalar(vals[k + j], cj, mem) else vals[k + j];
             }
             var off = try e.i32Const(base + off0);
             if (dyn) |d| off = try e.add(i32t, .{ .binop = .{ .op = .add, .lhs = d, .rhs = off } });
@@ -5108,7 +5503,7 @@ const Emitter = struct {
         if (res.kind == 11 and !try e.simpleRaw(ty)) return .{ .scalars = try e.rawLoad(res.*, idx, ty) };
         const n = try e.flatCount(ty);
         const c = try e.uniformScalar(ty);
-        const mem_c = if (c == .bool) Scalar.uint else c;
+        const mem_c = e.bufScalar(c);
         const st = try e.scalarTy(mem_c);
         const ret_ty = try e.resRetType(st);
         const i32t = try e.dm.intType(32);
@@ -5125,7 +5520,7 @@ const Emitter = struct {
                 const fn_i = try e.dxOp(try std.fmt.allocPrint(e.arena, "dx.op.bufferLoad.{s}", .{e.overloadName(st)}), ret_ty, &.{ i32t, e.handle_ty, i32t, i32t }, .nounwind_readonly);
                 call = try e.callOp(fn_i, ret_ty, &.{ try e.i32Const(68), res.handle, idx, undef_i32 });
             } else {
-                const offset = try e.i32Const(done * mem_c.size());
+                const offset = try e.i32Const(done * e.bufStride(mem_c));
                 const coord: Value, const off: Value = if (res.kind == 11) .{ idx, undef_i32 } else .{ idx, offset };
                 if (e.profile.minor >= 2) {
                     const fn_i = try e.dxOp(try std.fmt.allocPrint(e.arena, "dx.op.rawBufferLoad.{s}", .{e.overloadName(st)}), ret_ty, &.{ i32t, e.handle_ty, i32t, i32t, i8t, i32t }, .nounwind_readonly);
@@ -5138,7 +5533,7 @@ const Emitter = struct {
             }
             for (0..chunk) |k| {
                 const v = try e.add(st, .{ .extractvalue = .{ .agg = call, .index = @intCast(k) } });
-                out[done + k] = if (c == .bool) try e.convertScalar(v, .uint, .bool) else v;
+                out[done + k] = if (c == .bool) try e.convertScalar(v, .uint, .bool) else if (c != mem_c) try e.convertScalar(v, mem_c, c) else v;
             }
             done += chunk;
             if (res.kind != 12 and done < n) return e.unsupported("loads wider than four components from this resource", .{});
@@ -5165,14 +5560,14 @@ const Emitter = struct {
 
     /// A templated byte-address Load: one raw load per component.
     fn rawLoad(e: *Emitter, res: Resource, base: Value, ty: TypeId) Error![]const Value {
-        if (e.profile.minor < 2) return e.unsupported("templated loads of '{s}' need shader model 6.2", .{try e.t.format(e.arena, ty)});
+        if (e.profile.minor < 2) return e.rawLoadLegacy(res, base, ty);
         const i32t = try e.dm.intType(32);
         const i8t = try e.dm.intType(8);
         const undef_i32 = try e.dm.constant(.{ .ty = i32t, .kind = .undef });
         const out = try e.arena.alloc(Value, try e.flatCount(ty));
         for (out, 0..) |*o, k| {
             const c = e.compOf(try e.componentType(ty, @intCast(k)));
-            const mem_c = if (c == .bool) Scalar.uint else storageScalar(c);
+            const mem_c = e.bufScalar(c);
             const addr = try e.intArith(.add, base, try e.i32Const(try e.rawOffset(ty, @intCast(k))));
             if (mem_c.size() == 8 and e.profile.minor < 3) {
                 // 64-bit overloads need SM 6.3: two words.
@@ -5190,7 +5585,7 @@ const Emitter = struct {
             const fn_i = try e.dxOp(try std.fmt.allocPrint(e.arena, "dx.op.rawBufferLoad.{s}", .{e.overloadName(st)}), ret_ty, &.{ i32t, e.handle_ty, i32t, i32t, i8t, i32t }, .nounwind_readonly);
             const call = try e.callOp(fn_i, ret_ty, &.{ try e.i32Const(139), res.handle, addr, undef_i32, try e.dm.constInt(8, 1), try e.i32Const(mem_c.size()) });
             const v = try e.add(st, .{ .extractvalue = .{ .agg = call, .index = 0 } });
-            o.* = if (c == .bool) try e.convertScalar(v, .uint, .bool) else v;
+            o.* = if (c == .bool) try e.convertScalar(v, .uint, .bool) else if (c != mem_c) try e.convertScalar(v, mem_c, c) else v;
         }
         return out;
     }
@@ -5226,15 +5621,98 @@ const Emitter = struct {
         return .{ lo, try e.add(i32t, .{ .cast = .{ .op = .trunc, .val = sh } }) };
     }
 
+    /// Runs of components of a templated byte-address access that one
+    /// bufferLoad / bufferStore covers (shader model 6.0 and 6.1, without
+    /// raw buffer operations): up to four 32-bit words of one type, back
+    /// to back, as dxc gives each member one; a 64-bit component is two
+    /// words of its own.
+    const RawRun = struct { first: u32, len: u32, offset: u32, c: Scalar, mem: Scalar };
+
+    fn rawRuns(e: *Emitter, ty: TypeId, store: bool) Error![]const RawRun {
+        var runs: std.ArrayList(RawRun) = .empty;
+        const n = try e.flatCount(ty);
+        var k: u32 = 0;
+        while (k < n) {
+            const c = e.compOf(try e.componentType(ty, k));
+            const mem = if (store) e.bufStoreScalar(c) else e.bufScalar(c);
+            if (mem.size() == 2 and !e.minPrecHalf(mem)) return e.unsupported("16-bit byte-address buffer accesses need shader model 6.2", .{});
+            const off = try e.rawOffset(ty, k);
+            var len: u32 = 1;
+            if (e.bufStride(mem) == 4) {
+                while (k + len < n and len < 4) : (len += 1) {
+                    const c2 = e.compOf(try e.componentType(ty, k + len));
+                    if (c2 != c or try e.rawOffset(ty, k + len) != off + 4 * len) break;
+                }
+            }
+            try runs.append(e.arena, .{ .first = k, .len = len, .offset = off, .c = c, .mem = mem });
+            k += len;
+        }
+        return runs.items;
+    }
+
+    fn rawLoadLegacy(e: *Emitter, res: Resource, base: Value, ty: TypeId) Error![]const Value {
+        const i32t = try e.dm.intType(32);
+        const undef_i32 = try e.dm.constant(.{ .ty = i32t, .kind = .undef });
+        const out = try e.arena.alloc(Value, try e.flatCount(ty));
+        for (try e.rawRuns(ty, false)) |rr| {
+            const addr = try e.intArith(.add, base, try e.i32Const(rr.offset));
+            const wide = rr.mem.size() == 8;
+            const lt: Scalar = if (wide or !rr.mem.isFloat()) .uint else rr.mem;
+            const st = try e.scalarTy(lt);
+            const ret_ty = try e.resRetType(st);
+            const fn_i = try e.dxOp(try std.fmt.allocPrint(e.arena, "dx.op.bufferLoad.{s}", .{e.overloadName(st)}), ret_ty, &.{ i32t, e.handle_ty, i32t, i32t }, .nounwind_readonly);
+            const call = try e.callOp(fn_i, ret_ty, &.{ try e.i32Const(68), res.handle, addr, undef_i32 });
+            if (wide) {
+                const lo = try e.add(st, .{ .extractvalue = .{ .agg = call, .index = 0 } });
+                const hi = try e.add(st, .{ .extractvalue = .{ .agg = call, .index = 1 } });
+                out[rr.first] = try e.joinWords(lo, hi, rr.mem);
+                continue;
+            }
+            for (0..rr.len) |j| {
+                const v = try e.add(st, .{ .extractvalue = .{ .agg = call, .index = @intCast(j) } });
+                out[rr.first + j] = if (rr.c == .bool) try e.convertScalar(v, .uint, .bool) else if (rr.c != rr.mem) try e.convertScalar(v, rr.mem, rr.c) else v;
+            }
+        }
+        return out;
+    }
+
+    fn rawStoreLegacy(e: *Emitter, res: Resource, base: Value, ty: TypeId, vals: []const Value) Error!void {
+        const i32t = try e.dm.intType(32);
+        const i8t = try e.dm.intType(8);
+        const void_ty = try e.voidTy();
+        const undef_i32 = try e.dm.constant(.{ .ty = i32t, .kind = .undef });
+        for (try e.rawRuns(ty, true)) |rr| {
+            const addr = try e.intArith(.add, base, try e.i32Const(rr.offset));
+            const wide = rr.mem.size() == 8;
+            const lt: Scalar = if (wide or !rr.mem.isFloat()) .uint else rr.mem;
+            const st = try e.scalarTy(lt);
+            const undef_v = try e.dm.constant(.{ .ty = st, .kind = .undef });
+            var w: [4]Value = .{ undef_v, undef_v, undef_v, undef_v };
+            var count: u32 = rr.len;
+            if (wide) {
+                const words = try e.splitWords(vals[rr.first], rr.mem);
+                w[0] = words[0];
+                w[1] = words[1];
+                count = 2;
+            } else for (0..rr.len) |j| {
+                const v = vals[rr.first + j];
+                w[j] = if (rr.c == .bool) try e.convertScalar(v, .bool, .uint) else if (rr.c != rr.mem) try e.convertScalar(v, rr.c, rr.mem) else v;
+            }
+            const fn_i = try e.dxOp(try std.fmt.allocPrint(e.arena, "dx.op.bufferStore.{s}", .{e.overloadName(st)}), void_ty, &.{ i32t, e.handle_ty, i32t, i32t, st, st, st, st, i8t }, .nounwind);
+            const mask = try e.dm.constInt(8, (@as(i64, 1) << @intCast(count)) - 1);
+            _ = try e.callOp(fn_i, void_ty, &.{ try e.i32Const(69), res.handle, addr, undef_i32, w[0], w[1], w[2], w[3], mask });
+        }
+    }
+
     fn rawStore(e: *Emitter, res: Resource, base: Value, ty: TypeId, vals: []const Value) Error!void {
-        if (e.profile.minor < 2) return e.unsupported("templated stores of '{s}' need shader model 6.2", .{try e.t.format(e.arena, ty)});
+        if (e.profile.minor < 2) return e.rawStoreLegacy(res, base, ty, vals);
         const i32t = try e.dm.intType(32);
         const i8t = try e.dm.intType(8);
         const void_ty = try e.voidTy();
         const undef_i32 = try e.dm.constant(.{ .ty = i32t, .kind = .undef });
         for (vals, 0..) |v, k| {
             const c = e.compOf(try e.componentType(ty, @intCast(k)));
-            const mem_c = if (c == .bool) Scalar.uint else storageScalar(c);
+            const mem_c = e.bufScalar(c);
             const addr = try e.intArith(.add, base, try e.i32Const(try e.rawOffset(ty, @intCast(k))));
             if (mem_c.size() == 8 and e.profile.minor < 3) {
                 const ut = try e.scalarTy(.uint);
@@ -5247,7 +5725,7 @@ const Emitter = struct {
             const st = try e.scalarTy(mem_c);
             const undef_v = try e.dm.constant(.{ .ty = st, .kind = .undef });
             const fn_i = try e.dxOp(try std.fmt.allocPrint(e.arena, "dx.op.rawBufferStore.{s}", .{e.overloadName(st)}), void_ty, &.{ i32t, e.handle_ty, i32t, i32t, st, st, st, st, i8t, i32t }, .nounwind);
-            const sv = if (c == .bool) try e.convertScalar(v, .bool, .uint) else v;
+            const sv = if (c == .bool) try e.convertScalar(v, .bool, .uint) else if (c != mem_c) try e.convertScalar(v, c, mem_c) else v;
             _ = try e.callOp(fn_i, void_ty, &.{ try e.i32Const(140), res.handle, addr, undef_i32, sv, undef_v, undef_v, undef_v, try e.dm.constInt(8, 1), try e.i32Const(mem_c.size()) });
         }
     }
@@ -5266,7 +5744,8 @@ const Emitter = struct {
     /// byte-address buffer.
     fn bufferStoreVals(e: *Emitter, res: Resource, idx: Value, vals: []const Value, vt: TypeId) Error!void {
         const c = try e.uniformScalar(vt);
-        const mem_c = if (c == .bool) Scalar.uint else c;
+        // (Typed stores of minimum-precision halves: 16-bit, as dxc.)
+        const mem_c = if (res.kind == 10 and e.minPrecHalf(c)) c else e.bufStoreScalar(c);
         const st = try e.scalarTy(mem_c);
         const i32t = try e.dm.intType(32);
         const i8t = try e.dm.intType(8);
@@ -5277,7 +5756,7 @@ const Emitter = struct {
         while (done < vals.len) {
             const chunk: u32 = @intCast(@min(4, vals.len - done));
             var comps: [4]Value = .{ undef_v, undef_v, undef_v, undef_v };
-            for (0..chunk) |k| comps[k] = if (c == .bool) try e.convertScalar(vals[done + k], .bool, .uint) else vals[done + k];
+            for (0..chunk) |k| comps[k] = if (c == .bool) try e.convertScalar(vals[done + k], .bool, .uint) else if (c != mem_c) try e.convertScalar(vals[done + k], c, mem_c) else vals[done + k];
             var mask: i64 = (@as(i64, 1) << @intCast(chunk)) - 1;
             if (res.kind == 10) {
                 // Typed stores write every component (replicated).
@@ -5287,7 +5766,7 @@ const Emitter = struct {
             }
             const mask_c = try e.dm.constant(.{ .ty = i8t, .kind = .{ .int = mask } });
             const coord = idx;
-            const off = if (res.kind == 12) try e.i32Const(done * mem_c.size()) else undef_i32;
+            const off = if (res.kind == 12) try e.i32Const(done * e.bufStride(mem_c)) else undef_i32;
             if (res.kind != 10 and e.profile.minor >= 2) {
                 const fn_i = try e.dxOp(try std.fmt.allocPrint(e.arena, "dx.op.rawBufferStore.{s}", .{e.overloadName(st)}), void_ty, &.{ i32t, e.handle_ty, i32t, i32t, st, st, st, st, i8t, i32t }, .nounwind);
                 _ = try e.callOp(fn_i, void_ty, &.{ try e.i32Const(140), res.handle, coord, off, comps[0], comps[1], comps[2], comps[3], mask_c, try e.i32Const(mem_c.size()) });
@@ -6366,6 +6845,15 @@ const Emitter = struct {
 
     /// Whether wave operations and 64-bit integers are still in the code
     /// once dead code is gone (the validator wants flags to match).
+    fn is64BitInt(e: *Emitter, f: *const module.Function, v: Value) bool {
+        const ty = switch (v) {
+            .inst => |i| f.insts.items[i].ty,
+            .constant => |c| e.dm.constants.items[c].ty,
+            else => return false,
+        };
+        return e.dm.types.items[ty] == .int and e.dm.types.items[ty].int == 64;
+    }
+
     fn liveUses(e: *Emitter) struct { wave: bool, int64: bool, typed_uav_load: bool } {
         var wave = false;
         var int64 = false;
@@ -6382,11 +6870,13 @@ const Emitter = struct {
                             if (r.class == .uav and r.kind != 11 and r.kind != 12 and (e.flatCount(r.elem) catch 1) > 1) typed_uav_load = true;
                         } else typed_uav_load = true;
                     }
-                    for (c.args) |arg| if (arg == .inst and e.dm.types.items[f.insts.items[arg.inst].ty] == .int and e.dm.types.items[f.insts.items[arg.inst].ty].int == 64) {
+                    // (Constants too, as the validator counts them: a
+                    // 64-bit store of a value folding made constant.)
+                    for (c.args) |arg| if (e.is64BitInt(&f, arg)) {
                         int64 = true;
                     };
                 },
-                .store => |x| if (x.val == .inst and e.dm.types.items[f.insts.items[x.val.inst].ty] == .int and e.dm.types.items[f.insts.items[x.val.inst].ty].int == 64) {
+                .store => |x| if (e.is64BitInt(&f, x.val)) {
                     int64 = true;
                 },
                 else => {},
@@ -6395,10 +6885,42 @@ const Emitter = struct {
         return .{ .wave = wave, .int64 = int64, .typed_uav_load = typed_uav_load };
     }
 
+    /// Unreal's dxc (its "Check for derivative ops (in compute)" change)
+    /// reports, in a PRIV part, whether a compute shader uses derivatives:
+    /// implicit-LOD sampling, ddx / ddy, CalculateLOD, quad operations or
+    /// sampler feedback. Unreal reads it to let Nanite rasterize and shade
+    /// a material's clusters in compute (software raster, pixel binning);
+    /// without it every material counts as using derivatives.
+    fn computeDerivativeOps(e: *Emitter) bool {
+        if (e.entry.stage != .compute) return false;
+        for (e.dm.functions.items) |f| for (f.insts.items) |inst| switch (inst.op) {
+            .call => |c| {
+                if (c.args.len == 0 or c.args[0] != .constant) continue;
+                if (!std.mem.startsWith(u8, e.dm.functions.items[c.callee].name, "dx.op.")) continue;
+                const op = switch (e.dm.constants.items[c.args[0].constant].kind) {
+                    .int => |x| x,
+                    else => continue,
+                };
+                switch (op) {
+                    // Sample, SampleBias, SampleCmp, CalculateLOD,
+                    // DerivCoarseX/Y, DerivFineX/Y, QuadReadLaneAt, QuadOp,
+                    // WriteSamplerFeedback(Bias), QuadVote, SampleCmpBias.
+                    60, 61, 64, 81, 83, 84, 85, 86, 122, 123, 174, 175, 222, 255 => return true,
+                    else => {},
+                }
+            },
+            else => {},
+        };
+        return false;
+    }
+
     fn shaderFlags(e: *Emitter) u64 {
         var flags: u64 = 0;
         const live = e.liveUses();
         if (e.uses_double) flags |= 1 << 2;
+        // ForceEarlyDepthStencil: `[earlydepthstencil]`. (Without it the
+        // depth test waits for the shader: every hidden fragment shaded.)
+        if (e.entry.stage == .pixel and e.entry.early_depth_stencil) flags |= 1 << 3;
         if (e.uses_int64 and live.int64) flags |= 1 << 20;
         if (e.uses_min_precision) flags |= 1 << 5;
         var uavs: u32 = 0;
@@ -7422,10 +7944,15 @@ const Emitter = struct {
             },
         }, &.{.{ .fourcc = container.fourcc("SFI0"), .data = &sfi0 }});
         errdefer if (e.reflection) |r| gpa.free(r);
+        // (Unreal's dxc's PRIV part, as for shaders: a library is not a
+        // compute shader, so its derivatives bit is clear.)
+        var priv: [16]u8 = @splat(0);
+        std.mem.writeInt(u32, priv[0..4], container.fourcc("SFI0"), .little);
         return container.assemble(gpa, &.{
             .{ .fourcc = container.fourcc("SFI0"), .data = &sfi0 },
             .{ .fourcc = container.fourcc("RDAT"), .data = rdat_part },
             .{ .fourcc = container.fourcc("DXIL"), .data = dxil_part },
+            .{ .fourcc = container.fourcc("PRIV"), .data = &priv },
         });
     }
 
@@ -7741,6 +8268,14 @@ const Emitter = struct {
             try parts.append(e.arena, .{ .fourcc = container.fourcc("RTS0"), .data = try e.compileRootSignature(text, .global) });
         };
         try parts.append(e.arena, .{ .fourcc = container.fourcc("DXIL"), .data = dxil_part });
+        // Last, as Unreal's dxc writes it: { 'SFI0', (padding), the
+        // optional feature info: OptFeatureInfo_UsesDerivatives (bit 40)
+        // for a compute shader that uses derivatives }.
+        const priv = try e.arena.alloc(u8, 16);
+        @memset(priv, 0);
+        std.mem.writeInt(u32, priv[0..4], container.fourcc("SFI0"), .little);
+        std.mem.writeInt(u64, priv[8..16], if (e.computeDerivativeOps()) @as(u64, 1) << 40 else 0, .little);
+        try parts.append(e.arena, .{ .fourcc = container.fourcc("PRIV"), .data = priv });
         return container.assemble(gpa, parts.items);
     }
 };
@@ -7764,6 +8299,98 @@ fn gsTopology(g: ir.GeometryInfo) u32 {
 }
 
 /// Resources, samplers and (handles too) work graph node objects.
+/// Immediate dominators of an IR function's blocks (Cooper, Harvey and
+/// Kennedy), maxInt for blocks not reached from block 0.
+fn irDominators(a: Allocator, f: *const ir.Function) Allocator.Error![]u32 {
+    const none = std.math.maxInt(u32);
+    const nb = f.blocks.items.len;
+    const succ = try a.alloc([]const u32, nb);
+    for (f.blocks.items, 0..) |blk, b| {
+        var l: std.ArrayList(u32) = .empty;
+        switch (blk.term) {
+            .br => |t| try l.append(a, @intCast(t.index())),
+            .cond_br => |c| {
+                try l.append(a, @intCast(c.then.index()));
+                try l.append(a, @intCast(c.@"else".index()));
+            },
+            .@"switch" => |sw| {
+                try l.append(a, @intCast(sw.default.index()));
+                for (sw.cases) |cs| try l.append(a, @intCast(cs.block.index()));
+            },
+            else => {},
+        }
+        succ[b] = l.items;
+    }
+    // Reverse postorder.
+    const order = try a.alloc(u32, nb);
+    @memset(order, none);
+    var rpo: std.ArrayList(u32) = .empty;
+    const seen = try a.alloc(bool, nb);
+    @memset(seen, false);
+    const Fr = struct { b: u32, i: u32 };
+    var stack: std.ArrayList(Fr) = .empty;
+    try stack.append(a, .{ .b = 0, .i = 0 });
+    seen[0] = true;
+    while (stack.items.len > 0) {
+        const top = &stack.items[stack.items.len - 1];
+        if (top.i < succ[top.b].len) {
+            const s = succ[top.b][top.i];
+            top.i += 1;
+            if (!seen[s]) {
+                seen[s] = true;
+                try stack.append(a, .{ .b = s, .i = 0 });
+            }
+        } else {
+            try rpo.append(a, top.b);
+            _ = stack.pop();
+        }
+    }
+    std.mem.reverse(u32, rpo.items);
+    for (rpo.items, 0..) |b, i| order[b] = @intCast(i);
+    const preds = try a.alloc(std.ArrayList(u32), nb);
+    for (preds) |*p| p.* = .empty;
+    for (0..nb) |b| for (succ[b]) |s| try preds[s].append(a, @intCast(b));
+    const idom = try a.alloc(u32, nb);
+    @memset(idom, none);
+    idom[0] = 0;
+    var changed = true;
+    while (changed) {
+        changed = false;
+        for (rpo.items[1..]) |b| {
+            var new: u32 = none;
+            for (preds[b].items) |p| {
+                if (idom[p] == none) continue;
+                if (new == none) {
+                    new = p;
+                    continue;
+                }
+                var x = p;
+                var y = new;
+                while (x != y) {
+                    while (order[x] > order[y]) x = idom[x];
+                    while (order[y] > order[x]) y = idom[y];
+                }
+                new = x;
+            }
+            if (new != idom[b]) {
+                idom[b] = new;
+                changed = true;
+            }
+        }
+    }
+    return idom;
+}
+
+/// Whether block `d` dominates block `b` (by the immediate dominators).
+fn irDominates(idom: []const u32, d: u32, b: u32) bool {
+    var x = b;
+    while (true) {
+        if (x == d) return true;
+        if (x == 0 or idom[x] == std.math.maxInt(u32)) return false;
+        x = idom[x];
+    }
+}
+
 fn isResourceType(t: *TypeTable, ty: TypeId) bool {
     return switch (t.get(ty)) {
         .resource, .sampler, .node => true,
@@ -7784,6 +8411,167 @@ fn storesInOneBlock(f: *const ir.Function, ptr: Ref) bool {
         else => {},
     };
     return true;
+}
+
+/// Whether store `store` to resource local `ptr`, replacing what an earlier
+/// store put there, is what every read of the local sees from then on, with
+/// the blocks emitted in the frame's order (emitOrder), over the blocks
+/// still live given the branches on constants (see inlineCallFresh): the
+/// store's block is in no loop, every read the store reaches is emitted
+/// after it and reached only through it (the block dominates the read's),
+/// and every other read was emitted already.
+fn overwriteSeenByAll(a: Allocator, f: *const ir.Function, frame: *const Frame, ptr: Ref, store: Ref) Allocator.Error!bool {
+    const live = frame.live;
+    const taken = frame.taken;
+    const pos = frame.order_pos;
+    if (live.len != f.blocks.items.len or pos.len != f.blocks.items.len) return false;
+    const sb: u32 = for (f.blocks.items, 0..) |blk, bi| {
+        if (std.mem.indexOfScalar(Ref, blk.insts.items, store) != null) break @intCast(bi);
+    } else return false;
+    // Blocks after the store (reachable from its block's successors), and
+    // blocks reachable from the entry without passing through its block.
+    const after = try reachFrom(a, f, live, taken, sb, null);
+    if (after[sb]) return false;
+    const around = try reachFrom(a, f, live, taken, null, sb);
+    const Reads = struct {
+        ptr: Ref,
+        found: bool = false,
+        pub fn use(c: *@This(), x: Ref) void {
+            if (x == c.ptr) c.found = true;
+        }
+    };
+    for (f.blocks.items, 0..) |blk, bi| {
+        if (!live[bi] or bi == sb) continue;
+        var reads: Reads = .{ .ptr = ptr };
+        for (blk.insts.items) |x| {
+            const op = f.inst(x).op;
+            // (Stores to the local are checked when emitted.)
+            if (op == .store and op.store.ptr == ptr and op.store.value != ptr) continue;
+            opt.eachOperand(op, &reads);
+        }
+        if (!reads.found) continue;
+        if (after[bi]) {
+            if (pos[bi] < pos[sb] or around[bi]) return false;
+        } else if (pos[bi] > pos[sb]) return false;
+    }
+    return true;
+}
+
+/// The live blocks reachable from the successors of block `from` (or from
+/// the entry, when null), not passing through block `avoid`, following only
+/// the branch `taken` where a branch was folded.
+fn reachFrom(a: Allocator, f: *const ir.Function, live: []const bool, taken: []const u32, from: ?u32, avoid: ?u32) Allocator.Error![]bool {
+    const seen = try a.alloc(bool, f.blocks.items.len);
+    @memset(seen, false);
+    var stack: std.ArrayList(u32) = .empty;
+    const Succ = struct {
+        fn push(s: *std.ArrayList(u32), al: Allocator, fun: *const ir.Function, tk: []const u32, b: u32) Allocator.Error!void {
+            if (tk.len > 0 and tk[b] != std.math.maxInt(u32)) return s.append(al, tk[b]);
+            switch (fun.blocks.items[b].term) {
+                .br => |t| try s.append(al, t.index()),
+                .cond_br => |c| try s.appendSlice(al, &.{ c.then.index(), c.@"else".index() }),
+                .@"switch" => |sw| {
+                    try s.append(al, sw.default.index());
+                    for (sw.cases) |c| try s.append(al, c.block.index());
+                },
+                else => {},
+            }
+        }
+    };
+    if (from) |b| try Succ.push(&stack, a, f, taken, b) else try stack.append(a, 0);
+    while (stack.pop()) |b| {
+        if (seen[b] or !live[b] or (avoid != null and b == avoid.?)) continue;
+        seen[b] = true;
+        try Succ.push(&stack, a, f, taken, b);
+    }
+    return seen;
+}
+
+/// The order to emit a function's blocks in: each after every block that
+/// branches to it (but over a loop's back edge), the lowest index first of
+/// those ready, so index order wherever that is one already. (Lowering puts
+/// an `else` after its selection's merge, and what the emitter tracks as
+/// it goes, such as the resource a local holds, needs the `else`'s stores
+/// before the merge's reads.) Blocks the entry does not reach go last.
+fn indexOrder(a: Allocator, f: *const ir.Function) Allocator.Error![]u32 {
+    const order = try a.alloc(u32, f.blocks.items.len);
+    for (order, 0..) |*o, k| o.* = @intCast(k);
+    return order;
+}
+
+fn emitOrder(a: Allocator, f: *const ir.Function) Allocator.Error![]u32 {
+    const n = f.blocks.items.len;
+    const order = try a.alloc(u32, n);
+    if (n == 0) return order;
+    const succs = try a.alloc([]u32, n);
+    const back = try a.alloc([]bool, n);
+    for (f.blocks.items, succs, back) |blk, *s, *bk| {
+        var l: std.ArrayList(u32) = .empty;
+        switch (blk.term) {
+            .br => |t| try l.append(a, t.index()),
+            .cond_br => |c| try l.appendSlice(a, &.{ c.then.index(), c.@"else".index() }),
+            .@"switch" => |sw| {
+                try l.append(a, sw.default.index());
+                for (sw.cases) |c| try l.append(a, c.block.index());
+            },
+            else => {},
+        }
+        s.* = l.items;
+        bk.* = try a.alloc(bool, l.items.len);
+        @memset(bk.*, false);
+    }
+    // Back edges (to a block on the depth-first path) and the count of
+    // forward edges into each block.
+    const state = try a.alloc(u8, n); // 0 unseen, 1 on the path, 2 done
+    @memset(state, 0);
+    const preds = try a.alloc(u32, n);
+    @memset(preds, 0);
+    var stack: std.ArrayList(struct { b: u32, k: u32 }) = .empty;
+    try stack.append(a, .{ .b = 0, .k = 0 });
+    state[0] = 1;
+    while (stack.items.len > 0) {
+        const top = &stack.items[stack.items.len - 1];
+        const b = top.b;
+        if (top.k == succs[b].len) {
+            state[b] = 2;
+            _ = stack.pop();
+            continue;
+        }
+        const k = top.k;
+        top.k += 1;
+        const v = succs[b][k];
+        if (state[v] == 1) {
+            back[b][k] = true;
+            continue;
+        }
+        preds[v] += 1;
+        if (state[v] == 0) {
+            state[v] = 1;
+            try stack.append(a, .{ .b = v, .k = 0 });
+        }
+    }
+    const Ready = std.PriorityQueue(u32, void, struct {
+        fn lt(_: void, x: u32, y: u32) std.math.Order {
+            return std.math.order(x, y);
+        }
+    }.lt);
+    var ready: Ready = .empty;
+    try ready.push(a, 0);
+    var len: usize = 0;
+    while (ready.pop()) |b| {
+        order[len] = b;
+        len += 1;
+        for (succs[b], back[b]) |v, bk| if (!bk) {
+            preds[v] -= 1;
+            if (preds[v] == 0) try ready.push(a, v);
+        };
+    }
+    for (state, 0..) |st, b| if (st == 0) {
+        order[len] = @intCast(b);
+        len += 1;
+    };
+    std.debug.assert(len == n);
+    return order;
 }
 
 fn reachableBlocks(a: Allocator, f: *const ir.Function) Allocator.Error![]bool {

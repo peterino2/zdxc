@@ -275,18 +275,31 @@ pub fn run(a: Allocator, m: *module.Module, func: u32, dyn: *const std.AutoHashM
         }
     }
 
-    // Candidate allocas: arrays of scalars and scalars. `var_base[i]` is
-    // the variable of an alloca's element 0, `none` if it stays in memory.
+    // Candidate allocas: arrays of scalars, scalars, and structs (and
+    // arrays of them) whose leaves are scalars: one variable per leaf, in
+    // order (`leaves`). `var_base[i]` is the variable of an alloca's
+    // element 0, `none` if it stays in memory.
     const var_base = try a.alloc(u32, n);
     @memset(var_base, none);
     const elem_ty = try a.alloc(TypeId, n);
     const direct = try a.alloc(bool, n);
+    const leaves = try a.alloc([]const TypeId, n);
     for (allocas.items) |i| {
         const x = insts[i].op.alloca;
+        leaves[i] = &.{};
         switch (m.types.items[x.elem]) {
             .array => |arr| if (isScalar(m, arr.elem) and arr.len > 0) {
                 var_base[i] = 0;
                 elem_ty[i] = arr.elem;
+                direct[i] = false;
+            } else if (try leafTypes(a, m, x.elem)) |l| {
+                var_base[i] = 0;
+                leaves[i] = l;
+                direct[i] = false;
+            },
+            .@"struct" => if (try leafTypes(a, m, x.elem)) |l| {
+                var_base[i] = 0;
+                leaves[i] = l;
                 direct[i] = false;
             },
             else => if (isScalar(m, x.elem)) {
@@ -333,6 +346,14 @@ pub fn run(a: Allocator, m: *module.Module, func: u32, dyn: *const std.AutoHashM
                 var_base[al] = none;
                 continue;
             }
+            if (leaves[al].len > 0) {
+                // (Struct leaves: constant paths to a scalar only.)
+                if (leafIndex(m, insts[al].op.alloca.elem, g.indices)) |kk| {
+                    gep_alloca[i] = al;
+                    gep_k[i] = kk;
+                } else var_base[al] = none;
+                continue;
+            }
             const k = constIndex(m, g.indices, m.types.items[insts[al].op.alloca.elem].array.len);
             if (k) |kk| {
                 gep_alloca[i] = al;
@@ -358,7 +379,10 @@ pub fn run(a: Allocator, m: *module.Module, func: u32, dyn: *const std.AutoHashM
         };
         if (ptr != .inst) continue;
         const al = if (gep_alloca[ptr.inst] != none) gep_alloca[ptr.inst] else ptr.inst;
-        if (var_base[al] != none and insts[al].op == .alloca and ty != elem_ty[al]) var_base[al] = none;
+        if (var_base[al] == none or insts[al].op != .alloca) continue;
+        if (leaves[al].len > 0) {
+            if (gep_alloca[ptr.inst] == none or ty != leaves[al][gep_k[ptr.inst]]) var_base[al] = none;
+        } else if (ty != elem_ty[al]) var_base[al] = none;
     }
 
     // Variables.
@@ -367,12 +391,16 @@ pub fn run(a: Allocator, m: *module.Module, func: u32, dyn: *const std.AutoHashM
         const inst = insts[i];
         if (var_base[i] == none) continue;
         var_base[i] = nv;
-        nv += if (direct[i]) 1 else @intCast(m.types.items[inst.op.alloca.elem].array.len);
+        nv += if (direct[i]) 1 else if (leaves[i].len > 0) @intCast(leaves[i].len) else @intCast(m.types.items[inst.op.alloca.elem].array.len);
     }
     const var_ty = try a.alloc(TypeId, nv);
     for (allocas.items) |i| {
         const inst = insts[i];
         if (var_base[i] == none) continue;
+        if (leaves[i].len > 0) {
+            @memcpy(var_ty[var_base[i]..][0..leaves[i].len], leaves[i]);
+            continue;
+        }
         const len: u32 = if (direct[i]) 1 else @intCast(m.types.items[inst.op.alloca.elem].array.len);
         @memset(var_ty[var_base[i]..][0..len], elem_ty[i]);
     }
@@ -1541,6 +1569,72 @@ fn resolve(repl: []const ?Value, v: Value) Value {
 }
 
 /// Element `k` of `getelementptr [len x T], %a, 0, k`, or null.
+/// Most leaves a struct-typed local is promoted with.
+const max_leaves = 4096;
+
+/// The scalar leaves of struct / array type `ty`, in memory order, or null
+/// when one is not a scalar or there are more than max_leaves.
+fn leafTypes(a: Allocator, m: *const module.Module, ty: TypeId) Allocator.Error!?[]const TypeId {
+    var out: std.ArrayList(TypeId) = .empty;
+    if (!try appendLeaves(a, m, ty, &out) or out.items.len == 0) return null;
+    return out.items;
+}
+
+fn appendLeaves(a: Allocator, m: *const module.Module, ty: TypeId, out: *std.ArrayList(TypeId)) Allocator.Error!bool {
+    switch (m.types.items[ty]) {
+        .@"struct" => |st| for (st.elems) |el| if (!try appendLeaves(a, m, el, out)) return false,
+        .array => |arr| {
+            if (arr.len * (leafCount(m, arr.elem) orelse return false) + out.items.len > max_leaves) return false;
+            for (0..arr.len) |_| if (!try appendLeaves(a, m, arr.elem, out)) return false;
+        },
+        else => {
+            if (!isScalar(m, ty) or out.items.len >= max_leaves) return false;
+            try out.append(a, ty);
+        },
+    }
+    return true;
+}
+
+fn leafCount(m: *const module.Module, ty: TypeId) ?u64 {
+    return switch (m.types.items[ty]) {
+        .@"struct" => |st| blk: {
+            var c: u64 = 0;
+            for (st.elems) |el| c += leafCount(m, el) orelse return null;
+            break :blk c;
+        },
+        .array => |arr| arr.len * (leafCount(m, arr.elem) orelse return null),
+        else => if (isScalar(m, ty)) 1 else null,
+    };
+}
+
+/// The leaf a getelementptr into a local of struct / array type `ty`
+/// addresses: constant indices from 0 down to a scalar, else null.
+fn leafIndex(m: *const module.Module, ty: TypeId, indices: []const Value) ?u32 {
+    if (indices.len == 0 or constInt(m, indices[0]) != 0) return null;
+    var cur = ty;
+    var k: u64 = 0;
+    for (indices[1..]) |x| {
+        const c = constInt(m, x) orelse return null;
+        if (c < 0) return null;
+        const ci: u64 = @intCast(c);
+        switch (m.types.items[cur]) {
+            .@"struct" => |st| {
+                if (ci >= st.elems.len) return null;
+                for (st.elems[0..ci]) |el| k += leafCount(m, el) orelse return null;
+                cur = st.elems[ci];
+            },
+            .array => |arr| {
+                if (ci >= arr.len) return null;
+                k += ci * (leafCount(m, arr.elem) orelse return null);
+                cur = arr.elem;
+            },
+            else => return null,
+        }
+    }
+    if (!isScalar(m, cur)) return null;
+    return @intCast(k);
+}
+
 fn constIndex(m: *const module.Module, indices: []const Value, len: u64) ?u32 {
     if (indices.len != 2) return null;
     const first = constInt(m, indices[0]) orelse return null;

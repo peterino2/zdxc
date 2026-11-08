@@ -1168,6 +1168,7 @@ const Emitter = struct {
             },
             .pixel => {
                 try e.b.emit(.execution_modes, .execution_mode, &.{ wrapper, 7 }); // OriginUpperLeft
+                if (entry.early_depth_stencil) try e.b.emit(.execution_modes, .execution_mode, &.{ wrapper, 9 }); // EarlyFragmentTests
                 for (entry.outputs.items) |o| {
                     const eqi = std.ascii.eqlIgnoreCase;
                     if (eqi(o.semantic, "SV_Depth") or eqi(o.semantic, "SV_DepthLessEqual") or eqi(o.semantic, "SV_DepthGreaterEqual")) {
