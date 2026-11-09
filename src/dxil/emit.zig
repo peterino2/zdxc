@@ -4284,14 +4284,18 @@ const Emitter = struct {
                 return em.dm.constant(.{ .ty = try em.dm.intType(8), .kind = .{ .int = v } });
             }
         }.f;
-        const Nullary = struct { name: []const u8, op: i64, fname: []const u8, ret_bool: bool };
+        // Attributes as dxc's op table has them: WaveIsFirstLane depends
+        // on which lanes are active, a lane's index never changes
+        // (readonly, which cse.zig merges), and the wave's width is a
+        // constant (readnone).
+        const Nullary = struct { name: []const u8, op: i64, fname: []const u8, ret_bool: bool, attrs: module.FnAttrs };
         for ([_]Nullary{
-            .{ .name = "WaveIsFirstLane", .op = 110, .fname = "dx.op.waveIsFirstLane", .ret_bool = true },
-            .{ .name = "WaveGetLaneIndex", .op = 111, .fname = "dx.op.waveGetLaneIndex", .ret_bool = false },
-            .{ .name = "WaveGetLaneCount", .op = 112, .fname = "dx.op.waveGetLaneCount", .ret_bool = false },
+            .{ .name = "WaveIsFirstLane", .op = 110, .fname = "dx.op.waveIsFirstLane", .ret_bool = true, .attrs = .nounwind },
+            .{ .name = "WaveGetLaneIndex", .op = 111, .fname = "dx.op.waveGetLaneIndex", .ret_bool = false, .attrs = .nounwind_readonly },
+            .{ .name = "WaveGetLaneCount", .op = 112, .fname = "dx.op.waveGetLaneCount", .ret_bool = false, .attrs = .nounwind_readnone },
         }) |w| if (eq(u8, name, w.name)) {
             const rt = if (w.ret_bool) i1t else i32t;
-            out[0] = try e.callOp(try e.dxOp(w.fname, rt, &.{i32t}, .nounwind), rt, &.{try e.i32Const(w.op)});
+            out[0] = try e.callOp(try e.dxOp(w.fname, rt, &.{i32t}, w.attrs), rt, &.{try e.i32Const(w.op)});
             return true;
         };
         // Bool reductions over the wave.

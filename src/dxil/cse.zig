@@ -29,11 +29,12 @@ fn isTerminator(inst: Inst) bool {
 }
 
 /// dx.op readonly operations that read only what a dispatch cannot change:
-/// CreateHandle, CBufferLoad, CBufferLoadLegacy, CreateHandleForLib,
+/// CreateHandle, CBufferLoad, CBufferLoadLegacy, WaveGetLaneIndex (a
+/// lane's index is the same for its whole run), CreateHandleForLib,
 /// CreateHandleFromBinding, CreateHandleFromHeap.
 fn stableReadonly(opcode: i64) bool {
     return switch (opcode) {
-        57, 58, 59, 160, 217, 218 => true,
+        57, 58, 59, 111, 160, 217, 218 => true,
         else => false,
     };
 }
@@ -322,4 +323,33 @@ pub fn run(a: Allocator, m: *module.Module, func: u32) Allocator.Error!bool {
     }
     f.insts = out;
     return true;
+}
+
+/// `f() { %0 = op(); %1 = op(); ret %0 <combine> %1 }` with `op` a nullary
+/// dx.op; how many instructions are left after the pass.
+fn nullaryTwice(comptime name: []const u8, opcode: i64, attrs: module.FnAttrs, bits: u32, combine: module.BinOp) !usize {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    var m: module.Module = .init(std.testing.allocator);
+    defer m.deinit();
+    const rt = try m.intType(bits);
+    const i32_ty = try m.intType(32);
+    const op = try m.addFunction(.{ .name = name, .ty = try m.fnType(rt, &.{i32_ty}), .attrs = attrs });
+    const f = try m.addFunction(.{ .name = "f", .ty = try m.fnType(rt, &.{}), .num_blocks = 1 });
+    const args = try m.allocator().dupe(Value, &.{try m.constInt(32, opcode)});
+    const x = try m.addInst(f, .{ .ty = rt, .op = .{ .call = .{ .callee = op, .args = args } } });
+    const y = try m.addInst(f, .{ .ty = rt, .op = .{ .call = .{ .callee = op, .args = args } } });
+    const z = try m.addInst(f, .{ .ty = rt, .op = .{ .binop = .{ .op = combine, .lhs = x, .rhs = y } } });
+    _ = try m.addInst(f, .{ .ty = try m.getType(.void), .op = .{ .ret = z } });
+    _ = try run(arena.allocator(), &m, f);
+    return m.functions.items[f].insts.items.len;
+}
+
+test "a lane's index and the wave's width are read once" {
+    try std.testing.expectEqual(@as(usize, 3), try nullaryTwice("dx.op.waveGetLaneIndex", 111, .nounwind_readonly, 32, .add));
+    try std.testing.expectEqual(@as(usize, 3), try nullaryTwice("dx.op.waveGetLaneCount", 112, .nounwind_readnone, 32, .add));
+}
+
+test "WaveIsFirstLane is read again: the active lanes may have changed" {
+    try std.testing.expectEqual(@as(usize, 4), try nullaryTwice("dx.op.waveIsFirstLane", 110, .nounwind, 1, .@"and"));
 }

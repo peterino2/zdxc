@@ -60,6 +60,7 @@ test {
     std.testing.refAllDecls(front);
     std.testing.refAllDecls(dxil);
     _ = @import("dxil/sccp.zig");
+    _ = @import("dxil/cse.zig");
     std.testing.refAllDecls(ir);
     _ = @import("sema/types.zig");
     _ = @import("sema/sema.zig");
