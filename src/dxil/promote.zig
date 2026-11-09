@@ -634,8 +634,9 @@ pub fn run(a: Allocator, m: *module.Module, func: u32, dyn: *const std.AutoHashM
 
     // Peepholes on what promotion exposes, in instruction order so they
     // cascade: bitcast round trips (locals mixing ints and floats store
-    // i32s), constant integer arithmetic and comparisons, identities, and
-    // selects on a constant.
+    // i32s), constant integer arithmetic and comparisons, identities,
+    // selects on a constant, and static const tables read at a constant
+    // index. (Locals such a read indexes are promoted the next run.)
     for (insts, 0..) |inst, i| {
         if (repl[i] != null) continue;
         if (inst.op == .phi) if (try edgePhi(m, insts, block_start, repl, n, block_of[i], inst)) |v| {
@@ -1085,6 +1086,27 @@ fn simplify(m: *module.Module, f: *const module.Function, repl: []const ?Value, 
                 };
                 return try m.constant(.{ .ty = inst.ty, .kind = .{ .int = S.stored(S.bits(@bitCast(out), to), to) } });
             }
+            // An integer constant converted to floating point (a table's
+            // offsets used as coordinates), as dxc's constant folding
+            // converts it: exact in f64 up to 2^53, so rounded to the type
+            // once.
+            if (c.op == .sitofp or c.op == .uitofp) {
+                const v = resolve(repl, c.val);
+                const k = constInt(m, v) orelse return null;
+                const from = S.intWidth(m, typeOf(m, f, v)) orelse return null;
+                const p = S.bits(k, from);
+                const x: f64 = if (c.op == .uitofp) blk: {
+                    if (p > 1 << 53) return null;
+                    break :blk @floatFromInt(p);
+                } else if (from == 1)
+                    (if (p & 1 != 0) -1.0 else 0.0)
+                else blk: {
+                    const s = S.stored(p, from);
+                    if (@abs(s) > 1 << 53) return null;
+                    break :blk @floatFromInt(s);
+                };
+                return floatConst(m, inst.ty, x);
+            }
             if (c.op != .bitcast) return null;
             const x = resolve(repl, c.val);
             if (x == .inst and x.inst < n) {
@@ -1236,6 +1258,12 @@ fn simplify(m: *module.Module, f: *const module.Function, repl: []const ?Value, 
             return try m.constant(.{ .ty = inst.ty, .kind = .{ .int = @intFromBool(result orelse return null) } });
         },
         .call => return foldDxOp(m, repl, inst),
+        // A static const table read at constant indices (unrolling made a
+        // loop's index constant) is that element, as dxc's instcombine
+        // folds a load from a constant global. (Left in memory, it kept
+        // the locals its values index there too: Unreal's TAA read its
+        // 3x3 neighbourhood offsets so, at 5x dxc's GPU time.)
+        .load => |l| return tableElement(m, f, repl, n, inst.ty, resolve(repl, l.ptr)),
         .select => |sl| {
             const t = resolve(repl, sl.t);
             const fv = resolve(repl, sl.f);
@@ -1635,6 +1663,39 @@ fn leafIndex(m: *const module.Module, ty: TypeId, indices: []const Value) ?u32 {
     return @intCast(k);
 }
 
+/// The element of a static const table (an internal constant global) that
+/// `ptr` points to, when it is the global or a getelementptr into it with
+/// constant indices (followed through `repl`), and of type `ty`; else null.
+fn tableElement(m: *const module.Module, f: *const module.Function, repl: []const ?Value, n: u32, ty: TypeId, ptr: Value) ?Value {
+    var base = ptr;
+    var indices: []const Value = &.{};
+    if (ptr == .inst) {
+        if (ptr.inst >= n) return null;
+        const g = switch (f.insts.items[ptr.inst].op) {
+            .gep => |g| g,
+            else => return null,
+        };
+        if (g.indices.len == 0 or constInt(m, resolve(repl, g.indices[0])) != 0) return null;
+        base = resolve(repl, g.ptr);
+        indices = g.indices[1..];
+    }
+    if (base != .global) return null;
+    const gv = m.globals.items[base.global];
+    if (!gv.constant) return null;
+    var c = gv.init orelse return null;
+    for (indices) |x| {
+        const k = constInt(m, resolve(repl, x)) orelse return null;
+        const els = switch (m.constants.items[c].kind) {
+            .aggregate => |els| els,
+            else => return null,
+        };
+        if (k < 0 or k >= els.len) return null;
+        c = els[@intCast(k)];
+    }
+    if (m.constants.items[c].ty != ty) return null;
+    return .{ .constant = c };
+}
+
 fn constIndex(m: *const module.Module, indices: []const Value, len: u64) ?u32 {
     if (indices.len != 2) return null;
     const first = constInt(m, indices[0]) orelse return null;
@@ -1761,4 +1822,37 @@ pub fn pruneDeclarations(a: Allocator, m: *module.Module) Allocator.Error!?[]con
     };
     m.functions.shrinkRetainingCapacity(k);
     return index;
+}
+
+test "a static const table read at a constant index is its element" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    var m: module.Module = .init(std.testing.allocator);
+    defer m.deinit();
+    const i32_ty = try m.intType(32);
+    const float_ty = try m.getType(.float);
+    const arr = try m.getType(.{ .array = .{ .len = 3, .elem = i32_ty } });
+    const els = try m.allocator().dupe(module.ConstId, &.{
+        (try m.constInt(32, -1)).constant,
+        (try m.constInt(32, 0)).constant,
+        (try m.constInt(32, 7)).constant,
+    });
+    const t = try m.addGlobal("t.v.1dim", arr, 0);
+    m.globals.items[t.global].constant = true;
+    m.globals.items[t.global].init = (try m.constant(.{ .ty = arr, .kind = .{ .aggregate = els } })).constant;
+    // f() { %0 = gep @t, 0, 1 + 1; %1 = load %0; ret sitofp %1 }: 7.0,
+    // and the table is read no more.
+    const f = try m.addFunction(.{ .name = "f", .ty = try m.fnType(float_ty, &.{}), .num_blocks = 1 });
+    const idx = try m.addInst(f, .{ .ty = i32_ty, .op = .{ .binop = .{ .op = .add, .lhs = try m.constInt(32, 1), .rhs = try m.constInt(32, 1) } } });
+    const indices = try m.allocator().dupe(Value, &.{ try m.constInt(32, 0), idx });
+    const p = try m.addInst(f, .{ .ty = try m.ptrType(i32_ty), .op = .{ .gep = .{ .elem = arr, .ptr = t, .indices = indices } } });
+    const x = try m.addInst(f, .{ .ty = i32_ty, .op = .{ .load = .{ .ptr = p, .@"align" = 4 } } });
+    const y = try m.addInst(f, .{ .ty = float_ty, .op = .{ .cast = .{ .op = .sitofp, .val = x } } });
+    _ = try m.addInst(f, .{ .ty = try m.getType(.void), .op = .{ .ret = y } });
+    try run(arena.allocator(), &m, f, &.empty);
+    const insts = m.functions.items[f].insts.items;
+    try std.testing.expectEqual(@as(usize, 1), insts.len);
+    const r = insts[0].op.ret.?;
+    try std.testing.expect(r == .constant);
+    try std.testing.expectEqual(@as(u64, @as(u32, @bitCast(@as(f32, 7.0)))), m.constants.items[r.constant].kind.float_bits);
 }
