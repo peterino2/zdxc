@@ -1328,16 +1328,40 @@ const Emitter = struct {
         return null;
     }
 
+    /// Global indices in declaration order (as dxc numbers and binds
+    /// resources), then any globals with no declaration in first-use order.
+    fn declarationOrder(e: *Emitter) Error![]const u32 {
+        const n = e.m.globals.items.len;
+        const seen = try e.arena.alloc(bool, n);
+        @memset(seen, false);
+        var order: std.ArrayList(u32) = .empty;
+        for (e.m.binding_decls.items) |bd| {
+            if (bd.global) |g| if (g < n and !seen[g]) {
+                seen[g] = true;
+                try order.append(e.arena, g);
+            };
+            for (bd.members) |mb| if (mb.global) |g| if (g < n and !seen[g]) {
+                seen[g] = true;
+                try order.append(e.arena, g);
+            };
+        }
+        for (0..n) |gi| if (!seen[gi]) try order.append(e.arena, @intCast(gi));
+        return order.items;
+    }
+
     fn collectResources(e: *Emitter) Error!void {
         var counts = [_]u32{ 0, 0, 0, 0 };
-        // Constant buffers: `$Globals` first, then the others in order.
-        for ([_]bool{ true, false }) |globals_pass| for (e.m.globals.items, 0..) |g, gi| {
+        const order = try e.declarationOrder();
+        // Constant buffers: `$Globals` first, then the others in declaration order.
+        for ([_]bool{ true, false }) |globals_pass| for (order) |gi| {
+            const g = e.m.globals.items[gi];
             if (g.space != .cbuffer or g.tbuffer or std.mem.eql(u8, g.name, "$Globals") != globals_pass) continue;
             try e.resources.append(e.arena, .{ .global = @intCast(gi), .class = .cbuffer, .id = counts[2], .kind = 13, .elem = g.ty });
             counts[2] += 1;
             try e.resource_of_global.put(e.arena, @intCast(gi), @intCast(e.resources.items.len - 1));
         };
-        for (e.m.globals.items, 0..) |g, gi| {
+        for (order) |gi| {
+            const g = e.m.globals.items[gi];
             if (g.tbuffer) {
                 // tbuffer blocks: SRVs (TBuffer) laid out like cbuffers.
                 try e.resources.append(e.arena, .{ .global = @intCast(gi), .class = .srv, .id = counts[0], .kind = 15, .elem = g.ty });
