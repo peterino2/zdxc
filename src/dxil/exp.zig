@@ -1,5 +1,7 @@
 //! EXPERIMENT (not for landing): knobs for measuring what the GPU driver's
 //! pipeline compile time depends on, set by `-zdxc-exp=<knob>,<knob>,...`.
+//! VALIDATION BUILD: meld, meld_nohoist and opaque_trip are on by default
+//! (knobs only turn things on, so -zdxc-exp= cannot turn them off).
 //!   noopt_flag      set the DisableOptimizations shader flag (bit 0)
 //!   wave32, wave64  give compute shaders without [WaveSize] that size
 //!   unroll_none     unroll no loops
@@ -27,16 +29,16 @@ pub const Exp = struct {
     wave: u32 = 0,
     unroll: Unroll = .all,
     nocse: bool = false,
-    meld: bool = false,
+    meld: bool = true,
     meld_log: bool = false,
     meld_any: bool = false,
     meld_nopack: bool = false,
-    meld_nohoist: bool = false,
+    meld_nohoist: bool = true,
     meld_hoistonly: bool = false,
     ifconv: u32 = 0,
     meld_noholes: bool = false,
     meld_debug: bool = false,
-    opaque_trip: bool = false,
+    opaque_trip: bool = true,
     opaque_trip_all: bool = false,
     meld_min: u32 = 64,
 
