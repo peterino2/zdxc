@@ -69,4 +69,5 @@ test {
     _ = @import("diag.zig");
     _ = @import("options.zig");
     _ = @import("dxil/promote.zig");
+    _ = @import("dxil/meld.zig");
 }

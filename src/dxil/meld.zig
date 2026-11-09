@@ -2226,14 +2226,16 @@ pub fn packPhis(a: Allocator, m: *module.Module, func: u32) Allocator.Error!bool
 /// is constant, so it no longer knows the trip count. True if any
 /// changed.
 pub fn opaqueTrips(a: Allocator, m: *module.Module, func: u32) Allocator.Error!bool {
+    const i32_ty = try m.intType(32);
+    const i8_ty = try m.intType(8);
+    const fname = "dx.op.waveActiveOp.i32";
+    // (Declared before `f` is taken: adding a function can move the module's
+    // function list, and the edits would go to the old copy.)
+    const callee = m.findFunction(fname) orelse try m.addFunction(.{ .name = fname, .ty = try m.fnType(i32_ty, &.{ i32_ty, i32_ty, i8_ty, i8_ty }), .attrs = .nounwind });
     const f = &m.functions.items[func];
     const insts = f.insts.items;
     const g = (try build(a, insts, f.num_blocks, true)) orelse return false;
     var e = try Editor.init(a, m, insts, g.block_start, g.nb);
-    const i32_ty = try m.intType(32);
-    const i8_ty = try m.intType(8);
-    const fname = "dx.op.waveActiveOp.i32";
-    const callee = m.findFunction(fname) orelse try m.addFunction(.{ .name = fname, .ty = try m.fnType(i32_ty, &.{ i32_ty, i32_ty, i8_ty, i8_ty }), .attrs = .nounwind });
     const ma = m.allocator();
     var changed = false;
     // (Only loops that write memory other threads can see, as ShaderPrint's
@@ -2328,4 +2330,39 @@ fn addrSpace(m: *const module.Module, insts: []const Inst, v: Value) u32 {
         .pointer => |p| p.addr_space,
         else => 0,
     };
+}
+
+test "opaque_trip keeps its edits when declaring the wave op moves the function list" {
+    // for (i = 0; i < 4; i++) bufferStore(0, i), in a module whose function
+    // list is full, so that declaring dx.op.waveActiveOp.i32 moves it.
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    var m: module.Module = .init(std.testing.allocator);
+    defer m.deinit();
+    const ma = m.allocator();
+    const i32_ty = try m.intType(32);
+    const i1_ty = try m.intType(1);
+    const void_ty = try m.getType(.void);
+    const store = try m.addFunction(.{ .name = "dx.op.bufferStore.i32", .ty = try m.fnType(void_ty, &.{ i32_ty, i32_ty }), .attrs = .nounwind });
+    const f = try m.addFunction(.{ .name = "f", .ty = try m.fnType(void_ty, &.{}), .num_blocks = 3 });
+    const zero = try m.constInt(32, 0);
+    _ = try m.addInst(f, .{ .ty = void_ty, .op = .{ .br = .{ .then = 1 } } });
+    const i = try m.addInst(f, .{ .ty = i32_ty, .op = .{ .phi = .{ .incoming = &.{} } } });
+    _ = try m.addInst(f, .{ .ty = void_ty, .op = .{ .call = .{ .callee = store, .args = try ma.dupe(Value, &.{ zero, i }) } } });
+    const n = try m.addInst(f, .{ .ty = i32_ty, .op = .{ .binop = .{ .op = .add, .lhs = i, .rhs = try m.constInt(32, 1) } } });
+    const c = try m.addInst(f, .{ .ty = i1_ty, .op = .{ .cmp = .{ .pred = 36, .lhs = n, .rhs = try m.constInt(32, 4) } } });
+    _ = try m.addInst(f, .{ .ty = void_ty, .op = .{ .br = .{ .then = 1, .@"else" = 2, .cond = c } } });
+    _ = try m.addInst(f, .{ .ty = void_ty, .op = .{ .ret = null } });
+    m.functions.items[f].insts.items[i.inst].op.phi.incoming = try ma.dupe(Edge, &.{ .{ .val = zero, .block = 0 }, .{ .val = n, .block = 1 } });
+    while (m.functions.items.len < m.functions.capacity) _ = try m.addFunction(.{ .name = "pad", .ty = try m.fnType(void_ty, &.{}) });
+    const list = m.functions.items.ptr;
+    try std.testing.expect(try opaqueTrips(arena.allocator(), &m, f));
+    try std.testing.expect(m.functions.items.ptr != list);
+    const wave = m.findFunction("dx.op.waveActiveOp.i32").?;
+    var calls: u32 = 0;
+    for (m.functions.items[f].insts.items) |inst| switch (inst.op) {
+        .call => |cl| calls += @intFromBool(cl.callee == wave),
+        else => {},
+    };
+    try std.testing.expectEqual(1, calls);
 }
