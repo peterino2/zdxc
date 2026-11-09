@@ -2289,22 +2289,28 @@ fn inLoop(g: *const Graph, b: u32, h: u32) bool {
     return false;
 }
 
-/// Whether the loop at header `h` writes memory other threads can see: a
-/// store to groupshared memory, an atomic (DXIL has them only on
-/// groupshared), or a dx.op buffer or texture store, atomic or counter
-/// update. Stores to private memory (allocas, static arrays) don't count.
+/// Whether the loop at header `h` writes memory other threads can see
+/// (`sharedWrite`).
 fn loopWrites(g: *const Graph, m: *const module.Module, insts: []const Inst, h: u32) bool {
     for (0..g.nb) |xi| {
         const x: u32 = @intCast(xi);
         if (!g.reachable(x) or !inLoop(g, x, h)) continue;
-        for (insts[g.block_start[x]..g.block_start[x + 1]]) |inst| switch (inst.op) {
-            .store => |s| if (addrSpace(m, insts, s.ptr) == 3) return true,
-            .atomicrmw, .cmpxchg => return true,
-            .call => |c| if (visibleWrite(m.functions.items[c.callee].name)) return true,
-            else => {},
-        };
+        for (insts[g.block_start[x]..g.block_start[x + 1]]) |inst| if (sharedWrite(m, insts, inst)) return true;
     }
     return false;
+}
+
+/// Whether `inst` writes memory other threads can see: a store to
+/// groupshared memory, an atomic (DXIL has them only on groupshared), or a
+/// dx.op buffer or texture store, atomic or counter update. Stores to
+/// private memory (allocas, static arrays) don't count.
+pub fn sharedWrite(m: *const module.Module, insts: []const Inst, inst: Inst) bool {
+    return switch (inst.op) {
+        .store => |s| addrSpace(m, insts, s.ptr) == 3,
+        .atomicrmw, .cmpxchg => true,
+        .call => |c| visibleWrite(m.functions.items[c.callee].name),
+        else => false,
+    };
 }
 
 /// Whether the function named `name` is a dx.op call that writes memory

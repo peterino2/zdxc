@@ -25,6 +25,8 @@ const Allocator = std.mem.Allocator;
 const module = @import("module.zig");
 const stats = @import("../stats.zig");
 const promote = @import("promote.zig");
+const meld = @import("meld.zig");
+const exp = @import("exp.zig");
 
 const Value = module.Value;
 const Inst = module.Inst;
@@ -539,11 +541,17 @@ fn unrollOne(a: Allocator, m: *module.Module, func: u32, budget: *usize, tried: 
                 if (other_marked and !tried.contains(other.h)) continue :candidates;
             };
             try tried.put(a, h, {});
-            switch (@import("exp.zig").cur.unroll) {
+            switch (exp.cur.unroll) {
                 .all => {},
                 .marked => if (!marked_loop) continue,
                 .none => continue,
             }
+            // Without `[unroll]`, not the loops opaque_trip hides the trip
+            // counts of, when they use no local arrays: ShaderPrint's, one
+            // per string it prints. Unrolled, they cost the driver's compile
+            // time for little at run time. (Loops over local arrays still
+            // pay: unrolled, the arrays become registers.)
+            if (!marked_loop and exp.cur.opaque_trip and !exp.cur.unroll_writes and sharedWritesOnly(m, insts, &cfg, &lp.body)) continue;
 
             // Ways out: blocks branching out of the loop. Without `[unroll]`,
             // one (a conditional branch, to one block).
@@ -833,6 +841,42 @@ fn unrollOne(a: Allocator, m: *module.Module, func: u32, budget: *usize, tried: 
         }
     }
     return false;
+}
+
+/// Whether a loop writes memory other threads can see (`meld.sharedWrite`)
+/// and reads and writes no private memory but static const tables:
+/// unrolled, it would only repeat its writes, with no local array for
+/// promotion to take out of memory.
+fn sharedWritesOnly(m: *const module.Module, insts: []const Inst, cfg: *const Cfg, body: *const Body) bool {
+    var writes = false;
+    for (body.blocks) |bb| for (insts[cfg.block_start[bb]..cfg.block_start[bb + 1]]) |inst| {
+        if (meld.sharedWrite(m, insts, inst)) writes = true;
+        const ptr = switch (inst.op) {
+            .load => |l| l.ptr,
+            .store => |s| s.ptr,
+            else => continue,
+        };
+        if (privateArray(m, insts, ptr)) return false;
+    };
+    return writes;
+}
+
+/// Whether pointer `v` may point into a local array or a static array that
+/// is not a const table (true when it is chosen between pointers).
+fn privateArray(m: *const module.Module, insts: []const Inst, v: Value) bool {
+    var p = v;
+    while (true) switch (p) {
+        .inst => |i| switch (insts[i].op) {
+            .gep => |g| p = g.ptr,
+            .cast => |c| p = c.val,
+            else => return true, // an alloca, a phi or a select
+        },
+        .global => |gi| {
+            const g = m.globals.items[gi];
+            return g.addr_space == 0 and !g.constant;
+        },
+        else => return false,
+    };
 }
 
 /// For a loop with several ways out: null when nothing after the loop reads
@@ -1151,5 +1195,43 @@ pub fn operandsMap(a: Allocator, inst: *Inst, ctx: anytype) Allocator.Error!void
             S.one(ctx, &x.val);
             S.one(ctx, &x.index);
         },
+    }
+}
+
+test "a loop that only writes memory other threads see is left rolled" {
+    // for (i = 0; i < 4; i++) bufferStore(0, x): unrolled when `[unroll]`,
+    // with unroll_writes, or when x is read from a local array at [i].
+    const was = exp.cur;
+    defer exp.cur = was;
+    const Case = enum { plain, marked, unroll_writes, local };
+    for ([_]Case{ .plain, .marked, .unroll_writes, .local }) |case| {
+        var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+        defer arena.deinit();
+        var m: module.Module = .init(std.testing.allocator);
+        defer m.deinit();
+        exp.cur = .{ .unroll_writes = case == .unroll_writes };
+        const ma = m.allocator();
+        const i32_ty = try m.intType(32);
+        const i1_ty = try m.intType(1);
+        const void_ty = try m.getType(.void);
+        const arr_ty = try m.getType(.{ .array = .{ .len = 4, .elem = i32_ty } });
+        const store = try m.addFunction(.{ .name = "dx.op.bufferStore.i32", .ty = try m.fnType(void_ty, &.{ i32_ty, i32_ty }), .attrs = .nounwind });
+        const f = try m.addFunction(.{ .name = "f", .ty = try m.fnType(void_ty, &.{}), .num_blocks = 3 });
+        const zero = try m.constInt(32, 0);
+        const arr = try m.addInst(f, .{ .ty = try m.ptrType(arr_ty), .op = .{ .alloca = .{ .elem = arr_ty, .size = try m.constInt(32, 1) } } });
+        _ = try m.addInst(f, .{ .ty = void_ty, .op = .{ .br = .{ .then = 1 } } });
+        const i = try m.addInst(f, .{ .ty = i32_ty, .op = .{ .phi = .{ .incoming = &.{} } } });
+        var x = i;
+        if (case == .local) {
+            const p = try m.addInst(f, .{ .ty = try m.ptrType(i32_ty), .op = .{ .gep = .{ .elem = arr_ty, .ptr = arr, .indices = try ma.dupe(Value, &.{ zero, i }) } } });
+            x = try m.addInst(f, .{ .ty = i32_ty, .op = .{ .load = .{ .ptr = p, .@"align" = 4 } } });
+        }
+        _ = try m.addInst(f, .{ .ty = void_ty, .op = .{ .call = .{ .callee = store, .args = try ma.dupe(Value, &.{ zero, x }) } } });
+        const n = try m.addInst(f, .{ .ty = i32_ty, .op = .{ .binop = .{ .op = .add, .lhs = i, .rhs = try m.constInt(32, 1) } } });
+        const c = try m.addInst(f, .{ .ty = i1_ty, .op = .{ .cmp = .{ .pred = 36, .lhs = n, .rhs = try m.constInt(32, 4) } } });
+        _ = try m.addInst(f, .{ .ty = void_ty, .op = .{ .br = .{ .then = 1, .@"else" = 2, .cond = c } }, .md = if (case == .marked) .unroll else .none });
+        _ = try m.addInst(f, .{ .ty = void_ty, .op = .{ .ret = null } });
+        m.functions.items[f].insts.items[i.inst].op.phi.incoming = try ma.dupe(Edge, &.{ .{ .val = zero, .block = 0 }, .{ .val = n, .block = 1 } });
+        try std.testing.expectEqual(case != .plain, try run(arena.allocator(), &m, f));
     }
 }
