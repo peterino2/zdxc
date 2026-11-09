@@ -1023,11 +1023,16 @@ pub const Preprocessor = struct {
                 i -= 1;
                 const frame = pp.includes.items[i];
                 if (frame.dir.len == 0) continue; // predefines pseudo-file
-                const p = try std.fs.path.join(pp.arena, &.{ frame.dir, spelled });
+                // Joined with '/' on every OS, as dxc (clang) joins a quoted
+                // include onto its includer's directory: on Windows too the
+                // file is "./sub/b.h" in diagnostics and __FILE__.
+                const sep: []const u8 = if (std.fs.path.isSep(frame.dir[frame.dir.len - 1])) "" else "/";
+                const p = try std.mem.concat(pp.arena, u8, &.{ frame.dir, sep, spelled });
                 if (try pp.sm.load(p)) |id| return id;
             }
         }
         for (pp.opts.include_dirs) |dir| {
+            // With the OS's separator, as dxc joins -I directories.
             const p = try std.fs.path.join(pp.arena, &.{ dir, spelled });
             if (try pp.sm.load(p)) |id| return id;
         }
@@ -1564,6 +1569,18 @@ test "quoted includes search the include stack innermost first, then -I" {
     }, "#include \"sub/b.h\"\n", .{ .include_dirs = &.{"inc"} });
     defer t.deinit();
     try std.testing.expectEqualStrings("f_sub g_main a_inc", try t.output());
+    try std.testing.expectEqual(@as(u32, 0), t.diags.error_count);
+}
+
+test "an included file's path is its includer's directory, '/', the spelling" {
+    // As dxc names it on every OS (`dxc -P` on Windows writes "./sub/f.h").
+    var t: TestPP = .{};
+    try t.init(&.{
+        .{ "./sub/f.h", "#include \"g.h\"\n__FILE__" },
+        .{ "./sub/g.h", "__FILE__" },
+    }, "#include \"sub/f.h\"\n", .{});
+    defer t.deinit();
+    try std.testing.expectEqualStrings("\"./sub/g.h\" \"./sub/f.h\"", try t.output());
     try std.testing.expectEqual(@as(u32, 0), t.diags.error_count);
 }
 
