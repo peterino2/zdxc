@@ -65,4 +65,5 @@ test {
     std.testing.refAllDecls(spirv);
     _ = @import("diag.zig");
     _ = @import("options.zig");
+    _ = @import("dxil/promote.zig");
 }
