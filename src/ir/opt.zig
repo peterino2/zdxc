@@ -613,7 +613,10 @@ fn unrollOne(a: Allocator, t: *TypeTable, f: *ir.Function, h: u32, set: []const 
     }
     var v = init orelse return false;
 
-    const wanted = lp.unroll == .unroll or hasTexelOffsets(t, f, set);
+    // EXPERIMENT (dxil/exp.zig): unroll_none keeps only the unrolling texel
+    // offsets need (they must be constants).
+    const texel = hasTexelOffsets(t, f, set);
+    const wanted = (lp.unroll == .unroll and @import("../dxil/exp.zig").cur.unroll != .none) or texel;
     if (!wanted) return false;
     const limit: usize = if (lp.unroll == .unroll) unroll_limit else auto_unroll_limit;
     const cond = cb.term.cond_br.cond;

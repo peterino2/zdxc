@@ -147,9 +147,10 @@ const State = struct {
         if (t != .br or t.br.@"else" != null or t.br.then != m) return false;
         const items = s.body[b].items;
         var total: u32 = 0;
+        const limit: u32 = if (@import("exp.zig").cur.ifconv != 0) @import("exp.zig").cur.ifconv else max_arm_cost;
         for (items[0 .. items.len - 1]) |i| {
             total += s.cost(s.insts[i]) orelse return false;
-            if (total > max_arm_cost) return false;
+            if (total > limit) return false;
         }
         return true;
     }
@@ -164,6 +165,9 @@ const State = struct {
             },
             .cast => |c| if (c.op == .bitcast) 0 else 1,
             .cmp, .select, .extractvalue, .extractelement, .insertelement => 1,
+            // (EXPERIMENT: with -zdxc-exp=ifconv=N, math dx.op calls too:
+            // no effects, no memory.)
+            .call => |c| if (@import("exp.zig").cur.ifconv != 0 and s.m.functions.items[c.callee].attrs == .nounwind_readnone) 2 else null,
             else => null,
         };
     }

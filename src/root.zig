@@ -27,6 +27,7 @@ pub const dxil = struct {
     pub const shader = @import("dxil/shader.zig");
     pub const signature = @import("dxil/signature.zig");
     pub const emit = @import("dxil/emit.zig");
+    pub const exp = @import("dxil/exp.zig");
     pub const rootsig = @import("dxil/rootsig.zig");
     pub const reflect = @import("dxil/reflect.zig");
 };
@@ -59,6 +60,8 @@ test {
     const std = @import("std");
     std.testing.refAllDecls(front);
     std.testing.refAllDecls(dxil);
+    _ = @import("dxil/sccp.zig");
+    _ = @import("dxil/cse.zig");
     std.testing.refAllDecls(ir);
     _ = @import("sema/types.zig");
     _ = @import("sema/sema.zig");

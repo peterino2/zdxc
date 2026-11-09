@@ -1705,11 +1705,29 @@ const Emitter = struct {
             // merged, bypassed, and if-converted.
             // (What that leaves dead, or folds, and the blocks that leaves
             // empty: again, until nothing changes.)
-            _ = try cse.run(e.arena, &e.dm, func);
+            if (!@import("exp.zig").cur.nocse) _ = try cse.run(e.arena, &e.dm, func);
             var passes: u32 = 0;
             while (passes < 3 and try cfg.run(e.arena, &e.dm, func)) : (passes += 1) {
                 try promote.run(e.arena, &e.dm, func, &.empty);
             }
+            if (@import("exp.zig").cur.meld) {
+                var melds: u32 = 0;
+                while (melds < 64 and try @import("meld.zig").run(e.arena, &e.dm, func)) : (melds += 1) {
+                    try promote.run(e.arena, &e.dm, func, &.empty);
+                }
+                if (melds > 0) {
+                    if (!@import("exp.zig").cur.meld_nopack and try @import("meld.zig").packPhis(e.arena, &e.dm, func))
+                        try promote.run(e.arena, &e.dm, func, &.empty);
+                    _ = try cse.run(e.arena, &e.dm, func);
+                    passes = 0;
+                    while (passes < 3 and try cfg.run(e.arena, &e.dm, func)) : (passes += 1) {
+                        try promote.run(e.arena, &e.dm, func, &.empty);
+                    }
+                    try @import("meld.zig").cleanUndef(e.arena, &e.dm, func);
+                    try promote.run(e.arena, &e.dm, func, &.empty);
+                }
+            }
+            if (@import("exp.zig").cur.opaque_trip and try @import("meld.zig").opaqueTrips(e.arena, &e.dm, func)) e.uses_wave = true;
         } else if (e.promote_only) {
             try promote.run(e.arena, &e.dm, func, &ranges);
         }
@@ -3926,13 +3944,15 @@ const Emitter = struct {
             const ar: u32 = if (as.kind == .vector) 1 else as.rows;
             const ak: u32 = as.cols;
             const bc: u32 = if (bs.kind == .vector) 1 else bs.cols;
+            // A multiply, then multiply-adds onto it (FMad / UMad / IMad),
+            // as dxc's matrix lowering accumulates.
+            const mad_op: i64 = if (rc.isFloat()) 46 else if (rc.isUnsigned()) 49 else 48;
             for (0..ar) |ii| for (0..bc) |j| {
                 var acc: ?Value = null;
                 for (0..ak) |kk| {
                     const x = a[0][ii * ak + kk];
                     const y = if (bs.kind == .vector) a[1][kk] else a[1][kk * bc + j];
-                    const p = try e.add(rt, .{ .binop = .{ .op = .mul, .lhs = x, .rhs = y } });
-                    acc = if (acc) |s0| try e.add(rt, .{ .binop = .{ .op = .add, .lhs = s0, .rhs = p } }) else p;
+                    acc = if (acc) |s0| try e.tertiaryOp(mad_op, x, y, s0, rt) else try e.add(rt, .{ .binop = .{ .op = .mul, .lhs = x, .rhs = y } });
                 }
                 out[ii * bc + j] = acc.?;
             };
@@ -4284,14 +4304,18 @@ const Emitter = struct {
                 return em.dm.constant(.{ .ty = try em.dm.intType(8), .kind = .{ .int = v } });
             }
         }.f;
-        const Nullary = struct { name: []const u8, op: i64, fname: []const u8, ret_bool: bool };
+        // Attributes as dxc's op table has them: WaveIsFirstLane depends
+        // on which lanes are active, a lane's index never changes
+        // (readonly, which cse.zig merges), and the wave's width is a
+        // constant (readnone).
+        const Nullary = struct { name: []const u8, op: i64, fname: []const u8, ret_bool: bool, attrs: module.FnAttrs };
         for ([_]Nullary{
-            .{ .name = "WaveIsFirstLane", .op = 110, .fname = "dx.op.waveIsFirstLane", .ret_bool = true },
-            .{ .name = "WaveGetLaneIndex", .op = 111, .fname = "dx.op.waveGetLaneIndex", .ret_bool = false },
-            .{ .name = "WaveGetLaneCount", .op = 112, .fname = "dx.op.waveGetLaneCount", .ret_bool = false },
+            .{ .name = "WaveIsFirstLane", .op = 110, .fname = "dx.op.waveIsFirstLane", .ret_bool = true, .attrs = .nounwind },
+            .{ .name = "WaveGetLaneIndex", .op = 111, .fname = "dx.op.waveGetLaneIndex", .ret_bool = false, .attrs = .nounwind_readonly },
+            .{ .name = "WaveGetLaneCount", .op = 112, .fname = "dx.op.waveGetLaneCount", .ret_bool = false, .attrs = .nounwind_readnone },
         }) |w| if (eq(u8, name, w.name)) {
             const rt = if (w.ret_bool) i1t else i32t;
-            out[0] = try e.callOp(try e.dxOp(w.fname, rt, &.{i32t}, .nounwind), rt, &.{try e.i32Const(w.op)});
+            out[0] = try e.callOp(try e.dxOp(w.fname, rt, &.{i32t}, w.attrs), rt, &.{try e.i32Const(w.op)});
             return true;
         };
         // Bool reductions over the wave.
@@ -6942,6 +6966,7 @@ const Emitter = struct {
         var flags: u64 = 0;
         const live = e.liveUses();
         if (e.uses_double) flags |= 1 << 2;
+        if (@import("exp.zig").cur.noopt_flag) flags |= 1;
         // ForceEarlyDepthStencil: `[earlydepthstencil]`. (Without it the
         // depth test waits for the shader: every hidden fragment shaded.)
         if (e.entry.stage == .pixel and e.entry.early_depth_stencil) flags |= 1 << 3;
