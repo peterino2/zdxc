@@ -234,6 +234,7 @@ fn parseArgs(ctx: *Ctx, arena: std.mem.Allocator, args: []const []const u8) !?Op
                 .zdxc_sema => opts.sema = true,
                 .zdxc_ir => opts.dump_ir = true,
                 .zdxc_no_opt => opts.no_opt = true,
+                .zdxc_exp => zdxc.dxil.exp.cur = zdxc.dxil.exp.Exp.parse(a.value()),
                 .job => opts.job = a.value(),
                 .fcolor_diagnostics => opts.color = true,
                 .fno_color_diagnostics => opts.color = false,
@@ -573,6 +574,9 @@ fn run(ctx: *Ctx, arena: std.mem.Allocator) !void {
                 // root signature from it, as dxc.)
                 const text = try rootSignatureMacroText(ctx, arena, opts, input, macro, false) orelse return error.CompileFailed;
                 if (text.len > 0) m.entries.items[0].root_signature = text;
+            };
+            if (zdxc.dxil.exp.cur.wave != 0 and profile.?.minor >= 6) for (m.entries.items) |*en| {
+                if (en.stage == .compute and en.wave_size[0] == 0) en.wave_size = .{ zdxc.dxil.exp.cur.wave, 0, 0 };
             };
             const zd = stats.begin(.dxil);
             const dxil_out = zdxc.dxil.emit.emitWithReflectionAt(arena, m, profile.?, &diags, if (opts.no_opt) .none else if (opts.opt_level == .od) .debug else .full) catch |err| switch (err) {

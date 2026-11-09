@@ -27,6 +27,7 @@ pub const dxil = struct {
     pub const shader = @import("dxil/shader.zig");
     pub const signature = @import("dxil/signature.zig");
     pub const emit = @import("dxil/emit.zig");
+    pub const exp = @import("dxil/exp.zig");
     pub const rootsig = @import("dxil/rootsig.zig");
     pub const reflect = @import("dxil/reflect.zig");
 };

@@ -539,6 +539,11 @@ fn unrollOne(a: Allocator, m: *module.Module, func: u32, budget: *usize, tried: 
                 if (other_marked and !tried.contains(other.h)) continue :candidates;
             };
             try tried.put(a, h, {});
+            switch (@import("exp.zig").cur.unroll) {
+                .all => {},
+                .marked => if (!marked_loop) continue,
+                .none => continue,
+            }
 
             // Ways out: blocks branching out of the loop. Without `[unroll]`,
             // one (a conditional branch, to one block).

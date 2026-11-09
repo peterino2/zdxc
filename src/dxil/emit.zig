@@ -1705,11 +1705,29 @@ const Emitter = struct {
             // merged, bypassed, and if-converted.
             // (What that leaves dead, or folds, and the blocks that leaves
             // empty: again, until nothing changes.)
-            _ = try cse.run(e.arena, &e.dm, func);
+            if (!@import("exp.zig").cur.nocse) _ = try cse.run(e.arena, &e.dm, func);
             var passes: u32 = 0;
             while (passes < 3 and try cfg.run(e.arena, &e.dm, func)) : (passes += 1) {
                 try promote.run(e.arena, &e.dm, func, &.empty);
             }
+            if (@import("exp.zig").cur.meld) {
+                var melds: u32 = 0;
+                while (melds < 64 and try @import("meld.zig").run(e.arena, &e.dm, func)) : (melds += 1) {
+                    try promote.run(e.arena, &e.dm, func, &.empty);
+                }
+                if (melds > 0) {
+                    if (!@import("exp.zig").cur.meld_nopack and try @import("meld.zig").packPhis(e.arena, &e.dm, func))
+                        try promote.run(e.arena, &e.dm, func, &.empty);
+                    _ = try cse.run(e.arena, &e.dm, func);
+                    passes = 0;
+                    while (passes < 3 and try cfg.run(e.arena, &e.dm, func)) : (passes += 1) {
+                        try promote.run(e.arena, &e.dm, func, &.empty);
+                    }
+                    try @import("meld.zig").cleanUndef(e.arena, &e.dm, func);
+                    try promote.run(e.arena, &e.dm, func, &.empty);
+                }
+            }
+            if (@import("exp.zig").cur.opaque_trip and try @import("meld.zig").opaqueTrips(e.arena, &e.dm, func)) e.uses_wave = true;
         } else if (e.promote_only) {
             try promote.run(e.arena, &e.dm, func, &ranges);
         }
@@ -6948,6 +6966,7 @@ const Emitter = struct {
         var flags: u64 = 0;
         const live = e.liveUses();
         if (e.uses_double) flags |= 1 << 2;
+        if (@import("exp.zig").cur.noopt_flag) flags |= 1;
         // ForceEarlyDepthStencil: `[earlydepthstencil]`. (Without it the
         // depth test waits for the shader: every hidden fragment shaded.)
         if (e.entry.stage == .pixel and e.entry.early_depth_stencil) flags |= 1 << 3;
