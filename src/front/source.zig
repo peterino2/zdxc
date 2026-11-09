@@ -58,9 +58,30 @@ pub const FileSystem = struct {
     }
 };
 
-/// In-memory file system: path -> contents.
+/// In-memory file system: path -> contents. Paths compare as on the disk:
+/// on Windows `\` and `/` are the same separator, so a file put as
+/// "inc/a.h" reads as "inc\a.h" (the preprocessor joins -I directories with
+/// the OS's separator, as dxc does).
 pub const MemoryFs = struct {
-    files: std.StringHashMapUnmanaged([]const u8) = .empty,
+    files: std.HashMapUnmanaged([]const u8, []const u8, PathContext, std.hash_map.default_max_load_percentage) = .empty,
+
+    const PathContext = struct {
+        pub fn hash(_: PathContext, path: []const u8) u64 {
+            var h: std.hash.Wyhash = .init(0);
+            for (path) |c| h.update(&.{fold(c)});
+            return h.final();
+        }
+
+        pub fn eql(_: PathContext, a: []const u8, b: []const u8) bool {
+            if (a.len != b.len) return false;
+            for (a, b) |x, y| if (fold(x) != fold(y)) return false;
+            return true;
+        }
+
+        fn fold(c: u8) u8 {
+            return if (std.fs.path.isSep(c)) '/' else c;
+        }
+    };
 
     pub fn put(m: *MemoryFs, gpa: Allocator, path: []const u8, text: []const u8) !void {
         try m.files.put(gpa, path, text);
