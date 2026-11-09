@@ -2236,9 +2236,10 @@ pub fn opaqueTrips(a: Allocator, m: *module.Module, func: u32) Allocator.Error!b
     const callee = m.findFunction(fname) orelse try m.addFunction(.{ .name = fname, .ty = try m.fnType(i32_ty, &.{ i32_ty, i32_ty, i8_ty, i8_ty }), .attrs = .nounwind });
     const ma = m.allocator();
     var changed = false;
-    // (Only loops that write memory, as ShaderPrint's glyph loops do,
-    // unless opaque_trip_all: the driver's unrolling of sampling loops
-    // pays at run time.)
+    // (Only loops that write memory other threads can see, as ShaderPrint's
+    // glyph loops do, unless opaque_trip_all: the driver's unrolling of
+    // sampling loops, and of loops filling local arrays, which unrolled
+    // become registers, pays at run time.)
     var writes: std.AutoHashMapUnmanaged(u32, bool) = .empty;
     for (g.rpo) |b| {
         const term = insts[g.block_start[b + 1] - 1];
@@ -2286,21 +2287,45 @@ fn inLoop(g: *const Graph, b: u32, h: u32) bool {
     return false;
 }
 
-/// Whether the loop at header `h` writes memory: a store, an atomic, or a
-/// dx.op buffer or texture store.
+/// Whether the loop at header `h` writes memory other threads can see: a
+/// store to groupshared memory, an atomic (DXIL has them only on
+/// groupshared), or a dx.op buffer or texture store, atomic or counter
+/// update. Stores to private memory (allocas, static arrays) don't count.
 fn loopWrites(g: *const Graph, m: *const module.Module, insts: []const Inst, h: u32) bool {
     for (0..g.nb) |xi| {
         const x: u32 = @intCast(xi);
         if (!g.reachable(x) or !inLoop(g, x, h)) continue;
         for (insts[g.block_start[x]..g.block_start[x + 1]]) |inst| switch (inst.op) {
-            .store, .atomicrmw, .cmpxchg => return true,
-            .call => |c| {
-                const name = m.functions.items[c.callee].name;
-                if (std.mem.startsWith(u8, name, "dx.op.") and
-                    (std.mem.indexOf(u8, name, "Store") != null or std.mem.indexOf(u8, name, "atomic") != null)) return true;
-            },
+            .store => |s| if (addrSpace(m, insts, s.ptr) == 3) return true,
+            .atomicrmw, .cmpxchg => return true,
+            .call => |c| if (visibleWrite(m.functions.items[c.callee].name)) return true,
             else => {},
         };
     }
     return false;
+}
+
+/// Whether the function named `name` is a dx.op call that writes memory
+/// other threads can see.
+fn visibleWrite(name: []const u8) bool {
+    if (!std.mem.startsWith(u8, name, "dx.op.")) return false;
+    for ([_][]const u8{ "Store", "atomic", "UpdateCounter" }) |s| {
+        if (std.mem.indexOf(u8, name, s) != null) return true;
+    }
+    return false;
+}
+
+/// The address space of pointer `v` (0, private, when it has no pointer
+/// type).
+fn addrSpace(m: *const module.Module, insts: []const Inst, v: Value) u32 {
+    const ty = switch (v) {
+        .inst => |i| insts[i].ty,
+        .global => |gi| m.globals.items[gi].ptr_ty,
+        .constant => |c| m.constants.items[c].ty,
+        else => return 0,
+    };
+    return switch (m.types.items[ty]) {
+        .pointer => |p| p.addr_space,
+        else => 0,
+    };
 }

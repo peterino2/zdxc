@@ -14,6 +14,10 @@
 //!   ifconv=N        cfg if-converts arms costing up to N (default 2), math dx.op calls too
 //!   meld_noholes    melding merges only copies identical in every block (no holes)
 //!   meld_min=N      smallest region (and gain) melding merges (default 64)
+//!   meld_debug      print the regions melding considers, and why copies differ
+//!   opaque_trip     hide the trip counts of loops that write memory other
+//!                   threads can see (measuring only: it changes what the GPU runs)
+//!   opaque_trip_all hide every loop's trip count
 const std = @import("std");
 
 pub const Unroll = enum { all, marked, none };
