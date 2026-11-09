@@ -3926,13 +3926,15 @@ const Emitter = struct {
             const ar: u32 = if (as.kind == .vector) 1 else as.rows;
             const ak: u32 = as.cols;
             const bc: u32 = if (bs.kind == .vector) 1 else bs.cols;
+            // A multiply, then multiply-adds onto it (FMad / UMad / IMad),
+            // as dxc's matrix lowering accumulates.
+            const mad_op: i64 = if (rc.isFloat()) 46 else if (rc.isUnsigned()) 49 else 48;
             for (0..ar) |ii| for (0..bc) |j| {
                 var acc: ?Value = null;
                 for (0..ak) |kk| {
                     const x = a[0][ii * ak + kk];
                     const y = if (bs.kind == .vector) a[1][kk] else a[1][kk * bc + j];
-                    const p = try e.add(rt, .{ .binop = .{ .op = .mul, .lhs = x, .rhs = y } });
-                    acc = if (acc) |s0| try e.add(rt, .{ .binop = .{ .op = .add, .lhs = s0, .rhs = p } }) else p;
+                    acc = if (acc) |s0| try e.tertiaryOp(mad_op, x, y, s0, rt) else try e.add(rt, .{ .binop = .{ .op = .mul, .lhs = x, .rhs = y } });
                 }
                 out[ii * bc + j] = acc.?;
             };

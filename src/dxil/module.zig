@@ -958,7 +958,19 @@ const Encoder = struct {
                     try e.pushValueAndType(f, inst_id, b.lhs);
                     try e.pushValue(f, inst_id, b.rhs);
                     try e.push(@backingInt(b.op));
-                    if (b.flags != 0) try e.push(b.flags);
+                    // EXPERIMENT: every floating-point binop is `fast`
+                    // (LLVM 3.7's UnsafeAlgebra with the four flags it
+                    // implies), as dxc marks code that is not `precise`.
+                    const fp = switch (e.m.types.items[inst.ty]) {
+                        .half, .float, .double => true,
+                        .vector => |v| switch (e.m.types.items[v.elem]) {
+                            .half, .float, .double => true,
+                            else => false,
+                        },
+                        else => false,
+                    };
+                    const flags = if (b.flags != 0) b.flags else if (fp) @as(u32, 0x1f) else 0;
+                    if (flags != 0) try e.push(flags);
                     try e.rec(2);
                 },
                 .cast => |c| {
