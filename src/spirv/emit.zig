@@ -1560,12 +1560,11 @@ const Emitter = struct {
         const origin = struct {
             fn f(func: *const ir.Function, r: Ref) Origin {
                 var x = r;
-                while (true) switch (func.inst(x).op) {
+                var steps: usize = 0;
+                while (true) : (steps += 1) switch (func.inst(x).op) {
                     .load => |p| x = p,
                     .access => |a| x = a.base,
-                    .local_var => x = for (func.insts.items) |inst| {
-                        if (inst.op == .store and inst.op.store.ptr == x) break inst.op.store.value;
-                    } else return .none,
+                    .local_var => x = (if (steps < max_resource_steps) storedResource(func, x) else null) orelse return .none,
                     .global => |g| return .{ .global = g },
                     .param => |p| return .{ .param = .{ func, p } },
                     else => return .none,
@@ -1968,7 +1967,8 @@ const Emitter = struct {
     fn resourceBinding(e: *Emitter, a: Ref) Error!Binding {
         const f = e.f;
         var x = a;
-        while (true) switch (f.inst(x).op) {
+        var steps: usize = 0;
+        while (true) : (steps += 1) switch (f.inst(x).op) {
             .load => |p| {
                 // A read of an indexed local: its element, all indices dynamic.
                 if (e.indexed_loads.get(x.index())) |il| {
@@ -1983,9 +1983,7 @@ const Emitter = struct {
                 x = p;
             },
             // A resource local: what was stored into it.
-            .local_var => x = for (f.insts.items) |inst| {
-                if (inst.op == .store and inst.op.store.ptr == x) break inst.op.store.value;
-            } else return .{ .id = e.val(x) },
+            .local_var => x = (if (steps < max_resource_steps) storedResource(f, x) else null) orelse return .{ .id = e.val(x) },
             else => break,
         };
         switch (f.inst(x).op) {
@@ -3046,6 +3044,25 @@ const Emitter = struct {
                 else => {},
             };
         }
+    }
+
+    /// How far resourceBinding and findCounterGlobals follow resource
+    /// locals through what was stored into them (locals stored into each
+    /// other in a loop would never end).
+    const max_resource_steps = 256;
+
+    /// The resource first stored into resource local `local`, leaving out
+    /// stores of the local into itself (`r = r`), which do not say where
+    /// it comes from.
+    fn storedResource(f: *const ir.Function, local: Ref) ?Ref {
+        for (f.insts.items) |inst| {
+            if (inst.op != .store or inst.op.store.ptr != local) continue;
+            var v = inst.op.store.value;
+            while (f.inst(v).op == .load) v = f.inst(v).op.load;
+            if (v == local) continue;
+            return inst.op.store.value;
+        }
+        return null;
     }
 
     /// The global a pointer derives from, if any.
