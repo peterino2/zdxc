@@ -988,8 +988,67 @@ fn runText(a: std.mem.Allocator, args: []const []const u8, text: []const u8, sou
             req.fs = client.fileSystem();
         }
     }
+    // ZDXC_DUMP: the inputs are saved before compiling and removed after,
+    // so only a compile that brings the process down leaves them.
+    const saved = if (windows) saveInputs(a, args, text) else null;
     const c = try compile.compile(a, req);
+    if (saved) |s| saveOutput(a, s, c);
     return makeResult(c);
+}
+
+/// ZDXC_DUMP=<dir> (development, Windows): each compile's source and
+/// arguments, <dir>/<pid>-<n>.src and .args (one argument per line), are
+/// written before it runs, and its object (.obj) and diagnostics (.out)
+/// after. A process keeps its last `dump_keep` compiles, so when a client
+/// (Unreal's ShaderCompileWorker, say) crashes, in zdxc or in what it does
+/// with zdxc's output, the compiles that led to it are there to run again.
+const DumpK32 = struct {
+    extern "kernel32" fn GetEnvironmentVariableA(name: [*:0]const u8, buf: [*]u8, size: u32) callconv(.winapi) u32;
+    extern "kernel32" fn GetCurrentProcessId() callconv(.winapi) u32;
+};
+var dump_counter: std.atomic.Value(u32) = .init(0);
+
+fn saveInputs(a: std.mem.Allocator, args: []const []const u8, text: []const u8) ?[]const u8 {
+    var dir_buf: [512]u8 = undefined;
+    const n = DumpK32.GetEnvironmentVariableA("ZDXC_DUMP", &dir_buf, dir_buf.len);
+    if (n == 0 or n >= dir_buf.len) return null;
+    const id = dump_counter.fetchAdd(1, .monotonic);
+    var threaded: std.Io.Threaded = .init_single_threaded;
+    const io = threaded.io();
+    const pid = DumpK32.GetCurrentProcessId();
+    const base = std.fmt.allocPrint(a, "{s}/{d}-{d}", .{ dir_buf[0..n], pid, id }) catch return null;
+    if (id >= dump_keep) {
+        const old = std.fmt.allocPrint(a, "{s}/{d}-{d}", .{ dir_buf[0..n], pid, id - dump_keep }) catch return null;
+        removeDump(a, old);
+    }
+    var joined: std.Io.Writer.Allocating = .init(a);
+    for (args) |x| joined.writer.print("{s}\n", .{x}) catch return null;
+    for ([_][2][]const u8{ .{ ".src", text }, .{ ".args", joined.written() } }) |f| {
+        const path = std.mem.concat(a, u8, &.{ base, f[0] }) catch return null;
+        std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = f[1] }) catch return null;
+    }
+    return base;
+}
+
+const dump_keep = 4;
+
+fn saveOutput(a: std.mem.Allocator, base: []const u8, c: compile.Result) void {
+    var threaded: std.Io.Threaded = .init_single_threaded;
+    const io = threaded.io();
+    const out = std.fmt.allocPrint(a, "status {d}\n{s}", .{ @intFromEnum(c.status), c.diagnostics }) catch return;
+    for ([_][2][]const u8{ .{ ".out", out }, .{ ".obj", c.object orelse "" } }) |f| {
+        const path = std.mem.concat(a, u8, &.{ base, f[0] }) catch return;
+        std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = f[1] }) catch return;
+    }
+}
+
+fn removeDump(a: std.mem.Allocator, base: []const u8) void {
+    var threaded: std.Io.Threaded = .init_single_threaded;
+    const io = threaded.io();
+    for ([_][]const u8{ ".src", ".args", ".out", ".obj" }) |ext| {
+        const path = std.mem.concat(a, u8, &.{ base, ext }) catch return;
+        std.Io.Dir.cwd().deleteFile(io, path) catch {};
+    }
 }
 
 // ---- Utils ----------------------------------------------------------------
