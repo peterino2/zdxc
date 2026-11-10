@@ -240,6 +240,12 @@ const Emitter = struct {
     /// phi, patched when the function is done.
     labels: []const Id = &.{},
     phi_patches: std.ArrayList(struct { pos: usize, ref: Ref }) = .empty,
+    /// Phi incoming blocks: the word naming the block, patched at the end
+    /// of the function with the label the block's code ends under (the
+    /// emitter splits a block at a conditional discard, say).
+    phi_label_patches: std.ArrayList(struct { pos: usize, block: u32 }) = .empty,
+    /// Per block of the function: the label its terminator is under.
+    end_labels: []Id = &.{},
     /// OpUndef by type.
     undef_ids: std.AutoHashMapUnmanaged(TypeId, Id) = .empty,
     /// The bindings of the function being emitted (a specialization).
@@ -2174,6 +2180,9 @@ const Emitter = struct {
         for (labels) |*l| l.* = e.b.newId();
         e.labels = labels;
         e.phi_patches = .empty;
+        e.phi_label_patches = .empty;
+        e.end_labels = try e.arena.alloc(Id, f.blocks.items.len);
+        @memset(e.end_labels, 0);
 
         // Constants and parameters first (they may be used in any block).
         for (f.insts.items, 0..) |inst, i| switch (inst.op) {
@@ -2187,6 +2196,7 @@ const Emitter = struct {
         };
 
         for (order, 0..) |bi, oi| {
+            const block_start = e.b.sections.getPtr(.functions).items.len;
             try e.b.emit(.functions, .label, &.{labels[bi]});
             if (oi == 0) {
                 // OpVariables must open the first block.
@@ -2249,6 +2259,16 @@ const Emitter = struct {
                     .dont => 2,
                 } }),
             }
+            {
+                // The last label of the block's code.
+                const words = e.b.sections.getPtr(.functions).items;
+                var pos = block_start;
+                while (pos < words.len) {
+                    const wc = words[pos] >> 16;
+                    if (words[pos] & 0xffff == 248) e.end_labels[bi] = words[pos + 1]; // OpLabel
+                    pos += @max(wc, 1);
+                }
+            }
             switch (blk.term) {
                 .none, .@"unreachable" => try e.b.emit(.functions, .@"unreachable", &.{}),
                 .ret => |v| if (v == .none) {
@@ -2282,6 +2302,9 @@ const Emitter = struct {
             }
         }
         const words = e.b.sections.getPtr(.functions).items;
+        for (e.phi_label_patches.items) |p| {
+            if (e.end_labels[p.block] != 0) words[p.pos] = e.end_labels[p.block];
+        }
         for (e.phi_patches.items) |p| {
             words[p.pos] = e.val(p.ref);
             if (words[p.pos] == 0) return e.unsupported("internal: a phi names a value that is never emitted", .{});
@@ -3026,6 +3049,7 @@ const Emitter = struct {
                 for (ins) |in| {
                     const v = e.val(in.value);
                     if (v == 0) try e.phi_patches.append(e.arena, .{ .pos = base + ops.items.len, .ref = in.value });
+                    try e.phi_label_patches.append(e.arena, .{ .pos = base + ops.items.len + 1, .block = in.block.index() });
                     try ops.appendSlice(e.arena, &.{ v, e.labels[in.block.index()] });
                 }
                 try e.b.emit(.functions, .phi, ops.items);
