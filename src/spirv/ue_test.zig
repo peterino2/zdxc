@@ -317,3 +317,16 @@ test "-fspv-reflect: built-in inputs get their UserSemantic too" {
     // POSITION, SV_VertexID, SV_InstanceID, SV_Position (as dxc).
     try expectEqual(@as(usize, 4), n);
 }
+
+test "a source named by a path starting with '/' is not an option (Unreal's virtual paths)" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var threaded: std.Io.Threaded = .init_single_threaded;
+    // "/Engine/..." parsed as an argument would be /E "ngine/...".
+    for ([_][]const u8{ "/Engine/Private/HairStrands/HairStrandsSkinUpdate.usf", "" }) |name| {
+        const r = try compile.compile(a, .{ .args = &.{ "-T", "cs_6_6", "-E", "main", "-spirv" }, .source = "[numthreads(1,1,1)] void main() {}", .source_name = name, .io = threaded.io(), .compat_notes = false });
+        if (r.status != .ok) std.debug.print("{s}\n", .{r.diagnostics});
+        try std.testing.expectEqual(compile.Status.ok, r.status);
+    }
+}
