@@ -4224,7 +4224,7 @@ const Emitter = struct {
     /// components and split for 16-bit ones.
     fn rawLoad(e: *Emitter, buf: Id, base: Id, ty: TypeId) Error!Id {
         const ut = try e.t.scalar(.uint);
-        const n = e.t.componentCount(ty) orelse return e.unsupported("byte-address buffer accesses of type '{s}' are not supported yet", .{try e.t.format(e.arena, ty)});
+        const n = layout.flatCount(e.t, ty) catch return e.unsupported("byte-address buffer accesses of type '{s}' are not supported yet", .{try e.t.format(e.arena, ty)});
         const comps = try e.arena.alloc(Id, n);
         for (comps, 0..) |*c, k| {
             const rc = try e.rawComponent(ty, @intCast(k));
@@ -4254,7 +4254,7 @@ const Emitter = struct {
 
     fn rawStore(e: *Emitter, buf: Id, base: Id, ty: TypeId, v: Id) Error!void {
         const ut = try e.t.scalar(.uint);
-        const n = e.t.componentCount(ty) orelse return e.unsupported("byte-address buffer accesses of type '{s}' are not supported yet", .{try e.t.format(e.arena, ty)});
+        const n = layout.flatCount(e.t, ty) catch return e.unsupported("byte-address buffer accesses of type '{s}' are not supported yet", .{try e.t.format(e.arena, ty)});
         for (0..n) |k| {
             const rc = try e.rawComponent(ty, @intCast(k));
             const sc = rc[0];

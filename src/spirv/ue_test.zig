@@ -272,3 +272,16 @@ test "storing one component of a texel reads, updates and writes it back" {
     try expectEqual(@as(usize, 2), reads);
     try expectEqual(@as(usize, 2), writes);
 }
+
+test "byte-address loads and stores of structs with bitfields" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // (Unreal's FAnimBankBlockHeader.)
+    const src =
+        \\struct H { float Time; uint A; uint F : 16; uint G : 16; };
+        \\RWByteAddressBuffer Buf; RWStructuredBuffer<uint> O;
+        \\[numthreads(1,1,1)] void main() { H h = Buf.Load<H>(0); O[0] = h.G; h.F = 7; Buf.Store<H>(16, h); }
+    ;
+    _ = try ok(a, "cs_6_6", &.{ "-HV", "2021" }, src);
+}
