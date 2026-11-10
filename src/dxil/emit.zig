@@ -2421,6 +2421,66 @@ const Emitter = struct {
         };
     }
 
+    /// Marks branch `br`, block `bi`'s terminator, if it is the back edge of
+    /// a loop (to its header, among `targets`): of an `[unroll]` loop (from
+    /// its continue block) for the unroller; of a `[loop]` loop (from any
+    /// block inside it: a `do`/`while` with `&&` branches back from the
+    /// block testing its last part) with dxc's `!llvm.loop` unroll.disable,
+    /// for the driver.
+    fn markBackEdge(e: *Emitter, f: *const ir.Function, bi: u32, br: Value, targets: []const ir.BlockId) Error!void {
+        for (targets) |t| switch (f.blocks.items[t.index()].merge) {
+            .loop => |l| switch (l.unroll) {
+                .unroll => if (l.@"continue".index() == bi) {
+                    e.insts.at(br.inst).md = .unroll;
+                    return;
+                },
+                .dont => if (l.@"continue".index() == bi or try e.inLoop(f, t.index(), l.merge.index(), bi)) {
+                    e.insts.at(br.inst).md = try e.dm.loopDontUnroll();
+                    return;
+                },
+                .auto => {},
+            },
+            else => {},
+        };
+    }
+
+    /// Whether block `bi` is inside the loop headed by `header`: reachable
+    /// from it without passing its merge block.
+    fn inLoop(e: *Emitter, f: *const ir.Function, header: u32, merge: u32, bi: u32) Error!bool {
+        const seen = try e.arena.alloc(bool, f.blocks.items.len);
+        @memset(seen, false);
+        var stack: std.ArrayList(u32) = .empty;
+        try stack.append(e.arena, header);
+        seen[header] = true;
+        seen[merge] = true;
+        var two: [2]ir.BlockId = undefined;
+        while (stack.pop()) |b| {
+            if (b == bi) return true;
+            const succs: []const ir.BlockId = switch (f.blocks.items[b].term) {
+                .br => |s| blk: {
+                    two[0] = s;
+                    break :blk two[0..1];
+                },
+                .cond_br => |c| blk: {
+                    two = .{ c.then, c.@"else" };
+                    break :blk &two;
+                },
+                .@"switch" => |sw| blk: {
+                    const out = try e.arena.alloc(ir.BlockId, sw.cases.len + 1);
+                    out[0] = sw.default;
+                    for (sw.cases, out[1..]) |c, *o| o.* = c.block;
+                    break :blk out;
+                },
+                else => &.{},
+            };
+            for (succs) |s| if (!seen[s.index()]) {
+                seen[s.index()] = true;
+                try stack.append(e.arena, s.index());
+            };
+        }
+        return false;
+    }
+
     fn emitBlock(e: *Emitter, frame: *Frame, bi: u32) Error!void {
         const f = frame.f;
         const blk = f.blocks.items[bi];
@@ -2448,13 +2508,7 @@ const Emitter = struct {
             },
             .br => |t| {
                 const br = try e.add(void_ty, .{ .br = .{ .then = try e.blockFor(frame, t.index()) } });
-                // An `[unroll]` loop's back edge: marked for the unroller.
-                switch (f.blocks.items[t.index()].merge) {
-                    .loop => |l| if (l.unroll == .unroll and l.@"continue".index() == bi) {
-                        e.insts.at(br.inst).md = .unroll;
-                    },
-                    else => {},
-                }
+                try e.markBackEdge(f, bi, br, &.{t});
             },
             .cond_br => |c| {
                 const cond = (try e.scalars(frame, c.cond))[0];
@@ -2467,7 +2521,8 @@ const Emitter = struct {
                 };
                 const then_b = try e.blockFor(frame, c.then.index());
                 const else_b = try e.blockFor(frame, c.@"else".index());
-                _ = try e.add(void_ty, .{ .br = .{ .then = then_b, .@"else" = else_b, .cond = cond } });
+                const br = try e.add(void_ty, .{ .br = .{ .then = then_b, .@"else" = else_b, .cond = cond } });
+                try e.markBackEdge(f, bi, br, &.{ c.then, c.@"else" });
             },
             .none, .@"unreachable" => _ = try e.add(void_ty, .@"unreachable"),
             .@"switch" => |sw| {

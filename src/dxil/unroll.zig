@@ -541,6 +541,10 @@ fn unrollOne(a: Allocator, m: *module.Module, func: u32, budget: *usize, tried: 
                 if (other_marked and !tried.contains(other.h)) continue :candidates;
             };
             try tried.put(a, h, {});
+            // `[loop]`: never unrolled.
+            if (m.loop_dont_unroll != .none) for (lp.latches) |l| {
+                if (insts[cfg.block_start[l + 1] - 1].md == m.loop_dont_unroll) continue :candidates;
+            };
             switch (exp.cur.unroll) {
                 .all => {},
                 .marked => if (!marked_loop) continue,
