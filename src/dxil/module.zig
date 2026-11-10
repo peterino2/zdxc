@@ -194,6 +194,9 @@ pub const Metadata = union(enum) {
     value: struct { ty: TypeId, val: Value },
     /// Operands: null entries encode as 0 (no metadata).
     node: []const ?MdId,
+    /// A node never merged with an equal one (`distinct !{...}`), as a
+    /// loop's `!llvm.loop` id, whose first operand is itself.
+    distinct_node: []const ?MdId,
 };
 
 pub const Module = struct {
@@ -217,6 +220,9 @@ pub const Module = struct {
     inst_mds: std.ArrayList(struct { kind: u32, node: MdId }) = .empty,
     /// Instruction metadata kinds, by id.
     md_kinds: std.ArrayList([]const u8) = .empty,
+    /// The `!llvm.loop` attachment for `[loop]` loops' back edges (see
+    /// loopDontUnroll), once one is made.
+    loop_dont_unroll: InstMd = .none,
 
     pub fn init(gpa: Allocator) Module {
         return .{ .arena = .init(gpa) };
@@ -512,6 +518,20 @@ pub const Module = struct {
     pub fn mdNode(m: *Module, ops: []const ?MdId) !MdId {
         try m.metadata.append(m.allocator(), .{ .node = try m.allocator().dupe(?MdId, ops) });
         return @intCast(m.metadata.items.len - 1);
+    }
+
+    /// The attachment dxc puts on a `[loop]` loop's back edge:
+    /// `!llvm.loop !N`, `!N = distinct !{!N, !{!"llvm.loop.unroll.disable"}}`,
+    /// which tells the driver's compiler not to unroll the loop (and
+    /// zdxc's unroller, see unroll.zig). One node for all such loops: dxc
+    /// gives each loop its own, but the hint is the same.
+    pub fn loopDontUnroll(m: *Module) !InstMd {
+        if (m.loop_dont_unroll != .none) return m.loop_dont_unroll;
+        const hint = try m.mdNode(&.{try m.mdString("llvm.loop.unroll.disable")});
+        const self: MdId = @intCast(m.metadata.items.len);
+        try m.metadata.append(m.allocator(), .{ .distinct_node = try m.allocator().dupe(?MdId, &.{ self, hint }) });
+        m.loop_dont_unroll = try m.instMd(try m.mdKind("llvm.loop"), self);
+        return m.loop_dont_unroll;
     }
 
     /// The id of an instruction metadata kind.
@@ -875,6 +895,10 @@ const Encoder = struct {
                 .node => |ops| {
                     for (ops) |op| try e.push(if (op) |id| id + 1 else 0);
                     try e.rec(3);
+                },
+                .distinct_node => |ops| {
+                    for (ops) |op| try e.push(if (op) |id| id + 1 else 0);
+                    try e.rec(5); // METADATA_DISTINCT_NODE
                 },
             }
         }
