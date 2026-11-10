@@ -222,6 +222,8 @@ const Emitter = struct {
     subpass_coord: Id = 0,
     counter_vars: []Id = &.{},
     builtin_inputs: std.AutoHashMapUnmanaged(u32, Id) = .empty,
+    /// Shared builtin inputs already given their UserSemantic.
+    semantic_vars: std.AutoHashMapUnmanaged(Id, void) = .empty,
     /// Per instruction (current function): texel places (`tex[i]`).
     texel_places: std.AutoHashMapUnmanaged(u32, struct { res: Ref, coord: Ref, comp: Ref = .none }) = .empty,
     counter_type: Id = 0,
@@ -1859,6 +1861,8 @@ const Emitter = struct {
                     // One variable per input builtin, shared by its uses.
                     iface.* = .{ .var_id = try e.builtinInput(bi.?.id, ty), .ty = vty, .elem_array = e.t.get(ty) == .array, .builtin = bi.?.id };
                     if (bi.?.id == 11 or bi.?.id == 12) try e.b.emit(.annotations, .decorate, &.{ iface.var_id, 15 }); // Patch
+                    // -fspv-reflect: its semantic too, once (as dxc).
+                    if ((try e.semantic_vars.fetchPut(e.arena, iface.var_id, {})) == null) try e.userSemantic(iface.var_id, el);
                     continue;
                 }
                 const ptr = try e.pointerType(sc, try e.typeId(ty));

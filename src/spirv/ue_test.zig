@@ -302,3 +302,18 @@ test "textures of 64-bit integers (Nanite's visibility buffer)" {
     }
     try std.testing.expect(caps[0] and caps[1] and r64ui);
 }
+
+test "-fspv-reflect: built-in inputs get their UserSemantic too" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const src = "float4 main(float4 p : POSITION, uint vid : SV_VertexID, uint iid : SV_InstanceID) : SV_Position { return p + vid + iid; }";
+    const m = try ok(a, "vs_6_6", &.{"-fspv-reflect"}, src);
+    var it = m.ops();
+    var n: usize = 0;
+    while (it.next()) |i| {
+        if (i.op == 5632 and i.args[1] == 5635) n += 1; // OpDecorateString UserSemantic
+    }
+    // POSITION, SV_VertexID, SV_InstanceID, SV_Position (as dxc).
+    try expectEqual(@as(usize, 4), n);
+}
