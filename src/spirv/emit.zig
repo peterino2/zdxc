@@ -206,6 +206,11 @@ const Emitter = struct {
     /// Reads of resource locals nothing assigns: the resource of the same
     /// type each stands in with where it is used.
     undef_resources: std.AutoHashMapUnmanaged(u32, Id) = .empty,
+    /// A read of an undefined resource with no global of its type to stand
+    /// in for it was used (not only copied).
+    undef_resource_used: bool = false,
+    /// Resource locals: the value last stored into each.
+    res_src: std.AutoHashMapUnmanaged(u32, Ref) = .empty,
     /// Flattened resource arrays: a variable per element.
     flat_vars: std.AutoHashMapUnmanaged(u32, []const Id) = .empty,
     flat_iface: std.ArrayList(Id) = .empty,
@@ -859,6 +864,18 @@ const Emitter = struct {
     }
 
     /// A declared resource global of type `ty`.
+    /// A resource array (a bindless heap, say) of `ty` resources.
+    fn anyHeapOf(e: *Emitter, ty: TypeId) ?u32 {
+        for (e.m.globals.items, 0..) |g, gi| {
+            if (g.space != .resource or e.global_vars[gi] == 0) continue;
+            switch (e.t.get(g.ty)) {
+                .array => |arr| if (arr.elem == ty) return @intCast(gi),
+                else => {},
+            }
+        }
+        return null;
+    }
+
     fn anyGlobalOf(e: *Emitter, ty: TypeId) ?u32 {
         for (e.m.globals.items, 0..) |g, gi| {
             if (g.ty == ty and g.space == .resource and e.global_vars[gi] != 0) return @intCast(gi);
@@ -995,6 +1012,7 @@ const Emitter = struct {
             e.setEntry(m.functions.items[v.fi].entry);
             try e.emitFunction(m.functions.items[v.fi], v.id, v.bindings);
         }
+        if (e.undef_resource_used) return e.unsupported("a resource local read before it is assigned", .{});
 
         // An acceleration structure only declared (dxc's optimizer drops
         // it): its type needs ray queries or ray tracing.
@@ -1628,7 +1646,8 @@ const Emitter = struct {
         // counters.
         var indices: std.ArrayList(u32) = .empty;
         var x = res;
-        while (true) switch (e.f.inst(x).op) {
+        var steps: usize = 0;
+        while (true) : (steps += 1) switch (e.f.inst(x).op) {
             .load => |p| x = p,
             .access => |a| {
                 var k = a.indices.len;
@@ -1638,6 +1657,9 @@ const Emitter = struct {
                 }
                 x = a.base;
             },
+            // A resource local (Unreal's `static const` bindless handles):
+            // the resource stored into it.
+            .local_var => x = (if (steps < max_resource_steps) storedResource(e.f, x) else null) orelse break,
             else => break,
         };
         const g = e.globalOf(x) orelse return e.unsupported("counters of resources not tied to a global are not supported yet", .{});
@@ -2429,7 +2451,10 @@ const Emitter = struct {
 
     fn val(e: *Emitter, r: Ref) Id {
         const v = e.vals[r.index()];
-        if (v == 0) if (e.undef_resources.get(r.index())) |stand_in| return stand_in;
+        if (v == 0) if (e.undef_resources.get(r.index())) |stand_in| {
+            if (stand_in == 0) e.undef_resource_used = true;
+            return stand_in;
+        };
         return v;
     }
 
@@ -2509,12 +2534,26 @@ const Emitter = struct {
                             const v = f.inst(x.op.store.value);
                             if (v.op != .load or f.inst(v.op.load).op != .local_var) break false;
                         } else true;
-                        if (only_copies) if (e.anyGlobalOf(i.ty)) |g| {
-                            if (e.spv_minor >= 4) try e.useVar(e.global_vars[g]);
+                        if (only_copies) {
+                            // (No resource of its type, as when every one is
+                            // in a descriptor heap: fine while it is only
+                            // copied, as Unreal's struct copies do.)
+                            var stand_in: Id = 0;
+                            if (e.anyGlobalOf(i.ty)) |g| {
+                                if (e.spv_minor >= 4) try e.useVar(e.global_vars[g]);
+                                stand_in = e.global_vars[g];
+                            } else if (e.anyHeapOf(i.ty)) |g| {
+                                // Only bindless heaps of its type (Unreal's
+                                // ShaderPrint buffers left unset): their
+                                // first element.
+                                if (e.spv_minor >= 4) try e.useVar(e.global_vars[g]);
+                                const pt = try e.resourcePointee(i.ty);
+                                stand_in = try e.opRaw(.access_chain, try e.pointerType(pt.sc, pt.ty), &.{ e.global_vars[g], try e.constInt(0) });
+                            }
                             e.vals[ri] = 0;
-                            try e.undef_resources.put(e.arena, @intCast(ri), e.global_vars[g]);
+                            try e.undef_resources.put(e.arena, @intCast(ri), stand_in);
                             return;
-                        };
+                        }
                         return e.unsupported("a resource local read before it is assigned", .{});
                     }
                     e.vals[ri] = e.val(p);
@@ -2565,8 +2604,15 @@ const Emitter = struct {
                 if (target.op == .local_var and e.undef_resources.contains(s.value.index())) return;
                 if (target.op == .local_var and isResourceType(e.t, target.ty)) {
                     const old = e.vals[s.ptr.index()];
-                    if (old != 0 and old != e.val(s.value)) return e.unsupported("assigning different resources to one variable is not supported yet", .{});
+                    if (old != 0 and old != e.val(s.value)) {
+                        // The same resource reached again (each use of
+                        // Unreal's `static const` bindless handles
+                        // evaluates the heap access anew) is not another.
+                        const prev = e.res_src.get(s.ptr.index());
+                        if (prev == null or !e.sameResource(f, prev.?, s.value, 0)) return e.unsupported("assigning different resources to one variable is not supported yet", .{});
+                    }
                     e.vals[s.ptr.index()] = e.val(s.value);
+                    try e.res_src.put(e.arena, s.ptr.index(), s.value);
                     return;
                 }
                 if (e.ptr_layouts[s.ptr.index()]) |pl| {
@@ -3080,6 +3126,56 @@ const Emitter = struct {
                 else => {},
             };
         }
+    }
+
+    /// Whether resource values `x` and `y` are the same resource: built the
+    /// same way from the same globals, constants, constant buffer reads and
+    /// resource locals (each followed to what was stored into it).
+    fn sameResource(e: *Emitter, f: *const ir.Function, x0: Ref, y0: Ref, depth: u32) bool {
+        if (depth > 64) return false;
+        const x = resolveResourceLocal(f, x0);
+        const y = resolveResourceLocal(f, y0);
+        if (x == y) return true;
+        if (x == .none or y == .none) return false;
+        const a = f.inst(x);
+        const b = f.inst(y);
+        if (std.meta.activeTag(a.op) != std.meta.activeTag(b.op) or a.ty != b.ty) return false;
+        return switch (a.op) {
+            .constant => |c| std.meta.eql(c, b.op.constant),
+            .global => |g| g == b.op.global,
+            .param => |p| p == b.op.param,
+            // (Loads of resources, or of constant buffer members.)
+            .load => |p| blk: {
+                const ps = f.inst(p).ptr;
+                if (ps != .cbuffer and ps != .resource) break :blk false;
+                break :blk e.sameResource(f, p, b.op.load, depth + 1);
+            },
+            .access => |acc| blk: {
+                const bacc = b.op.access;
+                if (acc.indices.len != bacc.indices.len or !e.sameResource(f, acc.base, bacc.base, depth + 1)) break :blk false;
+                for (acc.indices, bacc.indices) |i, j| if (!e.sameResource(f, i, j, depth + 1)) break :blk false;
+                break :blk true;
+            },
+            .heap_resource => |h| h.sampler == b.op.heap_resource.sampler and e.sameResource(f, h.index, b.op.heap_resource.index, depth + 1),
+            else => false,
+        };
+    }
+
+    /// A resource local, or a load of one, as the value stored into it
+    /// (through any number of copies).
+    fn resolveResourceLocal(f: *const ir.Function, r: Ref) Ref {
+        var x = r;
+        var steps: usize = 0;
+        while (x != .none and steps < max_resource_steps) : (steps += 1) {
+            const i = f.inst(x);
+            const local = switch (i.op) {
+                .local_var => x,
+                .load => |p| if (f.inst(p).op == .local_var and f.inst(p).ptr == .function) p else return x,
+                else => return x,
+            };
+            x = storedResource(f, local) orelse return x;
+        }
+        return x;
     }
 
     /// How far resourceBinding and findCounterGlobals follow resource

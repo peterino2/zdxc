@@ -436,3 +436,75 @@ test "locals indexed by a dynamic component are promoted" {
     const m = try ok(a, "cs_6_6", &.{}, src);
     try expectEqual(@as(usize, 0), functionVars(m));
 }
+
+test "a static const struct holding resources (Nanite's FOutputQueue)" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const src =
+        \\struct FWorkQueueState { uint ReadOffset; uint WriteOffset; int TaskCount; };
+        \\struct FOutputQueue {
+        \\    RWByteAddressBuffer DataBuffer; RWStructuredBuffer<FWorkQueueState> StateBuffer; uint StateIndex; uint Size;
+        \\    uint Add() { uint w; InterlockedAdd(StateBuffer[StateIndex].WriteOffset, 1, w); return w; }
+        \\    void Store4(uint at, uint4 v) { DataBuffer.Store4(at, v); }
+        \\};
+        \\RWByteAddressBuffer D; RWStructuredBuffer<FWorkQueueState> S; cbuffer C { uint MaxN; };
+        \\static const FOutputQueue Q = { D, S, 0, MaxN };
+        \\[numthreads(64,1,1)] void main(uint3 id : SV_DispatchThreadID) { uint w = Q.Add(); if (w < Q.Size) Q.Store4(w * 16, uint4(id, 1)); }
+    ;
+    const m = try ok(a, "cs_6_6", &.{}, src);
+    try expectEqual(@as(usize, 1), countOp(m, 234)); // OpAtomicIAdd
+}
+
+test "a struct copied with a resource member never set" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // (Unreal's FComputeBoneMatrixInputs.SectionBoneMap; every resource of
+    // its type is in a bindless heap.)
+    const src =
+        \\struct In { Buffer<float4> M; Buffer<uint> Unused; uint Off; };
+        \\typedef Buffer<float4> SafeT; SafeT Heap[]; cbuffer C { uint o0; uint idx; };
+        \\static const SafeT S0 = Heap[idx];
+        \\RWBuffer<float4> O;
+        \\In make(Buffer<float4> b, uint off) { In r; r.M = b; r.Off = off; return r; }
+        \\float4 use(In i, uint k) { return i.M[i.Off + k]; }
+        \\[numthreads(64,1,1)] void main(uint3 id : SV_DispatchThreadID) { In x = make(S0, o0); O[id.x] = use(x, id.x); }
+    ;
+    _ = try ok(a, "cs_6_6", &.{}, src);
+    // Used, with only a heap of its type: the heap's first element.
+    const used =
+        \\struct In { Buffer<uint> Unused; uint Off; };
+        \\typedef Buffer<uint> SafeT; SafeT Heap[]; RWBuffer<uint> O;
+        \\uint use(In i) { return i.Unused[i.Off]; }
+        \\[numthreads(1,1,1)] void main() { In x; x.Off = 1; O[0] = use(x) + Heap[2][0]; }
+    ;
+    _ = try ok(a, "cs_6_6", &.{}, used);
+}
+
+test "counters of a buffer reached through a static const bindless handle" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const src =
+        \\typedef RWStructuredBuffer<uint> SafeT; SafeT Heap[]; cbuffer C { uint idx; };
+        \\static const SafeT B = Heap[idx];
+        \\[numthreads(64,1,1)] void main(uint3 id : SV_DispatchThreadID) { uint k = B.IncrementCounter(); B[k] = id.x; }
+    ;
+    const m = try ok(a, "cs_6_6", &.{ "-fvk-allow-rwstructuredbuffer-arrays", "-fspv-target-env=vulkan1.3" }, src);
+    try expectEqual(@as(usize, 1), countOp(m, 234)); // OpAtomicIAdd
+}
+
+test "the same bindless resource assigned to a variable twice" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // (Each use of a `static const` handle evaluates the heap access anew.)
+    const src =
+        \\typedef Texture2D<float4> SafeT; SafeT Heap[]; cbuffer C { uint idx; uint n; };
+        \\static const SafeT T = Heap[idx];
+        \\RWStructuredBuffer<float4> O;
+        \\[numthreads(1,1,1)] void main() { Texture2D<float4> t = T; float4 s = 0; for (uint i = 0; i < n; i++) { t = T; s += t.Load(int3(i, 0, 0)); } O[0] = s; }
+    ;
+    _ = try ok(a, "cs_6_6", &.{}, src);
+}

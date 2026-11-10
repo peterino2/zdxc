@@ -1908,7 +1908,7 @@ const Lowerer = struct {
             // initializer's, evaluated where it is used, as a local holding
             // it. (A resource does not change, so each evaluation is the
             // same resource.)
-            const val = try l.converted(init_e, v.type);
+            const val = if (init_e.kind == .init_list) try l.initList(init_e, v.type) else try l.converted(init_e, v.type);
             const local = try l.b.add(.{ .op = .local_var, .ty = try l.concrete(v.type), .ptr = .function });
             try l.b.store(local, val);
             return local;
@@ -1923,6 +1923,12 @@ const Lowerer = struct {
     fn staticResourceInit(l: *Lowerer, v: *const Variable) ?*ast.Expr {
         if (v.storage != .global_static and v.storage != .constant) return null;
         const init_e = v.init orelse return null;
+        // SPIR-V: a `static const` struct holding resources too (Nanite's
+        // `static const FOutputQueue SplitWorkQueue = { DataBuffer,
+        // StateBuffer, 0, Size };`). Resources have no storage there, so
+        // the struct cannot be a module variable; it does not change, so
+        // each evaluation is the same struct.
+        if (l.s.opts.spirv and v.storage == .constant and @import("split_resources.zig").holdsResources(&l.s.types, v.type)) return init_e;
         if (init_e.kind == .init_list or !isObject(&l.s.types, v.type)) return null;
         switch (l.s.types.get(v.type)) {
             .resource => |r| if (r.kind == .other) return null,
