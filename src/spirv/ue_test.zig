@@ -330,3 +330,109 @@ test "a source named by a path starting with '/' is not an option (Unreal's virt
         try std.testing.expectEqual(compile.Status.ok, r.status);
     }
 }
+
+fn countOp(m: Module, op: u16) usize {
+    var n: usize = 0;
+    var it = m.ops();
+    while (it.next()) |i| {
+        if (i.op == op) n += 1;
+    }
+    return n;
+}
+
+/// Function-storage OpVariables (what spirv-opt's ssa-rewrite would have to
+/// rewrite; dxc's legalized SPIR-V has next to none).
+fn functionVars(m: Module) usize {
+    var n: usize = 0;
+    var it = m.ops();
+    while (it.next()) |i| {
+        if (i.op == 59 and i.args[2] == 7) n += 1; // OpVariable Function
+    }
+    return n;
+}
+
+test "callees returning from inside loops are inlined (ray generation too)" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const src =
+        \\RWStructuredBuffer<float> O; cbuffer C { uint n; float lim; };
+        \\float find(uint start) {
+        \\    for (uint i = start; i < n; i++) {
+        \\        for (uint j = 0; j < n; j++) { if (O[i * n + j] > lim) return O[j]; }
+        \\        if (O[i] < 0) return -1;
+        \\    }
+        \\    return 0;
+        \\}
+        \\[numthreads(1,1,1)] void mainCS() { O[0] = find(1) + find(2); }
+        \\[shader("raygeneration")] void mainRG() { O[0] = find(1) + find(2); }
+    ;
+    const cs = try ok(a, "cs_6_6", &.{ "-E", "mainCS" }, src);
+    try expectEqual(@as(usize, 1), countOp(cs, 54)); // OpFunction
+    try expectEqual(@as(usize, 0), functionVars(cs));
+    const rg = try ok(a, "lib_6_6", &.{ "-E", "mainRG", "-fspv-target-env=vulkan1.3" }, src);
+    try expectEqual(@as(usize, 1), countOp(rg, 54));
+    try expectEqual(@as(usize, 0), functionVars(rg));
+}
+
+test "inlining leaves no chains of blocks" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const src =
+        \\RWStructuredBuffer<float> O;
+        \\float f(float x) { return x * 2 + 1; }
+        \\[numthreads(1,1,1)] void main() { O[0] = f(f(f(f(f(f(f(f(O[1])))))))); }
+    ;
+    const m = try ok(a, "cs_6_6", &.{}, src);
+    try expectEqual(@as(usize, 1), countOp(m, 248)); // OpLabel: one block
+}
+
+test "statics of a fully inlined shader are promoted, not Private variables" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // (Unreal's ray tracing shaders copy their uniforms into statics.)
+    const src =
+        \\RWStructuredBuffer<float4> O; cbuffer C { float4 u; float4x4 w; };
+        \\static float4 su; static float4x4 sw;
+        \\float4 use() { return mul(sw, su); }
+        \\[shader("raygeneration")] void main() { su = u; sw = w; O[0] = use(); }
+    ;
+    const m = try ok(a, "lib_6_6", &.{"-fspv-target-env=vulkan1.3"}, src);
+    var it = m.ops();
+    var private_uses: usize = 0;
+    var private_vars: std.AutoHashMapUnmanaged(u32, void) = .empty;
+    while (it.next()) |i| if (i.op == 59 and i.args[2] == 6) try private_vars.put(a, i.args[1], {}); // OpVariable Private
+    it = m.ops();
+    while (it.next()) |i| switch (i.op) {
+        61, 65 => if (private_vars.contains(i.args[2])) {
+            private_uses += 1; // OpLoad / OpAccessChain
+        },
+        62 => if (private_vars.contains(i.args[0])) {
+            private_uses += 1; // OpStore
+        },
+        else => {},
+    };
+    try expectEqual(@as(usize, 0), private_uses);
+    try expectEqual(@as(usize, 0), functionVars(m));
+}
+
+test "locals indexed by a dynamic component are promoted" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // (Unreal's FDFVector3 and DFGetComponent.)
+    const src =
+        \\struct V3 { float3 High; float3 Low; };
+        \\RWStructuredBuffer<float> O; cbuffer C { float3 h, l; int k; };
+        \\float get(V3 v, int c) { return v.High[c] + v.Low[c]; }
+        \\[numthreads(1,1,1)] void main() {
+        \\    V3 v; v.High = h; v.Low = l;
+        \\    float3 x = h; x[k] = 7;
+        \\    O[0] = get(v, k) + x[k ^ 1];
+        \\}
+    ;
+    const m = try ok(a, "cs_6_6", &.{}, src);
+    try expectEqual(@as(usize, 0), functionVars(m));
+}

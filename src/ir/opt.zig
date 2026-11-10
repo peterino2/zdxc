@@ -761,3 +761,76 @@ test "constant folding helpers" {
     try std.testing.expectEqual(@as(i64, 0), foldCmp(.int, .gt, .{ .int = -1 }, .{ .int = 1 }).?.int);
     try std.testing.expectEqual(@as(i64, 3), foldConvert(.float, .int, .{ .float = 3.7 }).int);
 }
+
+// ----------------------------------------------------------------------
+// Block merging
+
+/// Merges each block into its predecessor where the predecessor ends in
+/// an unconditional branch to it and nothing else reaches it, as dxc's
+/// optimizer does (merge-blocks). Inlining leaves a chain of such blocks
+/// per call; Unreal runs spirv-opt -O on its SPIR-V, and SPIRV-Tools'
+/// ssa-rewrite recurses once per block along a chain (a path tracing
+/// library of 34,565 blocks overflowed its stack).
+///
+/// Left alone: merge and continue targets and loop headers (structured
+/// control flow names them), blocks heading a construct as predecessor,
+/// and blocks with phis. A merged block is left empty and unreachable;
+/// the emitter skips it.
+pub fn mergeBlocks(a: Allocator, f: *ir.Function) Allocator.Error!void {
+    const n = f.blocks.items.len;
+    if (n < 2) return;
+    const live = try reachable(a, f);
+    const preds = try a.alloc(u32, n);
+    @memset(preds, 0);
+    const pinned = try a.alloc(bool, n);
+    @memset(pinned, false);
+    pinned[0] = true;
+    for (f.blocks.items, 0..) |b, i| {
+        if (!live[i]) continue;
+        for (try successors(a, b.term)) |s| preds[s.index()] += 1;
+        switch (b.merge) {
+            .none => {},
+            .selection => |m| pinned[m.index()] = true,
+            .loop => |l| {
+                pinned[i] = true;
+                pinned[l.merge.index()] = true;
+                pinned[l.@"continue".index()] = true;
+            },
+        }
+    }
+    for (0..n) |bi| {
+        if (!live[bi]) continue;
+        // Absorb successors for as long as the chain goes on.
+        while (true) {
+            const b = &f.blocks.items[bi];
+            if (b.merge != .none or b.term != .br) break;
+            const ci = b.term.br.index();
+            if (ci == bi or pinned[ci] or preds[ci] != 1) break;
+            const c = &f.blocks.items[ci];
+            const has_phi = for (c.insts.items) |r| {
+                if (f.inst(r).op == .phi) break true;
+            } else false;
+            if (has_phi) break;
+            try b.insts.appendSlice(a, c.insts.items);
+            b.term = c.term;
+            b.merge = c.merge;
+            b.selection_control = c.selection_control;
+            // Phis in the successors now come from `b`.
+            for (try successors(a, c.term)) |s| {
+                for (f.blocks.items[s.index()].insts.items) |r| {
+                    const inst = &f.insts.items[r.index()];
+                    if (inst.op != .phi) continue;
+                    const ins = try a.dupe(@typeInfo(@TypeOf(inst.op.phi)).pointer.child, inst.op.phi);
+                    for (ins) |*in| if (in.block.index() == ci) {
+                        in.block = @enumFromInt(bi);
+                    };
+                    inst.op = .{ .phi = ins };
+                }
+            }
+            c.insts = .empty;
+            c.term = .@"unreachable";
+            c.merge = .none;
+            live[ci] = false;
+        }
+    }
+}
