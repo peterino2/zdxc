@@ -10,8 +10,10 @@
 //! continuation. Returns inside selections first become breaks out of a
 //! loop that runs once (the callee wrapped in it), with the return value in
 //! a local; the loop's merge block is where the callee returns, once.
-//! Returns inside loops would need a break per loop level: those callees
-//! stay functions.
+//! A return inside loops also sets a "returned" flag and breaks out of
+//! its loop; the merge block of each loop around a return then breaks out
+//! of the next loop out (or the one-trip loop) when the flag is set, as
+//! SPIRV-Tools' merge-return does.
 //!
 //! Functions no root reaches any more are marked dead (and not emitted).
 
@@ -36,6 +38,12 @@ pub fn eligible(m: *const ir.Module) bool {
     if (m.entries.items.len == 0) return false;
     for (m.entries.items) |e| switch (e.stage) {
         .vertex, .pixel, .compute => {},
+        // Ray tracing entry points stay functions (their payloads and
+        // attributes are the emitter's); their callees are inlined, as
+        // dxc's legalization does. Unreal runs spirv-opt -O on its SPIR-V,
+        // whose ssa-rewrite recursion overflowed the stack on a path
+        // tracing library left as 842 functions.
+        .raygeneration, .intersection, .anyhit, .closesthit, .miss, .callable => {},
         else => return false,
     };
     for (m.globals.items) |g| {
@@ -115,8 +123,15 @@ const Shape = union(enum) {
     keep,
     /// One return, outside every construct: that block.
     single: u32,
-    /// Returns inside selections (or several): wrap in a one-trip loop.
-    wrap,
+    /// Returns inside selections or loops (or several): wrap in a one-trip
+    /// loop.
+    wrap: Wrap,
+};
+
+const Wrap = struct {
+    /// Returns inside loops: the block, and the headers of the loops around
+    /// it, innermost first.
+    in_loops: []const struct { block: u32, loops: []const u32 } = &.{},
 };
 
 fn shapeOf(a: Allocator, m: *const ir.Module, f: *const ir.Function) Error!Shape {
@@ -167,15 +182,17 @@ fn shapeOf(a: Allocator, m: *const ir.Module, f: *const ir.Function) Error!Shape
     var rets: u32 = 0;
     var ret_block: u32 = 0;
     var nested = false;
+    var in_loops: std.ArrayList(@typeInfo(@FieldType(Wrap, "in_loops")).pointer.child) = .empty;
     for (f.blocks.items, 0..) |blk, bi| {
         if (!seen[bi] or blk.term != .ret) continue;
         rets += 1;
         ret_block = @intCast(bi);
-        // Inside a loop: not inlinable.
+        var loops: std.ArrayList(u32) = .empty;
         var c = ctx[bi];
         while (c != root) : (c = parent[c]) {
-            if (f.blocks.items[c].merge == .loop) return .keep;
+            if (f.blocks.items[c].merge == .loop) try loops.append(a, c);
         }
+        if (loops.items.len > 0) try in_loops.append(a, .{ .block = @intCast(bi), .loops = loops.items });
         if (ctx[bi] != root) nested = true;
     }
     if (rets == 0) return .keep; // (never returns: leave it alone)
@@ -183,7 +200,7 @@ fn shapeOf(a: Allocator, m: *const ir.Module, f: *const ir.Function) Error!Shape
     // A resource returned through a local would be a resource local
     // assigned in several places.
     if (isResource(m.types, f.ret)) return .keep;
-    return .wrap;
+    return .{ .wrap = .{ .in_loops = in_loops.items } };
 }
 
 /// Whether `s`, a successor of a block whose innermost construct is headed
@@ -263,7 +280,7 @@ fn inlineCalls(m: *ir.Module, f: *ir.Function, shapes: []const ?Shape, work: *st
                 continue;
             }
             const callee = m.functions.items[call.func];
-            const value = try inlineOne(a, f, @intCast(bi), pos, call.args, callee, shape);
+            const value = try inlineOne(a, m.types, f, @intCast(bi), pos, call.args, callee, shape);
             try results.put(a, r.index(), value);
             // The rest of the block moved to the continuation block, which
             // is later in the block list.
@@ -310,7 +327,7 @@ fn mapTerm(term: ir.Terminator, mp: anytype) ir.Terminator {
 
 /// Inlines `callee(args)`, the instruction at `pos` of block `bi` of `f`.
 /// Returns the value the call produced (`.none` for void).
-fn inlineOne(a: Allocator, f: *ir.Function, bi: u32, pos: usize, args: []const Ref, callee: *const ir.Function, shape: Shape) Error!Ref {
+fn inlineOne(a: Allocator, m_types: *TypeTable, f: *ir.Function, bi: u32, pos: usize, args: []const Ref, callee: *const ir.Function, shape: Shape) Error!Ref {
     // Continuation: the instructions after the call, the terminator and
     // the merge.
     const cont = try newBlock(a, f, .{});
@@ -377,6 +394,17 @@ fn inlineOne(a: Allocator, f: *ir.Function, bi: u32, pos: usize, args: []const R
     var ret_var: Ref = .none;
     var result: Ref = .none;
     var entry_target: u32 = bmap[0];
+    // Returns inside loops: the "returned" flag, false on entry.
+    var flag: Ref = .none;
+    var ret_loop: std.AutoHashMapUnmanaged(u32, u32) = .empty; // callee ret block -> innermost loop header
+    if (shape == .wrap and shape.wrap.in_loops.len > 0) {
+        const bool_ty = try m_types.scalar(.bool);
+        flag = try newInst(a, f, .{ .op = .local_var, .ty = bool_ty, .ptr = .function });
+        const no = try newInst(a, f, .{ .op = .{ .constant = .{ .int = 0 } }, .ty = bool_ty });
+        const st = try newInst(a, f, .{ .op = .{ .store = .{ .ptr = flag, .value = no } }, .ty = TypeTable.void_type });
+        try f.blocks.items[bi].insts.appendSlice(a, &.{ no, st });
+        for (shape.wrap.in_loops) |rl| try ret_loop.put(a, rl.block, rl.loops[0]);
+    }
     if (shape == .wrap) {
         exit = try newBlock(a, f, .{});
         const header = try newBlock(a, f, .{});
@@ -405,6 +433,14 @@ fn inlineOne(a: Allocator, f: *ir.Function, bi: u32, pos: usize, args: []const R
                         const st = try newInst(a, f, .{ .op = .{ .store = .{ .ptr = ret_var, .value = mp.map(v) } }, .ty = TypeTable.void_type });
                         try insts.append(a, st);
                     }
+                    if (ret_loop.get(@intCast(k))) |header| {
+                        // Inside loops: set the flag, break out of the
+                        // innermost one.
+                        const yes = try newInst(a, f, .{ .op = .{ .constant = .{ .int = 1 } }, .ty = try m_types.scalar(.bool) });
+                        const st = try newInst(a, f, .{ .op = .{ .store = .{ .ptr = flag, .value = yes } }, .ty = TypeTable.void_type });
+                        try insts.appendSlice(a, &.{ yes, st });
+                        break :blk .{ .br = B.map(bmap, callee.blocks.items[header].merge.loop.merge) };
+                    }
                     break :blk .{ .br = @fromBackingInt(@intCast(exit)) };
                 }
                 if (v != .none) result = mp.map(v);
@@ -426,6 +462,22 @@ fn inlineOne(a: Allocator, f: *ir.Function, bi: u32, pos: usize, args: []const R
             .loop => |l| .{ .loop = .{ .merge = B.map(bmap, l.merge), .@"continue" = B.map(bmap, l.@"continue"), .unroll = l.unroll } },
         };
         f.blocks.items[bmap[k]] = .{ .insts = insts, .term = term, .merge = merge, .selection_control = src.selection_control };
+    }
+    // The merge block of each loop around a return leaves for the next
+    // loop out's merge (or the one-trip loop's) when the flag is set; what
+    // it held moves to a block after the check.
+    if (flag != .none) {
+        var done: std.AutoHashMapUnmanaged(u32, void) = .empty;
+        for (shape.wrap.in_loops) |rl| for (rl.loops, 0..) |header, li| {
+            if ((try done.fetchPut(a, header, {})) != null) continue;
+            const mb = bmap[callee.blocks.items[header].merge.loop.merge.index()];
+            const out: u32 = if (li + 1 < rl.loops.len) bmap[callee.blocks.items[rl.loops[li + 1]].merge.loop.merge.index()] else exit;
+            const rest = try newBlock(a, f, f.blocks.items[mb]);
+            const bool_ty = try m_types.scalar(.bool);
+            const ld = try newInst(a, f, .{ .op = .{ .load = flag }, .ty = bool_ty });
+            f.blocks.items[mb] = .{ .term = .{ .cond_br = .{ .cond = ld, .then = @fromBackingInt(@intCast(out)), .@"else" = @fromBackingInt(@intCast(rest)) } } };
+            try f.blocks.items[mb].insts.append(a, ld);
+        };
     }
     f.blocks.items[bi].term = .{ .br = @fromBackingInt(@intCast(entry_target)) };
     return result;
