@@ -3773,7 +3773,7 @@ const Emitter = struct {
     fn texelScalar(e: *Emitter, elem: TypeId) Error!Scalar {
         const c = storageScalar(e.t.component(elem) orelse return e.unsupported("textures of '{s}' are not supported yet", .{try e.t.format(e.arena, elem)}));
         return switch (c) {
-            .float, .int, .uint => c,
+            .float, .int, .uint, .int64, .uint64 => c,
             else => e.unsupported("textures of '{s}' are not supported yet", .{try e.t.format(e.arena, elem)}),
         };
     }
@@ -3783,6 +3783,8 @@ const Emitter = struct {
         if (e.vk.unknown_image_format) return 0;
         const n = e.t.componentCount(elem) orelse return 0;
         const c = e.t.component(elem) orelse return 0;
+        // 64-bit integer images have only one-component formats.
+        if (c == .uint64 or c == .int64) return if (n == 1) (if (c == .uint64) 40 else 41) else 0; // R64ui, R64i
         const k: usize = switch (n) {
             1 => 0,
             2 => 1,
@@ -3823,11 +3825,13 @@ const Emitter = struct {
         if (sh.rw and sh.ms) try e.cap(if (sh.array) .image_ms_array else .storage_image_multisample);
         switch (format) {
             6...20, 25...29, 34...39 => try e.cap(.storage_image_extended_formats),
-            40, 41 => {
-                try e.cap(.int64_image_ext);
-                try e.extension("SPV_EXT_shader_image_int64");
-            },
             else => {},
+        }
+        // 64-bit integer texels, whatever the format (sampled images have
+        // none).
+        if (format == 40 or format == 41 or storageScalar(e.t.component(elem).?).size() == 8) {
+            try e.cap(.int64_image_ext);
+            try e.extension("SPV_EXT_shader_image_int64");
         }
         const id = e.b.newId();
         try e.b.emit(.types_globals, .type_image, &.{ id, st, dim, 2, key[2], key[3], sampled, format });

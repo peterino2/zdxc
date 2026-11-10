@@ -285,3 +285,20 @@ test "byte-address loads and stores of structs with bitfields" {
     ;
     _ = try ok(a, "cs_6_6", &.{ "-HV", "2021" }, src);
 }
+
+test "textures of 64-bit integers (Nanite's visibility buffer)" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const src = "Texture2D<uint64_t> T; RWTexture2D<uint64_t> V; [numthreads(1,1,1)] void main(uint2 id : SV_DispatchThreadID) { uint64_t x = T[id]; InterlockedMax(V[id], x); V[id + 1] = x + 1; }";
+    const m = try ok(a, "cs_6_6", &.{"-fspv-target-env=vulkan1.3"}, src);
+    var it = m.ops();
+    var caps: [2]bool = .{ false, false };
+    var r64ui = false;
+    while (it.next()) |i| {
+        if (i.op == 17 and i.args[0] == 5016) caps[0] = true; // OpCapability Int64ImageEXT
+        if (i.op == 17 and i.args[0] == 12) caps[1] = true; // Int64Atomics
+        if (i.op == 25 and i.args[7] == 40) r64ui = true; // OpTypeImage ... R64ui
+    }
+    try std.testing.expect(caps[0] and caps[1] and r64ui);
+}
