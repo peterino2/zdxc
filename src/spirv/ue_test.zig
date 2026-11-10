@@ -547,3 +547,23 @@ test "branches on constant arguments fold away, with what they read" {
     // Nothing reads Sky or SkyMips any more: no image fetch.
     try expectEqual(@as(usize, 0), countOp(only_false, 95)); // OpImageFetch
 }
+
+test "a bindless handle passed along and never read leaves no binding" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // (Unreal's FarFieldTLAS: its heap and its $Globals index are gone from
+    // dxc's SPIR-V, and Unreal's Vulkan format rejects $Globals beside a
+    // root parameter buffer.)
+    const src =
+        \\uint BindlessSRV_Far; typedef Texture2D<float4> SafeT; SafeT SRVHeap_Far[];
+        \\static const SafeT Far = SRVHeap_Far[NonUniformResourceIndex(BindlessSRV_Far)];
+        \\Texture2D<float4> Near; RWStructuredBuffer<float4> O;
+        \\float4 light(Texture2D<float4> near, Texture2D<float4> far, uint i) { return near.Load(int3(i, 0, 0)); }
+        \\[numthreads(1,1,1)] void main(uint3 id : SV_DispatchThreadID) { O[id.x] = light(Near, Far, id.x); }
+    ;
+    const m = try ok(a, "cs_6_6", &.{"-fspv-target-env=vulkan1.3"}, src);
+    try std.testing.expect(m.named("SRVHeap_Far") == null);
+    try std.testing.expect(m.named("$Globals") == null);
+    try std.testing.expect(m.named("Near") != null);
+}

@@ -148,6 +148,7 @@ pub fn emit(gpa: Allocator, m: *const ir.Module, diags: *diag.Diagnostics, env: 
     var e: Emitter = .{ .arena = arena_state.allocator(), .b = .init(gpa), .m = m, .t = m.types, .diags = diags, .spv_minor = env.minor, .universal = env.universal, .vk = m.vk };
     defer e.b.deinit();
     try e.module();
+    try @import("dce.zig").run(e.arena, &e.b);
     return e.b.finish(0x00010000 | (@as(u32, env.minor) << 8));
 }
 
@@ -594,6 +595,11 @@ const Emitter = struct {
                     };
                     if (o % need != 0) return e.unsupported("[[vk::offset({d})]] on '{s}' is not aligned to {d} bytes for this buffer layout", .{ o, fld.name, need });
                 };
+                // The struct's name before its members' (as dxc): Unreal
+                // finds a struct by its OpName, then reads the OpMemberNames
+                // after it (ParseSpirvStructureMembers, for ray tracing
+                // shader records).
+                try e.b.emitWithString(.debug_names, .name, &.{id}, name, &.{});
                 for (st.fields.items, offs, 0..) |fld, o, k| {
                     if (layout.isOpaque(e.t, fld.type)) continue;
                     const mk: u32 = dataIndex(e.t, st, @intCast(k));
@@ -608,7 +614,6 @@ const Emitter = struct {
                     }
                     try e.b.emitWithString(.debug_names, .member_name, &.{ id, mk }, fld.name, &.{});
                 }
-                try e.b.emitWithString(.debug_names, .name, &.{id}, name, &.{});
                 try e.memberDecorations(id, st, true);
             }
         }

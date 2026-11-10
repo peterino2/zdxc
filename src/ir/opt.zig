@@ -929,3 +929,94 @@ fn fixPhis(a: Allocator, f: *ir.Function) Allocator.Error!void {
     }
     _ = n;
 }
+
+// ----------------------------------------------------------------------
+// Dead code
+
+fn isPureOp(op: Op) bool {
+    return switch (op) {
+        .constant, .global, .load, .access, .binary, .unary, .cmp, .convert, .bitcast, .splat, .extract, .insert, .construct, .shuffle, .select, .heap_resource, .phi, .undef, .res_load => true,
+        .intrinsic => |x| std.mem.eql(u8, x.name, "NonUniformResourceIndex"),
+        else => false,
+    };
+}
+
+/// Removes instructions without side effects whose values nothing uses,
+/// as dxc's optimizer does. Unreal's `static const` bindless handles are
+/// evaluated where they are used, and a handle passed along but never
+/// read still loaded its index from $Globals, which Unreal's Vulkan
+/// format must not find beside a root parameter buffer.
+pub fn removeDeadCode(a: Allocator, f: *ir.Function) Allocator.Error!void {
+    const n = f.insts.items.len;
+    const uses = try a.alloc(u32, n);
+    @memset(uses, 0);
+    const Count = struct {
+        uses: []u32,
+        pub fn use(c: @This(), r: Ref) void {
+            if (r != .none and r.index() < c.uses.len) c.uses[r.index()] += 1;
+        }
+    };
+    const in_block = try a.alloc(bool, n);
+    @memset(in_block, false);
+    for (f.blocks.items) |b| {
+        for (b.insts.items) |r| {
+            in_block[r.index()] = true;
+            eachOperand(f.inst(r).op, Count{ .uses = uses });
+        }
+        for (termRefs(b.term)) |r| Count.use(.{ .uses = uses }, r);
+    }
+    // (Instructions in no block, locals among them, are left alone, and
+    // so are their operands.)
+    for (f.insts.items, 0..) |inst, i| if (!in_block[i]) eachOperand(inst.op, Count{ .uses = uses });
+    const dead = try a.alloc(bool, n);
+    @memset(dead, false);
+    // Locals only stored into (a resource handle stored and never read):
+    // their stores are dead too. `reads` counts every use but as the
+    // pointer of a store.
+    const reads = try a.alloc(u32, n);
+    @memcpy(reads, uses);
+    for (f.blocks.items) |b| for (b.insts.items) |r| switch (f.inst(r).op) {
+        .store => |st| if (st.ptr.index() < n and reads[st.ptr.index()] > 0) {
+            reads[st.ptr.index()] -= 1;
+        },
+        else => {},
+    };
+    var changed = true;
+    while (changed) {
+        changed = false;
+        for (f.blocks.items) |b| for (b.insts.items) |r| {
+            const i = r.index();
+            if (dead[i]) continue;
+            const st = switch (f.inst(r).op) {
+                .store => |x| x,
+                else => continue,
+            };
+            const p = f.inst(st.ptr);
+            if (p.op != .local_var or p.ptr != .function or reads[st.ptr.index()] != 0) continue;
+            dead[i] = true;
+            changed = true;
+            if (uses[st.value.index()] > 0) uses[st.value.index()] -= 1;
+        };
+        for (f.blocks.items) |b| for (b.insts.items) |r| {
+            const i = r.index();
+            if (dead[i] or uses[i] != 0 or !isPureOp(f.inst(r).op)) continue;
+            dead[i] = true;
+            changed = true;
+            const Dec = struct {
+                uses: []u32,
+                reads: []u32,
+                pub fn use(c: @This(), x: Ref) void {
+                    if (x == .none or x.index() >= c.uses.len) return;
+                    if (c.uses[x.index()] > 0) c.uses[x.index()] -= 1;
+                    if (c.reads[x.index()] > 0) c.reads[x.index()] -= 1;
+                }
+            };
+            eachOperand(f.inst(r).op, Dec{ .uses = uses, .reads = reads });
+        };
+    }
+    for (f.blocks.items) |*b| {
+        var out: std.ArrayList(Ref) = .empty;
+        for (b.insts.items) |r| if (!dead[r.index()]) try out.append(a, r);
+        b.insts = out;
+    }
+}
