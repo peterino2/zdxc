@@ -243,3 +243,14 @@ test "Epic's other options are accepted" {
     const ps = "float4 main(float4 unused : TEXCOORD0, float4 used : TEXCOORD1) : SV_Target { return used; }";
     try std.testing.expect((try ok(a, "ps_6_6", &.{"-fspv-preserve-storage-input"}, ps)).named("in.var.TEXCOORD0") != null);
 }
+
+test "[[vk::location, vk::index]] after a parameter's name (Unreal's dual-source blending)" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const src = "void main(out float4 c0 [[vk::location(0), vk::index(0)]] : SV_Target0, out float4 c1 [[vk::location(0), vk::index(1)]] : SV_Target1) { c0 = 1; c1 = 2; }";
+    const m = try ok(a, "ps_6_6", &.{}, src);
+    const t1 = m.named("out.var.SV_Target1").?;
+    try expectEqual(@as(?u32, 0), m.deco(t1, 30)); // Location
+    try expectEqual(@as(?u32, 1), m.deco(t1, 32)); // Index
+}
