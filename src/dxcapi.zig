@@ -4,7 +4,8 @@
 //!
 //! Classes: CLSID_DxcCompiler (IDxcCompiler3, IDxcVersionInfo) and
 //! CLSID_DxcUtils, which is CLSID_DxcLibrary (IDxcUtils), plus the result,
-//! blob and include-handler objects they hand out. Other classes return
+//! blob and include-handler objects they hand out; CLSID_DxcRewriter and
+//! CLSID_DxcLinker exist with no methods implemented. Other classes return
 //! REGDB_E_CLASSNOTREG and methods without an implementation E_NOTIMPL.
 //!
 //! The ABI follows dxcapi.h and WinAdapter.h: an interface pointer points
@@ -101,6 +102,11 @@ const CLSID_DxcContainerBuilder = GUID.parse("94134294-411f-4574-b4d0-8741e25240
 const IID_IDxcLibrary = GUID.parse("e5204dc7-d18c-4c3c-bdfb-851673980fe7");
 const IID_IDxcContainerReflection = GUID.parse("d2c21b26-8350-4bdc-976a-331ce6f4c54c");
 const IID_IDxcContainerBuilder = GUID.parse("334b1f50-2292-4b35-99a1-25588d8c17fe");
+const CLSID_DxcRewriter = GUID.parse("b489b951-e07f-40b3-968d-93e124734da4");
+const IID_IDxcRewriter = GUID.parse("c012115b-8893-4eb9-9c5a-111456ea1c45");
+const IID_IDxcRewriter2 = GUID.parse("261afca1-0609-4ec6-a77f-d98c7035194e");
+const CLSID_DxcLinker = GUID.parse("ef6a8087-b0ea-4d56-9e45-d07e1a8b7806");
+const IID_IDxcLinker = GUID.parse("f1b5be2a-62dd-4327-a1c2-42ac1e1e78e6");
 const IID_ID3D12ShaderReflection = GUID.parse("5a58797d-a72c-478d-8ba2-efc6b0efe88e");
 const IID_ID3D12LibraryReflection = GUID.parse("8e349d19-54db-4a56-9dc9-119d87bdb804");
 const IID_IUnknown = GUID.parse("00000000-0000-0000-c000-000000000046");
@@ -2123,6 +2129,56 @@ const ContainerBuilder = struct {
     }
 };
 
+/// CLSID_DxcRewriter and CLSID_DxcLinker: objects that exist, with every
+/// method E_NOTIMPL. Unreal's ShaderConductor creates both when it loads
+/// the DLL, and throws if it cannot, but Unreal never rewrites or links
+/// with them.
+const Unimplemented = struct {
+    iface: Iface(Vtbl) = .{ .vtbl = &vtbl },
+    rc: RefCount = .{},
+    iids: [2]GUID,
+
+    /// IDxcRewriter2 has 4 methods, IDxcLinker 2. (The stub takes only
+    /// `this`: in the C calling convention the caller removes the
+    /// arguments, so it serves any method's.)
+    const Vtbl = extern struct { unknown: UnknownVtbl, methods: [8]*const fn (This) callconv(cc) HRESULT };
+    const vtbl: Vtbl = .{
+        .unknown = .{ .QueryInterface = queryInterface, .AddRef = addRef, .Release = release },
+        .methods = @splat(notImpl),
+    };
+
+    fn create(iids: [2]GUID, iid: *const GUID, out: Out) HRESULT {
+        const u = gpa.create(Unimplemented) catch return E_OUTOFMEMORY;
+        u.* = .{ .iids = iids };
+        defer _ = release(&u.iface);
+        return queryInterface(&u.iface, iid, out);
+    }
+    fn of(this: This) *Unimplemented {
+        return parent(Unimplemented, "iface", this);
+    }
+    fn queryInterface(this: This, iid: *const GUID, out: ?Out) callconv(cc) HRESULT {
+        const u = of(this);
+        if (!iid.eql(IID_IUnknown) and !iid.eql(u.iids[0]) and !iid.eql(u.iids[1])) {
+            _ = put(out, null);
+            return E_NOINTERFACE;
+        }
+        _ = u.rc.addRef();
+        return put(out, this);
+    }
+    fn addRef(this: This) callconv(cc) ULONG {
+        return of(this).rc.addRef();
+    }
+    fn release(this: This) callconv(cc) ULONG {
+        const u = of(this);
+        const n = u.rc.release();
+        if (n == 0) gpa.destroy(u);
+        return n;
+    }
+    fn notImpl(_: This) callconv(cc) HRESULT {
+        return E_NOTIMPL;
+    }
+};
+
 // ---------------------------------------------------------------------------
 // Exports
 
@@ -2155,6 +2211,8 @@ fn createInstance(clsid: ?*const GUID, iid: ?*const GUID, out: ?Out) HRESULT {
         defer _ = ContainerBuilder.release(&c.iface);
         return ContainerBuilder.queryInterface(&c.iface, want, o);
     }
+    if (class.eql(CLSID_DxcRewriter)) return Unimplemented.create(.{ IID_IDxcRewriter, IID_IDxcRewriter2 }, want, o);
+    if (class.eql(CLSID_DxcLinker)) return Unimplemented.create(.{ IID_IDxcLinker, IID_IDxcLinker }, want, o);
     return REGDB_E_CLASSNOTREG;
 }
 
@@ -2188,4 +2246,16 @@ test "GUID.parse" {
     try std.testing.expectEqual(@as(u32, 0x73e22d93), CLSID_DxcCompiler.a);
     try std.testing.expectEqual(@as(u8, 0xb5), CLSID_DxcCompiler.d[0]);
     try std.testing.expectEqual(@as(u8, 0xb0), CLSID_DxcCompiler.d[7]);
+}
+
+test "CLSID_DxcRewriter and CLSID_DxcLinker can be created (ShaderConductor needs them)" {
+    for ([_][2]GUID{ .{ CLSID_DxcRewriter, IID_IDxcRewriter }, .{ CLSID_DxcRewriter, IID_IDxcRewriter2 }, .{ CLSID_DxcLinker, IID_IDxcLinker } }) |c| {
+        var obj: ?*anyopaque = null;
+        try std.testing.expectEqual(S_OK, createInstance(&c[0], &c[1], &obj));
+        const vt: *const *const Unimplemented.Vtbl = @ptrCast(@alignCast(obj.?));
+        try std.testing.expectEqual(E_NOTIMPL, vt.*.methods[0](obj.?));
+        var other: ?*anyopaque = null;
+        try std.testing.expectEqual(E_NOINTERFACE, vt.*.unknown.QueryInterface(obj.?, &IID_IDxcCompiler3, &other));
+        try std.testing.expectEqual(@as(ULONG, 0), vt.*.unknown.Release(obj.?));
+    }
 }
