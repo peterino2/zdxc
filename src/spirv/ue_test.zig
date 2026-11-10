@@ -508,3 +508,19 @@ test "the same bindless resource assigned to a variable twice" {
     ;
     _ = try ok(a, "cs_6_6", &.{}, src);
 }
+
+test "constant buffers nothing reads are left out ($Globals included)" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // (Unreal's Vulkan format accepts no $Globals beside its root parameter
+    // buffer; dxc's optimizer drops an unread one.)
+    const src =
+        \\cbuffer Unused { float4 u; }; float4 g_unused; cbuffer Used { float4 v; }; RWStructuredBuffer<float4> O;
+        \\[numthreads(1,1,1)] void main() { O[0] = v; }
+    ;
+    const m = try ok(a, "cs_6_6", &.{}, src);
+    try std.testing.expect(m.named("Used") != null);
+    try std.testing.expect(m.named("Unused") == null);
+    try std.testing.expect(m.named("$Globals") == null);
+}

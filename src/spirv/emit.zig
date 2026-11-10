@@ -1233,7 +1233,23 @@ const Emitter = struct {
 
         try e.findCounterGlobals();
         try e.assignBindings();
+        // Constant buffers no live function reads are left out, as dxc's
+        // optimizer drops them: Unreal's Vulkan format expects only its
+        // root parameter buffer where it uses one, and an unread $Globals
+        // beside it fails its check.
+        const referenced = try e.arena.alloc(bool, m.globals.items.len);
+        @memset(referenced, false);
+        for (m.functions.items) |f| {
+            if (f.dead) continue;
+            for (f.insts.items) |inst| if (inst.op == .global) {
+                referenced[inst.op.global] = true;
+            };
+        }
         for (m.globals.items, 0..) |g, gi| {
+            if (g.space == .cbuffer and ownStorage(g) == null and !referenced[gi]) {
+                e.global_vars[gi] = 0;
+                continue;
+            }
             switch (g.space) {
                 .resource, .cbuffer => if (ownStorage(g)) |sc| {
                     // Shader record buffers and push constants: std430, no
