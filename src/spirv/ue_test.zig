@@ -524,3 +524,26 @@ test "constant buffers nothing reads are left out ($Globals included)" {
     try std.testing.expect(m.named("Unused") == null);
     try std.testing.expect(m.named("$Globals") == null);
 }
+
+test "branches on constant arguments fold away, with what they read" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // (Lumen: AccumulateResults(..., bRayTraceSkyLightContribution = false).)
+    const src =
+        \\RWStructuredBuffer<float4> O; Texture2D<float4> Sky; int SkyMips; float4 tint;
+        \\float4 shade(bool sky, float4 c) {
+        \\    float4 r = c * tint;
+        \\    if (sky) r += Sky.Load(int3(0, 0, SkyMips - 1));
+        \\    return r;
+        \\}
+        \\[numthreads(1,1,1)] void main(uint3 id : SV_DispatchThreadID) { O[id.x] = shade(false, O[id.x]) + shade(id.x > 3, 1); }
+    ;
+    const m = try ok(a, "cs_6_6", &.{}, src);
+    // (Both calls read tint; only the second can read the sky, so $Globals
+    // stays, but the folded call has one block less.)
+    try std.testing.expect(m.named("$Globals") != null);
+    const only_false = try ok(a, "cs_6_6", &.{}, std.mem.replaceOwned(u8, a, src, "shade(id.x > 3, 1)", "1") catch unreachable);
+    // Nothing reads Sky or SkyMips any more: no image fetch.
+    try expectEqual(@as(usize, 0), countOp(only_false, 95)); // OpImageFetch
+}

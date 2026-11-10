@@ -39,10 +39,12 @@ pub fn run(m: *ir.Module) Error!void {
         try splitLocals(m, f);
         try dynamicComponents(m, f);
         try promote(m, f);
-        // The straight-line chains inlining left.
-        try opt.mergeBlocks(m.arena, f);
-        // Values that were behind locals may fold now.
+        // Values that were behind locals may fold now, and branches on
+        // them (constant arguments of inlined calls).
         try opt.fold(m.arena, m.types, f);
+        if (try opt.foldBranches(m.arena, f)) try opt.fold(m.arena, m.types, f);
+        // The straight-line chains inlining (and folding) left.
+        try opt.mergeBlocks(m.arena, f);
     }
 }
 

@@ -1241,8 +1241,10 @@ const Emitter = struct {
         @memset(referenced, false);
         for (m.functions.items) |f| {
             if (f.dead) continue;
-            for (f.insts.items) |inst| if (inst.op == .global) {
-                referenced[inst.op.global] = true;
+            // (In the blocks emitted: code under a folded branch reads
+            // nothing.)
+            for (try blockOrder(e.arena, f)) |bi| for (f.blocks.items[bi].insts.items) |r| {
+                if (f.inst(r).op == .global) referenced[f.inst(r).op.global] = true;
             };
         }
         for (m.globals.items, 0..) |g, gi| {

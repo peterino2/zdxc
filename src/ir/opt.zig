@@ -834,3 +834,98 @@ pub fn mergeBlocks(a: Allocator, f: *ir.Function) Allocator.Error!void {
         }
     }
 }
+
+// ----------------------------------------------------------------------
+// Constant branches
+
+/// A conditional branch on a constant goes to the side it takes (a
+/// selection header so folded heads no construct; the side not taken loses
+/// this block from its phis). As dxc's dead branch elimination: Unreal
+/// passes constant flags to the functions it calls (Lumen's
+/// `bRayTraceSkyLightContribution = false`), and the code under them reads
+/// buffers its reflection must not see. Returns whether anything changed.
+pub fn foldBranches(a: Allocator, f: *ir.Function) Allocator.Error!bool {
+    var changed = false;
+    for (f.blocks.items, 0..) |*b, bi| {
+        if (b.term != .cond_br) continue;
+        const c = b.term.cond_br;
+        const ci = f.inst(c.cond);
+        if (ci.op != .constant) continue;
+        const take = switch (ci.op.constant) {
+            .int => |v| v != 0,
+            .float => |v| v != 0,
+        };
+        const taken = if (take) c.then else c.@"else";
+        const untaken = if (take) c.@"else" else c.then;
+        b.term = .{ .br = taken };
+        if (b.merge == .selection) {
+            b.merge = .none;
+            b.selection_control = .none;
+        }
+        if (untaken != taken) {
+            for (f.blocks.items[untaken.index()].insts.items) |r| {
+                const inst = &f.insts.items[r.index()];
+                if (inst.op != .phi) continue;
+                var ins: std.ArrayList(@typeInfo(@TypeOf(inst.op.phi)).pointer.child) = .empty;
+                for (inst.op.phi) |in| if (in.block.index() != bi) try ins.append(a, in);
+                inst.op = .{ .phi = ins.items };
+            }
+        }
+        changed = true;
+    }
+    if (changed) try fixPhis(a, f);
+    return changed;
+}
+
+/// Phis after branch folding: one entry per predecessor the emitter still
+/// writes out (reachable blocks, and the merge and continue targets of the
+/// constructs they head), `undef` from those not reachable.
+fn fixPhis(a: Allocator, f: *ir.Function) Allocator.Error!void {
+    const n = f.blocks.items.len;
+    const live = try reachable(a, f);
+    const emitted = try a.dupe(bool, live);
+    var grew = true;
+    while (grew) {
+        grew = false;
+        for (f.blocks.items, 0..) |b, i| {
+            if (!emitted[i]) continue;
+            const targets: [2]BlockId = switch (b.merge) {
+                .none => .{ .none, .none },
+                .selection => |mb| .{ mb, .none },
+                .loop => |l| .{ l.merge, l.@"continue" },
+            };
+            for (targets) |t| if (t != .none and !emitted[t.index()]) {
+                emitted[t.index()] = true;
+                grew = true;
+            };
+        }
+    }
+    // Where each instruction is defined.
+    const def_block = try a.alloc(u32, f.insts.items.len);
+    @memset(def_block, std.math.maxInt(u32));
+    for (f.blocks.items, 0..) |b, i| for (b.insts.items) |r| {
+        def_block[r.index()] = @intCast(i);
+    };
+    for (f.blocks.items, 0..) |b, si| {
+        if (!emitted[si]) continue;
+        for (b.insts.items) |r| {
+            const inst = f.insts.items[r.index()];
+            if (inst.op != .phi) continue;
+            var ins: std.ArrayList(@typeInfo(@TypeOf(inst.op.phi)).pointer.child) = .empty;
+            for (inst.op.phi) |in| {
+                const pb = in.block.index();
+                if (!emitted[pb]) continue;
+                const goes_here = for (try successors(a, f.blocks.items[pb].term)) |t| {
+                    if (t.index() == si) break true;
+                } else false;
+                if (!goes_here) continue;
+                const db = def_block[in.value.index()];
+                const dead = !live[pb] or (db != std.math.maxInt(u32) and !live[db]);
+                const v = if (dead) try addInst(a, f, .{ .op = .undef, .ty = inst.ty }) else in.value;
+                try ins.append(a, .{ .value = v, .block = in.block });
+            }
+            f.insts.items[r.index()].op = .{ .phi = ins.items };
+        }
+    }
+    _ = n;
+}
