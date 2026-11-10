@@ -2503,7 +2503,15 @@ const Emitter = struct {
             .store => |s| {
                 if (e.mesh_places.get(s.ptr.index())) |mp| return e.meshStore(mp, e.val(s.value), f.inst(s.value).ty);
                 if (e.texel_places.get(s.ptr.index())) |tp| {
-                    if (tp.comp != .none) return e.unsupported("storing one component of a texel is not supported yet", .{});
+                    if (tp.comp != .none) {
+                        // `tex[p].x = v`: read the texel, replace the
+                        // component, write it back (as dxc).
+                        const elem = e.resourceInfo(tp.res).elem;
+                        if (e.isScalarLike(elem)) return e.imageWrite(tp.res, e.val(tp.coord), e.val(s.value));
+                        const whole = try e.imageIndexLoad(tp.res, e.val(tp.coord), elem);
+                        const updated = try e.op1(.vector_insert_dynamic, elem, &.{ whole, e.val(s.value), e.val(tp.comp) });
+                        return e.imageWrite(tp.res, e.val(tp.coord), updated);
+                    }
                     return e.imageWrite(tp.res, e.val(tp.coord), e.val(s.value));
                 }
                 const target = f.inst(s.ptr);

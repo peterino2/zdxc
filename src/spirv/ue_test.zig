@@ -254,3 +254,21 @@ test "[[vk::location, vk::index]] after a parameter's name (Unreal's dual-source
     try expectEqual(@as(?u32, 0), m.deco(t1, 30)); // Location
     try expectEqual(@as(?u32, 1), m.deco(t1, 32)); // Index
 }
+
+test "storing one component of a texel reads, updates and writes it back" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const src = "RWTexture2D<float4> T; cbuffer C { uint k; }; [numthreads(1,1,1)] void main(uint2 id : SV_DispatchThreadID) { T[id].y = 3; T[id][k] = 4; }";
+    const m = try ok(a, "cs_6_6", &.{}, src);
+    var reads: usize = 0;
+    var writes: usize = 0;
+    var it = m.ops();
+    while (it.next()) |i| switch (i.op) {
+        98 => reads += 1, // OpImageRead
+        99 => writes += 1, // OpImageWrite
+        else => {},
+    };
+    try expectEqual(@as(usize, 2), reads);
+    try expectEqual(@as(usize, 2), writes);
+}
