@@ -314,6 +314,20 @@ fn parseArgs(ctx: *Ctx, arena: std.mem.Allocator, args: []const []const u8) !?Op
                     .fvk_use_gl_layout => opts.vk.layout = .gl,
                     .fvk_use_dx_layout => opts.vk.layout = .dx,
                     .fvk_use_scalar_layout => opts.vk.layout = .scalar,
+                    // Epic's DXC fork, which Unreal's ShaderConductor uses.
+                    .fvk_ue5_layout => opts.vk.ue5_layout = true,
+                    .fspv_support_precise_outputs => opts.vk.precise_outputs = true,
+                    .fspv_fusemuladd => opts.vk.fuse_mul_add = true,
+                    .fspv_force_subpass_image_depth_false => opts.vk.subpass_depth_false = true,
+                    .fspv_no_scalar_block_layout => opts.vk.no_scalar_block_layout = true,
+                    // Epic's DXC passes this to spirv-opt, whose dead code
+                    // passes would otherwise drop unused fragment inputs;
+                    // zdxc never removes interface variables.
+                    .fspv_preserve_storage_input => {},
+                    .fspv_svposition_implicit_invariant => opts.vk.position_invariant = true,
+                    // zdxc compiles arrays of RW / append / consume
+                    // structured buffers with or without it.
+                    .fvk_allow_rwstructuredbuffer_arrays => {},
                     .fspv_entrypoint_name_EQ => opts.vk.entry_name = v,
                     .fspv_extension_EQ => try opts.vk.extensions.append(arena, v),
                     .fspv_reflect => opts.vk.reflect = true,
@@ -368,6 +382,8 @@ fn parseArgs(ctx: *Ctx, arena: std.mem.Allocator, args: []const []const u8) !?Op
             },
         }
     }
+    // (Epic's DXC runs its fused multiply-add pass only when optimizing.)
+    if (opts.opt_level == .od or opts.opt_level == .o0) opts.vk.fuse_mul_add = false;
     if (opts.row_major and opts.col_major) return ctx.fail("Cannot specify /Zpr and /Zpc together, use /? to get usage information", .{});
     // Like dxc, the last input wins (dxc reads getLastArgValue(OPT_INPUT)).
     if (parsed.inputs.len > 0) opts.input = parsed.inputs[parsed.inputs.len - 1];

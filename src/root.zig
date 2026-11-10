@@ -66,6 +66,7 @@ test {
     _ = @import("sema/types.zig");
     _ = @import("sema/sema.zig");
     std.testing.refAllDecls(spirv);
+    _ = @import("spirv/ue_test.zig");
     _ = @import("diag.zig");
     _ = @import("options.zig");
     _ = @import("dxil/promote.zig");

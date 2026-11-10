@@ -2195,6 +2195,7 @@ const Lowerer = struct {
     const SigAttrs = struct {
         interp: Interp = .{},
         row_major: bool = false,
+        precise: bool = false,
         vk_location: ?u32 = null,
         vk_index: ?u32 = null,
         vk_builtin: ?[]const u8 = null,
@@ -2203,7 +2204,7 @@ const Lowerer = struct {
         /// A field's modifiers, inheriting the enclosing interpolation.
         fn field(outer: SigAttrs, fld: Field) SigAttrs {
             const own: u8 = @bitCast(fld.interp);
-            return .{ .interp = if (own != 0) fld.interp else outer.interp, .row_major = fld.row_major, .vk_location = fld.vk_location, .vk_index = fld.vk_index, .vk_builtin = fld.vk_builtin };
+            return .{ .interp = if (own != 0) fld.interp else outer.interp, .row_major = fld.row_major, .precise = fld.precise, .vk_location = fld.vk_location, .vk_index = fld.vk_index, .vk_builtin = fld.vk_builtin };
         }
     };
 
@@ -2211,6 +2212,7 @@ const Lowerer = struct {
         var r = el;
         r.interp = attrs.interp;
         r.row_major = attrs.row_major;
+        r.precise = attrs.precise;
         r.vk_location = attrs.vk_location;
         r.vk_index = attrs.vk_index;
         r.vk_builtin = attrs.vk_builtin;
@@ -2221,7 +2223,7 @@ const Lowerer = struct {
     /// A parameter's (or the return value's) interpolation and matrix
     /// orientation.
     fn paramAttrs(l: *Lowerer, q: ast.Qualifiers, ty: *const ast.TypeRef) SigAttrs {
-        return .{ .interp = semamod.interpOf(q), .row_major = l.s.sig_row_major.get(ty) orelse q.row_major };
+        return .{ .interp = semamod.interpOf(q), .row_major = l.s.sig_row_major.get(ty) orelse q.row_major, .precise = q.precise };
     }
 
     /// A parameter's (or, with the function's attributes, the return

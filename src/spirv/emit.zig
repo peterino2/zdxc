@@ -230,6 +230,8 @@ const Emitter = struct {
     /// Values selected with NonUniformResourceIndex (and resources reached
     /// through them).
     nonuniform_ids: std.AutoHashMapUnmanaged(Id, void) = .empty,
+    /// -fspv-fusemuladd: the operands and type of each OpFMul.
+    fmuls: std.AutoHashMapUnmanaged(Id, struct { a: Id, b: Id, ty: TypeId }) = .empty,
     variants: std.ArrayList(struct { fi: u32, bindings: []const Id, id: Id }) = .empty,
     /// The current function's block labels, and phi operands (word
     /// positions in the functions section) naming values emitted after the
@@ -1264,7 +1266,7 @@ const Emitter = struct {
                     // tbuffers: read-only storage buffers, std430.
                     // (A struct of its own, named `type.<buffer>` as in dxc.)
                     const st = e.b.newId();
-                    try e.layoutStruct(st, e.t.get(g.ty).@"struct", if (g.tbuffer) e.tbRules() else e.cbRules(), try std.fmt.allocPrint(e.arena, "type.{s}", .{g.name}));
+                    try e.layoutStruct(st, e.t.get(g.ty).@"struct", e.globalCbRules(g), try std.fmt.allocPrint(e.arena, "type.{s}", .{g.name}));
                     try e.b.emit(.annotations, .decorate, &.{ st, if (g.tbuffer) e.bufferBlockDecoration() else 2 }); // Block
                     if (g.tbuffer) for (0..e.t.get(g.ty).@"struct".fields.items.len) |k| {
                         try e.b.emit(.annotations, .member_decorate, &.{ st, @intCast(k), 24 }); // NonWritable
@@ -1866,6 +1868,11 @@ const Emitter = struct {
                 if (patch) try e.b.emit(.annotations, .decorate, if (entry.stage == .mesh) &.{ var_id, 5271 } else &.{ var_id, 15 }); // PerPrimitiveEXT / Patch
                 if (bi) |x| {
                     try e.b.emit(.annotations, .decorate, &.{ var_id, 11, x.id }); // BuiltIn
+                    // -fspv-support-precise-outputs (Epic's DXC).
+                    if (e.vk.precise_outputs and el.precise) try e.b.emit(.annotations, .decorate, &.{ var_id, 42 }); // NoContraction
+                    // Epic's DXC: SV_Position outputs are Invariant
+                    // (not those written by Append or into mesh outputs).
+                    if (!input and x.id == 0 and entry.stage != .geometry and entry.stage != .mesh and (e.vk.position_invariant or e.vk.ue5_layout)) try e.b.emit(.annotations, .decorate, &.{ var_id, 18 }); // Invariant
                     if (input and entry.stage == .pixel and !e.t.component(x.ty).?.isFloat() and e.t.component(x.ty).? != .bool) {
                         try e.b.emit(.annotations, .decorate, &.{ var_id, 14 }); // Flat
                     }
@@ -2429,7 +2436,7 @@ const Emitter = struct {
                     return;
                 }
                 e.ptr_layouts[ri] = switch (e.m.globals.items[g].space) {
-                    .cbuffer => if (e.m.globals.items[g].tbuffer) .{ .rules = e.tbRules(), .row_major = false, .buffer = true } else .{ .rules = e.cbRules(), .row_major = false },
+                    .cbuffer => if (e.m.globals.items[g].tbuffer) .{ .rules = e.tbRules(), .row_major = false, .buffer = true } else .{ .rules = e.globalCbRules(e.m.globals.items[g]), .row_major = false },
                     .resource => .{ .rules = e.sbRules(), .row_major = bufferRowMajor(e.t, e.m.globals.items[g].ty), .buffer = true },
                     else => null,
                 };
@@ -3284,6 +3291,16 @@ const Emitter = struct {
         const elem_ty = if (r.kind == .byte_address_buffer or r.kind == .rw_byte_address_buffer) try e.t.scalar(.uint) else r.elem;
         const elem = (try e.bufferElemType(ty)).?;
         const stride = layout.arrayStride(e.t, elem_ty, r.row_major, e.sbRules()) catch return e.unsupported("buffer element type '{s}'", .{try e.t.format(e.arena, elem_ty)});
+        if (e.vk.no_scalar_block_layout and r.kind != .byte_address_buffer and r.kind != .rw_byte_address_buffer) {
+            // -fspv-no-scalar-block-layout (Epic's DXC): the element must
+            // need no padding, as packed (FxcSBuffer) it has the same
+            // stride.
+            const packed_stride = layout.arrayStride(e.t, elem_ty, r.row_major, .dx_packed) catch return e.unsupported("buffer element type", .{});
+            if (packed_stride != stride) {
+                _ = e.diags.report(.{ .severity = .@"error", .loc = .none }, "cannot instantiate {s} with given packed alignment; 'VK_EXT_scalar_block_layout' not supported", .{r.name});
+                return error.Unsupported;
+            }
+        }
         const rt = try e.stridedArray(elem, 0, stride);
         const st = e.b.newId();
         try e.b.emit(.types_globals, .type_struct, &.{ st, rt });
@@ -3450,11 +3467,19 @@ const Emitter = struct {
     /// (-fvk-use-gl-layout, -fvk-use-dx-layout, -fvk-use-scalar-layout).
     fn cbRules(e: *Emitter) layout.Rules {
         return switch (e.vk.layout) {
-            .default => .vk_relaxed,
+            .default => if (e.vk.ue5_layout) .gl_std140 else .vk_relaxed,
             .gl => .gl_std140,
             .dx => .dx_legacy,
             .scalar => .scalar,
         };
+    }
+
+    /// The rules of cbuffer global `g`: with -fvk-ue5-layout, `$Globals`
+    /// is strict std140 whatever the layout (Epic's DeclResultIdMapper).
+    fn globalCbRules(e: *Emitter, g: ir.Global) layout.Rules {
+        if (g.tbuffer) return e.tbRules();
+        if (e.vk.ue5_layout and std.mem.eql(u8, g.name, "$Globals")) return .gl_std140;
+        return e.cbRules();
     }
 
     fn tbRules(e: *Emitter) layout.Rules {
@@ -3519,10 +3544,13 @@ const Emitter = struct {
         try e.cap(.input_attachment);
         const ms: u32 = @intFromBool(std.mem.eql(u8, r.name, "SubpassInputMS"));
         const st = try e.scalarType(storageScalar(e.t.component(r.elem).?));
-        const key: [6]u32 = .{ st, 6, 0, ms, 2, 0 };
+        // Depth unknown (2), or not depth (0) with
+        // -fspv-force-subpass-image-depth-false.
+        const depth: u32 = if (e.vk.subpass_depth_false) 0 else 2;
+        const key: [6]u32 = .{ st, 6, depth, ms, 2, 0 };
         if (e.image_types.get(key)) |id| return id;
         const id = e.b.newId();
-        try e.b.emit(.types_globals, .type_image, &.{ id, st, 6, 2, 0, ms, 2, 0 }); // SubpassData, Unknown
+        try e.b.emit(.types_globals, .type_image, &.{ id, st, 6, depth, 0, ms, 2, 0 }); // SubpassData
         try e.image_types.put(e.arena, key, id);
         return id;
     }
@@ -4452,6 +4480,24 @@ const Emitter = struct {
                 return e.op1(shop, ty, &.{ a, amount });
             },
         };
+        if (e.vk.fuse_mul_add and f) {
+            // -fspv-fusemuladd (Epic's SPIRV-Tools FusedMultiplyAddPass):
+            // an add of a multiply's result of the same type is
+            // Fma(x, y, other); of two, the earlier multiply's.
+            if (sop == .f_add) {
+                const ma = e.fmuls.get(a);
+                const mb = e.fmuls.get(b);
+                const use_a = if (ma != null and mb != null) a < b else ma != null;
+                if (if (use_a) ma else mb) |m| if (m.ty == ty) {
+                    return e.op1(.ext_inst, ty, &.{ e.glslSet(), 50, m.a, m.b, if (use_a) b else a }); // Fma
+                };
+            }
+            if (sop == .f_mul) {
+                const id = try e.op1(sop, ty, &.{ a, b });
+                try e.fmuls.put(e.arena, id, .{ .a = a, .b = b, .ty = ty });
+                return id;
+            }
+        }
         return e.op1(sop, ty, &.{ a, b });
     }
 

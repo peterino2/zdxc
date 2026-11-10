@@ -397,6 +397,26 @@ def fspv_use_legacy_buffer_matrix_order: Flag<["-"], "fspv-use-legacy-buffer-mat
   HelpText<"Assume the legacy matrix order (row major) when accessing raw buffers (e.g., ByteAdddressBuffer)">;
 def fspv_reflect: Flag<["-"], "fspv-reflect">, Group<spirv_Group>, Flags<[CoreOption, DriverOption]>,
   HelpText<"Emit additional SPIR-V instructions to aid reflection">;
+// zdxc: options from Epic's DXC fork (Unreal Engine's ShaderConductor),
+// copied from its HLSLOptions.td "UE Change" blocks, and
+// -fvk-allow-rwstructuredbuffer-arrays from later upstream DXC.
+def fvk_ue5_layout: Flag<["-"], "fvk-ue5-layout">, Group<spirv_Group>, Flags<[CoreOption, DriverOption]>,
+  HelpText<"Use a memory layout for Vulkan resources that matches what UE5 expects">;
+def fspv_force_subpass_image_depth_false: Flag<["-"], "fspv-force-subpass-image-depth-false">, Group<spirv_Group>, Flags<[CoreOption, DriverOption]>,
+  HelpText<"Force OpTypeImage depth flag to be set to 0">;
+def fspv_preserve_storage_input: Flag<["-"], "fspv-preserve-storage-input">, Group<spirv_Group>, Flags<[CoreOption, DriverOption]>,
+  HelpText<"Preserve the storage input classes when optimizing fragment shaders">;
+def fspv_svposition_implicit_invariant: Flag<["-"], "fspv-svposition-implicit-invariant">, Group<spirv_Group>, Flags<[CoreOption, DriverOption]>,
+  HelpText<"Treats SV_Position implicitly as invariant; This may prevent certain optimizations but can address Z-fighting">;
+def fspv_support_precise_outputs: Flag<["-"], "fspv-support-precise-outputs">, Group<spirv_Group>, Flags<[CoreOption, DriverOption]>,
+  HelpText<"Allow precise semantic outputs ; This may prevent certain optimizations but can address Z-fighting">;
+def fspv_fusemuladd: Flag<["-"], "fspv-fusemuladd">, Group<spirv_Group>, Flags<[CoreOption, DriverOption]>,
+  HelpText<"Fuse all floating-point multiply-add pairs to prevent reassociation of floating point instructions.">;
+def fspv_no_scalar_block_layout: Flag<["-"], "fspv-no-scalar-block-layout">, Group<spirv_Group>, Flags<[CoreOption, DriverOption]>,
+  HelpText<"Disable scalar block layout for structured buffers when generating SPIR-V.">;
+def fvk_allow_rwstructuredbuffer_arrays: Flag<["-"], "fvk-allow-rwstructuredbuffer-arrays">, Group<spirv_Group>, Flags<[CoreOption, DriverOption, HelpHidden]>,
+  HelpText<"Allow arrays of RWStructuredBuffers, AppendStructuredBuffers, and ConsumeStructuredBuffers. This is in development, and the option will be removed when the feature is complete.">;
+// zdxc: end of Epic's options.
 def fspv_debug_EQ : Joined<["-"], "fspv-debug=">, Group<spirv_Group>, Flags<[CoreOption, DriverOption]>,
   HelpText<"Specify whitelist of debug info category (file -> source -> line, tool, vulkan-with-source)">;
 def fspv_extension_EQ : Joined<["-"], "fspv-extension=">, Group<spirv_Group>, Flags<[CoreOption, DriverOption]>,
