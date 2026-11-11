@@ -898,6 +898,12 @@ pub fn fixPhis(a: Allocator, f: *ir.Function) Allocator.Error!void {
                 emitted[t.index()] = true;
                 grew = true;
             };
+            // (An unreachable merge target is emitted with what it branches
+            // to, as the SPIR-V emitter's block order does.)
+            for (try successors(a, b.term)) |t| if (t != .none and !emitted[t.index()]) {
+                emitted[t.index()] = true;
+                grew = true;
+            };
         }
     }
     // The emitted predecessors of each block.
