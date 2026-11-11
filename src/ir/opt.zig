@@ -880,7 +880,7 @@ pub fn foldBranches(a: Allocator, f: *ir.Function) Allocator.Error!bool {
 /// Phis after branch folding: one entry per predecessor the emitter still
 /// writes out (reachable blocks, and the merge and continue targets of the
 /// constructs they head), `undef` from those not reachable.
-fn fixPhis(a: Allocator, f: *ir.Function) Allocator.Error!void {
+pub fn fixPhis(a: Allocator, f: *ir.Function) Allocator.Error!void {
     const n = f.blocks.items.len;
     const live = try reachable(a, f);
     const emitted = try a.dupe(bool, live);
@@ -933,12 +933,91 @@ fn fixPhis(a: Allocator, f: *ir.Function) Allocator.Error!void {
 // ----------------------------------------------------------------------
 // Dead code
 
-fn isPureOp(op: Op) bool {
+/// Intrinsics without side effects: all but atomics, barriers, ray tracing
+/// calls, discards, appends and counters, mesh outputs, debug output and
+/// those writing through a pointer argument.
+pub fn isPureIntrinsic(f: *const ir.Function, name: []const u8, args: []const Ref) bool {
+    const effects = [_][]const u8{ "Interlocked", "Barrier", "clip", "abort", "printf", "errorf", "TraceRay", "ReportHit", "CallShader", "IgnoreHit", "AcceptHitAndEndSearch", "SetMeshOutputCounts", "DispatchMesh", "Store", "Append", "Consume", "IncrementCounter", "DecrementCounter", "discard", "WriteSamplerFeedback", "OutputComplete", "FinishedCrossGroupSharing", "Emit", "Cut", "Restart", "Proceed", "CommitNonOpaqueTriangleHit", "CommitProceduralPrimitiveHit", "Abort", "TraceRayInline", "hit_object", "HitObject", "MaybeReorderThread" };
+    for (effects) |e| if (std.mem.indexOf(u8, name, e) != null) return false;
+    for (args) |arg| if (f.inst(arg).ptr != .none) return false;
+    return true;
+}
+
+fn isPureOp(f: *const ir.Function, op: Op) bool {
     return switch (op) {
         .constant, .global, .load, .access, .binary, .unary, .cmp, .convert, .bitcast, .splat, .extract, .insert, .construct, .shuffle, .select, .heap_resource, .phi, .undef, .res_load => true,
-        .intrinsic => |x| std.mem.eql(u8, x.name, "NonUniformResourceIndex"),
+        .intrinsic => |x| isPureIntrinsic(f, x.name, x.args),
+        // Texture reads (not the forms that write a status through a
+        // pointer argument).
+        .method => |x| blk: {
+            const reads = [_][]const u8{ "Load", "Sample", "SampleLevel", "SampleGrad", "SampleBias", "SampleCmp", "SampleCmpLevelZero", "SampleCmpLevel", "Gather", "GatherRed", "GatherGreen", "GatherBlue", "GatherAlpha", "GatherCmp", "GatherCmpRed", "CalculateLevelOfDetail", "CalculateLevelOfDetailUnclamped" };
+            const known = for (reads) |r| {
+                if (std.mem.eql(u8, x.name, r)) break true;
+            } else false;
+            if (!known) break :blk false;
+            for (x.args) |arg| if (f.inst(arg).ptr != .none) break :blk false;
+            break :blk true;
+        },
         else => false,
     };
+}
+
+/// `extract(construct(..., v, ...), k)` and `extract(insert(a, v, k), k)`
+/// are `v` (through inserts of other members): a struct built whole and
+/// read in part (Unreal's FGBufferData from DecodeGBufferDataUV) no
+/// longer keeps its unread members' reads alive.
+fn forwardExtracts(a: Allocator, f: *ir.Function, t: *TypeTable) Allocator.Error!void {
+    const n = f.insts.items.len;
+    const repl = try a.alloc(Ref, n);
+    @memset(repl, .none);
+    var any = false;
+    for (f.blocks.items) |b| for (b.insts.items) |r| {
+        const x = switch (f.inst(r).op) {
+            .extract => |x| x,
+            else => continue,
+        };
+        var agg = x.agg;
+        var steps: usize = 0;
+        const v: Ref = while (steps < 64) : (steps += 1) {
+            const ai = f.inst(agg);
+            switch (ai.op) {
+                .insert => |ins| {
+                    if (ins.index == x.index) break ins.value;
+                    agg = ins.agg;
+                },
+                // (Struct constructs have one part per member.)
+                .construct => |parts| {
+                    if (t.get(ai.ty) != .@"struct" or x.index >= parts.len) break .none;
+                    break parts[x.index];
+                },
+                else => break .none,
+            }
+        } else .none;
+        if (v != .none and f.inst(v).ty == f.inst(r).ty) {
+            repl[r.index()] = v;
+            any = true;
+        }
+    };
+    if (!any) return;
+    const Map = struct {
+        repl: []const Ref,
+        pub fn map(c: @This(), x: Ref) Ref {
+            var y = x;
+            var k: usize = 0;
+            while (y != .none and y.index() < c.repl.len and c.repl[y.index()] != .none and k < 64) : (k += 1) y = c.repl[y.index()];
+            return y;
+        }
+    };
+    const mp = Map{ .repl = repl };
+    for (f.blocks.items) |*b| {
+        for (b.insts.items) |r| f.insts.items[r.index()].op = try mapOp(a, f.inst(r).op, mp);
+        b.term = switch (b.term) {
+            .ret => |v| .{ .ret = mp.map(v) },
+            .cond_br => |c| .{ .cond_br = .{ .cond = mp.map(c.cond), .then = c.then, .@"else" = c.@"else" } },
+            .@"switch" => |sw| .{ .@"switch" = .{ .value = mp.map(sw.value), .default = sw.default, .cases = sw.cases } },
+            else => b.term,
+        };
+    }
 }
 
 /// Removes instructions without side effects whose values nothing uses,
@@ -946,7 +1025,8 @@ fn isPureOp(op: Op) bool {
 /// evaluated where they are used, and a handle passed along but never
 /// read still loaded its index from $Globals, which Unreal's Vulkan
 /// format must not find beside a root parameter buffer.
-pub fn removeDeadCode(a: Allocator, f: *ir.Function) Allocator.Error!void {
+pub fn removeDeadCode(a: Allocator, t: *TypeTable, f: *ir.Function) Allocator.Error!void {
+    try forwardExtracts(a, f, t);
     const n = f.insts.items.len;
     const uses = try a.alloc(u32, n);
     @memset(uses, 0);
@@ -999,7 +1079,7 @@ pub fn removeDeadCode(a: Allocator, f: *ir.Function) Allocator.Error!void {
         };
         for (f.blocks.items) |b| for (b.insts.items) |r| {
             const i = r.index();
-            if (dead[i] or uses[i] != 0 or !isPureOp(f.inst(r).op)) continue;
+            if (dead[i] or uses[i] != 0 or !isPureOp(f, f.inst(r).op)) continue;
             dead[i] = true;
             changed = true;
             const Dec = struct {

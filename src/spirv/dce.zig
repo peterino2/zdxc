@@ -44,6 +44,23 @@ fn removable(op: u16, words: []const u32) bool {
         194, 195, 196, 197, 198, 199 => true,
         // OpPhi.
         245 => true,
+        // The rest of the arithmetic: OpSNegate, OpFNegate, the divisions
+        // and remainders, OpVectorTimesScalar through OpDot, OpTranspose,
+        // OpVectorInsertDynamic, conversions, OpAny, OpAll, OpIsNan, OpIsInf,
+        // OpLogicalEqual, OpLogicalNotEqual, float comparisons, OpNot,
+        // bit field operations, OpBitCount, OpCopyLogical, and extended
+        // instructions (GLSL.std.450 math).
+        126, 127, 134, 135, 136, 137, 138, 139, 140, 141 => true,
+        142, 143, 144, 145, 146, 147, 148, 84, 78 => true,
+        109, 110, 111, 115, 116, 117 => true,
+        154, 155, 156, 157, 164, 165 => true,
+        178, 179, 180, 181, 182, 183, 184, 185, 186, 187, 188, 189, 190, 191 => true,
+        200, 201, 202, 203, 204, 205, 400 => true,
+        12 => true,
+        // Image reads: OpSampledImage, the OpImageSample* forms, OpImageFetch,
+        // OpImageGather, OpImageDrefGather, OpImageRead, OpImage, and the
+        // size and level queries.
+        86, 87, 88, 89, 90, 91, 92, 95, 96, 97, 98, 100, 103, 104, 105, 106, 107 => true,
         else => false,
     };
 }

@@ -45,7 +45,10 @@ pub fn run(m: *ir.Module) Error!void {
         if (try opt.foldBranches(m.arena, f)) try opt.fold(m.arena, m.types, f);
         // The straight-line chains inlining (and folding) left.
         try opt.mergeBlocks(m.arena, f);
-        try opt.removeDeadCode(m.arena, f);
+        try opt.removeDeadCode(m.arena, m.types, f);
+        // Code whose results nothing live needs, branches included.
+        try @import("adce.zig").run(m.arena, f);
+        try opt.mergeBlocks(m.arena, f);
     }
 }
 
