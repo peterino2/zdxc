@@ -2106,22 +2106,34 @@ const Emitter = struct {
     /// one resource array, which keep their indices instead of aliasing
     /// one resource.
     fn findIndexedLocals(e: *Emitter, f: *const ir.Function) Error!void {
+        // The values stored to each resource local, in instruction order
+        // (one pass: a scan per local is quadratic in large shaders).
+        var stores: std.AutoHashMapUnmanaged(u32, std.ArrayList(Ref)) = .empty;
         for (f.insts.items, 0..) |inst, li| {
             if (inst.op != .local_var or !isResourceType(e.t, inst.ty) or e.t.get(inst.ty) == .array) continue;
-            const local: Ref = @enumFromInt(li);
+            try stores.put(e.arena, @intCast(li), .empty);
+        }
+        if (stores.count() == 0) return;
+        for (f.insts.items) |st| {
+            if (st.op != .store) continue;
+            const p = stores.getPtr(@intFromEnum(st.op.store.ptr)) orelse continue;
+            try p.append(e.arena, st.op.store.value);
+        }
+        for (f.insts.items, 0..) |inst, li| {
+            if (inst.op != .local_var) continue;
+            const values = (stores.get(@intCast(li)) orelse continue).items;
             var first: ?@FieldType(ir.Op, "access") = null;
             var first_value: Ref = .none;
             var distinct = false;
-            const ok = scan: for (f.insts.items) |st| {
-                if (st.op != .store or st.op.store.ptr != local) continue;
-                const acc = e.resourceElement(st.op.store.value) orelse break :scan false;
+            const ok = scan: for (values) |value| {
+                const acc = e.resourceElement(value) orelse break :scan false;
                 if (first) |fa| {
-                    if (st.op.store.value != first_value) distinct = true;
+                    if (value != first_value) distinct = true;
                     if (f.inst(fa.base).op.global != f.inst(acc.base).op.global or fa.indices.len != acc.indices.len) break :scan false;
                     for (fa.indices, acc.indices) |p, q| if (f.inst(p).ty != f.inst(q).ty) break :scan false;
                 } else {
                     first = acc;
-                    first_value = st.op.store.value;
+                    first_value = value;
                 }
             } else true;
             if (!ok or !distinct) continue;
