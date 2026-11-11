@@ -71,6 +71,29 @@ fn droppableStorage(sc: u32) bool {
     return sc == 0 or sc == 2 or sc == 6 or sc == 12;
 }
 
+/// The words of an instruction that may be types it uses: a result type,
+/// a type declaration's operand types, a function's type. (Never its own
+/// result.)
+fn typeRefs(w: []const u32) []const u32 {
+    const op: u16 = @truncate(w[0]);
+    return switch (op) {
+        // OpTypeVector, OpTypeMatrix, OpTypeImage, OpTypeSampledImage,
+        // OpTypeArray, OpTypeRuntimeArray: the element type (and an array's
+        // length constant, not a type, harmless).
+        23, 24, 25, 27, 29 => if (w.len >= 3) w[2..3] else &.{},
+        28 => if (w.len >= 4) w[2..4] else &.{},
+        // OpTypeStruct, OpTypeFunction.
+        30, 33 => if (w.len >= 2) w[2..] else &.{},
+        // OpTypePointer.
+        32 => if (w.len >= 4) w[3..4] else &.{},
+        // Other type declarations.
+        19...22, 26, 31, 34...39, 322, 4472, 5341 => &.{},
+        // A result type (OpFunction's function type is never removed); an
+        // instruction without one has an id here, never a type.
+        else => if (w.len >= 2) w[1..2] else &.{},
+    };
+}
+
 const Inst = struct { section: Section, start: usize, len: usize };
 
 fn instructions(a: Allocator, words: []const u32, section: Section, out: *std.ArrayList(Inst)) !void {
@@ -98,6 +121,16 @@ pub fn run(a: Allocator, b: *builder.Builder) !void {
             uses[x] += 1;
         };
     }
+    // Uses of types exactly, from the positions only types take (ids are
+    // unique, so only literals collide; a literal can equal a type's id).
+    const type_uses = try a.alloc(u32, bound);
+    @memset(type_uses, 0);
+    for (insts.items) |in| {
+        const w = b.sections.getPtr(in.section).items[in.start..][0..in.len];
+        for (typeRefs(w)) |x| if (x < bound) {
+            type_uses[x] += 1;
+        };
+    }
     // (Every id the entry point declares stays: its function.)
     {
         var eps: std.ArrayList(Inst) = .empty;
@@ -120,18 +153,26 @@ pub fn run(a: Allocator, b: *builder.Builder) !void {
             const op: u16 = @truncate(w[0]);
             const ok = switch (in.section) {
                 .functions => removable(op, w) and w.len >= 3,
-                .types_globals => op == 59 and w.len >= 4 and droppableStorage(w[3]), // OpVariable
+                .types_globals => (op == 59 and w.len >= 4 and droppableStorage(w[3])) or // OpVariable
+                    // OpTypeArray, OpTypeRuntimeArray, OpTypeStruct, OpTypePointer
+                    // (a struct whose members went, Unreal finds by name).
+                    ((op == 28 or op == 29 or op == 30 or op == 32) and w.len >= 2),
                 else => false,
             };
             if (!ok) continue;
-            const result = w[2];
+            const is_type = in.section == .types_globals and op != 59;
+            const result = if (is_type) w[1] else w[2];
             // (The instruction's own result word counted once.)
-            if (result >= bound or uses[result] > 1) continue;
+            if (result >= bound) continue;
+            if (if (is_type) type_uses[result] > 0 else uses[result] > 1) continue;
             gone[k] = true;
             dead[result] = true;
             changed = true;
             for (w[1..]) |x| if (x < bound and uses[x] > 0) {
                 uses[x] -= 1;
+            };
+            for (typeRefs(w)) |x| if (x < bound and type_uses[x] > 0) {
+                type_uses[x] -= 1;
             };
         }
     }
@@ -155,8 +196,9 @@ pub fn run(a: Allocator, b: *builder.Builder) !void {
         for (list.items) |in| {
             const w = s.items[in.start..][0..in.len];
             const op: u16 = @truncate(w[0]);
-            // OpName, OpDecorate, OpDecorateId, OpDecorateString.
-            const target_gone = (op == 5 or op == 71 or op == 332 or op == 5632) and w.len > 1 and w[1] < bound and dead[w[1]];
+            // OpName, OpMemberName, OpDecorate, OpMemberDecorate,
+            // OpDecorateId, OpDecorateString, OpMemberDecorateString.
+            const target_gone = (op == 5 or op == 6 or op == 71 or op == 72 or op == 332 or op == 5632 or op == 5633) and w.len > 1 and w[1] < bound and dead[w[1]];
             if (!target_gone) try out.appendSlice(a, w);
         }
         s.clearRetainingCapacity();

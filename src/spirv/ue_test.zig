@@ -35,6 +35,16 @@ const Module = struct {
         return null;
     }
 
+    /// The member index OpMemberName gives `name`, or null.
+    fn memberNamed(m: Module, name: []const u8) ?u32 {
+        var it = m.ops();
+        while (it.next()) |i| if (i.op == 6) { // OpMemberName
+            const s = std.mem.sliceAsBytes(i.args[2..]);
+            if (std.mem.eql(u8, std.mem.sliceTo(s, 0), name)) return i.args[1];
+        };
+        return null;
+    }
+
     /// The literal of member decoration `deco` on member `member` of `id`.
     fn memberDeco(m: Module, id: u32, member: u32, d: u32) ?u32 {
         var it = m.ops();
@@ -588,4 +598,39 @@ test "a loop whose results nothing uses goes, with what it reads" {
     // A loop that writes stays even if it computes nothing used.
     const writes = try ok(a, "cs_6_6", &.{}, "RWStructuredBuffer<uint> O; cbuffer C { uint n; }; [numthreads(1,1,1)] void main() { for (uint i = 0; i < n; i++) O[i] = i; }");
     try expectEqual(@as(usize, 1), countOp(writes, 246));
+}
+
+test "buffer struct members nothing reads go" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // (Unreal's shader record: VulkanShaderRecordLooseParameterData is
+    // gone from dxc's SPIR-V when DiffuseColorBoost is unused, and Unreal
+    // reflects the members left as the loose parameters a shader uses.)
+    const src =
+        \\struct Root { uint Config; uint Offset; uint First; uint User; };
+        \\struct Loose { float Boost; };
+        \\struct Params { Root R; uint Index; uint Vertex; uint UBs[32]; Loose Globals; };
+        \\[[vk::shader_record_ext]] ConstantBuffer<Params> P;
+        \\cbuffer C { float4 unused0; float4 used; float4 unused1; };
+        \\RWStructuredBuffer<float4> O;
+        \\[numthreads(1,1,1)] void main(uint3 id : SV_DispatchThreadID) { O[id.x] = used + float(P.R.First + P.Vertex); }
+    ;
+    const m = try ok(a, "cs_6_6", &.{}, src);
+    try std.testing.expect(m.memberNamed("Boost") == null);
+    try std.testing.expect(m.named("Loose") == null);
+    try std.testing.expect(m.memberNamed("UBs") == null);
+    try std.testing.expect(m.memberNamed("User") == null);
+    try std.testing.expect(m.memberNamed("unused0") == null);
+    try std.testing.expect(m.memberNamed("unused1") == null);
+    // What is used stays at its offset, renumbered.
+    try expectEqual(@as(?u32, 0), m.memberNamed("used"));
+    try expectEqual(@as(?u32, 1), m.memberNamed("Vertex"));
+    try expectEqual(@as(?u32, 0), m.memberNamed("First"));
+    const c = m.named("type.C").?;
+    try expectEqual(@as(?u32, 16), m.memberDeco(c, 0, offset));
+    // Used, Boost stays.
+    const used = try ok(a, "cs_6_6", &.{}, std.mem.replaceOwned(u8, a, src, "P.Vertex)", "P.Vertex) + P.Globals.Boost") catch unreachable);
+    try std.testing.expect(used.memberNamed("Boost") != null);
+    try std.testing.expect(used.named("Loose") != null);
 }

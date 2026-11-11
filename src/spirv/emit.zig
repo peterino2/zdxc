@@ -149,6 +149,7 @@ pub fn emit(gpa: Allocator, m: *const ir.Module, diags: *diag.Diagnostics, env: 
     defer e.b.deinit();
     try e.module();
     try @import("dce.zig").run(e.arena, &e.b);
+    if (try @import("members.zig").run(e.arena, &e.b)) try @import("dce.zig").run(e.arena, &e.b);
     return e.b.finish(0x00010000 | (@as(u32, env.minor) << 8));
 }
 
