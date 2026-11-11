@@ -54,6 +54,13 @@ fn isPure(f: *const ir.Function, op: ir.Op) bool {
     };
 }
 
+fn placedOp(op: ir.Op) bool {
+    return switch (op) {
+        .local_var, .constant, .undef, .param, .global, .spec_constant => false,
+        else => true,
+    };
+}
+
 pub fn run(a: Allocator, f: *ir.Function) Allocator.Error!void {
     const nb = f.blocks.items.len;
     const ni = f.insts.items.len;
@@ -99,6 +106,13 @@ pub fn run(a: Allocator, f: *ir.Function) Allocator.Error!void {
         }
     }
 
+    // The innermost loop around each block (none: in no loop).
+    const loop_of = try a.alloc(u32, nb);
+    for (0..nb) |bi| {
+        var c: u32 = if (f.blocks.items[bi].merge == .loop) @intCast(bi) else ctx[bi];
+        while (c != none and f.blocks.items[c].merge != .loop) c = parent[c];
+        loop_of[bi] = c;
+    }
     const live = try a.alloc(bool, ni);
     @memset(live, false);
     // Selection headers whose branch is live.
@@ -144,59 +158,83 @@ pub fn run(a: Allocator, f: *ir.Function) Allocator.Error!void {
         }
     }.f2;
 
-    // Locals only loaded and stored through (not escaping): a store to one
-    // is live when a load of it is.
+    // Locals used only through loads, stores and access chains (not
+    // escaping): a store into one (whole or through a chain) is live when a
+    // load from it is. root_of[x]: the local a pointer `x` is rooted at.
+    const root_of = try a.alloc(u32, ni);
+    @memset(root_of, none);
+    for (f.insts.items, 0..) |inst, i| {
+        if (inst.op == .local_var and inst.ptr == .function) root_of[i] = @intCast(i);
+    }
+    {
+        var grew = true;
+        while (grew) {
+            grew = false;
+            for (f.insts.items, 0..) |inst, i| {
+                if (root_of[i] != none) continue;
+                if (inst.op != .access) continue;
+                const rb = root_of[inst.op.access.base.index()];
+                if (rb == none) continue;
+                root_of[i] = rb;
+                grew = true;
+            }
+        }
+    }
     const escapes = try a.alloc(bool, ni);
     @memset(escapes, false);
     {
         const Esc = struct {
             f: *const ir.Function,
             escapes: []bool,
+            root_of: []const u32,
             user: Ref,
             pub fn use(c: @This(), x: Ref) void {
                 if (x == .none or x.index() >= c.escapes.len) return;
-                const xi = c.f.inst(x);
-                if (xi.op != .local_var) return;
+                const rt = c.root_of[x.index()];
+                if (rt == std.math.maxInt(u32)) return;
                 const fine = switch (c.f.inst(c.user).op) {
                     .load => true,
                     .store => |st| st.ptr == x and st.value != x,
+                    .access => |acc| acc.base == x,
                     else => false,
                 };
-                if (!fine) c.escapes[x.index()] = true;
+                if (!fine) c.escapes[rt] = true;
             }
         };
-        for (f.blocks.items) |b| for (b.insts.items) |r| opt.eachOperand(f.inst(r).op, Esc{ .f = f, .escapes = escapes, .user = r });
+        for (f.blocks.items) |b| for (b.insts.items) |r| opt.eachOperand(f.inst(r).op, Esc{ .f = f, .escapes = escapes, .root_of = root_of, .user = r });
         for (f.blocks.items) |b| switch (b.term) {
-            .ret => |v| if (v != .none and f.inst(v).op == .local_var) {
-                escapes[v.index()] = true;
+            .ret => |v| if (v != .none and root_of[v.index()] != none) {
+                escapes[root_of[v.index()]] = true;
             },
             else => {},
         };
     }
     var stores_of: std.AutoHashMapUnmanaged(u32, std.ArrayList(Ref)) = .empty;
     for (f.blocks.items) |b| for (b.insts.items) |r| switch (f.inst(r).op) {
-        .store => |st| if (f.inst(st.ptr).op == .local_var and f.inst(st.ptr).ptr == .function and !escapes[st.ptr.index()]) {
-            const gop = try stores_of.getOrPut(a, st.ptr.index());
+        .store => |st| {
+            const rt = root_of[st.ptr.index()];
+            if (rt == none or escapes[rt]) continue;
+            const gop = try stores_of.getOrPut(a, rt);
             if (!gop.found_existing) gop.value_ptr.* = .empty;
             try gop.value_ptr.append(a, r);
         },
         else => {},
     };
     const isLocalStore = struct {
-        fn f2(fn_: *const ir.Function, esc: []const bool, r: Ref) bool {
+        fn f2(fn_: *const ir.Function, esc: []const bool, roots: []const u32, r: Ref) bool {
             const st = switch (fn_.inst(r).op) {
                 .store => |x| x,
                 else => return false,
             };
-            const p = fn_.inst(st.ptr);
-            return p.op == .local_var and p.ptr == .function and !esc[st.ptr.index()];
+            const rt = roots[st.ptr.index()];
+            return rt != std.math.maxInt(u32) and !esc[rt];
         }
     }.f2;
 
     // Roots.
     for (f.blocks.items, 0..) |b, bi| {
         if (!seen[bi]) continue;
-        for (b.insts.items) |r| if (!isPure(f, f.inst(r).op) and !isLocalStore(f, escapes, r)) mark.ref(r);
+        for (b.insts.items) |r| if (!isPure(f, f.inst(r).op) and !isLocalStore(f, escapes, root_of, r)) mark.ref(r);
         switch (b.term) {
             .ret => |v| {
                 mark.ref(v);
@@ -204,9 +242,10 @@ pub fn run(a: Allocator, f: *ir.Function) Allocator.Error!void {
             },
             .discard, .@"unreachable", .none => headersLive(f, ctx, parent, branch_live, @intCast(bi), mark, none),
             .cond_br => |c| {
-                // Loop headers' (and branches not heading a selection, such
-                // as breaks) stay.
-                if (b.merge != .selection) {
+                // Branches not heading a selection (a loop's, and breaks)
+                // stay, unless they are a loop's: those are live when the
+                // loop is (below).
+                if (b.merge != .selection and loop_of[bi] == none) {
                     mark.ref(c.cond);
                     headersLive(f, ctx, parent, branch_live, @intCast(bi), mark, none);
                 }
@@ -249,14 +288,23 @@ pub fn run(a: Allocator, f: *ir.Function) Allocator.Error!void {
         .selection => |mb| merge_of[mb.index()] = @intCast(hi),
         else => {},
     };
+    // Loops whose control is live.
+    const loop_live = try a.alloc(bool, nb);
+    @memset(loop_live, false);
+    var loops_changed = true;
+    while (loops_changed) {
+    loops_changed = false;
     // Propagate.
     while (work.pop()) |r| {
         const inst = f.inst(r);
         opt.eachOperand(inst.op, mark);
         // A live load of a local: the stores into it.
-        if (inst.op == .load) if (stores_of.get(inst.op.load.index())) |list| {
-            for (list.items) |st| mark.ref(st);
-        };
+        if (inst.op == .load) {
+            const rt = root_of[inst.op.load.index()];
+            if (rt != none) if (stores_of.get(rt)) |list| {
+                for (list.items) |st| mark.ref(st);
+            };
+        }
         const bi = block_of[r.index()];
         // (Where a local, a constant or a reference to a global sits says
         // nothing about which branch was taken.)
@@ -299,8 +347,63 @@ pub fn run(a: Allocator, f: *ir.Function) Allocator.Error!void {
         }
     }
 
-    // Selections whose branch is not live go to their merge.
+    // A loop is live if anything live is inside it, or a block in it
+    // returns, discards, or leaves it other than by its merge.
+    for (f.blocks.items, 0..) |b, bi| {
+        if (!seen[bi]) continue;
+        const l = loop_of[bi];
+        if (l == none) continue;
+        var reason = false;
+        for (b.insts.items) |r| if (live[r.index()] and placedOp(f.inst(r).op)) {
+            reason = true;
+            break;
+        };
+        switch (b.term) {
+            .ret, .discard, .@"unreachable", .none => reason = true,
+            else => {},
+        }
+        if (!reason) for (try successors(a, b.term)) |s2| {
+            if (s2 == .none) continue;
+            // Inside this loop, or its merge: fine.
+            if (s2 == f.blocks.items[l].merge.loop.merge) continue;
+            var c = loop_of[s2.index()];
+            var inside = false;
+            while (c != none) : (c = if (parent[c] == none) none else loop_of[parent[c]]) if (c == l) {
+                inside = true;
+                break;
+            };
+            if (!inside and s2.index() != l) reason = true;
+        };
+        if (!reason) continue;
+        // This loop and those around it.
+        var c = l;
+        while (c != none) : (c = if (parent[c] == none) none else loop_of[parent[c]]) {
+            if (loop_live[c]) break;
+            loop_live[c] = true;
+            loops_changed = true;
+        }
+    }
+    // The control of live loops: branches in them not heading a selection.
+    if (loops_changed) for (f.blocks.items, 0..) |b, bi| {
+        if (!seen[bi] or loop_of[bi] == none or !loop_live[loop_of[bi]]) continue;
+        switch (b.term) {
+            .cond_br => |cb| if (b.merge != .selection and !live[cb.cond.index()]) {
+                mark.ref(cb.cond);
+                headersLive(f, ctx, parent, branch_live, @intCast(bi), mark, none);
+            },
+            else => {},
+        }
+    };
+    }
+    // Dead loops: their header goes to their merge.
     var changed = false;
+    for (f.blocks.items, 0..) |*b, bi| {
+        if (!seen[bi] or b.merge != .loop or loop_live[bi]) continue;
+        b.term = .{ .br = b.merge.loop.merge };
+        b.merge = .none;
+        changed = true;
+    }
+    // Selections whose branch is not live go to their merge.
     for (f.blocks.items, 0..) |*b, bi| {
         if (!seen[bi] or b.merge != .selection or branch_live[bi]) continue;
         if (b.term != .cond_br) continue;

@@ -567,3 +567,25 @@ test "a bindless handle passed along and never read leaves no binding" {
     try std.testing.expect(m.named("$Globals") == null);
     try std.testing.expect(m.named("Near") != null);
 }
+
+test "a loop whose results nothing uses goes, with what it reads" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // (Lumen: a light loop over ForwardLightStruct whose sum is unused.)
+    const src =
+        \\cbuffer Lights { uint NumLights; float4 LightColor[16]; };
+        \\RWStructuredBuffer<float4> O; float4 base;
+        \\float4 lights() { float4 s = 0; for (uint i = 0; i < NumLights; i++) s += LightColor[i & 15]; return s; }
+        \\[numthreads(1,1,1)] void main(uint3 id : SV_DispatchThreadID) { float4 unused = lights(); O[id.x] = base; }
+    ;
+    const m = try ok(a, "cs_6_6", &.{}, src);
+    try expectEqual(@as(usize, 0), countOp(m, 246)); // OpLoopMerge
+    try std.testing.expect(m.named("Lights") == null);
+    // Used: it stays.
+    const used = try ok(a, "cs_6_6", &.{}, std.mem.replaceOwned(u8, a, src, "O[id.x] = base;", "O[id.x] = base + unused;") catch unreachable);
+    try expectEqual(@as(usize, 1), countOp(used, 246));
+    // A loop that writes stays even if it computes nothing used.
+    const writes = try ok(a, "cs_6_6", &.{}, "RWStructuredBuffer<uint> O; cbuffer C { uint n; }; [numthreads(1,1,1)] void main() { for (uint i = 0; i < n; i++) O[i] = i; }");
+    try expectEqual(@as(usize, 1), countOp(writes, 246));
+}

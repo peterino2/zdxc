@@ -900,6 +900,13 @@ pub fn fixPhis(a: Allocator, f: *ir.Function) Allocator.Error!void {
             };
         }
     }
+    // The emitted predecessors of each block.
+    const preds = try a.alloc(std.ArrayList(u32), n);
+    for (preds) |*p| p.* = .empty;
+    for (f.blocks.items, 0..) |pbk, pbi| {
+        if (!emitted[pbi]) continue;
+        for (try successors(a, pbk.term)) |t| if (t != .none) try preds[t.index()].append(a, @intCast(pbi));
+    }
     // Where each instruction is defined.
     const def_block = try a.alloc(u32, f.insts.items.len);
     @memset(def_block, std.math.maxInt(u32));
@@ -924,10 +931,25 @@ pub fn fixPhis(a: Allocator, f: *ir.Function) Allocator.Error!void {
                 const v = if (dead) try addInst(a, f, .{ .op = .undef, .ty = inst.ty }) else in.value;
                 try ins.append(a, .{ .value = v, .block = in.block });
             }
+            // A new predecessor (the header of a loop that is gone): the
+            // value the edges it replaces carried, if it is still defined.
+            for (preds[si].items) |pbi| {
+                const has = for (ins.items) |in| {
+                    if (in.block.index() == pbi) break true;
+                } else false;
+                if (has) continue;
+                var v: Ref = .none;
+                if (inst.op.phi.len > 0) {
+                    const v0 = inst.op.phi[0].value;
+                    const db = def_block[v0.index()];
+                    if (db == std.math.maxInt(u32) or live[db]) v = v0;
+                }
+                if (v == .none or !live[pbi]) v = try addInst(a, f, .{ .op = .undef, .ty = inst.ty });
+                try ins.append(a, .{ .value = v, .block = @enumFromInt(pbi) });
+            }
             f.insts.items[r.index()].op = .{ .phi = ins.items };
         }
     }
-    _ = n;
 }
 
 // ----------------------------------------------------------------------
