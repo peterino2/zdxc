@@ -23,6 +23,8 @@ const Section = builder.Section;
 /// Opcodes with a result type and result id and no side effects.
 fn removable(op: u16, words: []const u32) bool {
     return switch (op) {
+        // OpVariable in a function (nothing loads, stores or points at it).
+        59 => words.len >= 4 and words[3] == 7,
         // OpLoad, unless volatile.
         61 => !(words.len > 4 and words[4] & 1 != 0),
         // OpAccessChain, OpInBoundsAccessChain, OpCopyObject.

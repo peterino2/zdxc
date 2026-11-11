@@ -36,13 +36,24 @@ pub fn run(m: *ir.Module) Error!void {
     try privateToLocal(m);
     for (m.functions.items) |f| {
         if (f.dead) continue;
-        try splitLocals(m, f);
-        try dynamicComponents(m, f);
-        try promote(m, f);
-        // Values that were behind locals may fold now, and branches on
-        // them (constant arguments of inlined calls).
-        try opt.fold(m.arena, m.types, f);
-        if (try opt.foldBranches(m.arena, f)) try opt.fold(m.arena, m.types, f);
+        // Splitting needs constant indices, which promotion and folding
+        // may make of loads (an unrolled loop's counter, an inlined
+        // argument): another round splits what they freed (TSR's register
+        // structs, indexed by their lane in unrolled loops).
+        var round: u32 = 0;
+        while (true) : (round += 1) {
+            const split = try splitLocals(m, f);
+            try dynamicComponents(m, f);
+            try promote(m, f);
+            // Values that were behind locals may fold now, and branches on
+            // them (constant arguments of inlined calls, members of the
+            // structs they return: extracts of constructs first).
+            try opt.forwardExtracts(m.arena, f, m.types);
+            try opt.fold(m.arena, m.types, f);
+            if (try opt.foldBranches(m.arena, f)) try opt.fold(m.arena, m.types, f);
+            if (round == max_rounds - 1 or !hasAggregateLocals(m.types, f)) break;
+            if (round > 0 and !split) break;
+        }
         // The straight-line chains inlining (and folding) left.
         try opt.mergeBlocks(m.arena, f);
         try opt.removeDeadCode(m.arena, m.types, f);
@@ -315,7 +326,19 @@ fn stepType(t: *TypeTable, ty: TypeId, k: u32) ?TypeId {
     };
 }
 
-fn splitLocals(m: *ir.Module, f: *ir.Function) Error!void {
+/// Rounds of splitting and promotion at most.
+const max_rounds = 4;
+
+/// Whether `f` has struct or array locals left.
+fn hasAggregateLocals(t: *TypeTable, f: *const ir.Function) bool {
+    for (f.insts.items) |inst| {
+        if (inst.op == .local_var and inst.ptr == .function and isAggregate(t, inst.ty)) return true;
+    }
+    return false;
+}
+
+/// Splits aggregate locals; whether it split any.
+fn splitLocals(m: *ir.Module, f: *ir.Function) Error!bool {
     const a = m.arena;
     const t = m.types;
     const n = f.insts.items.len;
@@ -350,7 +373,7 @@ fn splitLocals(m: *ir.Module, f: *ir.Function) Error!void {
             any = true;
         }
     }
-    if (!any) return;
+    if (!any) return false;
     // Chains in instruction order: an access's base precedes it in f.insts
     // when lowering made it; iterate to a fixed point to be safe.
     var changed = true;
@@ -479,6 +502,8 @@ fn splitLocals(m: *ir.Module, f: *ir.Function) Error!void {
         }
         blk.insts = out;
     }
+    for (cand) |c| if (c) return true;
+    return false;
 }
 
 /// Aggregates split into at most this many locals.

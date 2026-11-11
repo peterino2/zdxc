@@ -994,7 +994,7 @@ fn isPureOp(f: *const ir.Function, op: Op) bool {
 /// are `v` (through inserts of other members): a struct built whole and
 /// read in part (Unreal's FGBufferData from DecodeGBufferDataUV) no
 /// longer keeps its unread members' reads alive.
-fn forwardExtracts(a: Allocator, f: *ir.Function, t: *TypeTable) Allocator.Error!void {
+pub fn forwardExtracts(a: Allocator, f: *ir.Function, t: *TypeTable) Allocator.Error!void {
     const n = f.insts.items.len;
     const repl = try a.alloc(Ref, n);
     @memset(repl, .none);

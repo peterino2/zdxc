@@ -634,3 +634,63 @@ test "buffer struct members nothing reads go" {
     try std.testing.expect(used.memberNamed("Boost") != null);
     try std.testing.expect(used.named("Loose") != null);
 }
+
+test "struct locals indexed by an unrolled loop's counter are split" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // (Unreal's TSR: its register structs, indexed by lane in [unroll]
+    // loops; the index is a constant only once the counter is promoted.
+    // Left whole, they are tens of thousands of locals Unreal's spirv-opt
+    // then spends tens of seconds on.)
+    const src =
+        \\template<typename T, uint N, uint C>
+        \\struct Regs { vector<T, N> Array[C];
+        \\  vector<T, N> GetElement(const uint i) { return Array[i]; }
+        \\  void SetElement(const uint i, vector<T, N> v) { Array[i] = v; } };
+        \\template<typename T, uint N, uint X, uint Y>
+        \\struct Lane { static const uint SimdSize = X * Y; Regs<T, N, X * Y> Registers;
+        \\  vector<T, N> GetElement(const uint i) { return Registers.GetElement(i); }
+        \\  void SetElement(const uint i, vector<T, N> v) { Registers.SetElement(i, v); } };
+        \\template<typename T, uint N, uint X, uint Y>
+        \\Lane<T, N, X, Y> Add(Lane<T, N, X, Y> a, Lane<T, N, X, Y> b) {
+        \\  Lane<T, N, X, Y> r;
+        \\  [unroll] for (uint i = 0; i < Lane<T, N, X, Y>::SimdSize; i++) r.SetElement(i, a.GetElement(i) + b.GetElement(i));
+        \\  return r; }
+        \\RWStructuredBuffer<float3> O; StructuredBuffer<float3> I;
+        \\[numthreads(64,1,1)] void main(uint3 id : SV_DispatchThreadID) {
+        \\  Lane<float, 3, 1, 2> a, b;
+        \\  [unroll] for (uint i = 0; i < 2; i++) { a.SetElement(i, I[id.x * 2 + i]); b.SetElement(i, I[id.x * 2 + i + 1]); }
+        \\  Lane<float, 3, 1, 2> c = Add(a, b); c = Add(c, a);
+        \\  O[id.x] = c.GetElement(0) + c.GetElement(1);
+        \\}
+    ;
+    const m = try ok(a, "cs_6_6", &.{"-HV", "2021"}, src);
+    try expectEqual(@as(usize, 0), functionVars(m));
+}
+
+test "branches on members of a returned struct of constants fold" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // (Unreal's FWaveBroadcastSettings: InitWaveRotateLaneGroup returns
+    // Operation = 4, and the broadcast branches on it.)
+    const src =
+        \\struct Settings { uint Op; uint Mask; uint Xor; };
+        \\Settings InitSettings(uint op, uint mask) { Settings s; s.Op = op; s.Mask = mask; s.Xor = 0; return s; }
+        \\uint Lane(const Settings s, uint id) {
+        \\  if (s.Op == 1) return id ^ s.Mask;
+        \\  else if (s.Op == 2) return id & s.Mask;
+        \\  else if (s.Op == 4) return id + s.Xor;
+        \\  return id;
+        \\}
+        \\RWStructuredBuffer<uint> O;
+        \\[numthreads(64,1,1)] void main(uint3 id : SV_DispatchThreadID) {
+        \\  const Settings s = InitSettings(4, 3);
+        \\  O[id.x] = WaveReadLaneAt(id.x, Lane(s, WaveGetLaneIndex()));
+        \\}
+    ;
+    const m = try ok(a, "cs_6_6", &.{"-fspv-target-env=vulkan1.3"}, src);
+    try expectEqual(@as(usize, 0), countOp(m, 247)); // OpSelectionMerge
+    try expectEqual(@as(usize, 0), countOp(m, 170)); // OpIEqual
+}
