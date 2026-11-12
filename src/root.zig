@@ -54,7 +54,7 @@ pub const spirv = struct {
     pub const emit = @import("spirv/emit.zig");
 };
 
-pub const version = "0.1.0";
+pub const version = "0.1.1";
 
 test {
     const std = @import("std");
