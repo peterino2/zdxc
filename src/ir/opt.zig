@@ -857,6 +857,12 @@ pub fn foldBranches(a: Allocator, f: *ir.Function) Allocator.Error!bool {
         };
         const taken = if (take) c.then else c.@"else";
         const untaken = if (take) c.@"else" else c.then;
+        // (A loop's branch back stays: a loop header needs its back edge.
+        // A loop it never takes runs once, which one_trip.zig undoes.)
+        switch (f.blocks.items[untaken.index()].merge) {
+            .loop => |l| if (l.@"continue".index() == bi) continue,
+            else => {},
+        }
         b.term = .{ .br = taken };
         if (b.merge == .selection) {
             b.merge = .none;
@@ -990,20 +996,110 @@ fn isPureOp(f: *const ir.Function, op: Op) bool {
     };
 }
 
+/// The parts a construct of type `ty` takes one of per element (structs'
+/// members, arrays' elements, vectors' components when all are scalars).
+fn partsPerElement(t: *TypeTable, f: *ir.Function, ty: TypeId, parts: []const Ref) bool {
+    return switch (t.get(ty)) {
+        .@"struct", .array => true,
+        .vector => |v| parts.len == v.len and for (parts) |p| {
+            if (t.get(f.inst(p).ty) != .scalar) break false;
+        } else true,
+        else => false,
+    };
+}
+
 /// `extract(construct(..., v, ...), k)` and `extract(insert(a, v, k), k)`
 /// are `v` (through inserts of other members): a struct built whole and
 /// read in part (Unreal's FGBufferData from DecodeGBufferDataUV) no
-/// longer keeps its unread members' reads alive.
+/// longer keeps its unread members' reads alive. The same for arrays and
+/// vectors built of their components, and `extract(shuffle(v, ...), k)`
+/// reads `v` itself. `construct(extract(s, 0), ..., extract(s, n - 1))`
+/// is `s`: Unreal's arrays copied element by element (a struct's array
+/// member returned and assigned) come apart and back together whole.
 pub fn forwardExtracts(a: Allocator, f: *ir.Function, t: *TypeTable) Allocator.Error!void {
     const n = f.insts.items.len;
     const repl = try a.alloc(Ref, n);
     @memset(repl, .none);
     var any = false;
+    const Map = struct {
+        repl: []const Ref,
+        pub fn map(c: @This(), x: Ref) Ref {
+            var y = x;
+            var k: usize = 0;
+            while (y != .none and y.index() < c.repl.len and c.repl[y.index()] != .none and k < 64) : (k += 1) y = c.repl[y.index()];
+            return y;
+        }
+    };
+    const mp = Map{ .repl = repl };
     for (f.blocks.items) |b| for (b.insts.items) |r| {
-        const x = switch (f.inst(r).op) {
+        // A vector's every component inserted (`v.x = a; v.y = b; ...`,
+        // promoted): a construct of them.
+        if (f.inst(r).op == .insert) vec: {
+            const len = switch (t.get(f.inst(r).ty)) {
+                .vector => |v| v.len,
+                else => break :vec,
+            };
+            if (len < 2 or len > 4) break :vec;
+            var parts: [4]Ref = .{ .none, .none, .none, .none };
+            var have: usize = 0;
+            var cur = r;
+            var steps: usize = 0;
+            while (have < len and steps < 16) : (steps += 1) {
+                const ins = switch (f.inst(cur).op) {
+                    .insert => |x| x,
+                    else => break,
+                };
+                if (ins.index >= len) break :vec;
+                // (The last insert of a component wins.)
+                if (parts[ins.index] == .none) {
+                    parts[ins.index] = ins.value;
+                    have += 1;
+                }
+                cur = mp.map(ins.agg);
+            }
+            if (have < len) break :vec;
+            for (parts[0..len]) |p| if (t.get(f.inst(p).ty) != .scalar) break :vec;
+            f.insts.items[r.index()].op = .{ .construct = try a.dupe(Ref, parts[0..len]) };
+            any = true;
+            continue;
+        }
+        if (f.inst(r).op == .construct) {
+            const parts = f.inst(r).op.construct;
+            if (parts.len == 0 or !partsPerElement(t, f, f.inst(r).ty, parts)) continue;
+            var src: Ref = .none;
+            const whole = for (parts, 0..) |p, k| {
+                const x = switch (f.inst(mp.map(p)).op) {
+                    .extract => |x| x,
+                    else => break false,
+                };
+                if (x.index != k) break false;
+                const s = mp.map(x.agg);
+                if (src == .none) src = s else if (s != src) break false;
+            } else true;
+            if (whole and f.inst(src).ty == f.inst(r).ty and switch (t.get(f.inst(src).ty)) {
+                .@"struct" => |si| si.fields.items.len == parts.len,
+                .array => |ar| ar.len == parts.len,
+                .vector => |v| v.len == parts.len,
+                else => false,
+            }) {
+                repl[r.index()] = src;
+                any = true;
+            }
+            continue;
+        }
+        var x = switch (f.inst(r).op) {
             .extract => |x| x,
             else => continue,
         };
+        // (A component of a shuffle is one of its vector's.)
+        switch (f.inst(mp.map(x.agg)).op) {
+            .shuffle => |sh| if (x.index < sh.components.len) {
+                x = .{ .agg = sh.vec, .index = sh.components[x.index] };
+                f.insts.items[r.index()].op = .{ .extract = x };
+                any = true;
+            },
+            else => {},
+        }
         var agg = x.agg;
         var steps: usize = 0;
         const v: Ref = while (steps < 64) : (steps += 1) {
@@ -1013,9 +1109,8 @@ pub fn forwardExtracts(a: Allocator, f: *ir.Function, t: *TypeTable) Allocator.E
                     if (ins.index == x.index) break ins.value;
                     agg = ins.agg;
                 },
-                // (Struct constructs have one part per member.)
                 .construct => |parts| {
-                    if (t.get(ai.ty) != .@"struct" or x.index >= parts.len) break .none;
+                    if (x.index >= parts.len or !partsPerElement(t, f, ai.ty, parts)) break .none;
                     break parts[x.index];
                 },
                 else => break .none,
@@ -1027,16 +1122,6 @@ pub fn forwardExtracts(a: Allocator, f: *ir.Function, t: *TypeTable) Allocator.E
         }
     };
     if (!any) return;
-    const Map = struct {
-        repl: []const Ref,
-        pub fn map(c: @This(), x: Ref) Ref {
-            var y = x;
-            var k: usize = 0;
-            while (y != .none and y.index() < c.repl.len and c.repl[y.index()] != .none and k < 64) : (k += 1) y = c.repl[y.index()];
-            return y;
-        }
-    };
-    const mp = Map{ .repl = repl };
     for (f.blocks.items) |*b| {
         for (b.insts.items) |r| f.insts.items[r.index()].op = try mapOp(a, f.inst(r).op, mp);
         b.term = switch (b.term) {

@@ -178,6 +178,13 @@ const Emitter = struct {
     pointer_types: std.AutoHashMapUnmanaged(struct { StorageClass, Id }, Id) = .empty,
     function_types: std.StringHashMapUnmanaged(Id) = .empty,
     constants: std.AutoHashMapUnmanaged(struct { Id, u64 }, Id) = .empty,
+    /// The bits of each scalar OpConstant (the inverse of `constants`).
+    constant_bits: std.AutoHashMapUnmanaged(Id, u64) = .empty,
+    /// Other constants a composite constant may be made of (booleans,
+    /// composites).
+    other_constants: std.AutoHashMapUnmanaged(Id, void) = .empty,
+    /// OpConstantComposites by type and parts.
+    composite_constants: std.StringHashMapUnmanaged(Id) = .empty,
     capabilities: std.AutoArrayHashMapUnmanaged(Capability, void) = .empty,
     glsl: Id = 0,
     void_id: Id = 0,
@@ -754,6 +761,7 @@ const Emitter = struct {
             try e.b.emit(.types_globals, .constant, &.{ ty_id, id, @truncate(bits), @truncate(bits >> 32) });
         } else try e.b.emit(.types_globals, .constant, &.{ ty_id, id, @truncate(bits) });
         try e.constants.put(e.arena, .{ ty_id, bits }, id);
+        try e.constant_bits.put(e.arena, id, bits);
         return id;
     }
 
@@ -779,6 +787,7 @@ const Emitter = struct {
                 const id = e.b.newId();
                 try e.b.emit(.types_globals, if (v) .constant_true else .constant_false, &.{ ty_id, id });
                 try e.constants.put(e.arena, .{ ty_id, @intFromBool(v) }, id);
+                try e.other_constants.put(e.arena, id, {});
                 return id;
             },
             .float => return e.constBits(ty_id, @as(u32, @bitCast(@as(f32, @floatCast(floatOf(c))))), 1),
@@ -2245,7 +2254,11 @@ const Emitter = struct {
         // Constants and parameters first (they may be used in any block).
         for (f.insts.items, 0..) |inst, i| switch (inst.op) {
             .constant => |c| e.vals[i] = try e.constant(inst.ty, c),
-            .undef => e.vals[i] = try e.undefOf(inst.ty),
+            // (None of a resource: struct values leave resources out, and a
+            // split struct's resource members are undef.)
+            .undef => if (!layout.isOpaque(e.t, inst.ty)) {
+                e.vals[i] = try e.undefOf(inst.ty);
+            },
             .param => |p| {
                 e.vals[i] = param_ids[p];
                 if (e.mesh_params.get(.{ f, p })) |kind| try e.mesh_places.put(e.arena, @intCast(i), .{ .kind = kind, .ty = inst.ty });
@@ -3429,6 +3442,28 @@ const Emitter = struct {
 
     /// Emits `op` with a result of HLSL type `ty`; returns the result id.
     fn op1(e: *Emitter, op: Op, ty: TypeId, operands: []const u32) Error!Id {
+        // A composite of constants is a constant (one per type and parts,
+        // as dxc's SPIR-V has them).
+        if (op == .composite_construct and operands.len > 0) {
+            const all = for (operands) |x| {
+                if (!e.constant_bits.contains(x) and !e.other_constants.contains(x)) break false;
+            } else true;
+            if (all) {
+                var key: std.ArrayList(u32) = .empty;
+                try key.append(e.arena, try e.typeId(ty));
+                try key.appendSlice(e.arena, operands);
+                const k = std.mem.sliceAsBytes(key.items);
+                if (e.composite_constants.get(k)) |id| return id;
+                const id = e.b.newId();
+                var ops: std.ArrayList(u32) = .empty;
+                try ops.appendSlice(e.arena, &.{ key.items[0], id });
+                try ops.appendSlice(e.arena, operands);
+                try e.b.emit(.types_globals, .constant_composite, ops.items);
+                try e.composite_constants.put(e.arena, k, id);
+                try e.other_constants.put(e.arena, id, {});
+                return id;
+            }
+        }
         const id = e.b.newId();
         var ops: std.ArrayList(u32) = .empty;
         try ops.appendSlice(e.arena, &.{ try e.typeId(ty), id });
@@ -4311,20 +4346,14 @@ const Emitter = struct {
     /// Load/Store(2..4) and atomics on byte-address buffers (uint words).
     fn byteAddressMethod(e: *Emitter, name: []const u8, res: Ref, args: []const Ref, ty: TypeId) Error!Id {
         const uint_ty = try e.t.scalar(.uint);
-        const word = struct {
-            fn f(em: *Emitter, base: Id, off: Id, k: u32) Error!Id {
-                const ut = try em.t.scalar(.uint);
-                var idx = try em.op1(.shift_right_logical, ut, &.{ off, try em.constUint(2) });
-                if (k > 0) idx = try em.op1(.i_add, ut, &.{ idx, try em.constUint(k) });
-                return em.opRaw(.access_chain, try em.pointerType(em.bufferSc(), try em.scalarType(.uint)), &.{ base, try em.constInt(0), idx });
-            }
-        }.f;
+        // (Words from `off >> 2`, made once.)
+        var base_idx: Id = 0;
         const off = try e.convert(e.val(args[0]), e.f.inst(args[0]).ty, uint_ty);
         if (std.mem.startsWith(u8, name, "Load") and args.len == 1) {
             if (e.t.component(ty) != .uint or e.t.get(ty) == .matrix) return e.rawLoad(e.val(res), off, ty);
             const n = e.t.componentCount(ty).?;
             const parts = try e.arena.alloc(Id, n);
-            for (parts, 0..) |*p, k| p.* = try e.op1(.load, uint_ty, &.{try word(e, e.val(res), off, @intCast(k))});
+            for (parts, 0..) |*p, k| p.* = try e.op1(.load, uint_ty, &.{try e.rawWordOff(e.val(res), off, &base_idx, @as(u32, @intCast(k)) * 4)});
             return if (n == 1) parts[0] else e.op1(.composite_construct, ty, parts);
         }
         if (std.mem.startsWith(u8, name, "Store") and args.len == 2) {
@@ -4336,14 +4365,14 @@ const Emitter = struct {
             const n = e.t.componentCount(vty).?;
             for (0..n) |k| {
                 const v = if (n == 1) e.val(args[1]) else try e.op1(.composite_extract, uint_ty, &.{ e.val(args[1]), @intCast(k) });
-                try e.b.emit(.functions, .store, &.{ try word(e, e.val(res), off, @intCast(k)), v });
+                try e.b.emit(.functions, .store, &.{ try e.rawWordOff(e.val(res), off, &base_idx, @as(u32, @intCast(k)) * 4), v });
             }
             return 0;
         }
         if (std.mem.startsWith(u8, name, "Interlocked")) {
             const vc = e.t.component(e.f.inst(args[1]).ty) orelse return e.unsupported("'{s}' on this value is not supported yet", .{name});
             if (vc.size() != 4) return e.unsupported("64-bit '{s}' is not supported yet", .{name});
-            return e.atomicOp(name["Interlocked".len..], try word(e, e.val(res), off, 0), uint_ty, 1, args[1..]);
+            return e.atomicOp(name["Interlocked".len..], try e.rawWordOff(e.val(res), off, &base_idx, 0), uint_ty, 1, args[1..], TypeTable.void_type);
         }
         return e.unsupported("method '{s}' is not supported yet", .{name});
     }
@@ -4353,6 +4382,17 @@ const Emitter = struct {
     fn rawWord(e: *Emitter, buf: Id, addr: Id) Error!Id {
         const ut = try e.t.scalar(.uint);
         const idx = try e.op1(.shift_right_logical, ut, &.{ addr, try e.constUint(2) });
+        return e.opRaw(.access_chain, try e.pointerType(e.bufferSc(), try e.scalarType(.uint)), &.{ buf, try e.constInt(0), idx });
+    }
+
+    /// Pointer to the word at byte `base + off` (`off` a multiple of 4) of
+    /// a byte-address buffer: word `(base >> 2) + off / 4`, `base >> 2`
+    /// made once per access (in `base_idx`, 0 until then) as dxc does.
+    fn rawWordOff(e: *Emitter, buf: Id, base: Id, base_idx: *Id, off: u32) Error!Id {
+        const ut = try e.t.scalar(.uint);
+        if (base_idx.* == 0) base_idx.* = try e.op1(.shift_right_logical, ut, &.{ base, try e.constUint(2) });
+        var idx = base_idx.*;
+        if (off / 4 > 0) idx = try e.op1(.i_add, ut, &.{ idx, try e.constUint(off / 4) });
         return e.opRaw(.access_chain, try e.pointerType(e.bufferSc(), try e.scalarType(.uint)), &.{ buf, try e.constInt(0), idx });
     }
 
@@ -4390,16 +4430,18 @@ const Emitter = struct {
         const ut = try e.t.scalar(.uint);
         const n = layout.flatCount(e.t, ty) catch return e.unsupported("byte-address buffer accesses of type '{s}' are not supported yet", .{try e.t.format(e.arena, ty)});
         const comps = try e.arena.alloc(Id, n);
+        var base_idx: Id = 0;
         for (comps, 0..) |*c, k| {
             const rc = try e.rawComponent(ty, @intCast(k));
             const sc = rc[0];
-            const addr = try e.op1(.i_add, ut, &.{ base, try e.constUint(rc[1]) });
-            const w0 = try e.op1(.load, ut, &.{try e.rawWord(buf, addr)});
             const comp = storageScalar(e.t.component(sc).?);
+            // (Whole words from the word index; halves need the address.)
+            const whole = comp.size() >= 4 and rc[1] % 4 == 0;
+            const addr = if (whole) 0 else try e.op1(.i_add, ut, &.{ base, try e.constUint(rc[1]) });
+            const w0 = try e.op1(.load, ut, &.{if (whole) try e.rawWordOff(buf, base, &base_idx, rc[1]) else try e.rawWord(buf, addr)});
             c.* = switch (comp.size()) {
                 8 => blk: {
-                    const addr1 = try e.op1(.i_add, ut, &.{ addr, try e.constUint(4) });
-                    const w1 = try e.op1(.load, ut, &.{try e.rawWord(buf, addr1)});
+                    const w1 = try e.op1(.load, ut, &.{if (whole) try e.rawWordOff(buf, base, &base_idx, rc[1] + 4) else try e.rawWord(buf, try e.op1(.i_add, ut, &.{ addr, try e.constUint(4) }))});
                     const pair = try e.op1(.composite_construct, try e.t.vector(.uint, 2), &.{ w0, w1 });
                     break :blk try e.op1(.bitcast, sc, &.{pair});
                 },
@@ -4419,18 +4461,19 @@ const Emitter = struct {
     fn rawStore(e: *Emitter, buf: Id, base: Id, ty: TypeId, v: Id) Error!void {
         const ut = try e.t.scalar(.uint);
         const n = layout.flatCount(e.t, ty) catch return e.unsupported("byte-address buffer accesses of type '{s}' are not supported yet", .{try e.t.format(e.arena, ty)});
+        var base_idx: Id = 0;
         for (0..n) |k| {
             const rc = try e.rawComponent(ty, @intCast(k));
             const sc = rc[0];
             const x = (try e.flatComponent(v, ty, @intCast(k)))[0];
-            const addr = try e.op1(.i_add, ut, &.{ base, try e.constUint(rc[1]) });
             const comp = storageScalar(e.t.component(sc).?);
+            const whole = comp.size() >= 4 and rc[1] % 4 == 0;
+            const addr = if (whole) 0 else try e.op1(.i_add, ut, &.{ base, try e.constUint(rc[1]) });
             switch (comp.size()) {
                 8 => {
                     const pair = try e.op1(.bitcast, try e.t.vector(.uint, 2), &.{x});
-                    try e.b.emit(.functions, .store, &.{ try e.rawWord(buf, addr), try e.op1(.composite_extract, ut, &.{ pair, 0 }) });
-                    const addr1 = try e.op1(.i_add, ut, &.{ addr, try e.constUint(4) });
-                    try e.b.emit(.functions, .store, &.{ try e.rawWord(buf, addr1), try e.op1(.composite_extract, ut, &.{ pair, 1 }) });
+                    try e.b.emit(.functions, .store, &.{ if (whole) try e.rawWordOff(buf, base, &base_idx, rc[1]) else try e.rawWord(buf, addr), try e.op1(.composite_extract, ut, &.{ pair, 0 }) });
+                    try e.b.emit(.functions, .store, &.{ if (whole) try e.rawWordOff(buf, base, &base_idx, rc[1] + 4) else try e.rawWord(buf, try e.op1(.i_add, ut, &.{ addr, try e.constUint(4) })), try e.op1(.composite_extract, ut, &.{ pair, 1 }) });
                 },
                 2 => {
                     // Replace the half of the word (not atomic, as dxc).
@@ -4445,7 +4488,7 @@ const Emitter = struct {
                 },
                 else => {
                     const w = if (comp == .uint) x else if (comp == .bool) try e.convert(x, sc, ut) else try e.op1(.bitcast, ut, &.{x});
-                    try e.b.emit(.functions, .store, &.{ try e.rawWord(buf, addr), w });
+                    try e.b.emit(.functions, .store, &.{ if (whole) try e.rawWordOff(buf, base, &base_idx, rc[1]) else try e.rawWord(buf, addr), w });
                 },
             }
         }
@@ -4662,10 +4705,17 @@ const Emitter = struct {
             .log_and => .logical_and,
             .log_or => .logical_or,
             .shl, .shr => {
-                // HLSL masks the shift amount to the bit width.
-                const mask = try e.splatConst(ty, .{ .int = @as(i64, c.size()) * 8 - 1 });
-                const amount = try e.op1(.bitwise_and, ty, &.{ b, mask });
+                // HLSL masks the shift amount to the bit width (a constant
+                // one here; by 0, no shift).
+                const width_mask: u64 = @as(u64, c.size()) * 8 - 1;
                 const shop: Op = if (op == .shl) .shift_left_logical else if (u) .shift_right_logical else .shift_right_arithmetic;
+                if (e.isScalarLike(ty)) if (e.constant_bits.get(b)) |bits| {
+                    const k = bits & width_mask;
+                    if (k == 0) return a;
+                    return e.op1(shop, ty, &.{ a, try e.splatConst(ty, .{ .int = @intCast(k) }) });
+                };
+                const mask = try e.splatConst(ty, .{ .int = @intCast(width_mask) });
+                const amount = try e.op1(.bitwise_and, ty, &.{ b, mask });
                 return e.op1(shop, ty, &.{ a, amount });
             },
         };
@@ -4890,7 +4940,7 @@ const Emitter = struct {
                 const s_ = try e.texelScalar(e.resourceInfo(tp.res).elem);
                 ptr = try e.opRaw(.image_texel_pointer, try e.pointerType(.image, try e.scalarType(s_)), &.{ e.val(tp.res), e.val(tp.coord), try e.constUint(0) });
             }
-            return try e.atomicOp(name["Interlocked".len..], ptr, dest.ty, scope, args[1..]);
+            return try e.atomicOp(name["Interlocked".len..], ptr, dest.ty, scope, args[1..], ty);
         }
         if (eq(u8, name, "asuint") and args.len == 3) {
             const n = e.t.componentCount(xty).?;
@@ -4905,8 +4955,10 @@ const Emitter = struct {
     }
 
     /// An atomic on `ptr` (to a `dty` scalar); `rest` holds the value(s)
-    /// and, last, the optional out original.
-    fn atomicOp(e: *Emitter, op_name: []const u8, ptr: Id, dty: TypeId, scope: u32, rest: []const Ref) Error!Id {
+    /// and, last, the optional out original. Without one, an intrinsic of
+    /// type `rty` (not void) gives the original as its value (ssa.zig's
+    /// form of an out original, a store of it after).
+    fn atomicOp(e: *Emitter, op_name: []const u8, ptr: Id, dty: TypeId, scope: u32, rest: []const Ref, rty: TypeId) Error!Id {
         const eq = std.mem.eql;
         const dc = e.t.component(dty) orelse return e.unsupported("atomics on this destination are not supported yet", .{});
         if (dc.isFloat()) return e.unsupported("float atomics are not supported yet", .{});
@@ -4928,11 +4980,11 @@ const Emitter = struct {
             const op: Op = if (eq(u8, op_name, "Add")) .atomic_i_add else if (eq(u8, op_name, "And")) .atomic_and else if (eq(u8, op_name, "Or")) .atomic_or else if (eq(u8, op_name, "Xor")) .atomic_xor else if (eq(u8, op_name, "Min")) (if (dc.isUnsigned()) .atomic_u_min else .atomic_s_min) else if (eq(u8, op_name, "Max")) (if (dc.isUnsigned()) .atomic_u_max else .atomic_s_max) else if (eq(u8, op_name, "Exchange")) .atomic_exchange else return e.unsupported("'Interlocked{s}' is not supported yet", .{op_name});
             orig = try e.op1(op, dty, &.{ ptr, scope_id, sem, try asDest(e, rest[0], dty) });
         }
-        const has_orig = if (is_cmp) eq(u8, op_name, "CompareExchange") else rest.len > n_in;
+        const has_orig = rest.len > n_in;
         if (has_orig) {
             const out = rest[rest.len - 1];
             try e.b.emit(.functions, .store, &.{ e.val(out), try e.convert(orig, dty, e.f.inst(out).ty) });
-        }
+        } else if (rty != TypeTable.void_type) return try e.convert(orig, dty, rty);
         return 0;
     }
 

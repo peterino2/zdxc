@@ -202,7 +202,7 @@ test "-fspv-fusemuladd: an add of a multiply is an Fma, when optimizing" {
     const a = arena.allocator();
     const src =
         \\RWStructuredBuffer<float4> O; cbuffer C { float4 x, y, z, w; };
-        \\[numthreads(1,1,1)] void main() { O[0] = x * y + z; O[1] = z + x * y; O[2] = x * y - z; O[3] = x * y + z * w; }
+        \\[numthreads(1,1,1)] void main() { O[0] = x * y + z; O[1] = w + x * y; O[2] = x * y - z; O[3] = x * y + z * w; }
     ;
     const fma = 50;
     try expectEqual(@as(usize, 0), (try ok(a, "cs_6_6", &.{}, src)).extInstCount(fma));
@@ -693,4 +693,172 @@ test "branches on members of a returned struct of constants fold" {
     const m = try ok(a, "cs_6_6", &.{"-fspv-target-env=vulkan1.3"}, src);
     try expectEqual(@as(usize, 0), countOp(m, 247)); // OpSelectionMerge
     try expectEqual(@as(usize, 0), countOp(m, 170)); // OpIEqual
+}
+
+/// The number of OpAccessChains based on the variable named `name`.
+fn chainsInto(m: Module, name: []const u8) usize {
+    const v = m.named(name) orelse return 0;
+    var n: usize = 0;
+    var it = m.ops();
+    while (it.next()) |i| {
+        if (i.op == 65 and i.args[2] == v) n += 1; // OpAccessChain
+    }
+    return n;
+}
+
+test "an unused static struct goes, with its types and constants" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // (Unreal's ResolvedView, a Private struct a pixel shader never reads:
+    // a literal equal to its id kept it, and constants never went.)
+    const src =
+        \\struct View { float4x4 M; float4 V[16]; uint Flags; float Scale; };
+        \\static View RV;
+        \\void Resolve() { RV.Flags = 7; RV.Scale = 0.5; for (int i = 0; i < 16; i++) RV.V[i] = float4(i, i + 1, i + 2, i + 3); }
+        \\RWStructuredBuffer<float> O;
+        \\[numthreads(1,1,1)] void main() { Resolve(); O[0] = 1; }
+    ;
+    const m = try ok(a, "cs_6_6", &.{}, src);
+    try expectEqual(@as(usize, 1), countOp(m, 59)); // OpVariable: O only
+    try std.testing.expect(countOp(m, 43) <= 3); // OpConstant: O's index, 1.0 and the like
+}
+
+test "an array returned in a struct and copied whole comes apart once" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const src =
+        \\struct R { float v[4]; };
+        \\cbuffer C { float4 x; };
+        \\R make() { R r; r.v[0] = x.x; r.v[1] = x.y; r.v[2] = x.z; r.v[3] = x.w; return r; }
+        \\RWStructuredBuffer<float> O;
+        \\[numthreads(1,1,1)] void main() { R r = make(); float t[4] = r.v; O[0] = t[0] + t[3]; }
+    ;
+    const m = try ok(a, "cs_6_6", &.{}, src);
+    try expectEqual(@as(usize, 0), countOp(m, 80)); // OpCompositeConstruct
+    try expectEqual(@as(usize, 0), functionVars(m));
+}
+
+test "loops that run once are no loops" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // A back edge that folds (spirv-val rejects a loop header left without
+    // one), and an inlined callee with a return inside a selection.
+    const src =
+        \\RWStructuredBuffer<float> O; cbuffer C { float k; };
+        \\float f(float x) { if (x > 1) { x = x * 2; } return x + 1; }
+        \\[numthreads(1,1,1)] void main() { do { O[0] = f(k); } while (false); }
+    ;
+    const m = try ok(a, "cs_6_6", &.{}, src);
+    try expectEqual(@as(usize, 0), countOp(m, 246)); // OpLoopMerge
+}
+
+test "a constant buffer member read in a block and one it dominates is one read" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const src =
+        \\RWStructuredBuffer<float> O; cbuffer C { float k; float j; };
+        \\float twice() { return k * 2; }
+        \\[numthreads(1,1,1)] void main() { float a = k * 2; if (O[0] > 0) O[1] = twice(); O[2] = a + k; }
+    ;
+    const m = try ok(a, "cs_6_6", &.{}, src);
+    try expectEqual(@as(usize, 1), chainsInto(m, "C"));
+    try expectEqual(@as(usize, 1), countOp(m, 133)); // OpFMul: k * 2 once
+}
+
+test "a local's array of one element, indexed by a variable, still splits" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // (Unreal's FSSDKernelConfig: BufferColorSpace[MultiplexId], a batch
+    // of one signal.)
+    const src =
+        \\struct Config { uint Sets[1]; uint Mode; };
+        \\RWStructuredBuffer<uint> O; cbuffer C { uint k; };
+        \\[numthreads(1,1,1)] void main() {
+        \\  Config c; c.Mode = 2; c.Sets[k] = 5;
+        \\  if (c.Mode == 2) O[0] = c.Sets[0]; else O[1] = 3;
+        \\}
+    ;
+    const m = try ok(a, "cs_6_6", &.{}, src);
+    try expectEqual(@as(usize, 0), functionVars(m));
+    try expectEqual(@as(usize, 0), countOp(m, 247)); // OpSelectionMerge: the branch folded
+}
+
+test "a struct with a dynamically indexed array member keeps only the array a local" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // (Unreal's FPrimitiveSceneData and its CustomPrimitiveData[i].)
+    const src =
+        \\struct Prim { float4 Custom[9]; uint Flags; float Scale; float3 Pos; };
+        \\RWStructuredBuffer<float4> O; cbuffer C { uint k; uint j; float4 v; };
+        \\Prim load() { Prim p; p.Flags = 1; p.Scale = 2; p.Pos = v.xyz; for (int i = 0; i < 9; i++) p.Custom[i] = v * i; p.Custom[k] = 0; return p; }
+        \\[numthreads(1,1,1)] void main() {
+        \\  Prim p = load();
+        \\  if (p.Flags == 1) O[0] = p.Custom[j] * p.Scale + p.Pos.x; else O[1] = 0;
+        \\}
+    ;
+    const m = try ok(a, "cs_6_6", &.{}, src);
+    // Custom, twice: the callee's and the caller's copy of it (copies of
+    // whole locals are not forwarded yet).
+    try expectEqual(@as(usize, 2), functionVars(m));
+    try expectEqual(@as(usize, 0), countOp(m, 247)); // OpSelectionMerge: Flags is 1
+}
+
+test "a struct holding resources splits around them" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // (Unreal's FShaderPrintContext: its bIsActive left in a local kept all
+    // of a shader's debug printing.)
+    const src =
+        \\struct Buffers { Buffer<uint> State; RWBuffer<uint> Entries; };
+        \\struct Ctx { bool Active; float2 Pos; Buffers B; };
+        \\Buffer<uint> S; RWBuffer<uint> E; RWStructuredBuffer<float> O;
+        \\Ctx init(bool on) { Ctx c; c.Active = on; c.Pos = 0; c.B.State = S; c.B.Entries = E; return c; }
+        \\void print(inout Ctx c, float x) { if (c.Active) { uint i; InterlockedAdd(c.B.Entries[0], 1, i); c.B.Entries[i + 1] = asuint(x) + c.B.State[0]; c.Pos.x += 1; } }
+        \\[numthreads(1,1,1)] void main() { Ctx c = init(false); print(c, 1); print(c, 2); O[0] = c.Pos.y; }
+    ;
+    const m = try ok(a, "cs_6_6", &.{}, src);
+    try expectEqual(@as(usize, 0), functionVars(m));
+    try expectEqual(@as(usize, 0), countOp(m, 247)); // OpSelectionMerge: printing is off
+}
+
+test "matrix and vector locals written by row and component are promoted" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const src =
+        \\RWStructuredBuffer<float3> O; cbuffer C { float3 x, y, z; };
+        \\[numthreads(1,1,1)] void main() {
+        \\  float3x3 m; m[0] = x; m[1] = y; m[2] = z; m[1][2] = 4;
+        \\  float3 v; v.x = x.y; v.y = 1; v.z = m[2][0];
+        \\  O[0] = mul(m, v);
+        \\}
+    ;
+    const m = try ok(a, "cs_6_6", &.{}, src);
+    try expectEqual(@as(usize, 0), functionVars(m));
+}
+
+test "out arguments of atomics and sincos are values, not locals" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const src =
+        \\groupshared uint G; RWStructuredBuffer<float> O; RWStructuredBuffer<uint> U; cbuffer C { float x; };
+        \\[numthreads(64,1,1)] void main(uint3 id : SV_DispatchThreadID) {
+        \\  uint old; InterlockedAdd(G, 1, old);
+        \\  uint prev; InterlockedCompareExchange(U[0], 0, id.x, prev);
+        \\  float s, c; sincos(x, s, c);
+        \\  O[old] = s + c + prev;
+        \\}
+    ;
+    const m = try ok(a, "cs_6_6", &.{}, src);
+    try expectEqual(@as(usize, 0), functionVars(m));
+    try expectEqual(@as(usize, 1), countOp(m, 234)); // OpAtomicIAdd
+    try expectEqual(@as(usize, 1), countOp(m, 230)); // OpAtomicCompareExchange
 }

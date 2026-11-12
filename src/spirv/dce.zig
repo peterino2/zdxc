@@ -10,9 +10,11 @@
 //! does not have, and $Globals beside a root parameter buffer fails
 //! Unreal's checks.
 //!
-//! Uses are counted conservatively: every operand word of an instruction
-//! that is the id of something counts, so a literal that happens to equal
-//! an id can only keep an instruction, never remove one.
+//! Uses are counted from the words that are ids: the literals of the
+//! instructions the emitter writes with them (a constant's value, an
+//! extract's indices, loop controls) are skipped, and every operand word of
+//! any other instruction counts, so a literal that happens to equal an id
+//! can only keep an instruction, never remove one.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -96,6 +98,51 @@ fn typeRefs(w: []const u32) []const u32 {
     };
 }
 
+/// Whether word `i` (from 1) of an instruction may be an id.
+fn idWord(w: []const u32, i: usize) bool {
+    const op: u16 = @truncate(w[0]);
+    return switch (op) {
+        // OpExecutionMode: the entry point, then literals.
+        16 => i == 1,
+        // OpTypeInt, OpTypeFloat: literals.
+        21, 22 => i == 1,
+        // OpTypeVector, OpTypeMatrix: the component type, then a count.
+        23, 24 => i <= 2,
+        // OpTypeImage: the sampled type, then literals.
+        25 => i <= 2,
+        // OpTypePointer: a storage class between the result and the type.
+        32 => i != 2,
+        // OpConstant, OpSpecConstant: the value.
+        43, 50 => i <= 2,
+        // OpSpecConstantOp: the opcode.
+        52 => i != 3,
+        // OpFunction: its control.
+        54 => i != 3,
+        // OpVariable: the storage class.
+        59 => i != 3,
+        // OpLoad, OpStore, OpCopyMemory: memory operands.
+        61 => i <= 3,
+        62, 63 => i <= 2,
+        // OpVectorShuffle, OpCompositeExtract, OpCompositeInsert: indices.
+        79, 82 => i <= 4,
+        81 => i <= 3,
+        // OpExtInst: the instruction number.
+        12 => i != 4,
+        // Image instructions' operand masks.
+        87, 88, 91, 92, 95, 98 => i != 5,
+        89, 90, 93, 94, 96, 97 => i != 6,
+        99 => i != 4,
+        // OpLoopMerge, OpSelectionMerge: controls.
+        246 => i <= 2,
+        247 => i <= 1,
+        // OpBranchConditional: weights.
+        250 => i <= 3,
+        // OpSwitch: the selector, the default, then literal and label pairs.
+        251 => i <= 2 or i % 2 == 0,
+        else => true,
+    };
+}
+
 const Inst = struct { section: Section, start: usize, len: usize };
 
 fn instructions(a: Allocator, words: []const u32, section: Section, out: *std.ArrayList(Inst)) !void {
@@ -119,9 +166,20 @@ pub fn run(a: Allocator, b: *builder.Builder) !void {
     }
     for (insts.items) |in| {
         const w = b.sections.getPtr(in.section).items[in.start..][0..in.len];
-        for (w[1..]) |x| if (x < bound) {
+        for (w[1..], 1..) |x, i| if (x < bound and idWord(w, i)) {
             uses[x] += 1;
         };
+    }
+    // Ids decorations take (OpDecorateId's operands).
+    {
+        var anns: std.ArrayList(Inst) = .empty;
+        try instructions(a, b.sections.getPtr(.annotations).items, .annotations, &anns);
+        for (anns.items) |in| {
+            const w = b.sections.getPtr(.annotations).items[in.start..][0..in.len];
+            if (@as(u16, @truncate(w[0])) == 332 and w.len > 3) for (w[3..]) |x| if (x < bound) {
+                uses[x] += 1;
+            };
+        }
     }
     // Uses of types exactly, from the positions only types take (ids are
     // unique, so only literals collide; a literal can equal a type's id).
@@ -153,16 +211,19 @@ pub fn run(a: Allocator, b: *builder.Builder) !void {
             if (gone[k]) continue;
             const w = b.sections.getPtr(in.section).items[in.start..][0..in.len];
             const op: u16 = @truncate(w[0]);
+            const is_type = in.section == .types_globals and (op == 28 or op == 29 or op == 30 or op == 32);
             const ok = switch (in.section) {
-                .functions => removable(op, w) and w.len >= 3,
+                .functions => (removable(op, w) or op == 1) and w.len >= 3,
                 .types_globals => (op == 59 and w.len >= 4 and droppableStorage(w[3])) or // OpVariable
                     // OpTypeArray, OpTypeRuntimeArray, OpTypeStruct, OpTypePointer
                     // (a struct whose members went, Unreal finds by name).
-                    ((op == 28 or op == 29 or op == 30 or op == 32) and w.len >= 2),
+                    (is_type and w.len >= 2) or
+                    // OpUndef, OpConstantTrue, OpConstantFalse, OpConstant,
+                    // OpConstantComposite, OpConstantNull.
+                    ((op == 1 or op == 41 or op == 42 or op == 43 or op == 44 or op == 46) and w.len >= 3),
                 else => false,
             };
             if (!ok) continue;
-            const is_type = in.section == .types_globals and op != 59;
             const result = if (is_type) w[1] else w[2];
             // (The instruction's own result word counted once.)
             if (result >= bound) continue;
@@ -170,7 +231,7 @@ pub fn run(a: Allocator, b: *builder.Builder) !void {
             gone[k] = true;
             dead[result] = true;
             changed = true;
-            for (w[1..]) |x| if (x < bound and uses[x] > 0) {
+            for (w[1..], 1..) |x, i| if (x < bound and uses[x] > 0 and idWord(w, i)) {
                 uses[x] -= 1;
             };
             for (typeRefs(w)) |x| if (x < bound and type_uses[x] > 0) {
