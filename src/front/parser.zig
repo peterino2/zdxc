@@ -1323,13 +1323,18 @@ pub const Parser = struct {
                 pname_loc = n.loc;
                 try p.declareName(n.text, .value);
             }
+            // C++11 attributes may also follow the name, as in
+            // `out float4 c [[vk::location(0), vk::index(1)]] : SV_Target1`
+            // (Unreal's Vulkan dual-source blending).
+            var all_attrs = pattrs;
+            if (p.at(.l_square) and p.peek(1).kind == .l_square) all_attrs = try std.mem.concat(p.arena, ast.Attribute, &.{ pattrs, try p.parseAttributes() });
             const dims = try p.parseArrayDims();
             var bitfield: ?*ast.Expr = null;
             const sems = try p.parseSemantics(false, &bitfield);
             var default: ?*ast.Expr = null;
             if (p.eat(.equal)) default = try p.parseAssign();
             try params.append(p.arena, .{
-                .attrs = pattrs,
+                .attrs = all_attrs,
                 .quals = pquals,
                 .qual_words = pwords,
                 .type = pty,

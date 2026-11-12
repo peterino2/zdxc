@@ -1908,7 +1908,7 @@ const Lowerer = struct {
             // initializer's, evaluated where it is used, as a local holding
             // it. (A resource does not change, so each evaluation is the
             // same resource.)
-            const val = try l.converted(init_e, v.type);
+            const val = if (init_e.kind == .init_list) try l.initList(init_e, v.type) else try l.converted(init_e, v.type);
             const local = try l.b.add(.{ .op = .local_var, .ty = try l.concrete(v.type), .ptr = .function });
             try l.b.store(local, val);
             return local;
@@ -1923,6 +1923,12 @@ const Lowerer = struct {
     fn staticResourceInit(l: *Lowerer, v: *const Variable) ?*ast.Expr {
         if (v.storage != .global_static and v.storage != .constant) return null;
         const init_e = v.init orelse return null;
+        // SPIR-V: a `static const` struct holding resources too (Nanite's
+        // `static const FOutputQueue SplitWorkQueue = { DataBuffer,
+        // StateBuffer, 0, Size };`). Resources have no storage there, so
+        // the struct cannot be a module variable; it does not change, so
+        // each evaluation is the same struct.
+        if (l.s.opts.spirv and v.storage == .constant and @import("split_resources.zig").holdsResources(&l.s.types, v.type)) return init_e;
         if (init_e.kind == .init_list or !isObject(&l.s.types, v.type)) return null;
         switch (l.s.types.get(v.type)) {
             .resource => |r| if (r.kind == .other) return null,
@@ -2195,6 +2201,7 @@ const Lowerer = struct {
     const SigAttrs = struct {
         interp: Interp = .{},
         row_major: bool = false,
+        precise: bool = false,
         vk_location: ?u32 = null,
         vk_index: ?u32 = null,
         vk_builtin: ?[]const u8 = null,
@@ -2203,7 +2210,7 @@ const Lowerer = struct {
         /// A field's modifiers, inheriting the enclosing interpolation.
         fn field(outer: SigAttrs, fld: Field) SigAttrs {
             const own: u8 = @bitCast(fld.interp);
-            return .{ .interp = if (own != 0) fld.interp else outer.interp, .row_major = fld.row_major, .vk_location = fld.vk_location, .vk_index = fld.vk_index, .vk_builtin = fld.vk_builtin };
+            return .{ .interp = if (own != 0) fld.interp else outer.interp, .row_major = fld.row_major, .precise = fld.precise, .vk_location = fld.vk_location, .vk_index = fld.vk_index, .vk_builtin = fld.vk_builtin };
         }
     };
 
@@ -2211,6 +2218,7 @@ const Lowerer = struct {
         var r = el;
         r.interp = attrs.interp;
         r.row_major = attrs.row_major;
+        r.precise = attrs.precise;
         r.vk_location = attrs.vk_location;
         r.vk_index = attrs.vk_index;
         r.vk_builtin = attrs.vk_builtin;
@@ -2221,7 +2229,7 @@ const Lowerer = struct {
     /// A parameter's (or the return value's) interpolation and matrix
     /// orientation.
     fn paramAttrs(l: *Lowerer, q: ast.Qualifiers, ty: *const ast.TypeRef) SigAttrs {
-        return .{ .interp = semamod.interpOf(q), .row_major = l.s.sig_row_major.get(ty) orelse q.row_major };
+        return .{ .interp = semamod.interpOf(q), .row_major = l.s.sig_row_major.get(ty) orelse q.row_major, .precise = q.precise };
     }
 
     /// A parameter's (or, with the function's attributes, the return

@@ -379,6 +379,8 @@ pub const Field = struct {
     semantic: ?[]const u8 = null,
     /// Interpolation modifiers (for entry-point inputs and outputs).
     interp: Interp = .{},
+    /// `precise` (for entry-point inputs and outputs).
+    precise: bool = false,
     /// Hidden storage for consecutive bitfields (see StructInfo.bitfields).
     bits: bool = false,
     /// Constant buffer members: `packoffset` / `register(cN)` byte offset.

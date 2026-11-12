@@ -234,6 +234,8 @@ pub fn support(id: Id) Support {
         .target_profile, .entrypoint, .Fo, .D, .I, .P, .Fi, .hlsl_version, .spirv, .enable_16bit_types, .fspv_target_env_EQ, .Zpr, .Zpc => .implemented,
         .Frs, .Qstrip_rootsignature, .force_rootsig_ver, .force_rootsig_ver_, .rootsig_define => .implemented,
         .auto_binding_space, .fvk_b_shift, .fvk_t_shift, .fvk_s_shift, .fvk_u_shift, .fvk_bind_globals, .fvk_bind_register, .vkbr, .fvk_auto_shift_bindings, .fvk_stage_io_order_EQ, .fspv_flatten_resource_arrays, .fspv_use_legacy_buffer_matrix_order, .fspv_preserve_interface, .fspv_use_vulkan_memory_model, .fvk_invert_y, .fvk_use_dx_position_w, .fvk_use_gl_layout, .fvk_use_dx_layout, .fvk_use_scalar_layout, .fvk_support_nonzero_base_instance, .fvk_support_nonzero_base_vertex, .fspv_entrypoint_name_EQ, .fspv_enable_maximal_reconvergence, .fspv_use_unknown_image_format, .fspv_extension_EQ, .fspv_reflect => .implemented,
+        // Epic's DXC fork (Unreal's ShaderConductor).
+        .fvk_ue5_layout, .fspv_preserve_storage_input, .fspv_svposition_implicit_invariant, .fspv_support_precise_outputs, .fspv_fusemuladd, .fspv_force_subpass_image_depth_false, .fspv_no_scalar_block_layout, .fvk_allow_rwstructuredbuffer_arrays => .implemented,
         // (Output is the same with or without the unoptimized-IR switch.)
         .fcgl => .ignored,
         // Diagnostics.
@@ -358,5 +360,26 @@ test "every option has a support level and a table entry" {
     for (table.options) |o| {
         _ = support(o.id);
         try std.testing.expect(info(o.id).id == o.id);
+    }
+}
+
+test "Epic's DXC options (Unreal's ShaderConductor) are implemented" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    var f: Failure = .{};
+    const epic = [_]struct { []const u8, Id }{
+        .{ "-fvk-ue5-layout", .fvk_ue5_layout },
+        .{ "-fspv-preserve-storage-input", .fspv_preserve_storage_input },
+        .{ "-fspv-svposition-implicit-invariant", .fspv_svposition_implicit_invariant },
+        .{ "-fspv-support-precise-outputs", .fspv_support_precise_outputs },
+        .{ "-fspv-fusemuladd", .fspv_fusemuladd },
+        .{ "-fspv-force-subpass-image-depth-false", .fspv_force_subpass_image_depth_false },
+        .{ "-fspv-no-scalar-block-layout", .fspv_no_scalar_block_layout },
+        .{ "-fvk-allow-rwstructuredbuffer-arrays", .fvk_allow_rwstructuredbuffer_arrays },
+    };
+    for (epic) |e| {
+        const p = try parse(arena.allocator(), &.{e[0]}, &f);
+        try std.testing.expect(p.args[0].is(e[1]));
+        try std.testing.expect(support(e[1]) == .implemented);
     }
 }

@@ -1,0 +1,299 @@
+//! Dead code in a finished module, as spirv-opt's dead code and dead
+//! variable elimination leave dxc's SPIR-V: results of instructions without
+//! side effects that nothing uses, and resource, uniform and private
+//! variables nothing uses (with their names, decorations and entry point
+//! interface entries).
+//!
+//! Unreal's Vulkan format reflects every descriptor binding of a module. A
+//! buffer only dead code reads (a `static const` bindless handle evaluated
+//! and never used, its index read from $Globals) is a binding dxc's SPIR-V
+//! does not have, and $Globals beside a root parameter buffer fails
+//! Unreal's checks.
+//!
+//! Uses are counted from the words that are ids: the literals of the
+//! instructions the emitter writes with them (a constant's value, an
+//! extract's indices, loop controls) are skipped, and every operand word of
+//! any other instruction counts, so a literal that happens to equal an id
+//! can only keep an instruction, never remove one.
+
+const std = @import("std");
+const Allocator = std.mem.Allocator;
+const builder = @import("builder.zig");
+
+const Section = builder.Section;
+
+/// Opcodes with a result type and result id and no side effects.
+fn removable(op: u16, words: []const u32) bool {
+    return switch (op) {
+        // OpVariable in a function (nothing loads, stores or points at it).
+        59 => words.len >= 4 and words[3] == 7,
+        // OpLoad, unless volatile.
+        61 => !(words.len > 4 and words[4] & 1 != 0),
+        // OpAccessChain, OpInBoundsAccessChain, OpCopyObject.
+        65, 66, 83 => true,
+        // OpVectorExtractDynamic, OpVectorShuffle, OpCompositeConstruct,
+        // OpCompositeExtract, OpCompositeInsert.
+        77, 79, 80, 81, 82 => true,
+        // Conversions: OpConvertUToF, OpUConvert, OpSConvert, OpBitcast.
+        112, 113, 114, 124 => true,
+        // Integer and float arithmetic without traps: OpIAdd, OpFAdd,
+        // OpISub, OpFSub, OpIMul, OpFMul.
+        128, 129, 130, 131, 132, 133 => true,
+        // OpLogicalOr, OpLogicalAnd, OpLogicalNot, OpSelect, OpIEqual,
+        // OpINotEqual, OpUGreaterThan, OpSGreaterThan, OpUGreaterThanEqual,
+        // OpSGreaterThanEqual, OpULessThan, OpSLessThan.
+        166, 167, 168, 169, 170, 171, 172, 173, 174, 175, 176, 177 => true,
+        // Shifts and bitwise: OpShiftRightLogical, OpShiftRightArithmetic,
+        // OpShiftLeftLogical, OpBitwiseOr, OpBitwiseXor, OpBitwiseAnd.
+        194, 195, 196, 197, 198, 199 => true,
+        // OpPhi.
+        245 => true,
+        // The rest of the arithmetic: OpSNegate, OpFNegate, the divisions
+        // and remainders, OpVectorTimesScalar through OpDot, OpTranspose,
+        // OpVectorInsertDynamic, conversions, OpAny, OpAll, OpIsNan, OpIsInf,
+        // OpLogicalEqual, OpLogicalNotEqual, float comparisons, OpNot,
+        // bit field operations, OpBitCount, OpCopyLogical, and extended
+        // instructions (GLSL.std.450 math).
+        126, 127, 134, 135, 136, 137, 138, 139, 140, 141 => true,
+        142, 143, 144, 145, 146, 147, 148, 84, 78 => true,
+        109, 110, 111, 115, 116, 117 => true,
+        154, 155, 156, 157, 164, 165 => true,
+        178, 179, 180, 181, 182, 183, 184, 185, 186, 187, 188, 189, 190, 191 => true,
+        200, 201, 202, 203, 204, 205, 400 => true,
+        12 => true,
+        // Image reads: OpSampledImage, the OpImageSample* forms, OpImageFetch,
+        // OpImageGather, OpImageDrefGather, OpImageRead, OpImage, and the
+        // size and level queries.
+        86, 87, 88, 89, 90, 91, 92, 95, 96, 97, 98, 100, 103, 104, 105, 106, 107 => true,
+        else => false,
+    };
+}
+
+/// Storage classes of variables to drop when unused: UniformConstant,
+/// Uniform, Private, StorageBuffer.
+fn droppableStorage(sc: u32) bool {
+    return sc == 0 or sc == 2 or sc == 6 or sc == 12;
+}
+
+/// The words of an instruction that may be types it uses: a result type,
+/// a type declaration's operand types, a function's type. (Never its own
+/// result.)
+fn typeRefs(w: []const u32) []const u32 {
+    const op: u16 = @truncate(w[0]);
+    return switch (op) {
+        // OpTypeVector, OpTypeMatrix, OpTypeImage, OpTypeSampledImage,
+        // OpTypeArray, OpTypeRuntimeArray: the element type (and an array's
+        // length constant, not a type, harmless).
+        23, 24, 25, 27, 29 => if (w.len >= 3) w[2..3] else &.{},
+        28 => if (w.len >= 4) w[2..4] else &.{},
+        // OpTypeStruct, OpTypeFunction.
+        30, 33 => if (w.len >= 2) w[2..] else &.{},
+        // OpTypePointer.
+        32 => if (w.len >= 4) w[3..4] else &.{},
+        // Other type declarations.
+        19...22, 26, 31, 34...39, 322, 4472, 5341 => &.{},
+        // A result type (OpFunction's function type is never removed); an
+        // instruction without one has an id here, never a type.
+        else => if (w.len >= 2) w[1..2] else &.{},
+    };
+}
+
+/// Whether word `i` (from 1) of an instruction may be an id.
+fn idWord(w: []const u32, i: usize) bool {
+    const op: u16 = @truncate(w[0]);
+    return switch (op) {
+        // OpExecutionMode: the entry point, then literals.
+        16 => i == 1,
+        // OpTypeInt, OpTypeFloat: literals.
+        21, 22 => i == 1,
+        // OpTypeVector, OpTypeMatrix: the component type, then a count.
+        23, 24 => i <= 2,
+        // OpTypeImage: the sampled type, then literals.
+        25 => i <= 2,
+        // OpTypePointer: a storage class between the result and the type.
+        32 => i != 2,
+        // OpConstant, OpSpecConstant: the value.
+        43, 50 => i <= 2,
+        // OpSpecConstantOp: the opcode.
+        52 => i != 3,
+        // OpFunction: its control.
+        54 => i != 3,
+        // OpVariable: the storage class.
+        59 => i != 3,
+        // OpLoad, OpStore, OpCopyMemory: memory operands.
+        61 => i <= 3,
+        62, 63 => i <= 2,
+        // OpVectorShuffle, OpCompositeExtract, OpCompositeInsert: indices.
+        79, 82 => i <= 4,
+        81 => i <= 3,
+        // OpExtInst: the instruction number.
+        12 => i != 4,
+        // Image instructions' operand masks.
+        87, 88, 91, 92, 95, 98 => i != 5,
+        89, 90, 93, 94, 96, 97 => i != 6,
+        99 => i != 4,
+        // OpLoopMerge, OpSelectionMerge: controls.
+        246 => i <= 2,
+        247 => i <= 1,
+        // OpBranchConditional: weights.
+        250 => i <= 3,
+        // OpSwitch: the selector, the default, then literal and label pairs.
+        251 => i <= 2 or i % 2 == 0,
+        else => true,
+    };
+}
+
+const Inst = struct { section: Section, start: usize, len: usize };
+
+fn instructions(a: Allocator, words: []const u32, section: Section, out: *std.ArrayList(Inst)) !void {
+    var pos: usize = 0;
+    while (pos < words.len) {
+        const len = @max(words[pos] >> 16, 1);
+        try out.append(a, .{ .section = section, .start = pos, .len = len });
+        pos += len;
+    }
+}
+
+pub fn run(a: Allocator, b: *builder.Builder) !void {
+    const bound = b.next_id;
+    const uses = try a.alloc(u32, bound);
+    @memset(uses, 0);
+    // Instructions of the sections that use ids (not names, decorations or
+    // the entry point interfaces).
+    var insts: std.ArrayList(Inst) = .empty;
+    for ([_]Section{ .execution_modes, .types_globals, .functions }) |sec| {
+        try instructions(a, b.sections.getPtr(sec).items, sec, &insts);
+    }
+    for (insts.items) |in| {
+        const w = b.sections.getPtr(in.section).items[in.start..][0..in.len];
+        for (w[1..], 1..) |x, i| if (x < bound and idWord(w, i)) {
+            uses[x] += 1;
+        };
+    }
+    // Ids decorations take (OpDecorateId's operands).
+    {
+        var anns: std.ArrayList(Inst) = .empty;
+        try instructions(a, b.sections.getPtr(.annotations).items, .annotations, &anns);
+        for (anns.items) |in| {
+            const w = b.sections.getPtr(.annotations).items[in.start..][0..in.len];
+            if (@as(u16, @truncate(w[0])) == 332 and w.len > 3) for (w[3..]) |x| if (x < bound) {
+                uses[x] += 1;
+            };
+        }
+    }
+    // Uses of types exactly, from the positions only types take (ids are
+    // unique, so only literals collide; a literal can equal a type's id).
+    const type_uses = try a.alloc(u32, bound);
+    @memset(type_uses, 0);
+    for (insts.items) |in| {
+        const w = b.sections.getPtr(in.section).items[in.start..][0..in.len];
+        for (typeRefs(w)) |x| if (x < bound) {
+            type_uses[x] += 1;
+        };
+    }
+    // (Every id the entry point declares stays: its function.)
+    {
+        var eps: std.ArrayList(Inst) = .empty;
+        try instructions(a, b.sections.getPtr(.entry_points).items, .entry_points, &eps);
+        for (eps.items) |in| {
+            const w = b.sections.getPtr(.entry_points).items[in.start..][0..in.len];
+            if (w.len > 2 and w[2] < bound) uses[w[2]] += 1;
+        }
+    }
+    const dead = try a.alloc(bool, bound);
+    @memset(dead, false);
+    const gone = try a.alloc(bool, insts.items.len);
+    @memset(gone, false);
+    var changed = true;
+    while (changed) {
+        changed = false;
+        for (insts.items, 0..) |in, k| {
+            if (gone[k]) continue;
+            const w = b.sections.getPtr(in.section).items[in.start..][0..in.len];
+            const op: u16 = @truncate(w[0]);
+            const is_type = in.section == .types_globals and (op == 28 or op == 29 or op == 30 or op == 32);
+            const ok = switch (in.section) {
+                .functions => (removable(op, w) or op == 1) and w.len >= 3,
+                .types_globals => (op == 59 and w.len >= 4 and droppableStorage(w[3])) or // OpVariable
+                    // OpTypeArray, OpTypeRuntimeArray, OpTypeStruct, OpTypePointer
+                    // (a struct whose members went, Unreal finds by name).
+                    (is_type and w.len >= 2) or
+                    // OpUndef, OpConstantTrue, OpConstantFalse, OpConstant,
+                    // OpConstantComposite, OpConstantNull.
+                    ((op == 1 or op == 41 or op == 42 or op == 43 or op == 44 or op == 46) and w.len >= 3),
+                else => false,
+            };
+            if (!ok) continue;
+            const result = if (is_type) w[1] else w[2];
+            // (The instruction's own result word counted once.)
+            if (result >= bound) continue;
+            if (if (is_type) type_uses[result] > 0 else uses[result] > 1) continue;
+            gone[k] = true;
+            dead[result] = true;
+            changed = true;
+            for (w[1..], 1..) |x, i| if (x < bound and uses[x] > 0 and idWord(w, i)) {
+                uses[x] -= 1;
+            };
+            for (typeRefs(w)) |x| if (x < bound and type_uses[x] > 0) {
+                type_uses[x] -= 1;
+            };
+        }
+    }
+    // Rebuild the sections.
+    for ([_]Section{ .types_globals, .functions }) |sec| {
+        const s = b.sections.getPtr(sec);
+        var out: std.ArrayList(u32) = .empty;
+        for (insts.items, 0..) |in, k| {
+            if (in.section != sec or gone[k]) continue;
+            try out.appendSlice(a, s.items[in.start..][0..in.len]);
+        }
+        s.clearRetainingCapacity();
+        try s.appendSlice(b.gpa, out.items);
+    }
+    // Names and decorations of what is gone.
+    for ([_]Section{ .debug_names, .annotations }) |sec| {
+        const s = b.sections.getPtr(sec);
+        var list: std.ArrayList(Inst) = .empty;
+        try instructions(a, s.items, sec, &list);
+        var out: std.ArrayList(u32) = .empty;
+        for (list.items) |in| {
+            const w = s.items[in.start..][0..in.len];
+            const op: u16 = @truncate(w[0]);
+            // OpName, OpMemberName, OpDecorate, OpMemberDecorate,
+            // OpDecorateId, OpDecorateString, OpMemberDecorateString.
+            const target_gone = (op == 5 or op == 6 or op == 71 or op == 72 or op == 332 or op == 5632 or op == 5633) and w.len > 1 and w[1] < bound and dead[w[1]];
+            if (!target_gone) try out.appendSlice(a, w);
+        }
+        s.clearRetainingCapacity();
+        try s.appendSlice(b.gpa, out.items);
+    }
+    // Entry point interfaces: OpEntryPoint model, function, name, ids.
+    {
+        const s = b.sections.getPtr(.entry_points);
+        var list: std.ArrayList(Inst) = .empty;
+        try instructions(a, s.items, .entry_points, &list);
+        var out: std.ArrayList(u32) = .empty;
+        for (list.items) |in| {
+            const w = s.items[in.start..][0..in.len];
+            if (@as(u16, @truncate(w[0])) != 15 or w.len < 4) {
+                try out.appendSlice(a, w);
+                continue;
+            }
+            // The name: words up to the one with a zero byte.
+            var p: usize = 3;
+            while (p < w.len) : (p += 1) {
+                const x = w[p];
+                if (x & 0xff == 0 or x & 0xff00 == 0 or x & 0xff0000 == 0 or x & 0xff000000 == 0) break;
+            }
+            p += 1;
+            var ids: std.ArrayList(u32) = .empty;
+            for (w[@min(p, w.len)..]) |id| if (id >= bound or !dead[id]) try ids.append(a, id);
+            const n: u32 = @intCast(@min(p, w.len) + ids.items.len);
+            try out.append(a, (n << 16) | 15);
+            try out.appendSlice(a, w[1..@min(p, w.len)]);
+            try out.appendSlice(a, ids.items);
+        }
+        s.clearRetainingCapacity();
+        try s.appendSlice(b.gpa, out.items);
+    }
+}

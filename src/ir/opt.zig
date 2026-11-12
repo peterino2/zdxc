@@ -761,3 +761,455 @@ test "constant folding helpers" {
     try std.testing.expectEqual(@as(i64, 0), foldCmp(.int, .gt, .{ .int = -1 }, .{ .int = 1 }).?.int);
     try std.testing.expectEqual(@as(i64, 3), foldConvert(.float, .int, .{ .float = 3.7 }).int);
 }
+
+// ----------------------------------------------------------------------
+// Block merging
+
+/// Merges each block into its predecessor where the predecessor ends in
+/// an unconditional branch to it and nothing else reaches it, as dxc's
+/// optimizer does (merge-blocks). Inlining leaves a chain of such blocks
+/// per call; Unreal runs spirv-opt -O on its SPIR-V, and SPIRV-Tools'
+/// ssa-rewrite recurses once per block along a chain (a path tracing
+/// library of 34,565 blocks overflowed its stack).
+///
+/// Left alone: merge and continue targets and loop headers (structured
+/// control flow names them), blocks heading a construct as predecessor,
+/// and blocks with phis. A merged block is left empty and unreachable;
+/// the emitter skips it.
+pub fn mergeBlocks(a: Allocator, f: *ir.Function) Allocator.Error!void {
+    const n = f.blocks.items.len;
+    if (n < 2) return;
+    const live = try reachable(a, f);
+    const preds = try a.alloc(u32, n);
+    @memset(preds, 0);
+    const pinned = try a.alloc(bool, n);
+    @memset(pinned, false);
+    pinned[0] = true;
+    for (f.blocks.items, 0..) |b, i| {
+        if (!live[i]) continue;
+        for (try successors(a, b.term)) |s| preds[s.index()] += 1;
+        switch (b.merge) {
+            .none => {},
+            .selection => |m| pinned[m.index()] = true,
+            .loop => |l| {
+                pinned[i] = true;
+                pinned[l.merge.index()] = true;
+                pinned[l.@"continue".index()] = true;
+            },
+        }
+    }
+    for (0..n) |bi| {
+        if (!live[bi]) continue;
+        // Absorb successors for as long as the chain goes on.
+        while (true) {
+            const b = &f.blocks.items[bi];
+            if (b.merge != .none or b.term != .br) break;
+            const ci = b.term.br.index();
+            if (ci == bi or pinned[ci] or preds[ci] != 1) break;
+            const c = &f.blocks.items[ci];
+            const has_phi = for (c.insts.items) |r| {
+                if (f.inst(r).op == .phi) break true;
+            } else false;
+            if (has_phi) break;
+            try b.insts.appendSlice(a, c.insts.items);
+            b.term = c.term;
+            b.merge = c.merge;
+            b.selection_control = c.selection_control;
+            // Phis in the successors now come from `b`.
+            for (try successors(a, c.term)) |s| {
+                for (f.blocks.items[s.index()].insts.items) |r| {
+                    const inst = &f.insts.items[r.index()];
+                    if (inst.op != .phi) continue;
+                    const ins = try a.dupe(@typeInfo(@TypeOf(inst.op.phi)).pointer.child, inst.op.phi);
+                    for (ins) |*in| if (in.block.index() == ci) {
+                        in.block = @enumFromInt(bi);
+                    };
+                    inst.op = .{ .phi = ins };
+                }
+            }
+            c.insts = .empty;
+            c.term = .@"unreachable";
+            c.merge = .none;
+            live[ci] = false;
+        }
+    }
+}
+
+// ----------------------------------------------------------------------
+// Constant branches
+
+/// A conditional branch on a constant goes to the side it takes (a
+/// selection header so folded heads no construct; the side not taken loses
+/// this block from its phis). As dxc's dead branch elimination: Unreal
+/// passes constant flags to the functions it calls (Lumen's
+/// `bRayTraceSkyLightContribution = false`), and the code under them reads
+/// buffers its reflection must not see. Returns whether anything changed.
+pub fn foldBranches(a: Allocator, f: *ir.Function) Allocator.Error!bool {
+    var changed = false;
+    for (f.blocks.items, 0..) |*b, bi| {
+        if (b.term != .cond_br) continue;
+        const c = b.term.cond_br;
+        const ci = f.inst(c.cond);
+        if (ci.op != .constant) continue;
+        const take = switch (ci.op.constant) {
+            .int => |v| v != 0,
+            .float => |v| v != 0,
+        };
+        const taken = if (take) c.then else c.@"else";
+        const untaken = if (take) c.@"else" else c.then;
+        // (A loop's branch back stays: a loop header needs its back edge.
+        // A loop it never takes runs once, which one_trip.zig undoes.)
+        switch (f.blocks.items[untaken.index()].merge) {
+            .loop => |l| if (l.@"continue".index() == bi) continue,
+            else => {},
+        }
+        b.term = .{ .br = taken };
+        if (b.merge == .selection) {
+            b.merge = .none;
+            b.selection_control = .none;
+        }
+        if (untaken != taken) {
+            for (f.blocks.items[untaken.index()].insts.items) |r| {
+                const inst = &f.insts.items[r.index()];
+                if (inst.op != .phi) continue;
+                var ins: std.ArrayList(@typeInfo(@TypeOf(inst.op.phi)).pointer.child) = .empty;
+                for (inst.op.phi) |in| if (in.block.index() != bi) try ins.append(a, in);
+                inst.op = .{ .phi = ins.items };
+            }
+        }
+        changed = true;
+    }
+    if (changed) try fixPhis(a, f);
+    return changed;
+}
+
+/// Phis after branch folding: one entry per predecessor the emitter still
+/// writes out (reachable blocks, and the merge and continue targets of the
+/// constructs they head), `undef` from those not reachable.
+pub fn fixPhis(a: Allocator, f: *ir.Function) Allocator.Error!void {
+    const n = f.blocks.items.len;
+    const live = try reachable(a, f);
+    const emitted = try a.dupe(bool, live);
+    var grew = true;
+    while (grew) {
+        grew = false;
+        for (f.blocks.items, 0..) |b, i| {
+            if (!emitted[i]) continue;
+            const targets: [2]BlockId = switch (b.merge) {
+                .none => .{ .none, .none },
+                .selection => |mb| .{ mb, .none },
+                .loop => |l| .{ l.merge, l.@"continue" },
+            };
+            for (targets) |t| if (t != .none and !emitted[t.index()]) {
+                emitted[t.index()] = true;
+                grew = true;
+            };
+            // (An unreachable merge target is emitted with what it branches
+            // to, as the SPIR-V emitter's block order does.)
+            for (try successors(a, b.term)) |t| if (t != .none and !emitted[t.index()]) {
+                emitted[t.index()] = true;
+                grew = true;
+            };
+        }
+    }
+    // The emitted predecessors of each block.
+    const preds = try a.alloc(std.ArrayList(u32), n);
+    for (preds) |*p| p.* = .empty;
+    for (f.blocks.items, 0..) |pbk, pbi| {
+        if (!emitted[pbi]) continue;
+        for (try successors(a, pbk.term)) |t| if (t != .none) try preds[t.index()].append(a, @intCast(pbi));
+    }
+    // Where each instruction is defined.
+    const def_block = try a.alloc(u32, f.insts.items.len);
+    @memset(def_block, std.math.maxInt(u32));
+    for (f.blocks.items, 0..) |b, i| for (b.insts.items) |r| {
+        def_block[r.index()] = @intCast(i);
+    };
+    for (f.blocks.items, 0..) |b, si| {
+        if (!emitted[si]) continue;
+        for (b.insts.items) |r| {
+            const inst = f.insts.items[r.index()];
+            if (inst.op != .phi) continue;
+            var ins: std.ArrayList(@typeInfo(@TypeOf(inst.op.phi)).pointer.child) = .empty;
+            for (inst.op.phi) |in| {
+                const pb = in.block.index();
+                if (!emitted[pb]) continue;
+                const goes_here = for (try successors(a, f.blocks.items[pb].term)) |t| {
+                    if (t.index() == si) break true;
+                } else false;
+                if (!goes_here) continue;
+                const db = def_block[in.value.index()];
+                const dead = !live[pb] or (db != std.math.maxInt(u32) and !live[db]);
+                const v = if (dead) try addInst(a, f, .{ .op = .undef, .ty = inst.ty }) else in.value;
+                try ins.append(a, .{ .value = v, .block = in.block });
+            }
+            // A new predecessor (the header of a loop that is gone): the
+            // value the edges it replaces carried, if it is still defined.
+            for (preds[si].items) |pbi| {
+                const has = for (ins.items) |in| {
+                    if (in.block.index() == pbi) break true;
+                } else false;
+                if (has) continue;
+                var v: Ref = .none;
+                if (inst.op.phi.len > 0) {
+                    const v0 = inst.op.phi[0].value;
+                    const db = def_block[v0.index()];
+                    if (db == std.math.maxInt(u32) or live[db]) v = v0;
+                }
+                if (v == .none or !live[pbi]) v = try addInst(a, f, .{ .op = .undef, .ty = inst.ty });
+                try ins.append(a, .{ .value = v, .block = @enumFromInt(pbi) });
+            }
+            f.insts.items[r.index()].op = .{ .phi = ins.items };
+        }
+    }
+}
+
+// ----------------------------------------------------------------------
+// Dead code
+
+/// Intrinsics without side effects: all but atomics, barriers, ray tracing
+/// calls, discards, appends and counters, mesh outputs, debug output and
+/// those writing through a pointer argument.
+pub fn isPureIntrinsic(f: *const ir.Function, name: []const u8, args: []const Ref) bool {
+    const effects = [_][]const u8{ "Interlocked", "Barrier", "clip", "abort", "printf", "errorf", "TraceRay", "ReportHit", "CallShader", "IgnoreHit", "AcceptHitAndEndSearch", "SetMeshOutputCounts", "DispatchMesh", "Store", "Append", "Consume", "IncrementCounter", "DecrementCounter", "discard", "WriteSamplerFeedback", "OutputComplete", "FinishedCrossGroupSharing", "Emit", "Cut", "Restart", "Proceed", "CommitNonOpaqueTriangleHit", "CommitProceduralPrimitiveHit", "Abort", "TraceRayInline", "hit_object", "HitObject", "MaybeReorderThread" };
+    for (effects) |e| if (std.mem.indexOf(u8, name, e) != null) return false;
+    for (args) |arg| if (f.inst(arg).ptr != .none) return false;
+    return true;
+}
+
+fn isPureOp(f: *const ir.Function, op: Op) bool {
+    return switch (op) {
+        .constant, .global, .load, .access, .binary, .unary, .cmp, .convert, .bitcast, .splat, .extract, .insert, .construct, .shuffle, .select, .heap_resource, .phi, .undef, .res_load => true,
+        .intrinsic => |x| isPureIntrinsic(f, x.name, x.args),
+        // Texture reads (not the forms that write a status through a
+        // pointer argument).
+        .method => |x| blk: {
+            const reads = [_][]const u8{ "Load", "Sample", "SampleLevel", "SampleGrad", "SampleBias", "SampleCmp", "SampleCmpLevelZero", "SampleCmpLevel", "Gather", "GatherRed", "GatherGreen", "GatherBlue", "GatherAlpha", "GatherCmp", "GatherCmpRed", "CalculateLevelOfDetail", "CalculateLevelOfDetailUnclamped" };
+            const known = for (reads) |r| {
+                if (std.mem.eql(u8, x.name, r)) break true;
+            } else false;
+            if (!known) break :blk false;
+            for (x.args) |arg| if (f.inst(arg).ptr != .none) break :blk false;
+            break :blk true;
+        },
+        else => false,
+    };
+}
+
+/// The parts a construct of type `ty` takes one of per element (structs'
+/// members, arrays' elements, vectors' components when all are scalars).
+fn partsPerElement(t: *TypeTable, f: *ir.Function, ty: TypeId, parts: []const Ref) bool {
+    return switch (t.get(ty)) {
+        .@"struct", .array => true,
+        .vector => |v| parts.len == v.len and for (parts) |p| {
+            if (t.get(f.inst(p).ty) != .scalar) break false;
+        } else true,
+        else => false,
+    };
+}
+
+/// `extract(construct(..., v, ...), k)` and `extract(insert(a, v, k), k)`
+/// are `v` (through inserts of other members): a struct built whole and
+/// read in part (Unreal's FGBufferData from DecodeGBufferDataUV) no
+/// longer keeps its unread members' reads alive. The same for arrays and
+/// vectors built of their components, and `extract(shuffle(v, ...), k)`
+/// reads `v` itself. `construct(extract(s, 0), ..., extract(s, n - 1))`
+/// is `s`: Unreal's arrays copied element by element (a struct's array
+/// member returned and assigned) come apart and back together whole.
+pub fn forwardExtracts(a: Allocator, f: *ir.Function, t: *TypeTable) Allocator.Error!void {
+    const n = f.insts.items.len;
+    const repl = try a.alloc(Ref, n);
+    @memset(repl, .none);
+    var any = false;
+    const Map = struct {
+        repl: []const Ref,
+        pub fn map(c: @This(), x: Ref) Ref {
+            var y = x;
+            var k: usize = 0;
+            while (y != .none and y.index() < c.repl.len and c.repl[y.index()] != .none and k < 64) : (k += 1) y = c.repl[y.index()];
+            return y;
+        }
+    };
+    const mp = Map{ .repl = repl };
+    for (f.blocks.items) |b| for (b.insts.items) |r| {
+        // A vector's every component inserted (`v.x = a; v.y = b; ...`,
+        // promoted): a construct of them.
+        if (f.inst(r).op == .insert) vec: {
+            const len = switch (t.get(f.inst(r).ty)) {
+                .vector => |v| v.len,
+                else => break :vec,
+            };
+            if (len < 2 or len > 4) break :vec;
+            var parts: [4]Ref = .{ .none, .none, .none, .none };
+            var have: usize = 0;
+            var cur = r;
+            var steps: usize = 0;
+            while (have < len and steps < 16) : (steps += 1) {
+                const ins = switch (f.inst(cur).op) {
+                    .insert => |x| x,
+                    else => break,
+                };
+                if (ins.index >= len) break :vec;
+                // (The last insert of a component wins.)
+                if (parts[ins.index] == .none) {
+                    parts[ins.index] = ins.value;
+                    have += 1;
+                }
+                cur = mp.map(ins.agg);
+            }
+            if (have < len) break :vec;
+            for (parts[0..len]) |p| if (t.get(f.inst(p).ty) != .scalar) break :vec;
+            f.insts.items[r.index()].op = .{ .construct = try a.dupe(Ref, parts[0..len]) };
+            any = true;
+            continue;
+        }
+        if (f.inst(r).op == .construct) {
+            const parts = f.inst(r).op.construct;
+            if (parts.len == 0 or !partsPerElement(t, f, f.inst(r).ty, parts)) continue;
+            var src: Ref = .none;
+            const whole = for (parts, 0..) |p, k| {
+                const x = switch (f.inst(mp.map(p)).op) {
+                    .extract => |x| x,
+                    else => break false,
+                };
+                if (x.index != k) break false;
+                const s = mp.map(x.agg);
+                if (src == .none) src = s else if (s != src) break false;
+            } else true;
+            if (whole and f.inst(src).ty == f.inst(r).ty and switch (t.get(f.inst(src).ty)) {
+                .@"struct" => |si| si.fields.items.len == parts.len,
+                .array => |ar| ar.len == parts.len,
+                .vector => |v| v.len == parts.len,
+                else => false,
+            }) {
+                repl[r.index()] = src;
+                any = true;
+            }
+            continue;
+        }
+        var x = switch (f.inst(r).op) {
+            .extract => |x| x,
+            else => continue,
+        };
+        // (A component of a shuffle is one of its vector's.)
+        switch (f.inst(mp.map(x.agg)).op) {
+            .shuffle => |sh| if (x.index < sh.components.len) {
+                x = .{ .agg = sh.vec, .index = sh.components[x.index] };
+                f.insts.items[r.index()].op = .{ .extract = x };
+                any = true;
+            },
+            else => {},
+        }
+        var agg = x.agg;
+        var steps: usize = 0;
+        const v: Ref = while (steps < 64) : (steps += 1) {
+            const ai = f.inst(agg);
+            switch (ai.op) {
+                .insert => |ins| {
+                    if (ins.index == x.index) break ins.value;
+                    agg = ins.agg;
+                },
+                .construct => |parts| {
+                    if (x.index >= parts.len or !partsPerElement(t, f, ai.ty, parts)) break .none;
+                    break parts[x.index];
+                },
+                else => break .none,
+            }
+        } else .none;
+        if (v != .none and f.inst(v).ty == f.inst(r).ty) {
+            repl[r.index()] = v;
+            any = true;
+        }
+    };
+    if (!any) return;
+    for (f.blocks.items) |*b| {
+        for (b.insts.items) |r| f.insts.items[r.index()].op = try mapOp(a, f.inst(r).op, mp);
+        b.term = switch (b.term) {
+            .ret => |v| .{ .ret = mp.map(v) },
+            .cond_br => |c| .{ .cond_br = .{ .cond = mp.map(c.cond), .then = c.then, .@"else" = c.@"else" } },
+            .@"switch" => |sw| .{ .@"switch" = .{ .value = mp.map(sw.value), .default = sw.default, .cases = sw.cases } },
+            else => b.term,
+        };
+    }
+}
+
+/// Removes instructions without side effects whose values nothing uses,
+/// as dxc's optimizer does. Unreal's `static const` bindless handles are
+/// evaluated where they are used, and a handle passed along but never
+/// read still loaded its index from $Globals, which Unreal's Vulkan
+/// format must not find beside a root parameter buffer.
+pub fn removeDeadCode(a: Allocator, t: *TypeTable, f: *ir.Function) Allocator.Error!void {
+    try forwardExtracts(a, f, t);
+    const n = f.insts.items.len;
+    const uses = try a.alloc(u32, n);
+    @memset(uses, 0);
+    const Count = struct {
+        uses: []u32,
+        pub fn use(c: @This(), r: Ref) void {
+            if (r != .none and r.index() < c.uses.len) c.uses[r.index()] += 1;
+        }
+    };
+    const in_block = try a.alloc(bool, n);
+    @memset(in_block, false);
+    for (f.blocks.items) |b| {
+        for (b.insts.items) |r| {
+            in_block[r.index()] = true;
+            eachOperand(f.inst(r).op, Count{ .uses = uses });
+        }
+        for (termRefs(b.term)) |r| Count.use(.{ .uses = uses }, r);
+    }
+    // (Instructions in no block, locals among them, are left alone, and
+    // so are their operands.)
+    for (f.insts.items, 0..) |inst, i| if (!in_block[i]) eachOperand(inst.op, Count{ .uses = uses });
+    const dead = try a.alloc(bool, n);
+    @memset(dead, false);
+    // Locals only stored into (a resource handle stored and never read):
+    // their stores are dead too. `reads` counts every use but as the
+    // pointer of a store.
+    const reads = try a.alloc(u32, n);
+    @memcpy(reads, uses);
+    for (f.blocks.items) |b| for (b.insts.items) |r| switch (f.inst(r).op) {
+        .store => |st| if (st.ptr.index() < n and reads[st.ptr.index()] > 0) {
+            reads[st.ptr.index()] -= 1;
+        },
+        else => {},
+    };
+    var changed = true;
+    while (changed) {
+        changed = false;
+        for (f.blocks.items) |b| for (b.insts.items) |r| {
+            const i = r.index();
+            if (dead[i]) continue;
+            const st = switch (f.inst(r).op) {
+                .store => |x| x,
+                else => continue,
+            };
+            const p = f.inst(st.ptr);
+            if (p.op != .local_var or p.ptr != .function or reads[st.ptr.index()] != 0) continue;
+            dead[i] = true;
+            changed = true;
+            if (uses[st.value.index()] > 0) uses[st.value.index()] -= 1;
+        };
+        for (f.blocks.items) |b| for (b.insts.items) |r| {
+            const i = r.index();
+            if (dead[i] or uses[i] != 0 or !isPureOp(f, f.inst(r).op)) continue;
+            dead[i] = true;
+            changed = true;
+            const Dec = struct {
+                uses: []u32,
+                reads: []u32,
+                pub fn use(c: @This(), x: Ref) void {
+                    if (x == .none or x.index() >= c.uses.len) return;
+                    if (c.uses[x.index()] > 0) c.uses[x.index()] -= 1;
+                    if (c.reads[x.index()] > 0) c.reads[x.index()] -= 1;
+                }
+            };
+            eachOperand(f.inst(r).op, Dec{ .uses = uses, .reads = reads });
+        };
+    }
+    for (f.blocks.items) |*b| {
+        var out: std.ArrayList(Ref) = .empty;
+        for (b.insts.items) |r| if (!dead[r.index()]) try out.append(a, r);
+        b.insts = out;
+    }
+}

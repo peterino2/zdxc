@@ -262,6 +262,26 @@ pub const VkOptions = struct {
     alpha_io_order: bool = false,
     /// -fvk-use-gl-layout, -fvk-use-dx-layout, -fvk-use-scalar-layout.
     layout: enum { default, gl, dx, scalar } = .default,
+    /// -fvk-ue5-layout (Epic's DXC): under the default layout, strict
+    /// std140 for constant buffers (relaxed std430 for the rest, as by
+    /// default); under any layout, strict std140 for `$Globals`.
+    ue5_layout: bool = false,
+    /// -fspv-support-precise-outputs (Epic's DXC): `precise` built-in
+    /// stage variables get NoContraction.
+    precise_outputs: bool = false,
+    /// -fspv-fusemuladd (Epic's DXC): when optimizing, a float add of a
+    /// float multiply's result is a GLSL.std.450 Fma.
+    fuse_mul_add: bool = false,
+    /// -fspv-svposition-implicit-invariant: SV_Position outputs are
+    /// Invariant. (Epic's DXC decorates them whether or not it is given,
+    /// so -fvk-ue5-layout does too.)
+    position_invariant: bool = false,
+    /// -fspv-force-subpass-image-depth-false (Epic's DXC): subpass input
+    /// images are declared not depth (0) instead of unknown (2).
+    subpass_depth_false: bool = false,
+    /// -fspv-no-scalar-block-layout (Epic's DXC): reject structured
+    /// buffer elements whose array stride differs from the packed one.
+    no_scalar_block_layout: bool = false,
     /// -fspv-entrypoint-name=, -fspv-enable-maximal-reconvergence,
     /// -fvk-support-nonzero-base-instance / -vertex,
     /// -fspv-use-unknown-image-format.
@@ -399,6 +419,8 @@ pub const SigElement = struct {
     vk_index: ?u32 = null,
     vk_builtin: ?[]const u8 = null,
     ext_decorations: []const ExtDecoration = &.{},
+    /// Declared `precise` (the parameter, field or function).
+    precise: bool = false,
 };
 
 pub const Primitive = enum(u8) { point = 1, line = 2, triangle = 3, line_adj = 6, triangle_adj = 7 };

@@ -33,13 +33,446 @@ pub const Error = Allocator.Error;
 pub fn run(m: *ir.Module) Error!void {
     // (The same modules as inlining, for now.)
     if (!@import("inline.zig").eligible(m)) return;
+    try privateToLocal(m);
     for (m.functions.items) |f| {
         if (f.dead) continue;
-        try splitLocals(m, f);
-        try promote(m, f);
-        // Values that were behind locals may fold now.
-        try opt.fold(m.arena, m.types, f);
+        // Splitting needs constant indices, which promotion and folding
+        // may make of loads (an unrolled loop's counter, an inlined
+        // argument): another round splits what they freed (TSR's register
+        // structs, indexed by their lane in unrolled loops).
+        try outIntrinsics(m, f);
+        var round: u32 = 0;
+        while (true) : (round += 1) {
+            var split = try splitLocals(m, f);
+            if (try splitShallow(m, f)) split = true;
+            try dynamicComponents(m, f);
+            try constantComponents(m, f);
+            try promote(m, f);
+            // Values that were behind locals may fold now, and branches on
+            // them (constant arguments of inlined calls, members of the
+            // structs they return: extracts of constructs first).
+            try opt.forwardExtracts(m.arena, f, m.types);
+            try opt.fold(m.arena, m.types, f);
+            if (try opt.foldBranches(m.arena, f)) try opt.fold(m.arena, m.types, f);
+            if (round == max_rounds - 1 or !hasAggregateLocals(m.types, f)) break;
+            if (round > 0 and !split) break;
+        }
+        var pass: u32 = 0;
+        while (true) : (pass += 1) {
+            // The same values computed again (the view uniforms each
+            // inlined helper reads).
+            _ = try @import("cse.zig").run(m.arena, f);
+            // Phis of one value (merges folding left one way into).
+            try removeTrivialPhis(m.arena, f);
+            // Branches on what those two made constants.
+            try opt.fold(m.arena, m.types, f);
+            const folded = try opt.foldBranches(m.arena, f);
+            if (folded) try opt.fold(m.arena, m.types, f);
+            // The straight-line chains inlining (and folding) left.
+            try opt.mergeBlocks(m.arena, f);
+            try opt.removeDeadCode(m.arena, m.types, f);
+            // Code whose results nothing live needs, branches included.
+            try @import("adce.zig").run(m.arena, f);
+            // Loops that run once (inlining's, and those folding left one
+            // iteration of) and the blocks they joined.
+            _ = try @import("one_trip.zig").run(m.arena, f);
+            try opt.mergeBlocks(m.arena, f);
+            try removeTrivialPhis(m.arena, f);
+            if (!folded or pass == 2) break;
+        }
     }
+}
+
+/// With one function left (everything inlined into it), its `static`
+/// globals of plain types are its locals, which the passes below promote
+/// (SPIRV-Tools' private-to-local; dxc's SPIR-V has none left). Unreal's
+/// ray tracing shaders read hundreds of such statics, copies of their
+/// shader record and view uniforms, and spirv-opt -O, which Unreal runs
+/// on them, overflowed its stack rewriting them as locals over 8,000
+/// blocks. (Private variables have no initializer, so neither do the
+/// locals.)
+fn privateToLocal(m: *ir.Module) Error!void {
+    var only: ?*ir.Function = null;
+    for (m.functions.items) |f| {
+        if (f.dead) continue;
+        if (only != null) return;
+        only = f;
+    }
+    const f = only orelse return;
+    const a = m.arena;
+    const canon = try a.alloc(Ref, m.globals.items.len);
+    @memset(canon, .none);
+    var any_dup = false;
+    for (f.insts.items, 0..) |*inst, i| {
+        if (inst.op != .global) continue;
+        const gi = inst.op.global;
+        const g = m.globals.items[gi];
+        if (g.space != .private or g.ext.builtin != null or g.ext.storage_class != null or !plainType(m.types, g.ty)) continue;
+        if (canon[gi] == .none) {
+            canon[gi] = @enumFromInt(i);
+            inst.* = .{ .op = .local_var, .ty = inst.ty, .ptr = .function };
+        } else any_dup = true;
+    }
+    defer retagPointers(f);
+    if (!any_dup) return;
+    // Other references to the same global use the first one's local.
+    const dup = try a.alloc(Ref, f.insts.items.len);
+    @memset(dup, .none);
+    for (f.insts.items, 0..) |inst, i| {
+        if (inst.op == .global and canon[inst.op.global] != .none) dup[i] = canon[inst.op.global];
+    }
+    const Map = struct {
+        dup: []const Ref,
+        pub fn map(c: @This(), x: Ref) Ref {
+            if (x == .none or x.index() >= c.dup.len) return x;
+            return if (c.dup[x.index()] != .none) c.dup[x.index()] else x;
+        }
+    };
+    const mp = Map{ .dup = dup };
+    for (f.insts.items) |*inst| inst.op = try opt.mapOp(a, inst.op, mp);
+    for (f.blocks.items) |*blk| blk.term = switch (blk.term) {
+        .ret => |v| .{ .ret = mp.map(v) },
+        .cond_br => |c| .{ .cond_br = .{ .cond = mp.map(c.cond), .then = c.then, .@"else" = c.@"else" } },
+        .@"switch" => |sw| .{ .@"switch" = .{ .value = mp.map(sw.value), .default = sw.default, .cases = sw.cases } },
+        else => blk.term,
+    };
+}
+
+/// Pointers into the locals privateToLocal made (access chains, through
+/// any depth) point at Function storage now.
+fn retagPointers(f: *ir.Function) void {
+    var changed = true;
+    while (changed) {
+        changed = false;
+        for (f.insts.items) |*inst| {
+            if (inst.op != .access or inst.ptr != .private) continue;
+            const base = f.insts.items[inst.op.access.base.index()];
+            if (base.ptr == .function) {
+                inst.ptr = .function;
+                changed = true;
+            }
+        }
+    }
+}
+
+/// `v[i]` with `i` not constant, on a vector local only loaded or stored
+/// through: the load is a select over the components, the store builds
+/// the vector with the component at `i` replaced, so the local can be
+/// promoted (dxc's SPIR-V has OpVectorExtractDynamic and
+/// OpVectorInsertDynamic there). Unreal's large-world-coordinate helpers
+/// (DFGetComponent) index float3 members this way.
+fn dynamicComponents(m: *ir.Module, f: *ir.Function) Error!void {
+    const a = m.arena;
+    const t = m.types;
+    const n = f.insts.items.len;
+    // The accesses to rewrite, and whether every use of each qualifies.
+    const target = try a.alloc(bool, n);
+    @memset(target, false);
+    var any = false;
+    for (f.blocks.items) |blk| for (blk.insts.items) |r| {
+        const inst = f.inst(r);
+        if (inst.op != .access or inst.op.access.indices.len != 1) continue;
+        const base = f.inst(inst.op.access.base);
+        if (base.op != .local_var or base.ptr != .function or t.get(base.ty) != .vector) continue;
+        if (constIndex(f, inst.op.access.indices[0]) != null) continue;
+        target[r.index()] = true;
+        any = true;
+    };
+    if (!any) return;
+    const Check = struct {
+        f: *const ir.Function,
+        target: []bool,
+        user: Ref,
+        pub fn use(c: @This(), x: Ref) void {
+            if (!c.target[x.index()]) return;
+            const fine = switch (c.f.inst(c.user).op) {
+                .load => true,
+                .store => |st| st.ptr == x and st.value != x,
+                else => false,
+            };
+            if (!fine) c.target[x.index()] = false;
+        }
+    };
+    for (f.blocks.items) |blk| {
+        for (blk.insts.items) |r| try forOperands(a, f.inst(r).op, Check{ .f = f, .target = target, .user = r });
+        const tr = termOperand(blk.term);
+        if (tr != .none) target[tr.index()] = false;
+    }
+    const bool_ty = try t.scalar(.bool);
+    for (f.blocks.items) |*blk| {
+        var out: std.ArrayList(Ref) = .empty;
+        for (blk.insts.items) |r| {
+            const inst = f.inst(r);
+            switch (inst.op) {
+                .access => if (target[r.index()]) continue,
+                .load => |p| if (target[p.index()]) {
+                    const acc = f.inst(p).op.access;
+                    const vec_ty = f.inst(acc.base).ty;
+                    const len = t.get(vec_ty).vector.len;
+                    const w = try addInst(a, f, .{ .op = .{ .load = acc.base }, .ty = vec_ty });
+                    try out.append(a, w);
+                    var v = try addInst(a, f, .{ .op = .{ .extract = .{ .agg = w, .index = len - 1 } }, .ty = inst.ty });
+                    try out.append(a, v);
+                    var k: u32 = len - 1;
+                    while (k > 0) {
+                        k -= 1;
+                        const e = try addInst(a, f, .{ .op = .{ .extract = .{ .agg = w, .index = k } }, .ty = inst.ty });
+                        const c = try indexIs(a, f, acc.indices[0], k, bool_ty, &out);
+                        try out.append(a, e);
+                        v = try addInst(a, f, .{ .op = .{ .select = .{ .cond = c, .t = e, .f = v } }, .ty = inst.ty });
+                        try out.append(a, v);
+                    }
+                    // The load becomes the selected value.
+                    f.insts.items[r.index()].op = f.inst(v).op;
+                    out.items[out.items.len - 1] = r;
+                    continue;
+                },
+                .store => |st| if (target[st.ptr.index()]) {
+                    const acc = f.inst(st.ptr).op.access;
+                    const vec_ty = f.inst(acc.base).ty;
+                    const vt = t.get(vec_ty).vector;
+                    const comp_ty = try t.scalar(vt.elem);
+                    const w = try addInst(a, f, .{ .op = .{ .load = acc.base }, .ty = vec_ty });
+                    try out.append(a, w);
+                    const comps = try a.alloc(Ref, vt.len);
+                    for (comps, 0..) |*cp, k| {
+                        const e = try addInst(a, f, .{ .op = .{ .extract = .{ .agg = w, .index = @intCast(k) } }, .ty = comp_ty });
+                        const c = try indexIs(a, f, acc.indices[0], @intCast(k), bool_ty, &out);
+                        try out.append(a, e);
+                        cp.* = try addInst(a, f, .{ .op = .{ .select = .{ .cond = c, .t = st.value, .f = e } }, .ty = comp_ty });
+                        try out.append(a, cp.*);
+                    }
+                    const nv = try addInst(a, f, .{ .op = .{ .construct = comps }, .ty = vec_ty });
+                    try out.append(a, nv);
+                    f.insts.items[r.index()].op = .{ .store = .{ .ptr = acc.base, .value = nv } };
+                },
+                else => {},
+            }
+            try out.append(a, r);
+        }
+        blk.insts = out;
+    }
+}
+
+/// Intrinsics writing results through pointers write them with stores
+/// instead, which promotion takes: an atomic's original value
+/// (`InterlockedAdd(dest, v, original)`: the atomic's value, the emitter
+/// gives it when the intrinsic has a type) and sincos's sine and cosine.
+/// Unreal's counters keep the original in a local, which would otherwise
+/// stay one.
+fn outIntrinsics(m: *ir.Module, f: *ir.Function) Error!void {
+    const a = m.arena;
+    for (f.blocks.items) |*blk| {
+        var out: std.ArrayList(Ref) = .empty;
+        var any = false;
+        for (blk.insts.items) |r| {
+            try out.append(a, r);
+            const x = switch (f.inst(r).op) {
+                .intrinsic => |x| x,
+                else => continue,
+            };
+            if (std.mem.startsWith(u8, x.name, "Interlocked")) {
+                const n_in: usize = if (std.mem.startsWith(u8, x.name, "InterlockedCompare")) 2 else 1;
+                if (x.args.len != n_in + 2) continue;
+                const ptr = x.args[x.args.len - 1];
+                if (f.inst(ptr).ptr != .function) continue;
+                f.insts.items[r.index()] = .{ .op = .{ .intrinsic = .{ .name = x.name, .args = x.args[0 .. x.args.len - 1] } }, .ty = f.inst(ptr).ty };
+                try out.append(a, try addInst(a, f, .{ .op = .{ .store = .{ .ptr = ptr, .value = r } }, .ty = TypeTable.void_type }));
+                any = true;
+            } else if (std.mem.eql(u8, x.name, "sincos") and x.args.len == 3) {
+                const ty = f.inst(x.args[0]).ty;
+                const sp = x.args[1];
+                const cp = x.args[2];
+                if (f.inst(sp).ptr != .function or f.inst(cp).ptr != .function) continue;
+                if (f.inst(sp).ty != ty or f.inst(cp).ty != ty) continue;
+                const args = try a.dupe(Ref, x.args[0..1]);
+                f.insts.items[r.index()] = .{ .op = .{ .intrinsic = .{ .name = "sin", .args = args } }, .ty = ty };
+                const c = try addInst(a, f, .{ .op = .{ .intrinsic = .{ .name = "cos", .args = args } }, .ty = ty });
+                try out.append(a, c);
+                try out.append(a, try addInst(a, f, .{ .op = .{ .store = .{ .ptr = sp, .value = r } }, .ty = TypeTable.void_type }));
+                try out.append(a, try addInst(a, f, .{ .op = .{ .store = .{ .ptr = cp, .value = c } }, .ty = TypeTable.void_type }));
+                any = true;
+            }
+        }
+        if (any) blk.insts = out;
+    }
+}
+
+/// Vector and matrix locals accessed with constant indices (`v.x = ...`,
+/// `m[1]`, `m[1][2]`): reads become extracts of the whole value and
+/// writes inserts into it, so that promotion takes them (SPIRV-Tools'
+/// local-access-chain-convert). Matrices with a row or column of one keep
+/// their accesses (the emitter lays them out as vectors).
+fn constantComponents(m: *ir.Module, f: *ir.Function) Error!void {
+    const a = m.arena;
+    const t = m.types;
+    const n = f.insts.items.len;
+    const Kind = enum { none, vector, matrix };
+    const kindOf = struct {
+        fn k(tt: *TypeTable, ty: TypeId) Kind {
+            return switch (tt.get(ty)) {
+                .vector => |v| if (v.len >= 2) .vector else .none,
+                .matrix => |mm| if (mm.rows >= 2 and mm.cols >= 2) .matrix else .none,
+                else => .none,
+            };
+        }
+    }.k;
+    // root[x]: the candidate local chain `x` is rooted at; path[x]: its
+    // constant indices from there.
+    const root = try a.alloc(Ref, n);
+    @memset(root, .none);
+    const path = try a.alloc([]const u32, n);
+    const cand = try a.alloc(bool, n);
+    @memset(cand, false);
+    var any = false;
+    for (f.insts.items, 0..) |inst, i| {
+        if (inst.op != .local_var or inst.ptr != .function or kindOf(t, inst.ty) == .none) continue;
+        cand[i] = true;
+        root[i] = @fromBackingInt(@intCast(i));
+        path[i] = &.{};
+        any = true;
+    }
+    if (!any) return;
+    const in_block = try a.alloc(bool, n);
+    @memset(in_block, false);
+    for (f.blocks.items) |blk| for (blk.insts.items) |r| {
+        in_block[r.index()] = true;
+    };
+    var changed = true;
+    while (changed) {
+        changed = false;
+        for (f.insts.items, 0..) |inst, i| {
+            if (!in_block[i] or root[i] != .none) continue;
+            const acc = switch (inst.op) {
+                .access => |x| x,
+                else => continue,
+            };
+            const rb = root[acc.base.index()];
+            if (rb == .none or !cand[rb.index()]) continue;
+            const depth: usize = if (kindOf(t, f.inst(rb).ty) == .matrix) 2 else 1;
+            var p: std.ArrayList(u32) = .empty;
+            try p.appendSlice(a, path[acc.base.index()]);
+            const ok = for (acc.indices) |ix| {
+                const k = constIndex(f, ix) orelse break false;
+                try p.append(a, k);
+            } else p.items.len <= depth and p.items.len > 0;
+            if (!ok) {
+                cand[rb.index()] = false;
+                continue;
+            }
+            // (In range: the component or row, then the column.)
+            const in_range = switch (t.get(f.inst(rb).ty)) {
+                .vector => |v| p.items[0] < v.len,
+                .matrix => |mm| p.items[0] < mm.rows and (p.items.len < 2 or p.items[1] < mm.cols),
+                else => false,
+            };
+            if (!in_range) {
+                cand[rb.index()] = false;
+                continue;
+            }
+            root[i] = rb;
+            path[i] = p.items;
+            changed = true;
+        }
+    }
+    // Every use of the local or a chain: a load, a store to it, or a
+    // further chain.
+    const Check = struct {
+        f: *const ir.Function,
+        root: []const Ref,
+        cand: []bool,
+        user: Ref,
+        pub fn use(c: @This(), x: Ref) void {
+            const rt = c.root[x.index()];
+            if (rt == .none) return;
+            const fine = switch (c.f.inst(c.user).op) {
+                .load => true,
+                .store => |s| s.ptr == x and s.value != x,
+                .access => |acc| acc.base == x and c.root[c.user.index()] == rt,
+                else => false,
+            };
+            if (!fine) c.cand[rt.index()] = false;
+        }
+    };
+    for (f.blocks.items) |blk| {
+        for (blk.insts.items) |r| try forOperands(a, f.inst(r).op, Check{ .f = f, .root = root, .cand = cand, .user = r });
+        const tr = termOperand(blk.term);
+        if (tr != .none and root[tr.index()] != .none) cand[root[tr.index()].index()] = false;
+    }
+    // The type one step into a vector (a component) or a matrix (a row).
+    const stepTy = struct {
+        fn s(tt: *TypeTable, ty: TypeId) Error!TypeId {
+            return switch (tt.get(ty)) {
+                .vector => |v| try tt.scalar(v.elem),
+                .matrix => |mm| try tt.vector(mm.elem, mm.cols),
+                else => unreachable,
+            };
+        }
+    }.s;
+    for (f.blocks.items) |*blk| {
+        var out: std.ArrayList(Ref) = .empty;
+        for (blk.insts.items) |r| {
+            const inst = f.inst(r);
+            switch (inst.op) {
+                .access => if (root[r.index()] != .none and cand[root[r.index()].index()]) continue,
+                .load => |ptr| {
+                    const rt = root[ptr.index()];
+                    if (rt != .none and cand[rt.index()] and ptr != rt) {
+                        var v = try addInst(a, f, .{ .op = .{ .load = rt }, .ty = f.inst(rt).ty });
+                        try out.append(a, v);
+                        var ty = f.inst(rt).ty;
+                        const p = path[ptr.index()];
+                        for (p, 0..) |k, j| {
+                            ty = try stepTy(t, ty);
+                            if (j + 1 == p.len) {
+                                // The load becomes the last extract.
+                                f.insts.items[r.index()].op = .{ .extract = .{ .agg = v, .index = k } };
+                            } else {
+                                v = try addInst(a, f, .{ .op = .{ .extract = .{ .agg = v, .index = k } }, .ty = ty });
+                                try out.append(a, v);
+                            }
+                        }
+                    }
+                },
+                .store => |st| {
+                    const rt = root[st.ptr.index()];
+                    if (rt != .none and cand[rt.index()] and st.ptr != rt) {
+                        const p = path[st.ptr.index()];
+                        // The values along the path, outermost first.
+                        var aggs: [2]Ref = undefined;
+                        var tys: [2]TypeId = undefined;
+                        tys[0] = f.inst(rt).ty;
+                        aggs[0] = try addInst(a, f, .{ .op = .{ .load = rt }, .ty = tys[0] });
+                        try out.append(a, aggs[0]);
+                        for (1..p.len) |j| {
+                            tys[j] = try stepTy(t, tys[j - 1]);
+                            aggs[j] = try addInst(a, f, .{ .op = .{ .extract = .{ .agg = aggs[j - 1], .index = p[j - 1] } }, .ty = tys[j] });
+                            try out.append(a, aggs[j]);
+                        }
+                        var v = st.value;
+                        var j = p.len;
+                        while (j > 0) {
+                            j -= 1;
+                            v = try addInst(a, f, .{ .op = .{ .insert = .{ .agg = aggs[j], .value = v, .index = p[j] } }, .ty = tys[j] });
+                            try out.append(a, v);
+                        }
+                        f.insts.items[r.index()].op = .{ .store = .{ .ptr = rt, .value = v } };
+                    }
+                },
+                else => {},
+            }
+            try out.append(a, r);
+        }
+        blk.insts = out;
+    }
+}
+
+/// `index == k` (as `index`'s type), appended to `out`.
+fn indexIs(a: Allocator, f: *ir.Function, index: Ref, k: u32, bool_ty: TypeId, out: *std.ArrayList(Ref)) Error!Ref {
+    const kc = try addInst(a, f, .{ .op = .{ .constant = .{ .int = k } }, .ty = f.inst(index).ty });
+    const c = try addInst(a, f, .{ .op = .{ .cmp = .{ .op = .eq, .lhs = index, .rhs = kc } }, .ty = bool_ty });
+    try out.appendSlice(a, &.{ kc, c });
+    return c;
 }
 
 // ----------------------------------------------------------------------
@@ -111,6 +544,9 @@ const Place = struct { block: u32, pos: u32 };
 
 fn constIndex(f: *const ir.Function, r: Ref) ?u32 {
     const i = f.inst(r);
+    // (An undefined index may be any: 0. Promotion makes one of a counter
+    // read where no write reaches, in code that never runs.)
+    if (i.op == .undef) return 0;
     if (i.op != .constant or i.op.constant != .int) return null;
     const v = i.op.constant.int;
     if (v < 0 or v > std.math.maxInt(u32)) return null;
@@ -126,7 +562,19 @@ fn stepType(t: *TypeTable, ty: TypeId, k: u32) ?TypeId {
     };
 }
 
-fn splitLocals(m: *ir.Module, f: *ir.Function) Error!void {
+/// Rounds of splitting and promotion at most.
+const max_rounds = 8;
+
+/// Whether `f` has struct or array locals left.
+fn hasAggregateLocals(t: *TypeTable, f: *const ir.Function) bool {
+    for (f.insts.items) |inst| {
+        if (inst.op == .local_var and inst.ptr == .function and isAggregate(t, inst.ty)) return true;
+    }
+    return false;
+}
+
+/// Splits aggregate locals; whether it split any.
+fn splitLocals(m: *ir.Module, f: *ir.Function) Error!bool {
     const a = m.arena;
     const t = m.types;
     const n = f.insts.items.len;
@@ -141,6 +589,11 @@ fn splitLocals(m: *ir.Module, f: *ir.Function) Error!void {
     const root = try a.alloc(Ref, n);
     @memset(root, .none);
     const paths = try a.alloc([]const u32, n);
+    // tail[x]: indices of chain `x` past its leaf (into a vector or
+    // matrix member, constant or not): `x` becomes an access into that
+    // member's local.
+    const tail = try a.alloc([]const Ref, n);
+    @memset(tail, &.{});
     // Candidate locals: struct / array locals of plain types.
     const cand = try a.alloc(bool, n);
     @memset(cand, false);
@@ -156,7 +609,7 @@ fn splitLocals(m: *ir.Module, f: *ir.Function) Error!void {
             any = true;
         }
     }
-    if (!any) return;
+    if (!any) return false;
     // Chains in instruction order: an access's base precedes it in f.insts
     // when lowering made it; iterate to a fixed point to be safe.
     var changed = true;
@@ -173,15 +626,37 @@ fn splitLocals(m: *ir.Module, f: *ir.Function) Error!void {
             var ty = f.inst(acc.base).ty;
             var path: std.ArrayList(u32) = .empty;
             try path.appendSlice(a, paths[acc.base.index()]);
-            const ok = for (acc.indices) |x| {
-                const k = constIndex(f, x) orelse break false;
-                ty = stepType(t, ty, k) orelse break false;
+            var j: usize = 0;
+            // (A chain past a leaf goes no further.)
+            var ok = tail[acc.base.index()].len == 0;
+            while (ok and j < acc.indices.len) : (j += 1) {
+                if (!isAggregate(t, ty)) break;
+                // (An array of one element has only index 0: any other is
+                // out of bounds, which is undefined. Unreal's denoisers
+                // index such arrays, a batch of one signal, by a loop
+                // counter, and one such index kept the whole struct around
+                // it a local.)
+                const k = constIndex(f, acc.indices[j]) orelse switch (t.get(ty)) {
+                    .array => |x| if (x.len == 1) 0 else {
+                        ok = false;
+                        break;
+                    },
+                    else => {
+                        ok = false;
+                        break;
+                    },
+                };
+                ty = stepType(t, ty, k) orelse {
+                    ok = false;
+                    break;
+                };
                 try path.append(a, k);
-            } else true;
+            }
             if (!ok) {
                 cand[rb.index()] = false;
                 continue;
             }
+            tail[i] = acc.indices[j..];
             root[i] = rb;
             paths[i] = path.items;
             changed = true;
@@ -238,11 +713,18 @@ fn splitLocals(m: *ir.Module, f: *ir.Function) Error!void {
         for (blk.insts.items) |r| {
             const inst = f.inst(r);
             switch (inst.op) {
-                .access => if (root[r.index()] != .none and cand[root[r.index()].index()]) continue,
+                .access => if (root[r.index()] != .none and cand[root[r.index()].index()]) {
+                    const rt = root[r.index()];
+                    if (tail[r.index()].len == 0) continue;
+                    // Into a vector or matrix member: an access into its
+                    // local.
+                    const at = leafAt(t, f.inst(rt).ty, paths[r.index()]);
+                    f.insts.items[r.index()].op = .{ .access = .{ .base = leaves.items[leaf_base[rt.index()] + at.offset], .indices = tail[r.index()] } };
+                },
                 .local_var => if (cand[r.index()]) continue,
                 .load => |p| {
                     const rt = root[p.index()];
-                    if (rt != .none and cand[rt.index()]) {
+                    if (rt != .none and cand[rt.index()] and tail[p.index()].len == 0) {
                         const at = leafAt(t, f.inst(rt).ty, paths[p.index()]);
                         const base = leaves.items[leaf_base[rt.index()] + at.offset ..];
                         const v = try gather(a, f, t, at.ty, base, &out);
@@ -254,7 +736,7 @@ fn splitLocals(m: *ir.Module, f: *ir.Function) Error!void {
                 },
                 .store => |st| {
                     const rt = root[st.ptr.index()];
-                    if (rt != .none and cand[rt.index()]) {
+                    if (rt != .none and cand[rt.index()] and tail[st.ptr.index()].len == 0) {
                         const at = leafAt(t, f.inst(rt).ty, paths[st.ptr.index()]);
                         const base = leaves.items[leaf_base[rt.index()] + at.offset ..];
                         try scatter(a, f, t, at.ty, base, st.value, &out);
@@ -267,10 +749,267 @@ fn splitLocals(m: *ir.Module, f: *ir.Function) Error!void {
         }
         blk.insts = out;
     }
+    for (cand) |c| if (c) return true;
+    return false;
+}
+
+/// A type of resources only (no data a local of it keeps).
+fn noData(t: *TypeTable, ty: TypeId) bool {
+    return switch (t.get(ty)) {
+        .resource => |r| !std.mem.eql(u8, r.name, "RayQuery"),
+        .sampler => true,
+        .array => |x| noData(t, x.elem),
+        .@"struct" => |st| st.fields.items.len > 0 and st.bases.items.len == 0 and for (st.fields.items) |fld| {
+            if (!noData(t, fld.type)) break false;
+        } else true,
+        else => false,
+    };
+}
+
+/// Plain data and resources only, nested in structs.
+fn shallowOk(t: *TypeTable, ty: TypeId) bool {
+    if (plainType(t, ty) or noData(t, ty)) return true;
+    return switch (t.get(ty)) {
+        .@"struct" => |st| st.bases.items.len == 0 and for (st.fields.items) |fld| {
+            if (!shallowOk(t, fld.type)) break false;
+        } else true,
+        else => false,
+    };
+}
+
+/// Arrays split one level (`splitShallow`) have at most this many
+/// elements.
+const max_shallow_elems = 16;
+
+/// Splits aggregate locals `splitLocals` left whole one level: one local
+/// per member, when every chain into the local selects its member with a
+/// constant (indices past it may be anything). A dynamic index into one
+/// array member (Unreal's FPrimitiveSceneData's CustomPrimitiveData[i], a
+/// loop counter into a payload's array) then keeps only that member a
+/// local; the next round splits the rest whole (SPIRV-Tools'
+/// scalar-replacement also splits one level at a time).
+fn splitShallow(m: *ir.Module, f: *ir.Function) Error!bool {
+    const a = m.arena;
+    const t = m.types;
+    const n = f.insts.items.len;
+    const cand = try a.alloc(bool, n);
+    @memset(cand, false);
+    var any = false;
+    // Resource members something reads (by struct type and member): those
+    // stay (the emitter finds a resource through the locals it is stored
+    // in, not through values built of it).
+    var read_res: std.AutoHashMapUnmanaged(struct { TypeId, u32 }, void) = .empty;
+    // Chains only stored through (`ctx.Buffers = b`): writes, which go
+    // with the member.
+    const stored_only = try a.alloc(bool, n);
+    @memset(stored_only, true);
+    {
+        const Mark = struct {
+            f: *const ir.Function,
+            so: []bool,
+            user: Ref,
+            pub fn use(c: @This(), x: Ref) void {
+                if (x.index() >= c.so.len) return;
+                switch (c.f.inst(c.user).op) {
+                    .store => |s| if (s.ptr == x and s.value != x) return,
+                    else => {},
+                }
+                c.so[x.index()] = false;
+            }
+        };
+        for (f.blocks.items) |blk| {
+            for (blk.insts.items) |r| try forOperands(a, f.inst(r).op, Mark{ .f = f, .so = stored_only, .user = r });
+            const tr = termOperand(blk.term);
+            if (tr != .none and tr.index() < n) stored_only[tr.index()] = false;
+        }
+    }
+    for (f.blocks.items) |blk| for (blk.insts.items) |r| switch (f.inst(r).op) {
+        .access => |acc| if (!stored_only[r.index()]) {
+            var ty = f.inst(acc.base).ty;
+            for (acc.indices) |ix| switch (t.get(ty)) {
+                .@"struct" => |st| {
+                    const k = constIndex(f, ix) orelse break;
+                    if (k >= st.fields.items.len) break;
+                    if (noData(t, st.fields.items[k].type)) try read_res.put(a, .{ ty, k }, {});
+                    ty = st.fields.items[k].type;
+                },
+                .array => |x| ty = x.elem,
+                else => break,
+            };
+        },
+        .extract => |x| switch (t.get(f.inst(x.agg).ty)) {
+            .@"struct" => |st| if (x.index < st.fields.items.len and noData(t, st.fields.items[x.index].type))
+                try read_res.put(a, .{ f.inst(x.agg).ty, x.index }, {}),
+            else => {},
+        },
+        else => {},
+    };
+    for (f.insts.items, 0..) |inst, i| {
+        if (inst.op != .local_var or inst.ptr != .function) continue;
+        const unread = switch (t.get(inst.ty)) {
+            .@"struct" => |st| for (st.fields.items, 0..) |fld, k| {
+                if (noData(t, fld.type) and read_res.contains(.{ inst.ty, @intCast(k) })) break false;
+            } else true,
+            else => true,
+        };
+        if (!unread) continue;
+        const ok = switch (t.get(inst.ty)) {
+            // (Structs with resources in them too: resource members are
+            // dead weight here, split_resources having given each its own
+            // local; Unreal's FShaderPrintContext, whose flag left whole
+            // keeps all of a shader's debug printing.)
+            .@"struct" => |st| st.fields.items.len > 0 and !noData(t, inst.ty) and shallowOk(t, inst.ty),
+            .array => |x| x.len > 0 and x.len <= max_shallow_elems and plainType(t, inst.ty),
+            else => false,
+        };
+        if (ok) {
+            cand[i] = true;
+            any = true;
+        }
+    }
+    if (!any) return false;
+    // Every use of a candidate: a whole load, a whole store to it, or a
+    // chain whose first index is a constant member.
+    const Check = struct {
+        f: *const ir.Function,
+        t: *TypeTable,
+        cand: []bool,
+        stored_only: []const bool,
+        user: Ref,
+        pub fn use(c: @This(), x: Ref) void {
+            if (!c.cand[x.index()]) return;
+            const fine = switch (c.f.inst(c.user).op) {
+                .load => true,
+                .store => |s| s.ptr == x and s.value != x,
+                // (Into a resource member, only to store to it.)
+                .access => |acc| acc.base == x and acc.indices.len > 0 and for (acc.indices[1..]) |r| {
+                    if (r == x) break false;
+                } else if (constIndex(c.f, acc.indices[0])) |k| if (stepType(c.t, c.f.inst(x).ty, k)) |mt| !noData(c.t, mt) or c.stored_only[c.user.index()] else false else false,
+                else => false,
+            };
+            if (!fine) c.cand[x.index()] = false;
+        }
+    };
+    for (f.blocks.items) |blk| {
+        for (blk.insts.items) |r| try forOperands(a, f.inst(r).op, Check{ .f = f, .t = t, .cand = cand, .stored_only = stored_only, .user = r });
+        const tr = termOperand(blk.term);
+        if (tr != .none and cand[tr.index()]) cand[tr.index()] = false;
+    }
+    // One local per member.
+    const first = try a.alloc(u32, n);
+    var members: std.ArrayList(Ref) = .empty;
+    any = false;
+    for (0..n) |i| {
+        if (!cand[i]) continue;
+        any = true;
+        first[i] = @intCast(members.items.len);
+        const ty = f.insts.items[i].ty;
+        switch (t.get(ty)) {
+            // (No local for a member holding only resources.)
+            .@"struct" => |st| for (st.fields.items) |fld| try members.append(a, if (noData(t, fld.type)) .none else try addInst(a, f, .{ .op = .local_var, .ty = fld.type, .ptr = .function })),
+            .array => |x| for (0..x.len) |_| try members.append(a, try addInst(a, f, .{ .op = .local_var, .ty = x.elem, .ptr = .function })),
+            else => unreachable,
+        }
+    }
+    if (!any) return false;
+    const repl = try a.alloc(Ref, f.insts.items.len);
+    @memset(repl, .none);
+    // Chains into resource members (stored through only) go, with their
+    // stores.
+    const dropped = try a.alloc(bool, f.insts.items.len);
+    @memset(dropped, false);
+    for (f.blocks.items) |blk| for (blk.insts.items) |r| switch (f.inst(r).op) {
+        .access => |acc| if (cand[acc.base.index()] and members.items[first[acc.base.index()] + constIndex(f, acc.indices[0]).?] == .none) {
+            dropped[r.index()] = true;
+        },
+        else => {},
+    };
+    for (f.blocks.items) |*blk| {
+        var out: std.ArrayList(Ref) = .empty;
+        for (blk.insts.items) |r| {
+            const inst = f.inst(r);
+            switch (inst.op) {
+                .local_var => if (cand[r.index()]) continue,
+                .store => |st| if (dropped[st.ptr.index()]) continue,
+                else => {},
+            }
+            switch (inst.op) {
+                .local_var => if (cand[r.index()]) continue,
+                .access => |acc| if (cand[acc.base.index()]) {
+                    if (dropped[r.index()]) continue;
+                    const k = constIndex(f, acc.indices[0]).?;
+                    const mem = members.items[first[acc.base.index()] + k];
+                    if (acc.indices.len == 1) {
+                        // (The member's local itself.)
+                        repl[r.index()] = mem;
+                        continue;
+                    }
+                    f.insts.items[r.index()].op = .{ .access = .{ .base = mem, .indices = acc.indices[1..] } };
+                },
+                .load => |p| if (cand[p.index()]) {
+                    const mems = members.items[first[p.index()]..];
+                    var parts: std.ArrayList(Ref) = .empty;
+                    switch (t.get(inst.ty)) {
+                        .@"struct" => |st| for (st.fields.items, 0..) |fld, k| {
+                            const v = try addInst(a, f, if (mems[k] == .none) .{ .op = .undef, .ty = fld.type } else .{ .op = .{ .load = mems[k] }, .ty = fld.type });
+                            // (The emitter leaves resource members out of
+                            // a construct: no undef of a resource to emit.)
+                            if (mems[k] != .none or !@import("layout.zig").isOpaque(t, fld.type)) try out.append(a, v);
+                            try parts.append(a, v);
+                        },
+                        .array => |x| for (0..x.len) |k| {
+                            const v = try addInst(a, f, .{ .op = .{ .load = mems[k] }, .ty = x.elem });
+                            try out.append(a, v);
+                            try parts.append(a, v);
+                        },
+                        else => unreachable,
+                    }
+                    // The load becomes the construct of its members.
+                    f.insts.items[r.index()].op = .{ .construct = parts.items };
+                },
+                .store => |st| if (cand[st.ptr.index()]) {
+                    const mems = members.items[first[st.ptr.index()]..];
+                    const ty = f.inst(st.ptr).ty;
+                    const count: usize = switch (t.get(ty)) {
+                        .@"struct" => |s| s.fields.items.len,
+                        .array => |x| x.len,
+                        else => unreachable,
+                    };
+                    for (0..count) |k| {
+                        if (mems[k] == .none) continue;
+                        const ety = stepType(t, ty, @intCast(k)).?;
+                        const x = try addInst(a, f, .{ .op = .{ .extract = .{ .agg = st.value, .index = @intCast(k) } }, .ty = ety });
+                        try out.append(a, x);
+                        try out.append(a, try addInst(a, f, .{ .op = .{ .store = .{ .ptr = mems[k], .value = x } }, .ty = TypeTable.void_type }));
+                    }
+                    continue;
+                },
+                else => {},
+            }
+            try out.append(a, r);
+        }
+        blk.insts = out;
+    }
+    // Uses of chains that became members' locals.
+    const Map = struct {
+        repl: []const Ref,
+        pub fn map(c: @This(), x: Ref) Ref {
+            var y = x;
+            while (y != .none and y.index() < c.repl.len and c.repl[y.index()] != .none) y = c.repl[y.index()];
+            return y;
+        }
+    };
+    for (f.blocks.items) |blk| for (blk.insts.items) |r| {
+        f.insts.items[r.index()].op = try opt.mapOp(a, f.inst(r).op, Map{ .repl = repl });
+    };
+    for (0..n) |i| if (cand[i]) {
+        f.insts.items[i] = .{ .op = .undef, .ty = f.insts.items[i].ty };
+    };
+    return true;
 }
 
 /// Aggregates split into at most this many locals.
-const max_leaves = 64;
+const max_leaves = 1024;
 
 fn isAggregate(t: *TypeTable, ty: TypeId) bool {
     return switch (t.get(ty)) {
@@ -776,6 +1515,72 @@ fn promote(m: *ir.Module, f: *ir.Function) Error!void {
 /// Drops phis nothing but dead phis uses: phis are live when a non-phi
 /// instruction or a terminator uses them, or a live phi does (dead cycles
 /// through loop headers go too).
+/// Phis of one value (besides themselves and undef) are that value: phis
+/// of blocks folding and merging left one predecessor, and those of
+/// locals a loop or branch never wrote (SPIRV-Tools' ssa-rewrite and
+/// simplify leave dxc's SPIR-V without them). The value dominates the
+/// phi: it dominates every predecessor the phi has a value from.
+fn removeTrivialPhis(a: Allocator, f: *ir.Function) Error!void {
+    const n = f.insts.items.len;
+    const repl = try a.alloc(Ref, n);
+    @memset(repl, .none);
+    const Map = struct {
+        repl: []const Ref,
+        pub fn map(c: @This(), x: Ref) Ref {
+            var y = x;
+            while (y != .none and y.index() < c.repl.len and c.repl[y.index()] != .none) y = c.repl[y.index()];
+            return y;
+        }
+    };
+    const mp = Map{ .repl = repl };
+    var any = false;
+    var changed = true;
+    while (changed) {
+        changed = false;
+        for (f.blocks.items) |blk| for (blk.insts.items) |r| {
+            if (repl[r.index()] != .none) continue;
+            const ins = switch (f.inst(r).op) {
+                .phi => |p| p,
+                else => continue,
+            };
+            var v: Ref = .none;
+            var undefs = false;
+            const one = for (ins) |in| {
+                const x = mp.map(in.value);
+                if (x == r) continue;
+                if (f.inst(x).op == .undef) {
+                    undefs = true;
+                    continue;
+                }
+                if (v == .none) v = x else if (x != v) break false;
+            } else true;
+            if (!one or v == .none) continue;
+            // (Undef from some predecessors may be `v` only where `v`
+            // dominates them too: constants and parameters do.)
+            if (undefs and f.inst(v).op != .constant and f.inst(v).op != .param) continue;
+            repl[r.index()] = v;
+            changed = true;
+            any = true;
+        };
+    }
+    if (!any) return;
+    for (f.blocks.items) |*blk| {
+        var out: std.ArrayList(Ref) = .empty;
+        for (blk.insts.items) |r| {
+            if (repl[r.index()] != .none) continue;
+            f.insts.items[r.index()].op = try opt.mapOp(a, f.inst(r).op, mp);
+            try out.append(a, r);
+        }
+        blk.insts = out;
+        blk.term = switch (blk.term) {
+            .ret => |v| .{ .ret = mp.map(v) },
+            .cond_br => |c| .{ .cond_br = .{ .cond = mp.map(c.cond), .then = c.then, .@"else" = c.@"else" } },
+            .@"switch" => |sw| .{ .@"switch" = .{ .value = mp.map(sw.value), .default = sw.default, .cases = sw.cases } },
+            else => blk.term,
+        };
+    }
+}
+
 fn removeDeadPhis(a: Allocator, f: *ir.Function) Error!void {
     const n = f.insts.items.len;
     const live = try a.alloc(bool, n);

@@ -148,6 +148,8 @@ pub fn emit(gpa: Allocator, m: *const ir.Module, diags: *diag.Diagnostics, env: 
     var e: Emitter = .{ .arena = arena_state.allocator(), .b = .init(gpa), .m = m, .t = m.types, .diags = diags, .spv_minor = env.minor, .universal = env.universal, .vk = m.vk };
     defer e.b.deinit();
     try e.module();
+    try @import("dce.zig").run(e.arena, &e.b);
+    if (try @import("members.zig").run(e.arena, &e.b)) try @import("dce.zig").run(e.arena, &e.b);
     return e.b.finish(0x00010000 | (@as(u32, env.minor) << 8));
 }
 
@@ -176,6 +178,13 @@ const Emitter = struct {
     pointer_types: std.AutoHashMapUnmanaged(struct { StorageClass, Id }, Id) = .empty,
     function_types: std.StringHashMapUnmanaged(Id) = .empty,
     constants: std.AutoHashMapUnmanaged(struct { Id, u64 }, Id) = .empty,
+    /// The bits of each scalar OpConstant (the inverse of `constants`).
+    constant_bits: std.AutoHashMapUnmanaged(Id, u64) = .empty,
+    /// Other constants a composite constant may be made of (booleans,
+    /// composites).
+    other_constants: std.AutoHashMapUnmanaged(Id, void) = .empty,
+    /// OpConstantComposites by type and parts.
+    composite_constants: std.StringHashMapUnmanaged(Id) = .empty,
     capabilities: std.AutoArrayHashMapUnmanaged(Capability, void) = .empty,
     glsl: Id = 0,
     void_id: Id = 0,
@@ -206,6 +215,11 @@ const Emitter = struct {
     /// Reads of resource locals nothing assigns: the resource of the same
     /// type each stands in with where it is used.
     undef_resources: std.AutoHashMapUnmanaged(u32, Id) = .empty,
+    /// A read of an undefined resource with no global of its type to stand
+    /// in for it was used (not only copied).
+    undef_resource_used: bool = false,
+    /// Resource locals: the value last stored into each.
+    res_src: std.AutoHashMapUnmanaged(u32, Ref) = .empty,
     /// Flattened resource arrays: a variable per element.
     flat_vars: std.AutoHashMapUnmanaged(u32, []const Id) = .empty,
     flat_iface: std.ArrayList(Id) = .empty,
@@ -222,6 +236,8 @@ const Emitter = struct {
     subpass_coord: Id = 0,
     counter_vars: []Id = &.{},
     builtin_inputs: std.AutoHashMapUnmanaged(u32, Id) = .empty,
+    /// Shared builtin inputs already given their UserSemantic.
+    semantic_vars: std.AutoHashMapUnmanaged(Id, void) = .empty,
     /// Per instruction (current function): texel places (`tex[i]`).
     texel_places: std.AutoHashMapUnmanaged(u32, struct { res: Ref, coord: Ref, comp: Ref = .none }) = .empty,
     counter_type: Id = 0,
@@ -230,12 +246,20 @@ const Emitter = struct {
     /// Values selected with NonUniformResourceIndex (and resources reached
     /// through them).
     nonuniform_ids: std.AutoHashMapUnmanaged(Id, void) = .empty,
+    /// -fspv-fusemuladd: the operands and type of each OpFMul.
+    fmuls: std.AutoHashMapUnmanaged(Id, struct { a: Id, b: Id, ty: TypeId }) = .empty,
     variants: std.ArrayList(struct { fi: u32, bindings: []const Id, id: Id }) = .empty,
     /// The current function's block labels, and phi operands (word
     /// positions in the functions section) naming values emitted after the
     /// phi, patched when the function is done.
     labels: []const Id = &.{},
     phi_patches: std.ArrayList(struct { pos: usize, ref: Ref }) = .empty,
+    /// Phi incoming blocks: the word naming the block, patched at the end
+    /// of the function with the label the block's code ends under (the
+    /// emitter splits a block at a conditional discard, say).
+    phi_label_patches: std.ArrayList(struct { pos: usize, block: u32 }) = .empty,
+    /// Per block of the function: the label its terminator is under.
+    end_labels: []Id = &.{},
     /// OpUndef by type.
     undef_ids: std.AutoHashMapUnmanaged(TypeId, Id) = .empty,
     /// The bindings of the function being emitted (a specialization).
@@ -579,6 +603,11 @@ const Emitter = struct {
                     };
                     if (o % need != 0) return e.unsupported("[[vk::offset({d})]] on '{s}' is not aligned to {d} bytes for this buffer layout", .{ o, fld.name, need });
                 };
+                // The struct's name before its members' (as dxc): Unreal
+                // finds a struct by its OpName, then reads the OpMemberNames
+                // after it (ParseSpirvStructureMembers, for ray tracing
+                // shader records).
+                try e.b.emitWithString(.debug_names, .name, &.{id}, name, &.{});
                 for (st.fields.items, offs, 0..) |fld, o, k| {
                     if (layout.isOpaque(e.t, fld.type)) continue;
                     const mk: u32 = dataIndex(e.t, st, @intCast(k));
@@ -593,7 +622,6 @@ const Emitter = struct {
                     }
                     try e.b.emitWithString(.debug_names, .member_name, &.{ id, mk }, fld.name, &.{});
                 }
-                try e.b.emitWithString(.debug_names, .name, &.{id}, name, &.{});
                 try e.memberDecorations(id, st, true);
             }
         }
@@ -733,6 +761,7 @@ const Emitter = struct {
             try e.b.emit(.types_globals, .constant, &.{ ty_id, id, @truncate(bits), @truncate(bits >> 32) });
         } else try e.b.emit(.types_globals, .constant, &.{ ty_id, id, @truncate(bits) });
         try e.constants.put(e.arena, .{ ty_id, bits }, id);
+        try e.constant_bits.put(e.arena, id, bits);
         return id;
     }
 
@@ -758,6 +787,7 @@ const Emitter = struct {
                 const id = e.b.newId();
                 try e.b.emit(.types_globals, if (v) .constant_true else .constant_false, &.{ ty_id, id });
                 try e.constants.put(e.arena, .{ ty_id, @intFromBool(v) }, id);
+                try e.other_constants.put(e.arena, id, {});
                 return id;
             },
             .float => return e.constBits(ty_id, @as(u32, @bitCast(@as(f32, @floatCast(floatOf(c))))), 1),
@@ -849,6 +879,18 @@ const Emitter = struct {
     }
 
     /// A declared resource global of type `ty`.
+    /// A resource array (a bindless heap, say) of `ty` resources.
+    fn anyHeapOf(e: *Emitter, ty: TypeId) ?u32 {
+        for (e.m.globals.items, 0..) |g, gi| {
+            if (g.space != .resource or e.global_vars[gi] == 0) continue;
+            switch (e.t.get(g.ty)) {
+                .array => |arr| if (arr.elem == ty) return @intCast(gi),
+                else => {},
+            }
+        }
+        return null;
+    }
+
     fn anyGlobalOf(e: *Emitter, ty: TypeId) ?u32 {
         for (e.m.globals.items, 0..) |g, gi| {
             if (g.ty == ty and g.space == .resource and e.global_vars[gi] != 0) return @intCast(gi);
@@ -985,6 +1027,7 @@ const Emitter = struct {
             e.setEntry(m.functions.items[v.fi].entry);
             try e.emitFunction(m.functions.items[v.fi], v.id, v.bindings);
         }
+        if (e.undef_resource_used) return e.unsupported("a resource local read before it is assigned", .{});
 
         // An acceleration structure only declared (dxc's optimizer drops
         // it): its type needs ray queries or ray tracing.
@@ -1205,7 +1248,25 @@ const Emitter = struct {
 
         try e.findCounterGlobals();
         try e.assignBindings();
+        // Constant buffers no live function reads are left out, as dxc's
+        // optimizer drops them: Unreal's Vulkan format expects only its
+        // root parameter buffer where it uses one, and an unread $Globals
+        // beside it fails its check.
+        const referenced = try e.arena.alloc(bool, m.globals.items.len);
+        @memset(referenced, false);
+        for (m.functions.items) |f| {
+            if (f.dead) continue;
+            // (In the blocks emitted: code under a folded branch reads
+            // nothing.)
+            for (try blockOrder(e.arena, f)) |bi| for (f.blocks.items[bi].insts.items) |r| {
+                if (f.inst(r).op == .global) referenced[f.inst(r).op.global] = true;
+            };
+        }
         for (m.globals.items, 0..) |g, gi| {
+            if (g.space == .cbuffer and ownStorage(g) == null and !referenced[gi]) {
+                e.global_vars[gi] = 0;
+                continue;
+            }
             switch (g.space) {
                 .resource, .cbuffer => if (ownStorage(g)) |sc| {
                     // Shader record buffers and push constants: std430, no
@@ -1264,7 +1325,7 @@ const Emitter = struct {
                     // tbuffers: read-only storage buffers, std430.
                     // (A struct of its own, named `type.<buffer>` as in dxc.)
                     const st = e.b.newId();
-                    try e.layoutStruct(st, e.t.get(g.ty).@"struct", if (g.tbuffer) e.tbRules() else e.cbRules(), try std.fmt.allocPrint(e.arena, "type.{s}", .{g.name}));
+                    try e.layoutStruct(st, e.t.get(g.ty).@"struct", e.globalCbRules(g), try std.fmt.allocPrint(e.arena, "type.{s}", .{g.name}));
                     try e.b.emit(.annotations, .decorate, &.{ st, if (g.tbuffer) e.bufferBlockDecoration() else 2 }); // Block
                     if (g.tbuffer) for (0..e.t.get(g.ty).@"struct".fields.items.len) |k| {
                         try e.b.emit(.annotations, .member_decorate, &.{ st, @intCast(k), 24 }); // NonWritable
@@ -1558,12 +1619,11 @@ const Emitter = struct {
         const origin = struct {
             fn f(func: *const ir.Function, r: Ref) Origin {
                 var x = r;
-                while (true) switch (func.inst(x).op) {
+                var steps: usize = 0;
+                while (true) : (steps += 1) switch (func.inst(x).op) {
                     .load => |p| x = p,
                     .access => |a| x = a.base,
-                    .local_var => x = for (func.insts.items) |inst| {
-                        if (inst.op == .store and inst.op.store.ptr == x) break inst.op.store.value;
-                    } else return .none,
+                    .local_var => x = (if (steps < max_resource_steps) storedResource(func, x) else null) orelse return .none,
                     .global => |g| return .{ .global = g },
                     .param => |p| return .{ .param = .{ func, p } },
                     else => return .none,
@@ -1619,7 +1679,8 @@ const Emitter = struct {
         // counters.
         var indices: std.ArrayList(u32) = .empty;
         var x = res;
-        while (true) switch (e.f.inst(x).op) {
+        var steps: usize = 0;
+        while (true) : (steps += 1) switch (e.f.inst(x).op) {
             .load => |p| x = p,
             .access => |a| {
                 var k = a.indices.len;
@@ -1629,6 +1690,9 @@ const Emitter = struct {
                 }
                 x = a.base;
             },
+            // A resource local (Unreal's `static const` bindless handles):
+            // the resource stored into it.
+            .local_var => x = (if (steps < max_resource_steps) storedResource(e.f, x) else null) orelse break,
             else => break,
         };
         const g = e.globalOf(x) orelse return e.unsupported("counters of resources not tied to a global are not supported yet", .{});
@@ -1858,6 +1922,8 @@ const Emitter = struct {
                     // One variable per input builtin, shared by its uses.
                     iface.* = .{ .var_id = try e.builtinInput(bi.?.id, ty), .ty = vty, .elem_array = e.t.get(ty) == .array, .builtin = bi.?.id };
                     if (bi.?.id == 11 or bi.?.id == 12) try e.b.emit(.annotations, .decorate, &.{ iface.var_id, 15 }); // Patch
+                    // -fspv-reflect: its semantic too, once (as dxc).
+                    if ((try e.semantic_vars.fetchPut(e.arena, iface.var_id, {})) == null) try e.userSemantic(iface.var_id, el);
                     continue;
                 }
                 const ptr = try e.pointerType(sc, try e.typeId(ty));
@@ -1866,6 +1932,11 @@ const Emitter = struct {
                 if (patch) try e.b.emit(.annotations, .decorate, if (entry.stage == .mesh) &.{ var_id, 5271 } else &.{ var_id, 15 }); // PerPrimitiveEXT / Patch
                 if (bi) |x| {
                     try e.b.emit(.annotations, .decorate, &.{ var_id, 11, x.id }); // BuiltIn
+                    // -fspv-support-precise-outputs (Epic's DXC).
+                    if (e.vk.precise_outputs and el.precise) try e.b.emit(.annotations, .decorate, &.{ var_id, 42 }); // NoContraction
+                    // Epic's DXC: SV_Position outputs are Invariant
+                    // (not those written by Append or into mesh outputs).
+                    if (!input and x.id == 0 and entry.stage != .geometry and entry.stage != .mesh and (e.vk.position_invariant or e.vk.ue5_layout)) try e.b.emit(.annotations, .decorate, &.{ var_id, 18 }); // Invariant
                     if (input and entry.stage == .pixel and !e.t.component(x.ty).?.isFloat() and e.t.component(x.ty).? != .bool) {
                         try e.b.emit(.annotations, .decorate, &.{ var_id, 14 }); // Flat
                     }
@@ -1961,7 +2032,8 @@ const Emitter = struct {
     fn resourceBinding(e: *Emitter, a: Ref) Error!Binding {
         const f = e.f;
         var x = a;
-        while (true) switch (f.inst(x).op) {
+        var steps: usize = 0;
+        while (true) : (steps += 1) switch (f.inst(x).op) {
             .load => |p| {
                 // A read of an indexed local: its element, all indices dynamic.
                 if (e.indexed_loads.get(x.index())) |il| {
@@ -1976,9 +2048,7 @@ const Emitter = struct {
                 x = p;
             },
             // A resource local: what was stored into it.
-            .local_var => x = for (f.insts.items) |inst| {
-                if (inst.op == .store and inst.op.store.ptr == x) break inst.op.store.value;
-            } else return .{ .id = e.val(x) },
+            .local_var => x = (if (steps < max_resource_steps) storedResource(f, x) else null) orelse return .{ .id = e.val(x) },
             else => break,
         };
         switch (f.inst(x).op) {
@@ -2045,22 +2115,34 @@ const Emitter = struct {
     /// one resource array, which keep their indices instead of aliasing
     /// one resource.
     fn findIndexedLocals(e: *Emitter, f: *const ir.Function) Error!void {
+        // The values stored to each resource local, in instruction order
+        // (one pass: a scan per local is quadratic in large shaders).
+        var stores: std.AutoHashMapUnmanaged(u32, std.ArrayList(Ref)) = .empty;
         for (f.insts.items, 0..) |inst, li| {
             if (inst.op != .local_var or !isResourceType(e.t, inst.ty) or e.t.get(inst.ty) == .array) continue;
-            const local: Ref = @enumFromInt(li);
+            try stores.put(e.arena, @intCast(li), .empty);
+        }
+        if (stores.count() == 0) return;
+        for (f.insts.items) |st| {
+            if (st.op != .store) continue;
+            const p = stores.getPtr(@intFromEnum(st.op.store.ptr)) orelse continue;
+            try p.append(e.arena, st.op.store.value);
+        }
+        for (f.insts.items, 0..) |inst, li| {
+            if (inst.op != .local_var) continue;
+            const values = (stores.get(@intCast(li)) orelse continue).items;
             var first: ?@FieldType(ir.Op, "access") = null;
             var first_value: Ref = .none;
             var distinct = false;
-            const ok = scan: for (f.insts.items) |st| {
-                if (st.op != .store or st.op.store.ptr != local) continue;
-                const acc = e.resourceElement(st.op.store.value) orelse break :scan false;
+            const ok = scan: for (values) |value| {
+                const acc = e.resourceElement(value) orelse break :scan false;
                 if (first) |fa| {
-                    if (st.op.store.value != first_value) distinct = true;
+                    if (value != first_value) distinct = true;
                     if (f.inst(fa.base).op.global != f.inst(acc.base).op.global or fa.indices.len != acc.indices.len) break :scan false;
                     for (fa.indices, acc.indices) |p, q| if (f.inst(p).ty != f.inst(q).ty) break :scan false;
                 } else {
                     first = acc;
-                    first_value = st.op.store.value;
+                    first_value = value;
                 }
             } else true;
             if (!ok or !distinct) continue;
@@ -2165,11 +2247,18 @@ const Emitter = struct {
         for (labels) |*l| l.* = e.b.newId();
         e.labels = labels;
         e.phi_patches = .empty;
+        e.phi_label_patches = .empty;
+        e.end_labels = try e.arena.alloc(Id, f.blocks.items.len);
+        @memset(e.end_labels, 0);
 
         // Constants and parameters first (they may be used in any block).
         for (f.insts.items, 0..) |inst, i| switch (inst.op) {
             .constant => |c| e.vals[i] = try e.constant(inst.ty, c),
-            .undef => e.vals[i] = try e.undefOf(inst.ty),
+            // (None of a resource: struct values leave resources out, and a
+            // split struct's resource members are undef.)
+            .undef => if (!layout.isOpaque(e.t, inst.ty)) {
+                e.vals[i] = try e.undefOf(inst.ty);
+            },
             .param => |p| {
                 e.vals[i] = param_ids[p];
                 if (e.mesh_params.get(.{ f, p })) |kind| try e.mesh_places.put(e.arena, @intCast(i), .{ .kind = kind, .ty = inst.ty });
@@ -2178,6 +2267,7 @@ const Emitter = struct {
         };
 
         for (order, 0..) |bi, oi| {
+            const block_start = e.b.sections.getPtr(.functions).items.len;
             try e.b.emit(.functions, .label, &.{labels[bi]});
             if (oi == 0) {
                 // OpVariables must open the first block.
@@ -2240,6 +2330,16 @@ const Emitter = struct {
                     .dont => 2,
                 } }),
             }
+            {
+                // The last label of the block's code.
+                const words = e.b.sections.getPtr(.functions).items;
+                var pos = block_start;
+                while (pos < words.len) {
+                    const wc = words[pos] >> 16;
+                    if (words[pos] & 0xffff == 248) e.end_labels[bi] = words[pos + 1]; // OpLabel
+                    pos += @max(wc, 1);
+                }
+            }
             switch (blk.term) {
                 .none, .@"unreachable" => try e.b.emit(.functions, .@"unreachable", &.{}),
                 .ret => |v| if (v == .none) {
@@ -2273,6 +2373,9 @@ const Emitter = struct {
             }
         }
         const words = e.b.sections.getPtr(.functions).items;
+        for (e.phi_label_patches.items) |p| {
+            if (e.end_labels[p.block] != 0) words[p.pos] = e.end_labels[p.block];
+        }
         for (e.phi_patches.items) |p| {
             words[p.pos] = e.val(p.ref);
             if (words[p.pos] == 0) return e.unsupported("internal: a phi names a value that is never emitted", .{});
@@ -2397,7 +2500,10 @@ const Emitter = struct {
 
     fn val(e: *Emitter, r: Ref) Id {
         const v = e.vals[r.index()];
-        if (v == 0) if (e.undef_resources.get(r.index())) |stand_in| return stand_in;
+        if (v == 0) if (e.undef_resources.get(r.index())) |stand_in| {
+            if (stand_in == 0) e.undef_resource_used = true;
+            return stand_in;
+        };
         return v;
     }
 
@@ -2429,7 +2535,7 @@ const Emitter = struct {
                     return;
                 }
                 e.ptr_layouts[ri] = switch (e.m.globals.items[g].space) {
-                    .cbuffer => if (e.m.globals.items[g].tbuffer) .{ .rules = e.tbRules(), .row_major = false, .buffer = true } else .{ .rules = e.cbRules(), .row_major = false },
+                    .cbuffer => if (e.m.globals.items[g].tbuffer) .{ .rules = e.tbRules(), .row_major = false, .buffer = true } else .{ .rules = e.globalCbRules(e.m.globals.items[g]), .row_major = false },
                     .resource => .{ .rules = e.sbRules(), .row_major = bufferRowMajor(e.t, e.m.globals.items[g].ty), .buffer = true },
                     else => null,
                 };
@@ -2477,12 +2583,26 @@ const Emitter = struct {
                             const v = f.inst(x.op.store.value);
                             if (v.op != .load or f.inst(v.op.load).op != .local_var) break false;
                         } else true;
-                        if (only_copies) if (e.anyGlobalOf(i.ty)) |g| {
-                            if (e.spv_minor >= 4) try e.useVar(e.global_vars[g]);
+                        if (only_copies) {
+                            // (No resource of its type, as when every one is
+                            // in a descriptor heap: fine while it is only
+                            // copied, as Unreal's struct copies do.)
+                            var stand_in: Id = 0;
+                            if (e.anyGlobalOf(i.ty)) |g| {
+                                if (e.spv_minor >= 4) try e.useVar(e.global_vars[g]);
+                                stand_in = e.global_vars[g];
+                            } else if (e.anyHeapOf(i.ty)) |g| {
+                                // Only bindless heaps of its type (Unreal's
+                                // ShaderPrint buffers left unset): their
+                                // first element.
+                                if (e.spv_minor >= 4) try e.useVar(e.global_vars[g]);
+                                const pt = try e.resourcePointee(i.ty);
+                                stand_in = try e.opRaw(.access_chain, try e.pointerType(pt.sc, pt.ty), &.{ e.global_vars[g], try e.constInt(0) });
+                            }
                             e.vals[ri] = 0;
-                            try e.undef_resources.put(e.arena, @intCast(ri), e.global_vars[g]);
+                            try e.undef_resources.put(e.arena, @intCast(ri), stand_in);
                             return;
-                        };
+                        }
                         return e.unsupported("a resource local read before it is assigned", .{});
                     }
                     e.vals[ri] = e.val(p);
@@ -2498,7 +2618,15 @@ const Emitter = struct {
             .store => |s| {
                 if (e.mesh_places.get(s.ptr.index())) |mp| return e.meshStore(mp, e.val(s.value), f.inst(s.value).ty);
                 if (e.texel_places.get(s.ptr.index())) |tp| {
-                    if (tp.comp != .none) return e.unsupported("storing one component of a texel is not supported yet", .{});
+                    if (tp.comp != .none) {
+                        // `tex[p].x = v`: read the texel, replace the
+                        // component, write it back (as dxc).
+                        const elem = e.resourceInfo(tp.res).elem;
+                        if (e.isScalarLike(elem)) return e.imageWrite(tp.res, e.val(tp.coord), e.val(s.value));
+                        const whole = try e.imageIndexLoad(tp.res, e.val(tp.coord), elem);
+                        const updated = try e.op1(.vector_insert_dynamic, elem, &.{ whole, e.val(s.value), e.val(tp.comp) });
+                        return e.imageWrite(tp.res, e.val(tp.coord), updated);
+                    }
                     return e.imageWrite(tp.res, e.val(tp.coord), e.val(s.value));
                 }
                 const target = f.inst(s.ptr);
@@ -2525,8 +2653,15 @@ const Emitter = struct {
                 if (target.op == .local_var and e.undef_resources.contains(s.value.index())) return;
                 if (target.op == .local_var and isResourceType(e.t, target.ty)) {
                     const old = e.vals[s.ptr.index()];
-                    if (old != 0 and old != e.val(s.value)) return e.unsupported("assigning different resources to one variable is not supported yet", .{});
+                    if (old != 0 and old != e.val(s.value)) {
+                        // The same resource reached again (each use of
+                        // Unreal's `static const` bindless handles
+                        // evaluates the heap access anew) is not another.
+                        const prev = e.res_src.get(s.ptr.index());
+                        if (prev == null or !e.sameResource(f, prev.?, s.value, 0)) return e.unsupported("assigning different resources to one variable is not supported yet", .{});
+                    }
                     e.vals[s.ptr.index()] = e.val(s.value);
+                    try e.res_src.put(e.arena, s.ptr.index(), s.value);
                     return;
                 }
                 if (e.ptr_layouts[s.ptr.index()]) |pl| {
@@ -3009,6 +3144,7 @@ const Emitter = struct {
                 for (ins) |in| {
                     const v = e.val(in.value);
                     if (v == 0) try e.phi_patches.append(e.arena, .{ .pos = base + ops.items.len, .ref = in.value });
+                    try e.phi_label_patches.append(e.arena, .{ .pos = base + ops.items.len + 1, .block = in.block.index() });
                     try ops.appendSlice(e.arena, &.{ v, e.labels[in.block.index()] });
                 }
                 try e.b.emit(.functions, .phi, ops.items);
@@ -3039,6 +3175,75 @@ const Emitter = struct {
                 else => {},
             };
         }
+    }
+
+    /// Whether resource values `x` and `y` are the same resource: built the
+    /// same way from the same globals, constants, constant buffer reads and
+    /// resource locals (each followed to what was stored into it).
+    fn sameResource(e: *Emitter, f: *const ir.Function, x0: Ref, y0: Ref, depth: u32) bool {
+        if (depth > 64) return false;
+        const x = resolveResourceLocal(f, x0);
+        const y = resolveResourceLocal(f, y0);
+        if (x == y) return true;
+        if (x == .none or y == .none) return false;
+        const a = f.inst(x);
+        const b = f.inst(y);
+        if (std.meta.activeTag(a.op) != std.meta.activeTag(b.op) or a.ty != b.ty) return false;
+        return switch (a.op) {
+            .constant => |c| std.meta.eql(c, b.op.constant),
+            .global => |g| g == b.op.global,
+            .param => |p| p == b.op.param,
+            // (Loads of resources, or of constant buffer members.)
+            .load => |p| blk: {
+                const ps = f.inst(p).ptr;
+                if (ps != .cbuffer and ps != .resource) break :blk false;
+                break :blk e.sameResource(f, p, b.op.load, depth + 1);
+            },
+            .access => |acc| blk: {
+                const bacc = b.op.access;
+                if (acc.indices.len != bacc.indices.len or !e.sameResource(f, acc.base, bacc.base, depth + 1)) break :blk false;
+                for (acc.indices, bacc.indices) |i, j| if (!e.sameResource(f, i, j, depth + 1)) break :blk false;
+                break :blk true;
+            },
+            .heap_resource => |h| h.sampler == b.op.heap_resource.sampler and e.sameResource(f, h.index, b.op.heap_resource.index, depth + 1),
+            else => false,
+        };
+    }
+
+    /// A resource local, or a load of one, as the value stored into it
+    /// (through any number of copies).
+    fn resolveResourceLocal(f: *const ir.Function, r: Ref) Ref {
+        var x = r;
+        var steps: usize = 0;
+        while (x != .none and steps < max_resource_steps) : (steps += 1) {
+            const i = f.inst(x);
+            const local = switch (i.op) {
+                .local_var => x,
+                .load => |p| if (f.inst(p).op == .local_var and f.inst(p).ptr == .function) p else return x,
+                else => return x,
+            };
+            x = storedResource(f, local) orelse return x;
+        }
+        return x;
+    }
+
+    /// How far resourceBinding and findCounterGlobals follow resource
+    /// locals through what was stored into them (locals stored into each
+    /// other in a loop would never end).
+    const max_resource_steps = 256;
+
+    /// The resource first stored into resource local `local`, leaving out
+    /// stores of the local into itself (`r = r`), which do not say where
+    /// it comes from.
+    fn storedResource(f: *const ir.Function, local: Ref) ?Ref {
+        for (f.insts.items) |inst| {
+            if (inst.op != .store or inst.op.store.ptr != local) continue;
+            var v = inst.op.store.value;
+            while (f.inst(v).op == .load) v = f.inst(v).op.load;
+            if (v == local) continue;
+            return inst.op.store.value;
+        }
+        return null;
     }
 
     /// The global a pointer derives from, if any.
@@ -3237,6 +3442,28 @@ const Emitter = struct {
 
     /// Emits `op` with a result of HLSL type `ty`; returns the result id.
     fn op1(e: *Emitter, op: Op, ty: TypeId, operands: []const u32) Error!Id {
+        // A composite of constants is a constant (one per type and parts,
+        // as dxc's SPIR-V has them).
+        if (op == .composite_construct and operands.len > 0) {
+            const all = for (operands) |x| {
+                if (!e.constant_bits.contains(x) and !e.other_constants.contains(x)) break false;
+            } else true;
+            if (all) {
+                var key: std.ArrayList(u32) = .empty;
+                try key.append(e.arena, try e.typeId(ty));
+                try key.appendSlice(e.arena, operands);
+                const k = std.mem.sliceAsBytes(key.items);
+                if (e.composite_constants.get(k)) |id| return id;
+                const id = e.b.newId();
+                var ops: std.ArrayList(u32) = .empty;
+                try ops.appendSlice(e.arena, &.{ key.items[0], id });
+                try ops.appendSlice(e.arena, operands);
+                try e.b.emit(.types_globals, .constant_composite, ops.items);
+                try e.composite_constants.put(e.arena, k, id);
+                try e.other_constants.put(e.arena, id, {});
+                return id;
+            }
+        }
         const id = e.b.newId();
         var ops: std.ArrayList(u32) = .empty;
         try ops.appendSlice(e.arena, &.{ try e.typeId(ty), id });
@@ -3284,6 +3511,16 @@ const Emitter = struct {
         const elem_ty = if (r.kind == .byte_address_buffer or r.kind == .rw_byte_address_buffer) try e.t.scalar(.uint) else r.elem;
         const elem = (try e.bufferElemType(ty)).?;
         const stride = layout.arrayStride(e.t, elem_ty, r.row_major, e.sbRules()) catch return e.unsupported("buffer element type '{s}'", .{try e.t.format(e.arena, elem_ty)});
+        if (e.vk.no_scalar_block_layout and r.kind != .byte_address_buffer and r.kind != .rw_byte_address_buffer) {
+            // -fspv-no-scalar-block-layout (Epic's DXC): the element must
+            // need no padding, as packed (FxcSBuffer) it has the same
+            // stride.
+            const packed_stride = layout.arrayStride(e.t, elem_ty, r.row_major, .dx_packed) catch return e.unsupported("buffer element type", .{});
+            if (packed_stride != stride) {
+                _ = e.diags.report(.{ .severity = .@"error", .loc = .none }, "cannot instantiate {s} with given packed alignment; 'VK_EXT_scalar_block_layout' not supported", .{r.name});
+                return error.Unsupported;
+            }
+        }
         const rt = try e.stridedArray(elem, 0, stride);
         const st = e.b.newId();
         try e.b.emit(.types_globals, .type_struct, &.{ st, rt });
@@ -3450,11 +3687,19 @@ const Emitter = struct {
     /// (-fvk-use-gl-layout, -fvk-use-dx-layout, -fvk-use-scalar-layout).
     fn cbRules(e: *Emitter) layout.Rules {
         return switch (e.vk.layout) {
-            .default => .vk_relaxed,
+            .default => if (e.vk.ue5_layout) .gl_std140 else .vk_relaxed,
             .gl => .gl_std140,
             .dx => .dx_legacy,
             .scalar => .scalar,
         };
+    }
+
+    /// The rules of cbuffer global `g`: with -fvk-ue5-layout, `$Globals`
+    /// is strict std140 whatever the layout (Epic's DeclResultIdMapper).
+    fn globalCbRules(e: *Emitter, g: ir.Global) layout.Rules {
+        if (g.tbuffer) return e.tbRules();
+        if (e.vk.ue5_layout and std.mem.eql(u8, g.name, "$Globals")) return .gl_std140;
+        return e.cbRules();
     }
 
     fn tbRules(e: *Emitter) layout.Rules {
@@ -3519,10 +3764,13 @@ const Emitter = struct {
         try e.cap(.input_attachment);
         const ms: u32 = @intFromBool(std.mem.eql(u8, r.name, "SubpassInputMS"));
         const st = try e.scalarType(storageScalar(e.t.component(r.elem).?));
-        const key: [6]u32 = .{ st, 6, 0, ms, 2, 0 };
+        // Depth unknown (2), or not depth (0) with
+        // -fspv-force-subpass-image-depth-false.
+        const depth: u32 = if (e.vk.subpass_depth_false) 0 else 2;
+        const key: [6]u32 = .{ st, 6, depth, ms, 2, 0 };
         if (e.image_types.get(key)) |id| return id;
         const id = e.b.newId();
-        try e.b.emit(.types_globals, .type_image, &.{ id, st, 6, 2, 0, ms, 2, 0 }); // SubpassData, Unknown
+        try e.b.emit(.types_globals, .type_image, &.{ id, st, 6, depth, 0, ms, 2, 0 }); // SubpassData
         try e.image_types.put(e.arena, key, id);
         return id;
     }
@@ -3720,7 +3968,7 @@ const Emitter = struct {
     fn texelScalar(e: *Emitter, elem: TypeId) Error!Scalar {
         const c = storageScalar(e.t.component(elem) orelse return e.unsupported("textures of '{s}' are not supported yet", .{try e.t.format(e.arena, elem)}));
         return switch (c) {
-            .float, .int, .uint => c,
+            .float, .int, .uint, .int64, .uint64 => c,
             else => e.unsupported("textures of '{s}' are not supported yet", .{try e.t.format(e.arena, elem)}),
         };
     }
@@ -3730,6 +3978,8 @@ const Emitter = struct {
         if (e.vk.unknown_image_format) return 0;
         const n = e.t.componentCount(elem) orelse return 0;
         const c = e.t.component(elem) orelse return 0;
+        // 64-bit integer images have only one-component formats.
+        if (c == .uint64 or c == .int64) return if (n == 1) (if (c == .uint64) 40 else 41) else 0; // R64ui, R64i
         const k: usize = switch (n) {
             1 => 0,
             2 => 1,
@@ -3770,11 +4020,13 @@ const Emitter = struct {
         if (sh.rw and sh.ms) try e.cap(if (sh.array) .image_ms_array else .storage_image_multisample);
         switch (format) {
             6...20, 25...29, 34...39 => try e.cap(.storage_image_extended_formats),
-            40, 41 => {
-                try e.cap(.int64_image_ext);
-                try e.extension("SPV_EXT_shader_image_int64");
-            },
             else => {},
+        }
+        // 64-bit integer texels, whatever the format (sampled images have
+        // none).
+        if (format == 40 or format == 41 or storageScalar(e.t.component(elem).?).size() == 8) {
+            try e.cap(.int64_image_ext);
+            try e.extension("SPV_EXT_shader_image_int64");
         }
         const id = e.b.newId();
         try e.b.emit(.types_globals, .type_image, &.{ id, st, dim, 2, key[2], key[3], sampled, format });
@@ -4094,20 +4346,14 @@ const Emitter = struct {
     /// Load/Store(2..4) and atomics on byte-address buffers (uint words).
     fn byteAddressMethod(e: *Emitter, name: []const u8, res: Ref, args: []const Ref, ty: TypeId) Error!Id {
         const uint_ty = try e.t.scalar(.uint);
-        const word = struct {
-            fn f(em: *Emitter, base: Id, off: Id, k: u32) Error!Id {
-                const ut = try em.t.scalar(.uint);
-                var idx = try em.op1(.shift_right_logical, ut, &.{ off, try em.constUint(2) });
-                if (k > 0) idx = try em.op1(.i_add, ut, &.{ idx, try em.constUint(k) });
-                return em.opRaw(.access_chain, try em.pointerType(em.bufferSc(), try em.scalarType(.uint)), &.{ base, try em.constInt(0), idx });
-            }
-        }.f;
+        // (Words from `off >> 2`, made once.)
+        var base_idx: Id = 0;
         const off = try e.convert(e.val(args[0]), e.f.inst(args[0]).ty, uint_ty);
         if (std.mem.startsWith(u8, name, "Load") and args.len == 1) {
             if (e.t.component(ty) != .uint or e.t.get(ty) == .matrix) return e.rawLoad(e.val(res), off, ty);
             const n = e.t.componentCount(ty).?;
             const parts = try e.arena.alloc(Id, n);
-            for (parts, 0..) |*p, k| p.* = try e.op1(.load, uint_ty, &.{try word(e, e.val(res), off, @intCast(k))});
+            for (parts, 0..) |*p, k| p.* = try e.op1(.load, uint_ty, &.{try e.rawWordOff(e.val(res), off, &base_idx, @as(u32, @intCast(k)) * 4)});
             return if (n == 1) parts[0] else e.op1(.composite_construct, ty, parts);
         }
         if (std.mem.startsWith(u8, name, "Store") and args.len == 2) {
@@ -4119,14 +4365,14 @@ const Emitter = struct {
             const n = e.t.componentCount(vty).?;
             for (0..n) |k| {
                 const v = if (n == 1) e.val(args[1]) else try e.op1(.composite_extract, uint_ty, &.{ e.val(args[1]), @intCast(k) });
-                try e.b.emit(.functions, .store, &.{ try word(e, e.val(res), off, @intCast(k)), v });
+                try e.b.emit(.functions, .store, &.{ try e.rawWordOff(e.val(res), off, &base_idx, @as(u32, @intCast(k)) * 4), v });
             }
             return 0;
         }
         if (std.mem.startsWith(u8, name, "Interlocked")) {
             const vc = e.t.component(e.f.inst(args[1]).ty) orelse return e.unsupported("'{s}' on this value is not supported yet", .{name});
             if (vc.size() != 4) return e.unsupported("64-bit '{s}' is not supported yet", .{name});
-            return e.atomicOp(name["Interlocked".len..], try word(e, e.val(res), off, 0), uint_ty, 1, args[1..]);
+            return e.atomicOp(name["Interlocked".len..], try e.rawWordOff(e.val(res), off, &base_idx, 0), uint_ty, 1, args[1..], TypeTable.void_type);
         }
         return e.unsupported("method '{s}' is not supported yet", .{name});
     }
@@ -4136,6 +4382,17 @@ const Emitter = struct {
     fn rawWord(e: *Emitter, buf: Id, addr: Id) Error!Id {
         const ut = try e.t.scalar(.uint);
         const idx = try e.op1(.shift_right_logical, ut, &.{ addr, try e.constUint(2) });
+        return e.opRaw(.access_chain, try e.pointerType(e.bufferSc(), try e.scalarType(.uint)), &.{ buf, try e.constInt(0), idx });
+    }
+
+    /// Pointer to the word at byte `base + off` (`off` a multiple of 4) of
+    /// a byte-address buffer: word `(base >> 2) + off / 4`, `base >> 2`
+    /// made once per access (in `base_idx`, 0 until then) as dxc does.
+    fn rawWordOff(e: *Emitter, buf: Id, base: Id, base_idx: *Id, off: u32) Error!Id {
+        const ut = try e.t.scalar(.uint);
+        if (base_idx.* == 0) base_idx.* = try e.op1(.shift_right_logical, ut, &.{ base, try e.constUint(2) });
+        var idx = base_idx.*;
+        if (off / 4 > 0) idx = try e.op1(.i_add, ut, &.{ idx, try e.constUint(off / 4) });
         return e.opRaw(.access_chain, try e.pointerType(e.bufferSc(), try e.scalarType(.uint)), &.{ buf, try e.constInt(0), idx });
     }
 
@@ -4171,18 +4428,20 @@ const Emitter = struct {
     /// components and split for 16-bit ones.
     fn rawLoad(e: *Emitter, buf: Id, base: Id, ty: TypeId) Error!Id {
         const ut = try e.t.scalar(.uint);
-        const n = e.t.componentCount(ty) orelse return e.unsupported("byte-address buffer accesses of type '{s}' are not supported yet", .{try e.t.format(e.arena, ty)});
+        const n = layout.flatCount(e.t, ty) catch return e.unsupported("byte-address buffer accesses of type '{s}' are not supported yet", .{try e.t.format(e.arena, ty)});
         const comps = try e.arena.alloc(Id, n);
+        var base_idx: Id = 0;
         for (comps, 0..) |*c, k| {
             const rc = try e.rawComponent(ty, @intCast(k));
             const sc = rc[0];
-            const addr = try e.op1(.i_add, ut, &.{ base, try e.constUint(rc[1]) });
-            const w0 = try e.op1(.load, ut, &.{try e.rawWord(buf, addr)});
             const comp = storageScalar(e.t.component(sc).?);
+            // (Whole words from the word index; halves need the address.)
+            const whole = comp.size() >= 4 and rc[1] % 4 == 0;
+            const addr = if (whole) 0 else try e.op1(.i_add, ut, &.{ base, try e.constUint(rc[1]) });
+            const w0 = try e.op1(.load, ut, &.{if (whole) try e.rawWordOff(buf, base, &base_idx, rc[1]) else try e.rawWord(buf, addr)});
             c.* = switch (comp.size()) {
                 8 => blk: {
-                    const addr1 = try e.op1(.i_add, ut, &.{ addr, try e.constUint(4) });
-                    const w1 = try e.op1(.load, ut, &.{try e.rawWord(buf, addr1)});
+                    const w1 = try e.op1(.load, ut, &.{if (whole) try e.rawWordOff(buf, base, &base_idx, rc[1] + 4) else try e.rawWord(buf, try e.op1(.i_add, ut, &.{ addr, try e.constUint(4) }))});
                     const pair = try e.op1(.composite_construct, try e.t.vector(.uint, 2), &.{ w0, w1 });
                     break :blk try e.op1(.bitcast, sc, &.{pair});
                 },
@@ -4201,19 +4460,20 @@ const Emitter = struct {
 
     fn rawStore(e: *Emitter, buf: Id, base: Id, ty: TypeId, v: Id) Error!void {
         const ut = try e.t.scalar(.uint);
-        const n = e.t.componentCount(ty) orelse return e.unsupported("byte-address buffer accesses of type '{s}' are not supported yet", .{try e.t.format(e.arena, ty)});
+        const n = layout.flatCount(e.t, ty) catch return e.unsupported("byte-address buffer accesses of type '{s}' are not supported yet", .{try e.t.format(e.arena, ty)});
+        var base_idx: Id = 0;
         for (0..n) |k| {
             const rc = try e.rawComponent(ty, @intCast(k));
             const sc = rc[0];
             const x = (try e.flatComponent(v, ty, @intCast(k)))[0];
-            const addr = try e.op1(.i_add, ut, &.{ base, try e.constUint(rc[1]) });
             const comp = storageScalar(e.t.component(sc).?);
+            const whole = comp.size() >= 4 and rc[1] % 4 == 0;
+            const addr = if (whole) 0 else try e.op1(.i_add, ut, &.{ base, try e.constUint(rc[1]) });
             switch (comp.size()) {
                 8 => {
                     const pair = try e.op1(.bitcast, try e.t.vector(.uint, 2), &.{x});
-                    try e.b.emit(.functions, .store, &.{ try e.rawWord(buf, addr), try e.op1(.composite_extract, ut, &.{ pair, 0 }) });
-                    const addr1 = try e.op1(.i_add, ut, &.{ addr, try e.constUint(4) });
-                    try e.b.emit(.functions, .store, &.{ try e.rawWord(buf, addr1), try e.op1(.composite_extract, ut, &.{ pair, 1 }) });
+                    try e.b.emit(.functions, .store, &.{ if (whole) try e.rawWordOff(buf, base, &base_idx, rc[1]) else try e.rawWord(buf, addr), try e.op1(.composite_extract, ut, &.{ pair, 0 }) });
+                    try e.b.emit(.functions, .store, &.{ if (whole) try e.rawWordOff(buf, base, &base_idx, rc[1] + 4) else try e.rawWord(buf, try e.op1(.i_add, ut, &.{ addr, try e.constUint(4) })), try e.op1(.composite_extract, ut, &.{ pair, 1 }) });
                 },
                 2 => {
                     // Replace the half of the word (not atomic, as dxc).
@@ -4228,7 +4488,7 @@ const Emitter = struct {
                 },
                 else => {
                     const w = if (comp == .uint) x else if (comp == .bool) try e.convert(x, sc, ut) else try e.op1(.bitcast, ut, &.{x});
-                    try e.b.emit(.functions, .store, &.{ try e.rawWord(buf, addr), w });
+                    try e.b.emit(.functions, .store, &.{ if (whole) try e.rawWordOff(buf, base, &base_idx, rc[1]) else try e.rawWord(buf, addr), w });
                 },
             }
         }
@@ -4445,13 +4705,38 @@ const Emitter = struct {
             .log_and => .logical_and,
             .log_or => .logical_or,
             .shl, .shr => {
-                // HLSL masks the shift amount to the bit width.
-                const mask = try e.splatConst(ty, .{ .int = @as(i64, c.size()) * 8 - 1 });
-                const amount = try e.op1(.bitwise_and, ty, &.{ b, mask });
+                // HLSL masks the shift amount to the bit width (a constant
+                // one here; by 0, no shift).
+                const width_mask: u64 = @as(u64, c.size()) * 8 - 1;
                 const shop: Op = if (op == .shl) .shift_left_logical else if (u) .shift_right_logical else .shift_right_arithmetic;
+                if (e.isScalarLike(ty)) if (e.constant_bits.get(b)) |bits| {
+                    const k = bits & width_mask;
+                    if (k == 0) return a;
+                    return e.op1(shop, ty, &.{ a, try e.splatConst(ty, .{ .int = @intCast(k) }) });
+                };
+                const mask = try e.splatConst(ty, .{ .int = @intCast(width_mask) });
+                const amount = try e.op1(.bitwise_and, ty, &.{ b, mask });
                 return e.op1(shop, ty, &.{ a, amount });
             },
         };
+        if (e.vk.fuse_mul_add and f) {
+            // -fspv-fusemuladd (Epic's SPIRV-Tools FusedMultiplyAddPass):
+            // an add of a multiply's result of the same type is
+            // Fma(x, y, other); of two, the earlier multiply's.
+            if (sop == .f_add) {
+                const ma = e.fmuls.get(a);
+                const mb = e.fmuls.get(b);
+                const use_a = if (ma != null and mb != null) a < b else ma != null;
+                if (if (use_a) ma else mb) |m| if (m.ty == ty) {
+                    return e.op1(.ext_inst, ty, &.{ e.glslSet(), 50, m.a, m.b, if (use_a) b else a }); // Fma
+                };
+            }
+            if (sop == .f_mul) {
+                const id = try e.op1(sop, ty, &.{ a, b });
+                try e.fmuls.put(e.arena, id, .{ .a = a, .b = b, .ty = ty });
+                return id;
+            }
+        }
         return e.op1(sop, ty, &.{ a, b });
     }
 
@@ -4655,7 +4940,7 @@ const Emitter = struct {
                 const s_ = try e.texelScalar(e.resourceInfo(tp.res).elem);
                 ptr = try e.opRaw(.image_texel_pointer, try e.pointerType(.image, try e.scalarType(s_)), &.{ e.val(tp.res), e.val(tp.coord), try e.constUint(0) });
             }
-            return try e.atomicOp(name["Interlocked".len..], ptr, dest.ty, scope, args[1..]);
+            return try e.atomicOp(name["Interlocked".len..], ptr, dest.ty, scope, args[1..], ty);
         }
         if (eq(u8, name, "asuint") and args.len == 3) {
             const n = e.t.componentCount(xty).?;
@@ -4670,8 +4955,10 @@ const Emitter = struct {
     }
 
     /// An atomic on `ptr` (to a `dty` scalar); `rest` holds the value(s)
-    /// and, last, the optional out original.
-    fn atomicOp(e: *Emitter, op_name: []const u8, ptr: Id, dty: TypeId, scope: u32, rest: []const Ref) Error!Id {
+    /// and, last, the optional out original. Without one, an intrinsic of
+    /// type `rty` (not void) gives the original as its value (ssa.zig's
+    /// form of an out original, a store of it after).
+    fn atomicOp(e: *Emitter, op_name: []const u8, ptr: Id, dty: TypeId, scope: u32, rest: []const Ref, rty: TypeId) Error!Id {
         const eq = std.mem.eql;
         const dc = e.t.component(dty) orelse return e.unsupported("atomics on this destination are not supported yet", .{});
         if (dc.isFloat()) return e.unsupported("float atomics are not supported yet", .{});
@@ -4693,11 +4980,11 @@ const Emitter = struct {
             const op: Op = if (eq(u8, op_name, "Add")) .atomic_i_add else if (eq(u8, op_name, "And")) .atomic_and else if (eq(u8, op_name, "Or")) .atomic_or else if (eq(u8, op_name, "Xor")) .atomic_xor else if (eq(u8, op_name, "Min")) (if (dc.isUnsigned()) .atomic_u_min else .atomic_s_min) else if (eq(u8, op_name, "Max")) (if (dc.isUnsigned()) .atomic_u_max else .atomic_s_max) else if (eq(u8, op_name, "Exchange")) .atomic_exchange else return e.unsupported("'Interlocked{s}' is not supported yet", .{op_name});
             orig = try e.op1(op, dty, &.{ ptr, scope_id, sem, try asDest(e, rest[0], dty) });
         }
-        const has_orig = if (is_cmp) eq(u8, op_name, "CompareExchange") else rest.len > n_in;
+        const has_orig = rest.len > n_in;
         if (has_orig) {
             const out = rest[rest.len - 1];
             try e.b.emit(.functions, .store, &.{ e.val(out), try e.convert(orig, dty, e.f.inst(out).ty) });
-        }
+        } else if (rty != TypeTable.void_type) return try e.convert(orig, dty, rty);
         return 0;
     }
 

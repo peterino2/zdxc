@@ -41,6 +41,9 @@ pub const Request = struct {
     /// that start with `file:line:col:` as errors, and calls a failure
     /// with none an internal error.)
     place_unplaced: bool = false,
+    /// Set by `compile`: the input when `source` is given and the arguments
+    /// name none (not parsed as an argument).
+    main_input: ?[]const u8 = null,
 };
 
 pub const Status = enum(u8) {
@@ -85,15 +88,16 @@ pub fn compile(arena: std.mem.Allocator, req: Request) error{OutOfMemory}!Result
         // The main file is the given text, under its name.
         var failure: options.Failure = .{};
         const inputs = if (options.parse(arena, req.args, &failure)) |p| p.inputs else |_| &.{};
-        const name = req.source_name orelse if (inputs.len > 0) inputs[inputs.len - 1] else "hlsl.hlsl";
+        // (An empty name counts as none.)
+        const given = if (req.source_name) |n| (if (n.len > 0) n else null) else null;
+        const name = given orelse if (inputs.len > 0) inputs[inputs.len - 1] else "hlsl.hlsl";
         overlay.name = name;
         overlay.text = text;
-        if (inputs.len == 0) {
-            const args = try arena.alloc([]const u8, req.args.len + 1);
-            @memcpy(args[0..req.args.len], req.args);
-            args[req.args.len] = name;
-            r.args = args;
-        }
+        // With no input among the arguments, the name is the input. It is
+        // not parsed as an argument: Unreal names its sources by virtual
+        // path, and "/Engine/Private/X.usf" would be /E (the entry point)
+        // with the value "ngine/Private/X.usf".
+        if (inputs.len == 0) r.main_input = name;
     }
     var ctx: Ctx = .{
         .io = req.io,
@@ -314,6 +318,20 @@ fn parseArgs(ctx: *Ctx, arena: std.mem.Allocator, args: []const []const u8) !?Op
                     .fvk_use_gl_layout => opts.vk.layout = .gl,
                     .fvk_use_dx_layout => opts.vk.layout = .dx,
                     .fvk_use_scalar_layout => opts.vk.layout = .scalar,
+                    // Epic's DXC fork, which Unreal's ShaderConductor uses.
+                    .fvk_ue5_layout => opts.vk.ue5_layout = true,
+                    .fspv_support_precise_outputs => opts.vk.precise_outputs = true,
+                    .fspv_fusemuladd => opts.vk.fuse_mul_add = true,
+                    .fspv_force_subpass_image_depth_false => opts.vk.subpass_depth_false = true,
+                    .fspv_no_scalar_block_layout => opts.vk.no_scalar_block_layout = true,
+                    // Epic's DXC passes this to spirv-opt, whose dead code
+                    // passes would otherwise drop unused fragment inputs;
+                    // zdxc never removes interface variables.
+                    .fspv_preserve_storage_input => {},
+                    .fspv_svposition_implicit_invariant => opts.vk.position_invariant = true,
+                    // zdxc compiles arrays of RW / append / consume
+                    // structured buffers with or without it.
+                    .fvk_allow_rwstructuredbuffer_arrays => {},
                     .fspv_entrypoint_name_EQ => opts.vk.entry_name = v,
                     .fspv_extension_EQ => try opts.vk.extensions.append(arena, v),
                     .fspv_reflect => opts.vk.reflect = true,
@@ -368,9 +386,11 @@ fn parseArgs(ctx: *Ctx, arena: std.mem.Allocator, args: []const []const u8) !?Op
             },
         }
     }
+    // (Epic's DXC runs its fused multiply-add pass only when optimizing.)
+    if (opts.opt_level == .od or opts.opt_level == .o0) opts.vk.fuse_mul_add = false;
     if (opts.row_major and opts.col_major) return ctx.fail("Cannot specify /Zpr and /Zpc together, use /? to get usage information", .{});
     // Like dxc, the last input wins (dxc reads getLastArgValue(OPT_INPUT)).
-    if (parsed.inputs.len > 0) opts.input = parsed.inputs[parsed.inputs.len - 1];
+    if (parsed.inputs.len > 0) opts.input = parsed.inputs[parsed.inputs.len - 1] else if (ctx.req.main_input) |m| opts.input = m;
 
     if (opts.ignored.items.len > 0 and !opts.no_warnings and ctx.req.compat_notes) {
         try ctx.stderr.writeAll("zdxc: note: accepted for compatibility, no effect yet:");
