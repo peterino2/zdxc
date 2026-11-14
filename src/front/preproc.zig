@@ -1387,7 +1387,10 @@ const Eval = struct {
                 e.pp.diags.err(t.loc, "invalid integer constant in preprocessor expression", .{});
                 return error.EvalFailed;
             },
-            .char => return .{ .v = charValue(t.text) },
+            .char => return .{ .v = lexer.charValue(t.text) orelse {
+                e.pp.diags.err(t.loc, "empty character constant", .{});
+                return error.EvalFailed;
+            } },
             .identifier => {
                 // Remaining identifiers are 0, except C++ true/false.
                 return .{ .v = @intFromBool(std.mem.eql(u8, t.text, "true")) };
@@ -1426,23 +1429,6 @@ fn parseInt(text: []const u8) ?Value {
     }
     const v = std.fmt.parseInt(u64, body, base) catch return null;
     return .{ .v = @bitCast(v), .unsigned = unsigned or v > std.math.maxInt(i64) };
-}
-
-fn charValue(text: []const u8) i64 {
-    if (text.len < 3) return 0;
-    const body = text[1 .. text.len - 1];
-    if (body[0] != '\\') return body[0];
-    if (body.len < 2) return 0;
-    return switch (body[1]) {
-        'n' => '\n',
-        't' => '\t',
-        'r' => '\r',
-        '0' => 0,
-        '\\' => '\\',
-        '\'' => '\'',
-        '"' => '"',
-        else => body[1],
-    };
 }
 
 // -------------------------------------------------------------------------
@@ -1529,6 +1515,7 @@ test "conditionals" {
     try expectPP("#if 0\n'unterminated in skipped block\n#endif\nz", "z");
     try expectPP("#if (-1 < 0u) || 0x10 != 16\nbad\n#else\ngood\n#endif", "good");
     try expectPP("#ifndef __HLSL_VERSION\nbad\n#elif __HLSL_VERSION >= 2021\ngood\n#endif", "good");
+    try expectPP("#if 'a' == 97 && '\\n' == 10 && '\\x41' == 65 && '\\101' == 65 && '\\0' == 0\ngood\n#endif", "good");
 }
 
 test "include, pragma once, line, builtins" {
@@ -1548,6 +1535,14 @@ test "errors are diagnosed" {
     defer t.deinit();
     _ = try t.output();
     try std.testing.expectEqual(@as(u32, 2), t.diags.error_count);
+}
+
+test "an empty character constant is diagnosed in #if" {
+    var t: TestPP = .{};
+    try t.init(&.{}, "#if ''\n#endif\n", .{});
+    defer t.deinit();
+    _ = try t.output();
+    try std.testing.expectEqual(@as(u32, 1), t.diags.error_count);
 }
 
 test "#if short-circuits && || ?:" {

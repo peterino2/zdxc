@@ -1937,10 +1937,10 @@ fn splitLiteralSwizzle(text: []const u8) ?struct { literal: []const u8, swizzle:
 }
 
 fn isFloatLiteral(text: []const u8) bool {
-    if (text.len > 1 and text[0] == '0' and (text[1] == 'x' or text[1] == 'X')) return false;
-    if (std.mem.indexOfAny(u8, text, ".eE") != null) return true;
-    const last = text[text.len - 1];
-    return last == 'f' or last == 'F' or last == 'h' or last == 'H';
+    // Hex: floating only with a binary exponent (`0x1p-24f`); `f` is a digit.
+    if (text.len > 1 and text[0] == '0' and (text[1] == 'x' or text[1] == 'X')) return std.mem.indexOfAny(u8, text, "pP") != null;
+    // A trailing `f` / `h` alone does not make one: `1f` is an error in dxc.
+    return std.mem.indexOfAny(u8, text, ".eE") != null;
 }
 
 /// Words that can never be identifiers.
