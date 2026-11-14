@@ -988,11 +988,11 @@ const Lowerer = struct {
         switch (e.kind) {
             .int_lit => |text| {
                 const ty = try l.concrete(e.ty);
-                return l.b.constInt(ty, semamod.parseIntLiteral(text) orelse 0);
+                return l.b.constInt(ty, semamod.parseIntLiteral(text) orelse unreachable); // checkLiteralSuffix
             },
             .float_lit => |text| {
                 const ty = try l.concrete(e.ty);
-                return l.b.constFloat(ty, semamod.parseFloatLiteral(text) orelse 0);
+                return l.b.constFloat(ty, semamod.parseFloatLiteral(text) orelse unreachable); // checkLiteralSuffix
             },
             .bool_lit => |b| return l.b.constInt(try t.scalar(.bool), @intFromBool(b)),
             .name => {

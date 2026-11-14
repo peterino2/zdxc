@@ -11,6 +11,7 @@ const Allocator = std.mem.Allocator;
 const ast = @import("../front/ast.zig");
 const ast_clone = @import("../front/ast_clone.zig");
 const source = @import("../front/source.zig");
+const lexer = @import("../front/lexer.zig");
 const diag = @import("../diag.zig");
 const types = @import("types.zig");
 const layout = @import("../ir/layout.zig");
@@ -2866,8 +2867,13 @@ pub const Sema = struct {
     /// Reports an invalid numeric literal suffix (`1#INF`, `1.5q`);
     /// returns false if there was one.
     fn checkLiteralSuffix(s: *Sema, loc: Loc, text: []const u8) bool {
-        if (text[0] == '\'') return true;
+        if (text[0] == '\'') {
+            if (lexer.charValue(text) != null) return true;
+            s.err(loc, "empty character constant", .{});
+            return false;
+        }
         const lit = scanLiteral(text);
+        if (!s.checkLiteralDigits(loc, text, lit)) return false;
         const suffix = text[lit.end..];
         if (lit.float) if (fixedFloatSuffix(text)) |suf| if (suf.ptr == suffix.ptr) {
             s.warn(loc.advance(@intCast(lit.end)), "hlsl-202x-extensions", "fixed-size floating-point literal suffix '{s}' is a HLSL 202x extension", .{suf});
@@ -2880,10 +2886,75 @@ pub const Sema = struct {
         const ok = if (lit.float)
             suffix.len == 0 or (suffix.len == 1 and std.mem.indexOfScalar(u8, "fFhHlL", suffix[0]) != null)
         else
-            isIntSuffix(suffix) or (!lit.inf and suffix.len == 1 and std.mem.indexOfScalar(u8, "fFhH", suffix[0]) != null);
+            isIntSuffix(suffix);
         if (ok) return true;
         s.err(loc.advance(@intCast(lit.end)), "invalid suffix '{s}' on {s} constant", .{ suffix, if (lit.float) "floating" else "integer" });
         return false;
+    }
+
+    /// Literals whose digits do not form a number (clang's
+    /// NumericLiteralParser errors). After this, parseIntLiteral and
+    /// parseFloatLiteral succeed on whatever checkLiteralSuffix accepts:
+    /// both take their digits from scanLiteral, as this does.
+    fn checkLiteralDigits(s: *Sema, loc: Loc, text: []const u8, lit: Literal) bool {
+        const hex = isHexLiteral(text);
+        const binary = isBinaryLiteral(text);
+        if (hex) {
+            // `0x`, `0xp1`: no significand and no `.`, so the suffix starts at `x`.
+            var i: usize = 2;
+            while (i < text.len and std.ascii.isHex(text[i])) i += 1;
+            if (i == 2) {
+                if (i == text.len or text[i] != '.') {
+                    s.err(loc.advance(1), "invalid suffix '{s}' on integer constant", .{text[1..]});
+                    return false;
+                }
+                // `0x.`, `0x.p1`: a `.` with no digits on either side.
+                i += 1;
+                const frac = i;
+                while (i < text.len and std.ascii.isHex(text[i])) i += 1;
+                if (i == frac) {
+                    s.err(loc.advance(@intCast(i)), "hexadecimal floating constants require a significand", .{});
+                    return false;
+                }
+            }
+        }
+        if (lit.end < text.len) {
+            const c = text[lit.end];
+            if (binary) {
+                // clang: any hex digit after the binary digits (`0b12`, `0b1f`).
+                if (std.ascii.isHex(c)) {
+                    s.err(loc.advance(@intCast(lit.end)), "invalid digit '{c}' in binary constant", .{c});
+                    return false;
+                }
+            } else if (std.mem.indexOfScalar(u8, if (hex) "pP" else "eE", c) != null) {
+                s.err(loc.advance(@intCast(lit.end)), "exponent has no digits", .{});
+                return false;
+            }
+        }
+        if (lit.inf) return true;
+        const digits = text[0..lit.end];
+        if (hex and lit.float and std.mem.indexOfAny(u8, digits, "pP") == null) {
+            s.err(loc.advance(@intCast(lit.end)), "hexadecimal floating constants require an exponent", .{});
+            return false;
+        }
+        if (lit.float) return true;
+        if (!hex and !binary) {
+            if (digits.len > 1 and digits[0] == '0') for (digits[1..], 1..) |c, i| if (c >= '8') {
+                s.err(loc.advance(@intCast(i)), "invalid digit '{c}' in octal constant", .{c});
+                return false;
+            };
+            // clang: a hex letter after decimal / octal digits (`1f`, `0f`, `07a`).
+            if (lit.end < text.len and std.ascii.isHex(text[lit.end])) {
+                const c = text[lit.end];
+                s.err(loc.advance(@intCast(lit.end)), "invalid digit '{c}' in {s} constant", .{ c, if (digits[0] == '0') "octal" else "decimal" });
+                return false;
+            }
+        }
+        if (parseIntLiteral(digits) == null) {
+            s.err(loc, "integer literal is too large to be represented in any integer type", .{});
+            return false;
+        }
+        return true;
     }
 
     fn rvalue(ty: TypeId) Typed {
@@ -4164,14 +4235,13 @@ fn evalBinary(op: ast.BinaryOp, l: Sema.Const, r: Sema.Const) ?Sema.Const {
 }
 
 pub fn parseIntLiteral(text: []const u8) ?i64 {
-    var end = text.len;
-    while (end > 0 and std.mem.indexOfScalar(u8, "uUlL", text[end - 1]) != null) end -= 1;
-    const digits = text[0..end];
-    if (digits.len == 0) return null;
-    if (digits[0] == '\'') return if (digits.len >= 3) digits[1] else null;
+    if (text.len == 0) return null;
+    if (text[0] == '\'') return lexer.charValue(text);
+    // The digits alone, as for floats: whatever follows is the suffix.
+    const digits = text[0..scanLiteral(text).end];
     var base: u8 = 10;
     var body = digits;
-    if (digits.len > 2 and digits[0] == '0' and (digits[1] == 'x' or digits[1] == 'X')) {
+    if (isHexLiteral(digits)) {
         base = 16;
         body = digits[2..];
     } else if (isBinaryLiteral(digits)) {
@@ -4186,22 +4256,24 @@ pub fn parseIntLiteral(text: []const u8) ?i64 {
 }
 
 pub fn parseFloatLiteral(text: []const u8) ?f64 {
-    if (std.mem.indexOf(u8, text, ".#INF") != null) return std.math.inf(f64);
-    var end = text.len;
-    while (end > 0 and std.mem.indexOfScalar(u8, "fFhHlL", text[end - 1]) != null) end -= 1;
-    return std.fmt.parseFloat(f64, text[0..end]) catch null;
+    // The digits alone: suffixes include `f32` / `f16` / `f64`, not only single letters.
+    const lit = scanLiteral(text);
+    if (lit.inf) return std.math.inf(f64);
+    return std.fmt.parseFloat(f64, text[0..lit.end]) catch null;
 }
+
+const Literal = struct { end: usize, float: bool, inf: bool = false };
 
 /// The digits of a numeric literal (clang's NumericLiteralParser, with
 /// dxc's `.#INF`): where the suffix starts and whether it is floating.
-fn scanLiteral(text: []const u8) struct { end: usize, float: bool, inf: bool = false } {
+fn scanLiteral(text: []const u8) Literal {
     var i: usize = 0;
     if (isBinaryLiteral(text)) {
         i = 2;
         while (i < text.len and (text[i] == '0' or text[i] == '1')) i += 1;
         return .{ .end = i, .float = false };
     }
-    const hex = text.len > 1 and text[0] == '0' and (text[1] == 'x' or text[1] == 'X');
+    const hex = isHexLiteral(text);
     if (hex) i = 2;
     const isDigit = struct {
         fn f(c: u8, h: bool) bool {
@@ -4229,7 +4301,6 @@ fn scanLiteral(text: []const u8) struct { end: usize, float: bool, inf: bool = f
     return .{ .end = i, .float = float };
 }
 
-/// `0b101`: a binary integer literal (clang accepts them in HLSL).
 /// Where an expression's text starts (clang's getBeginLoc): `i` in `i.T`.
 fn startLoc(e: *const ast.Expr) Loc {
     return switch (e.kind) {
@@ -4243,6 +4314,12 @@ fn startLoc(e: *const ast.Expr) Loc {
     };
 }
 
+/// `0x...`: a hexadecimal literal, integer or (with `p`) floating.
+fn isHexLiteral(text: []const u8) bool {
+    return text.len > 1 and text[0] == '0' and (text[1] == 'x' or text[1] == 'X');
+}
+
+/// `0b101`: a binary integer literal (clang accepts them in HLSL).
 fn isBinaryLiteral(text: []const u8) bool {
     return text.len > 2 and text[0] == '0' and (text[1] == 'b' or text[1] == 'B') and (text[2] == '0' or text[2] == '1');
 }
@@ -4574,6 +4651,86 @@ test "literal suffixes" {
     , .{}, &.{
         "8: error: invalid suffix '#INF' on integer constant",
         "9: error: invalid suffix 'I' on floating constant",
+    });
+    // Character constants: escapes are evaluated, `''` is an error (not 0).
+    try expectDiags(
+        \\_Static_assert('a' == 97, "");
+        \\_Static_assert('\n' == 10 && '\t' == 9 && '\\' == 92 && '\'' == 39, "");
+        \\_Static_assert('\x41' == 65 && '\101' == 65 && '\0' == 0, "");
+        \\static const int e = '';
+    , .{}, &.{
+        "4: error: empty character constant",
+    });
+    // Hex literals are floating only with a binary exponent; otherwise `f` is a digit.
+    try expectDiags(
+        \\_Static_assert(std::is_same<float, __decltype(0x1p-24f)>::value, "");
+        \\_Static_assert(asuint(0x1p-24f) == 0x33800000, "");
+        \\_Static_assert(asuint((float)0x1.8P1) == 0x40400000, "");
+        \\_Static_assert(std::is_same<uint, __decltype(0x1fu)>::value, "");
+        \\_Static_assert(0x1f == 31, "");
+    , .{}, &.{});
+    // Digits that do not form a number are errors, as in dxc, not 0.
+    try expectDiags(
+        \\static const uint64_t a = 0x1ffffffffffffffff;
+        \\static const uint64_t b = 0xffffffffffffffff;
+        \\static const uint c = 09;
+        \\static const uint d = 0777;
+        \\static const uint e = 0x;
+        \\static const uint f = 0b12;
+        \\static const float g = 0x1.8;
+        \\static const float h = 0x1.8f;
+        \\static const float i = 0x1p;
+        \\static const float j = 1.5e;
+        \\static const float k = 09.5;
+        \\static const uint l = 0x1h;
+        \\static const uint m = 0xp1;
+        \\static const float n = 0x.p1;
+        \\static const float o = 0x.;
+        \\static const uint p = 0xg;
+        \\static const uint q = 0b1h;
+        \\static const uint r = 0b1f;
+        \\static const float t = 0x.8p1;
+        \\static const float u = 0x1.p1;
+        \\static const uint v = 0b2;
+        \\static const uint64_t w = 0xFFFFFFFFFFFFFFFFu;
+        \\static const uint64_t x = 0xFFFFFFFFFFFFFFFFull;
+        \\static const uint64_t y = 0x10000000000000000ull;
+        \\_Static_assert(0xFFFFFFFFFFFFFFFFull == ~0ull && 0777u == 511 && 0b101ul == 5, "");
+    , .{}, &.{
+        "1: error: integer literal is too large to be represented in any integer type",
+        "3: error: invalid digit '9' in octal constant",
+        "5: error: invalid suffix 'x' on integer constant",
+        "6: error: invalid digit '2' in binary constant",
+        "7: error: hexadecimal floating constants require an exponent",
+        "8: error: hexadecimal floating constants require an exponent",
+        "9: error: exponent has no digits",
+        "10: error: exponent has no digits",
+        "12: error: invalid suffix 'h' on integer constant",
+        "13: error: invalid suffix 'xp1' on integer constant",
+        "14: error: hexadecimal floating constants require a significand",
+        "15: error: hexadecimal floating constants require a significand",
+        "16: error: invalid suffix 'xg' on integer constant",
+        "17: error: invalid suffix 'h' on integer constant",
+        "18: error: invalid digit 'f' in binary constant",
+        "21: error: invalid digit 'b' in octal constant",
+        "24: error: integer literal is too large to be represented in any integer type",
+    });
+    // Fixed-size suffixes are stripped for the value, not only the type.
+    try expectDiags(
+        \\_Static_assert(std::is_same<float, __decltype(1.5f32)>::value, "");
+        \\_Static_assert(asuint(1.5F32) == 0x3fc00000, "");
+        \\_Static_assert(asuint((float)1.5f64) == 0x3fc00000, "");
+        \\_Static_assert(asuint(0x1p-24f32) == 0x33800000, "");
+    , .{}, &.{
+        "1: warning: fixed-size floating-point literal suffix 'f32' is a HLSL 202x extension",
+        "2: warning: fixed-size floating-point literal suffix 'F32' is a HLSL 202x extension",
+        "3: warning: fixed-size floating-point literal suffix 'f64' is a HLSL 202x extension",
+        "4: warning: fixed-size floating-point literal suffix 'f32' is a HLSL 202x extension",
+    });
+    try expectDiags(
+        \\_Static_assert(asuint((float)1.5f16) == 0x3fc00000, "");
+    , .{ .enable_16bit = true }, &.{
+        "1: warning: fixed-size floating-point literal suffix 'f16' is a HLSL 202x extension",
     });
     try expectDiags(
         \\_Static_assert(std::is_same<half, float16_t>::value, "");

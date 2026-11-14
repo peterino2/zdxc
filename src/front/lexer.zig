@@ -329,6 +329,36 @@ pub const Lexer = struct {
     }
 };
 
+/// The value of a character literal token (`'a'`, `'\n'`, `'\x41'`), or
+/// null for `''`. Of a multi-character constant, only the first character.
+pub fn charValue(text: []const u8) ?i64 {
+    if (text.len < 3) return null;
+    const body = text[1 .. text.len - 1];
+    if (body[0] != '\\') return body[0];
+    if (body.len < 2) return null;
+    const c = body[1];
+    return switch (c) {
+        'n' => '\n',
+        't' => '\t',
+        'r' => '\r',
+        'a' => 0x07,
+        'b' => 0x08,
+        'f' => 0x0c,
+        'v' => 0x0b,
+        'x' => {
+            var v: u8 = 0;
+            for (body[2..]) |h| v = v *% 16 +% (std.fmt.charToDigit(h, 16) catch break);
+            return v;
+        },
+        '0'...'7' => {
+            var v: u8 = 0;
+            for (body[1..@min(body.len, 4)]) |o| v = v *% 8 +% (std.fmt.charToDigit(o, 8) catch break);
+            return v;
+        },
+        else => c, // `\\`, `\'`, `\"`, `\?`
+    };
+}
+
 pub fn isIdentChar(c: u8) bool {
     return std.ascii.isAlphanumeric(c) or c == '_';
 }
