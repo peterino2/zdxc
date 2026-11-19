@@ -43,6 +43,7 @@ pub const ir = struct {
     pub const opt = @import("ir/opt.zig");
     pub const split_resources = @import("ir/split_resources.zig");
     pub const inline_calls = @import("ir/inline.zig");
+    pub const precise = @import("ir/precise.zig");
     pub const ssa = @import("ir/ssa.zig");
 };
 
@@ -70,6 +71,7 @@ test {
     _ = @import("sema/sema.zig");
     std.testing.refAllDecls(spirv);
     _ = @import("spirv/ue_test.zig");
+    _ = @import("precise_test.zig");
     _ = @import("diag.zig");
     _ = @import("options.zig");
     _ = @import("dxil/promote.zig");

@@ -435,7 +435,7 @@ fn inlineOne(m: *ir.Module, f: *ir.Function, bi: u32, pos: usize, args: []const 
     var ret_loop: std.AutoHashMapUnmanaged(u32, u32) = .empty; // callee ret block -> innermost loop header
     if (shape == .wrap and shape.wrap.in_loops.len > 0) {
         const bool_ty = try m_types.scalar(.bool);
-        flag = try newInst(a, f, .{ .op = .local_var, .ty = bool_ty, .ptr = .function });
+        flag = try newInst(a, f, .{ .op = .{ .local_var = .{} }, .ty = bool_ty, .ptr = .function });
         const no = try newInst(a, f, .{ .op = .{ .constant = .{ .int = 0 } }, .ty = bool_ty });
         const st = try newInst(a, f, .{ .op = .{ .store = .{ .ptr = flag, .value = no } }, .ty = TypeTable.void_type });
         try f.blocks.items[bi].insts.appendSlice(a, &.{ no, st });
@@ -450,7 +450,7 @@ fn inlineOne(m: *ir.Module, f: *ir.Function, bi: u32, pos: usize, args: []const 
         f.blocks.items[header].term = .{ .br = @fromBackingInt(@intCast(bmap[0])) };
         entry_target = header;
         if (callee.ret != TypeTable.void_type) {
-            ret_var = try newInst(a, f, .{ .op = .local_var, .ty = callee.ret, .ptr = .function });
+            ret_var = try newInst(a, f, .{ .op = .{ .local_var = .{} }, .ty = callee.ret, .ptr = .function });
             result = try newInst(a, f, .{ .op = .{ .load = ret_var }, .ty = callee.ret });
             try f.blocks.items[exit].insts.append(a, result);
         }

@@ -287,6 +287,8 @@ pub fn run(a: Allocator, m: *module.Module, func: u32, dyn: *const std.AutoHashM
     for (allocas.items) |i| {
         const x = insts[i].op.alloca;
         leaves[i] = &.{};
+        // (In memory until `precise` is marked: dxil/precise.zig.)
+        if (insts[i].precise.keep) continue;
         switch (m.types.items[x.elem]) {
             .array => |arr| if (isScalar(m, arr.elem) and arr.len > 0) {
                 var_base[i] = 0;
@@ -837,12 +839,55 @@ pub fn run(a: Allocator, m: *module.Module, func: u32, dyn: *const std.AutoHashM
             out.appendAssumeCapacity(inst);
         };
     }
+    // Debug information. As llvm.dbg.declare stays with its alloca until
+    // mem2reg promotes it, a variable whose alloca this run leaves wholly
+    // in memory (one kept for dxil/precise.zig) keeps its entry for a
+    // later run. The values an earlier run noted move with the
+    // instructions they name.
+    if (have_dbg or f.dbg_values.items.len > 0) {
+        var left: std.ArrayList(module.DbgAlloca) = .empty;
+        for (f.dbg_allocas.items) |d| {
+            if (var_base[d.alloca] != none or index[d.alloca] == none) continue;
+            var x = d;
+            x.alloca = index[d.alloca];
+            try left.append(ma, x);
+        }
+        if (f.dbg_values.items.len > 0) {
+            // Each old position: the first instruction kept from there to
+            // the end of its block (its terminator at the latest).
+            const at = try a.alloc(u32, n + 1);
+            at[n] = count;
+            for (0..nb) |b| {
+                var next: u32 = none;
+                var i = block_start[b + 1];
+                while (i > block_start[b]) {
+                    i -= 1;
+                    if (reach[b] and live[i]) next = index[i];
+                    at[i] = next;
+                }
+            }
+            // Both lists are in order of `before`: merge them (the old
+            // values first where they meet).
+            var merged: std.ArrayList(module.DbgValue) = .empty;
+            try merged.ensureTotalCapacityPrecise(ma, f.dbg_values.items.len + dbg_values.items.len);
+            var k: usize = 0;
+            for (f.dbg_values.items) |dv| {
+                var x = dv;
+                x.before = at[dv.before];
+                if (x.before == none) continue;
+                x.val = map.visit(dv.val, .other);
+                if (x.val == .inst and x.val.inst == none) continue;
+                while (k < dbg_values.items.len and dbg_values.items[k].before < x.before) : (k += 1) merged.appendAssumeCapacity(dbg_values.items[k]);
+                merged.appendAssumeCapacity(x);
+            }
+            merged.appendSliceAssumeCapacity(dbg_values.items[k..]);
+            dbg_values = merged;
+        }
+        f.dbg_values = dbg_values;
+        f.dbg_allocas = left;
+    }
     f.insts = out;
     f.num_blocks = kept;
-    if (have_dbg) {
-        f.dbg_values = dbg_values;
-        f.dbg_allocas = .empty;
-    }
 }
 
 /// See run. Returns the blocks still reachable.

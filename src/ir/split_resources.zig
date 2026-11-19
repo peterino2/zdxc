@@ -179,7 +179,7 @@ const Pass = struct {
             // from the leaf parameters.
             const ptrs = try p.a.alloc(Ref, vals.len);
             for (ptrs, vals, lts.items) |*pp, v, lt| {
-                pp.* = try p.add(f, .{ .op = .local_var, .ty = lt, .ptr = .function });
+                pp.* = try p.add(f, .{ .op = .{ .local_var = .{} }, .ty = lt, .ptr = .function });
                 try out.append(p.a, pp.*);
                 try out.append(p.a, try p.add(f, .{ .op = .{ .store = .{ .ptr = pp.*, .value = v } }, .ty = TypeTable.void_type }));
             }
@@ -242,7 +242,7 @@ const Pass = struct {
                             try out.append(p.a, r);
                             continue;
                         }
-                        f.insts.items[r.index()].op = .local_var;
+                        f.insts.items[r.index()].op = .{ .local_var = .{} };
                         f.insts.items[r.index()].ptr = .function;
                         try out.append(p.a, r);
                         try ref_locals.put(p.a, pi, r);
@@ -261,7 +261,7 @@ const Pass = struct {
                         try leafTypes(p.a, p.t, ty, &lts);
                         const ptrs = try p.a.alloc(Ref, lts.items.len);
                         for (ptrs, lts.items) |*pp, lt| {
-                            pp.* = try p.add(f, .{ .op = .local_var, .ty = lt, .ptr = .function });
+                            pp.* = try p.add(f, .{ .op = .{ .local_var = .{} }, .ty = lt, .ptr = .function });
                             try out.append(p.a, pp.*);
                         }
                         try pleaves.put(p.a, r, ptrs);

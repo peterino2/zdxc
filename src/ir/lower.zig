@@ -413,13 +413,13 @@ const Lowerer = struct {
                 .in => .in,
                 .out => .out,
                 .inout => .inout,
-            }, .semantic = sem, .sema_ty = p.type });
+            }, .semantic = sem, .sema_ty = p.type, .precise = k < f.decl.params.len and f.decl.params[k].quals.precise });
         }
         const order: u32 = @intCast(std.mem.indexOfScalar(*semamod.Function, l.s.all_functions.items, @constCast(f)) orelse std.math.maxInt(u32));
         const no_inline = !isMethod(f) and f.template_args.len == 0 and for (f.decl.attrs) |a| {
             if (std.mem.eql(u8, a.name, "noinline")) break true;
         } else false;
-        const i = try l.m.addFunction(.{ .name = f.name, .params = params.items, .ret = l.s.types.canonical(f.ret), .entry = l.cur_entry, .ret_semantic = semanticOf(f.decl.ret_semantics), .decl_order = order, .no_inline = no_inline });
+        const i = try l.m.addFunction(.{ .name = f.name, .params = params.items, .ret = l.s.types.canonical(f.ret), .entry = l.cur_entry, .ret_semantic = semanticOf(f.decl.ret_semantics), .decl_order = order, .no_inline = no_inline, .precise = f.decl.quals.precise });
         try l.funcs.put(l.arena, f, i);
         try l.pending.append(l.arena, f);
         return i;
@@ -470,7 +470,7 @@ const Lowerer = struct {
                 continue;
             }
             const storage = if (p.dir != .in or p.groupshared) pv else blk: {
-                const local = try l.b.add(.{ .op = .local_var, .ty = pty, .ptr = .function });
+                const local = try l.b.add(.{ .op = .{ .local_var = .{} }, .ty = pty, .ptr = .function });
                 try l.b.store(local, pv);
                 break :blk local;
             };
@@ -767,7 +767,7 @@ const Lowerer = struct {
                     try l.value_vars.put(l.arena, variable, try l.converted(init_e, variable.type));
                     return;
                 }
-                const local = try l.b.add(.{ .op = .local_var, .ty = variable.type, .ptr = .function });
+                const local = try l.b.add(.{ .op = .{ .local_var = .{ .precise = v.quals.precise } }, .ty = variable.type, .ptr = .function });
                 try l.vars.put(l.arena, variable, local);
                 try l.debugVar(local, variable, 0);
                 if (v.init) |init_e| {
@@ -1080,7 +1080,7 @@ const Lowerer = struct {
                     const b = try l.converted(x.@"else", ty);
                     return l.b.add(.{ .op = .{ .select = .{ .cond = cond, .t = a, .f = b } }, .ty = ty });
                 }
-                const tmp = try l.b.add(.{ .op = .local_var, .ty = ty, .ptr = .function });
+                const tmp = try l.b.add(.{ .op = .{ .local_var = .{} }, .ty = ty, .ptr = .function });
                 const cond = try l.condition(x.cond);
                 const then_b = try l.b.newBlock();
                 const else_b = try l.b.newBlock();
@@ -1126,7 +1126,7 @@ const Lowerer = struct {
                 const base = try l.rvalue(x.base);
                 if (l.s.evalInt(x.index)) |k| return l.b.add(.{ .op = .{ .extract = .{ .agg = base, .index = @intCast(k) } }, .ty = try l.concrete(e.ty) });
                 // Dynamic index into a value: spill to storage.
-                const tmp = try l.b.add(.{ .op = .local_var, .ty = l.b.f.inst(base).ty, .ptr = .function });
+                const tmp = try l.b.add(.{ .op = .{ .local_var = .{} }, .ty = l.b.f.inst(base).ty, .ptr = .function });
                 try l.b.store(tmp, base);
                 const idx = try l.converted(x.index, try t.scalar(.uint));
                 const p = try l.b.add(.{ .op = .{ .access = .{ .base = tmp, .indices = try l.arena.dupe(Ref, &.{idx}) } }, .ty = try l.concrete(e.ty), .ptr = .function });
@@ -1176,7 +1176,7 @@ const Lowerer = struct {
             } else {
                 // Short-circuit (HLSL 2021: scalar operands).
                 const bool_ty = try t.scalar(.bool);
-                const tmp = try l.b.add(.{ .op = .local_var, .ty = bool_ty, .ptr = .function });
+                const tmp = try l.b.add(.{ .op = .{ .local_var = .{} }, .ty = bool_ty, .ptr = .function });
                 const a = try l.condition(lhs);
                 try l.b.store(tmp, a);
                 const rhs_b = try l.b.newBlock();
@@ -1287,7 +1287,7 @@ const Lowerer = struct {
         const t = l.types();
         if (args.len == 0 and isRayQuery(t, ty)) {
             // A new query object.
-            return l.b.load(try l.b.add(.{ .op = .local_var, .ty = ty, .ptr = .function }));
+            return l.b.load(try l.b.add(.{ .op = .{ .local_var = .{} }, .ty = ty, .ptr = .function }));
         }
         var comps: std.ArrayList(Ref) = .empty;
         for (args) |a| try l.flatten(try l.rvalue(a), &comps);
@@ -1588,7 +1588,7 @@ const Lowerer = struct {
                 // Through a function-local copy of the method's own
                 // struct (a base prefix of derived objects), written
                 // back afterwards to writable storage.
-                const tmp = try l.b.add(.{ .op = .local_var, .ty = owner_ty, .ptr = .function });
+                const tmp = try l.b.add(.{ .op = .{ .local_var = .{} }, .ty = owner_ty, .ptr = .function });
                 var whole = if (direct) |p| try l.b.load(p) else try l.rvalue(base);
                 var whole_ty = base.ty;
                 if (l.s.types.get(base.ty) == .resource) {
@@ -1674,7 +1674,7 @@ const Lowerer = struct {
                         vals[i] = try l.converted(a, p.type);
                     } else {
                         // Copy-in / copy-out through a temporary.
-                        temps[i] = try l.b.add(.{ .op = .local_var, .ty = p.type, .ptr = .function });
+                        temps[i] = try l.b.add(.{ .op = .{ .local_var = .{} }, .ty = p.type, .ptr = .function });
                         if (p.dir == .inout) try l.b.store(temps[i], try l.converted(a, p.type));
                         vals[i] = temps[i];
                     }
@@ -1730,7 +1730,7 @@ const Lowerer = struct {
                     for (args, 0..) |a, i| {
                         const pt = try l.concrete(it.params[i]);
                         if (i < spec.params.len and spec.params[i].qual != .in) {
-                            vals[i] = try l.b.add(.{ .op = .local_var, .ty = pt, .ptr = .function });
+                            vals[i] = try l.b.add(.{ .op = .{ .local_var = .{} }, .ty = pt, .ptr = .function });
                             any_out = true;
                         } else vals[i] = try l.converted(a, pt);
                     }
@@ -1791,7 +1791,7 @@ const Lowerer = struct {
                         .in => vals[i] = try l.converted(a, pt),
                         .ref => vals[i] = try l.lvalue(a),
                         .out, .inout => {
-                            vals[i] = try l.b.add(.{ .op = .local_var, .ty = pt, .ptr = .function });
+                            vals[i] = try l.b.add(.{ .op = .{ .local_var = .{} }, .ty = pt, .ptr = .function });
                             if (q == .inout) try l.b.store(vals[i], try l.converted(a, pt));
                             any_out = true;
                         },
@@ -1964,7 +1964,7 @@ const Lowerer = struct {
             // it. (A resource does not change, so each evaluation is the
             // same resource.)
             const val = if (init_e.kind == .init_list) try l.initList(init_e, v.type) else try l.converted(init_e, v.type);
-            const local = try l.b.add(.{ .op = .local_var, .ty = try l.concrete(v.type), .ptr = .function });
+            const local = try l.b.add(.{ .op = .{ .local_var = .{} }, .ty = try l.concrete(v.type), .ptr = .function });
             try l.b.store(local, val);
             return local;
         }
@@ -2648,7 +2648,7 @@ const Lowerer = struct {
         const args = try l.arena.alloc(Ref, pcf.params.len);
         const locals = try l.arena.alloc(Ref, pcf.params.len);
         for (pcf.decl.params, pcf.params, 0..) |pd, p, i| {
-            locals[i] = try l.b.add(.{ .op = .local_var, .ty = l.irType(p.type), .ptr = .function });
+            locals[i] = try l.b.add(.{ .op = .{ .local_var = .{} }, .ty = l.irType(p.type), .ptr = .function });
             if (l.s.types.get(p.type) == .patch) {
                 if (l.s.types.get(p.type).patch.output) {
                     // The entry's output control points, read back.
@@ -2853,7 +2853,7 @@ const Lowerer = struct {
                 args[i] = locals[i];
                 continue;
             }
-            locals[i] = try l.b.add(.{ .op = .local_var, .ty = l.irType(p.type), .ptr = .function });
+            locals[i] = try l.b.add(.{ .op = .{ .local_var = .{} }, .ty = l.irType(p.type), .ptr = .function });
             if (opts.stage == .mesh and q.payload) {
                 entry.mesh.payload = p.type;
                 try l.b.store(locals[i], try l.b.add(.{ .op = .mesh_payload, .ty = p.type }));

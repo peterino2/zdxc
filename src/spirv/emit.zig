@@ -122,6 +122,7 @@ const Capability = enum(u32) {
     storage_image_array_non_uniform_indexing = 5309,
     vulkan_memory_model = 5345,
     variable_pointers = 4442,
+    signed_zero_inf_nan_preserve = 4466,
     /// (Inline SPIR-V may use any value.)
     _,
 };
@@ -282,6 +283,9 @@ const Emitter = struct {
     flat_vars: std.AutoHashMapUnmanaged(u32, []const Id) = .empty,
     flat_iface: std.ArrayList(Id) = .empty,
     vk: ir.VkOptions = .{},
+    /// Emitting an IR instruction marked `precise`: its floating-point
+    /// arithmetic is decorated NoContraction.
+    precise: bool = false,
     /// Image types by (sampled type, dim, arrayed, ms, sampled, format).
     image_types: std.AutoHashMapUnmanaged([6]u32, Id) = .empty,
     sampled_image_types: std.AutoHashMapUnmanaged(Id, Id) = .empty,
@@ -1489,6 +1493,12 @@ const Emitter = struct {
                 try e.extension("SPV_KHR_vulkan_memory_model");
             }
         }
+        // -Gis: signed zeros, infinities and NaNs preserved (the execution
+        // mode is on each entry), as dxc.
+        if (m.ieee_strict) {
+            try e.cap(.signed_zero_inf_nan_preserve);
+            if (e.spv_minor < 4) try e.extension("SPV_KHR_float_controls");
+        }
         for (e.capabilities.keys()) |c| try e.b.emit(.capabilities, .capability, &.{@backingInt(c)});
         if (e.glsl != 0) try e.b.emitWithString(.ext_inst_imports, .ext_inst_import, &.{e.glsl}, "GLSL.std.450", &.{});
         // (PhysicalStorageBuffer64 addressing with physical pointers.)
@@ -1664,6 +1674,8 @@ const Emitter = struct {
             },
             else => {},
         }
+        // -Gis (dxc gives the mode for 32-bit floats only).
+        if (e.m.ieee_strict) try e.b.emit(.execution_modes, .execution_mode, &.{ wrapper, 4461, 32 }); // SignedZeroInfNanPreserve
         if (e.st.derivative_mode != 0) try e.b.emit(.execution_modes, .execution_mode, &.{ wrapper, e.st.derivative_mode });
         if (e.st.interlock_mode != 0) try e.b.emit(.execution_modes, .execution_mode, &.{ wrapper, e.st.interlock_mode });
         // vk::ext_execution_mode(...) / ext_execution_mode_id(...).
@@ -3027,6 +3039,9 @@ const Emitter = struct {
         const f = e.f;
         const i = f.inst(r);
         const ri = r.index();
+        const outer_precise = e.precise;
+        e.precise = i.precise;
+        defer e.precise = outer_precise;
         switch (i.op) {
             .constant, .param, .local_var => {},
             .node_io => return e.unsupported("work graph nodes are not supported in SPIR-V", .{}),
@@ -4046,7 +4061,18 @@ const Emitter = struct {
         try ops.appendSlice(e.arena, &.{ try e.typeId(ty), id });
         try ops.appendSlice(e.arena, operands);
         try e.b.emit(.functions, op, ops.items);
+        if (e.precise and contractable(op)) try e.b.emit(.annotations, .decorate, &.{ id, 42 }); // NoContraction
         return id;
+    }
+
+    /// The floating-point arithmetic dxc decorates NoContraction in
+    /// `precise` code: the arithmetic opcodes, not the extended
+    /// instructions. (`mad`'s Fma is decorated always: intrinsic.)
+    fn contractable(op: Op) bool {
+        return switch (op) {
+            .f_negate, .f_add, .f_sub, .f_mul, .f_div, .f_rem, .f_mod, .vector_times_scalar, .matrix_times_scalar, .vector_times_matrix, .matrix_times_vector, .matrix_times_matrix, .dot => true,
+            else => false,
+        };
     }
 
     /// Pointer to `buffer[index]` (structured / byte-address buffers).
@@ -5328,10 +5354,13 @@ const Emitter = struct {
                 return e.op1(shop, ty, &.{ a, amount });
             },
         };
-        if (e.vk.fuse_mul_add and f) {
+        if (e.vk.fuse_mul_add and f and !e.precise) {
             // -fspv-fusemuladd (Epic's SPIRV-Tools FusedMultiplyAddPass):
             // an add of a multiply's result of the same type is
-            // Fma(x, y, other); of two, the earlier multiply's.
+            // Fma(x, y, other); of two, the earlier multiply's. Not in
+            // `precise` code: fusing is the contraction NoContraction
+            // forbids, so neither a precise add nor a precise multiply
+            // (never recorded) is fused.
             if (sop == .f_add) {
                 const ma = e.fmuls.get(a);
                 const mb = e.fmuls.get(b);
@@ -5691,15 +5720,23 @@ const Emitter = struct {
         }
         for (glsl_ops) |g| if (std.mem.eql(u8, g.name, name)) {
             if (std.mem.eql(u8, name, "mad") and !fl) {
+                // NoContraction on both, as dxc (always).
                 const p = try e.op1(.i_mul, ty, &.{ ids[0], ids[1] });
-                return e.op1(.i_add, ty, &.{ p, ids[2] });
+                try e.b.emit(.annotations, .decorate, &.{ p, 42 });
+                const s = try e.op1(.i_add, ty, &.{ p, ids[2] });
+                try e.b.emit(.annotations, .decorate, &.{ s, 42 });
+                return s;
             }
             const op = if (fl) g.f else if (un) g.u else g.s;
             if (op == 0) break;
             var ops: std.ArrayList(u32) = .empty;
             try ops.appendSlice(e.arena, &.{ e.glslSet(), op });
             try ops.appendSlice(e.arena, ids);
-            return e.op1(.ext_inst, ty, ops.items);
+            const id = try e.op1(.ext_inst, ty, ops.items);
+            // dxc decorates every float `mad` NoContraction, precise or
+            // not.
+            if (fl and eqn(u8, name, "mad")) try e.b.emit(.annotations, .decorate, &.{ id, 42 });
+            return id;
         };
         if (eqn(u8, name, "mul") and args.len == 2) return e.mul(ty, tys[0], tys[1], ids[0], ids[1]);
         if (eqn(u8, name, "transpose")) {

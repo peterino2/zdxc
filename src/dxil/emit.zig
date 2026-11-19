@@ -28,6 +28,7 @@ const promote = @import("promote.zig");
 const unroll = @import("unroll.zig");
 const stats = @import("../stats.zig");
 const sccp = @import("sccp.zig");
+const precise = @import("precise.zig");
 const cfg = @import("cfg.zig");
 const cse = @import("cse.zig");
 const opt = @import("../ir/opt.zig");
@@ -78,7 +79,7 @@ pub const Debug = struct {
 };
 
 pub fn emitWithReflection(gpa: Allocator, m: *const ir.Module, profile: shader.Profile, diags: *diag.Diagnostics, optimize: bool) Error!Output {
-    return emitWithReflectionAt(gpa, m, profile, diags, if (optimize) .full else .none);
+    return emitWithReflectionAt(gpa, m, profile, diags, if (optimize) .full else .none, null);
 }
 
 /// How much `emitWithReflectionAt` optimizes: nothing (-zdxc-no-opt), as
@@ -86,14 +87,21 @@ pub fn emitWithReflection(gpa: Allocator, m: *const ir.Module, profile: shader.P
 /// dead removed, nothing else), or fully.
 pub const Optimize = enum { none, debug, full };
 
-pub fn emitWithReflectionAt(gpa: Allocator, m: *const ir.Module, profile: shader.Profile, diags: *diag.Diagnostics, level: Optimize) Error!Output {
-    return emitDebug(gpa, m, profile, diags, level, null);
+/// Sees the finished DXIL module, optimized and about to be written (for
+/// tests: zdxc does not read its bitcode back).
+pub const Inspect = struct {
+    ctx: *anyopaque,
+    call: *const fn (ctx: *anyopaque, m: *const module.Module) void,
+};
+
+pub fn emitWithReflectionAt(gpa: Allocator, m: *const ir.Module, profile: shader.Profile, diags: *diag.Diagnostics, level: Optimize, inspect: ?Inspect) Error!Output {
+    return emitDebug(gpa, m, profile, diags, level, null, inspect);
 }
 
-pub fn emitDebug(gpa: Allocator, m: *const ir.Module, profile: shader.Profile, diags: *diag.Diagnostics, level: Optimize, dbg: ?Debug) Error!Output {
+pub fn emitDebug(gpa: Allocator, m: *const ir.Module, profile: shader.Profile, diags: *diag.Diagnostics, level: Optimize, dbg: ?Debug, inspect: ?Inspect) Error!Output {
     var arena_state: BumpArena = .init(gpa);
     defer arena_state.deinit();
-    var e: Emitter = .{ .arena = arena_state.allocator(), .dm = .init(gpa), .m = m, .t = m.types, .profile = profile, .diags = diags, .optimize = level == .full, .promote_only = level == .debug, .dbg = dbg };
+    var e: Emitter = .{ .arena = arena_state.allocator(), .dm = .init(gpa), .m = m, .t = m.types, .profile = profile, .diags = diags, .optimize = level == .full, .promote_only = level == .debug, .dbg = dbg, .inspect = inspect };
     defer e.dm.deinit();
     if (dbg != null) {
         e.dbg_scopes = try e.arena.alloc(?module.DbgId, m.scopes.items.len);
@@ -240,6 +248,8 @@ const Resource = struct {
 
 const Frame = struct {
     f: *const ir.Function,
+    /// Emitter.keptLocals of `f`.
+    kept: []const bool = &.{},
     /// For inlined calls: Emitter.regsLocals of `f`.
     regs: []const bool = &.{},
     /// Emitter.bufLocals of `f`.
@@ -341,6 +351,10 @@ const Emitter = struct {
     m: *const ir.Module,
     t: *TypeTable,
     profile: shader.Profile,
+    /// The module has `precise` locals or outputs: the emitter marks them
+    /// for dxil/precise.zig (keptLocals).
+    keeps_precise: bool = false,
+    kept_locals: std.AutoHashMapUnmanaged(u32, []const bool) = .empty,
     entry: ir.Entry = undefined,
     /// -Zi: the position new instructions get (a module.Inst.dbg), the
     /// module function being filled, and the debug metadata made so far:
@@ -364,6 +378,7 @@ const Emitter = struct {
     pdb: ?[]u8 = null,
     pdb_name: ?[]u8 = null,
     diags: *diag.Diagnostics,
+    inspect: ?Inspect = null,
 
     main_fn: u32 = 0,
     /// Hull shaders: the patch constant function.
@@ -1013,6 +1028,7 @@ const Emitter = struct {
 
     fn run(e: *Emitter, gpa: Allocator) Error![]u8 {
         const m = e.m;
+        e.keeps_precise = anyPrecise(m);
         if (e.profile.kind == .library) return e.runLibrary(gpa);
         if (m.entries.items.len != 1) return e.unsupported("several entry points are not supported here", .{});
         const entry = m.entries.items[0];
@@ -1240,6 +1256,7 @@ const Emitter = struct {
         var funcs: std.ArrayList(LibFunc) = .empty;
         for (m.entries.items, 0..) |entry, k| {
             e.entry = entry;
+            e.kept_locals = .empty; // (by entry: its outputs)
             e.blocks = .empty;
             e.prologue = .empty;
             e.call_memo = .empty;
@@ -1454,6 +1471,7 @@ const Emitter = struct {
     fn emitExport(e: *Emitter, fi: u32, lf0: LibFunc) Error!LibFunc {
         const f = e.m.functions.items[fi];
         e.entry = .{ .func = fi, .name = f.name, .stage = .library, .wrapper = std.math.maxInt(u32) };
+        e.kept_locals = .empty;
         e.blocks = .empty;
         e.prologue = .empty;
         e.call_memo = .empty;
@@ -2012,6 +2030,7 @@ const Emitter = struct {
         zf.end();
         if (e.optimize) {
             try promote.run(e.arena, &e.dm, func, &ranges);
+            try e.markPrecise(func);
             // Values only ever one constant (through loops too), and the
             // branches they decide.
             if (try sccp.run(e.arena, &e.dm, func)) try promote.run(e.arena, &e.dm, func, &.empty);
@@ -2060,7 +2079,16 @@ const Emitter = struct {
             if (@import("exp.zig").cur.opaque_trip and try @import("meld.zig").opaqueTrips(e.arena, &e.dm, func)) e.uses_wave = true;
         } else if (e.promote_only) {
             try promote.run(e.arena, &e.dm, func, &ranges);
-        }
+            try e.markPrecise(func);
+        } else try e.markPrecise(func);
+    }
+
+    /// `precise` (dxil/precise.zig), as dxc marks it: once everything is
+    /// inlined and promoted, but for the locals kept for it, which are
+    /// promoted then.
+    fn markPrecise(e: *Emitter, func: u32) Error!void {
+        try precise.run(e.arena, &e.dm, func, e.m.ieee_strict);
+        if (e.keeps_precise and (e.optimize or e.promote_only)) try promote.run(e.arena, &e.dm, func, &.empty);
     }
 
     /// Drops removable prologue instructions nothing uses (repeatedly: a
@@ -2325,6 +2353,12 @@ const Emitter = struct {
         if (e.optimize and args.len > 0) frame.copies = try e.paramCopies(fi);
         if (e.optimize) frame.regs = try e.regsLocals(fi);
         if (e.optimize) frame.buf_locals = try e.bufLocals(fi);
+        if (e.keeps_precise) {
+            // (Memory, not values: dxil/precise.zig reads their stores.)
+            frame.kept = try e.keptLocals(fi);
+            if (frame.regs.len > 0) frame.regs = try without(e.arena, frame.regs, frame.kept);
+            if (frame.buf_locals.len > 0) frame.buf_locals = try without(e.arena, frame.buf_locals, frame.kept);
+        }
         // Debug information: the body is inlined at the call being
         // lowered; what the call itself still adds is at the call again.
         if (e.dbg != null) {
@@ -2423,6 +2457,46 @@ const Emitter = struct {
                 },
             }
         }
+        return out;
+    }
+
+    /// Whether the entry has `precise` outputs or patch constants.
+    fn preciseOutputs(e: *const Emitter) bool {
+        for (e.entry.outputs.items) |o| if (o.precise) return true;
+        for (e.entry.patch_constants.items) |o| if (o.precise) return true;
+        return false;
+    }
+
+    /// For each instruction of IR function `fi`: whether it is a local
+    /// dxil/precise.zig needs in memory (an alloca marked `keep`) and
+    /// written with a store per write. A `precise` local; and with
+    /// `precise` outputs, the entry's outputs, which dxc writes in place:
+    /// in the HLSL entry, the local it returns, and in its wrapper, the
+    /// locals passed to it by reference (its out parameters).
+    fn keptLocals(e: *Emitter, fi: u32) Error![]const bool {
+        const gop = try e.kept_locals.getOrPut(e.arena, fi);
+        if (gop.found_existing) return gop.value_ptr.*;
+        const f = e.m.functions.items[fi];
+        const out = try e.arena.alloc(bool, f.insts.items.len);
+        for (f.insts.items, out) |inst, *o| o.* = inst.op == .local_var and inst.op.local_var.precise;
+        gop.value_ptr.* = out;
+        if (!e.preciseOutputs()) return out;
+        const en = e.entry;
+        if (fi == en.func or fi == en.patch_func) for (f.blocks.items) |blk| switch (blk.term) {
+            .ret => |v| if (v != .none) switch (f.inst(v).op) {
+                .load => |p| if (f.inst(p).op == .local_var) {
+                    out[p.index()] = true;
+                },
+                else => {},
+            },
+            else => {},
+        };
+        if (fi == en.wrapper or fi == en.patch_wrapper) for (f.insts.items) |inst| switch (inst.op) {
+            .call => |c| for (c.args) |arg| if (f.inst(arg).op == .local_var) {
+                out[arg.index()] = true;
+            },
+            else => {},
+        };
         return out;
     }
 
@@ -3082,20 +3156,25 @@ const Emitter = struct {
                     return .{ .res_local = @intCast(e.res_locals.items.len - 1) };
                 }
                 if (e.holdsResources(i.ty)) return e.aggLocal(i.ty);
-                if (try e.mixedSizes(i.ty) or e.containsLinAlg(i.ty)) {
-                    // Components of several sizes (or matrix handles): a
-                    // struct-typed alloca.
-                    const dty = try e.memoryType(i.ty);
-                    const base = try e.addPrologue(try e.dm.ptrType(dty), .{ .alloca = .{ .elem = dty, .size = try e.i32Const(1) } });
-                    return .{ .typed = .{ .base = base, .dty = dty, .addr_space = 0, .ty = i.ty } };
-                }
-                if (e.optimize and frame.cont != null and e.t.get(i.ty) == .array) {
+                // Components of several sizes (or matrix handles): a
+                // struct-typed alloca.
+                const mixed = try e.mixedSizes(i.ty) or e.containsLinAlg(i.ty);
+                // (For dxil/precise.zig: an alloca of its own, in memory
+                // until it has run.)
+                const kept = frame.kept.len > 0 and frame.kept[r.index()];
+                if (e.optimize and frame.cont != null and e.t.get(i.ty) == .array and !mixed and !kept) {
                     const pooled = if (e.array_pool.getPtr(i.ty)) |l| l.pop() else null;
                     const ptr = pooled orelse try e.alloca(i.ty);
                     try frame.arrays.append(e.arena, .{ .ty = i.ty, .ptr = ptr });
                     return .{ .ptr = ptr };
                 }
-                return .{ .ptr = try e.alloca(i.ty) };
+                const local: Lowered = if (mixed) blk: {
+                    const dty = try e.memoryType(i.ty);
+                    const base = try e.addPrologue(try e.dm.ptrType(dty), .{ .alloca = .{ .elem = dty, .size = try e.i32Const(1) } });
+                    break :blk .{ .typed = .{ .base = base, .dty = dty, .addr_space = 0, .ty = i.ty } };
+                } else .{ .ptr = try e.alloca(i.ty) };
+                if (kept) e.keep(if (mixed) local.typed.base else local.ptr.base, i.op.local_var.precise);
+                return local;
             },
             .load => |p| if (frame.copies.len > 0 and frame.copies[p.index()] != std.math.maxInt(u32) and frame.params[frame.copies[p.index()]] == .scalars and e.t.isNumeric(i.ty)) {
                 // (A parameter's copy, never written: the argument, so
@@ -4047,6 +4126,18 @@ const Emitter = struct {
         };
     }
 
+    /// Marks alloca `base` for dxil/precise.zig: kept in memory until it
+    /// has run, and with `root`, a `precise` local.
+    fn keep(e: *Emitter, base: Value, root: bool) void {
+        const inst = e.insts.at(base.inst);
+        inst.precise.keep = true;
+        inst.precise.root = root;
+    }
+
+    fn isKept(e: *Emitter, base: Value) bool {
+        return e.keeps_precise and base == .inst and e.insts.at(base.inst).precise.keep;
+    }
+
     fn storePtrLocal(e: *Emitter, ptr: Ptr, vals: []const Value, ty: TypeId) Error!void {
         const void_ty = try e.voidTy();
         for (vals, 0..) |v, c| {
@@ -4056,7 +4147,7 @@ const Emitter = struct {
                 // block need no instructions, and constants stay constants,
                 // as ops such as linear algebra layouts need immediates
                 // passed through parameters.)
-                const forward = ptr.addr_space == 0 or (e.status_vals.count() > 0 and e.status_vals.contains(v));
+                const forward = (ptr.addr_space == 0 and !e.isKept(ptr.base)) or (e.status_vals.count() > 0 and e.status_vals.contains(v));
                 if (forward) {
                     try e.forwarded.put(e.arena, key, .{ .v = v, .block = e.cur });
                 } else if (e.forwarded.count() > 0) _ = e.forwarded.remove(key);
@@ -4069,8 +4160,14 @@ const Emitter = struct {
                 try e.add(ptr.scalar_ty, .{ .cast = .{ .op = .bitcast, .val = v } })
             else
                 v;
-            _ = try e.add(void_ty, .{ .store = .{ .ptr = p, .val = sv, .@"align" = e.flatAlign(ptr) } });
+            e.laneStore(try e.add(void_ty, .{ .store = .{ .ptr = p, .val = sv, .@"align" = e.flatAlign(ptr) } }), ty);
         }
+    }
+
+    /// Marks `store`, of a component of a value of type `ty`, for
+    /// dxil/precise.zig: with a vector `ty`, a store of one lane.
+    fn laneStore(e: *Emitter, store: Value, ty: TypeId) void {
+        if (store == .inst and e.t.get(ty) == .vector) e.insts.at(store.inst).precise.vector = true;
     }
 
     /// Alignment of a flattened storage element (16-bit ones: 2).
@@ -6505,9 +6602,19 @@ const Emitter = struct {
                 rc[0] = 0;
             }
             const sv = try e.convertScalar(v, from, via);
-            _ = try e.callOp(fn_i, void_ty, &.{ try e.i32Const(5), try e.i32Const(target.id), try e.i32Const(rc[0]), try e.dm.constInt(8, rc[1]), sv });
+            const call = try e.callOp(fn_i, void_ty, &.{ try e.i32Const(5), try e.i32Const(target.id), try e.i32Const(rc[0]), try e.dm.constInt(8, rc[1]), sv });
+            if (el.precise) e.preciseOutput(frame, call, value);
             target.usage |= @as(u8, 1) << @intCast(rc[1]);
         }
+    }
+
+    /// Marks storeOutput or storePatchConstant `call`, of IR `value`, for
+    /// dxil/precise.zig: a `precise` output.
+    fn preciseOutput(e: *Emitter, frame: *const Frame, call: Value, value: Ref) void {
+        if (call != .inst) return;
+        const inst = e.insts.at(call.inst);
+        inst.precise.root = true;
+        inst.precise.vector = e.t.get(frame.f.inst(value).ty) == .vector;
     }
 
     /// A domain shader's patch constant (or a system value read with its
@@ -6544,7 +6651,8 @@ const Emitter = struct {
         const fn_i = try e.dxOp(try std.fmt.allocPrint(e.arena, "dx.op.storePatchConstant.{s}", .{e.overloadName(vt)}), void_ty, &.{ i32t, i32t, i32t, i8t, vt }, .nounwind);
         for (vals, 0..) |v, c| {
             const rc = try e.sigComponent(el.ty, @intCast(c));
-            _ = try e.callOp(fn_i, void_ty, &.{ try e.i32Const(106), try e.i32Const(se.id), try e.i32Const(rc[0]), try e.dm.constInt(8, rc[1]), try e.convertScalar(v, e.compOf(el.ty), via) });
+            const call = try e.callOp(fn_i, void_ty, &.{ try e.i32Const(106), try e.i32Const(se.id), try e.i32Const(rc[0]), try e.dm.constInt(8, rc[1]), try e.convertScalar(v, e.compOf(el.ty), via) });
+            if (el.precise) e.preciseOutput(frame, call, value);
             se.usage |= @as(u8, 1) << @intCast(rc[1]);
         }
     }
@@ -7190,7 +7298,7 @@ const Emitter = struct {
             const ct = e.compOf(cty);
             const st = try e.scalarTy(memScalar(ct));
             const sv = if (ct == .bool) try e.add(st, .{ .cast = .{ .op = .zext, .val = v } }) else v;
-            _ = try e.add(try e.voidTy(), .{ .store = .{ .ptr = try e.typedScalarPtr(tp, sub, st), .val = sv, .@"align" = memScalar(ct).size() } });
+            e.laneStore(try e.add(try e.voidTy(), .{ .store = .{ .ptr = try e.typedScalarPtr(tp, sub, st), .val = sv, .@"align" = memScalar(ct).size() } }), ty);
         }
     }
 
@@ -7581,6 +7689,7 @@ const Emitter = struct {
     }
 
     fn writeLibraryModule(e: *Emitter, funcs: []const LibFunc) Error![]u8 {
+        if (e.inspect) |i| i.call(i.ctx, &e.dm);
         const dm = &e.dm;
         const mdI32 = struct {
             fn f(m: *module.Module, v: i64) !module.MdId {
@@ -8504,6 +8613,7 @@ const Emitter = struct {
     }
 
     fn writeModule(e: *Emitter, entry: ir.Entry) Error![]u8 {
+        if (e.inspect) |i| i.call(i.ctx, &e.dm);
         const zone = stats.begin(.bitcode);
         defer zone.end();
         const dm = &e.dm;
@@ -9078,6 +9188,28 @@ fn emitOrder(a: Allocator, f: *const ir.Function) Allocator.Error![]u32 {
     };
     std.debug.assert(len == n);
     return order;
+}
+
+/// Whether anything is declared `precise` (most shaders: nothing for the
+/// emitter to mark for dxil/precise.zig).
+fn anyPrecise(m: *const ir.Module) bool {
+    for (m.entries.items) |en| {
+        for (en.outputs.items) |o| if (o.precise) return true;
+        for (en.patch_constants.items) |o| if (o.precise) return true;
+    }
+    for (m.functions.items) |f| for (f.insts.items) |inst| {
+        if (inst.op == .local_var and inst.op.local_var.precise) return true;
+    };
+    return false;
+}
+
+/// `xs`, false where `drop` is true.
+fn without(a: Allocator, xs: []const bool, drop: []const bool) Allocator.Error![]const bool {
+    const out = try a.dupe(bool, xs);
+    for (out, 0..) |*o, k| if (k < drop.len and drop[k]) {
+        o.* = false;
+    };
+    return out;
 }
 
 fn reachableBlocks(a: Allocator, f: *const ir.Function) Allocator.Error![]bool {

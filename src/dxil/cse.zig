@@ -100,9 +100,9 @@ const Key = struct {
         k.word(@backingInt(std.meta.activeTag(inst.op)));
         k.word(inst.ty);
         switch (inst.op) {
-            .binop => |b| k.word(@as(u64, @backingInt(b.op)) << 32 | b.flags),
+            .binop => |b| k.word(@as(u64, @backingInt(b.op)) << 32 | @intFromBool(b.precise)),
             .cast => |c| k.word(@backingInt(c.op)),
-            .cmp => |c| k.word(c.pred),
+            .cmp => |c| k.word(@as(u64, c.pred) << 32 | @intFromBool(c.precise)),
             .extractvalue => |x| k.word(x.index),
             .gep => |g| k.word(g.elem),
             .call => |c| k.word(c.callee),
@@ -272,6 +272,10 @@ pub fn run(a: Allocator, m: *module.Module, func: u32) Allocator.Error!bool {
                 if (gop.found_existing) {
                     repl[i] = .{ .inst = gop.value_ptr.* };
                     found = true;
+                    // `precise` wins: a dx.op call merged with a precise
+                    // one stays `!dx.precise` (as dxc's).
+                    const kept = &insts[gop.value_ptr.*];
+                    if (inst.md != .none and inst.md == m.precise_md and kept.md == .none) kept.md = inst.md;
                 } else {
                     gop.key_ptr.* = try a.dupe(u8, key.buf.items);
                     gop.value_ptr.* = @intCast(i);

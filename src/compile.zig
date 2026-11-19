@@ -41,6 +41,9 @@ pub const Request = struct {
     /// that start with `file:line:col:` as errors, and calls a failure
     /// with none an internal error.)
     place_unplaced: bool = false,
+    /// Sees the DXIL module before it is written (tests: what the emitter
+    /// made of each instruction).
+    inspect_dxil: ?zdxc.dxil.emit.Inspect = null,
     /// Set by `compile`: the input when `source` is given and the arguments
     /// name none (not parsed as an argument).
     main_input: ?[]const u8 = null,
@@ -216,6 +219,8 @@ const Options = struct {
     spv_debug: ?struct { file: bool = false, source: bool = false, line: bool = false, tool: bool = false, rich: bool = false } = null,
     /// -zdxc-no-opt: no SPIR-V IR optimizations.
     no_opt: bool = false,
+    /// -Gis: force IEEE strictness.
+    ieee_strict: bool = false,
     /// -O0..-O3 / -Od (default -O3, as in dxc).
     opt_level: enum { od, o0, o1, o2, o3 } = .o3,
     /// Accepted options with no effect yet, reported once each.
@@ -420,6 +425,7 @@ fn parseArgs(ctx: *Ctx, arena: std.mem.Allocator, args: []const []const u8) !?Op
                     .O2 => opts.opt_level = .o2,
                     .O3 => opts.opt_level = .o3,
                     .Od => opts.opt_level = .od,
+                    .Gis => opts.ieee_strict = true,
                     else => {}, // implemented as a no-op (e.g. -Vd, -nologo)
                 }
             },
@@ -582,6 +588,7 @@ fn run(ctx: *Ctx, arena: std.mem.Allocator) !void {
                             mm.row_major = opts.row_major;
                             mm.vk = opts.vk;
                             mm.strip_rootsig = opts.strip_rootsig;
+                            mm.ieee_strict = opts.ieee_strict;
                             if (opts.rootsig_ver) |rv| {
                                 if (std.mem.eql(u8, rv, "rootsig_1_0")) mm.rootsig_version = .v1_0 else if (!std.mem.eql(u8, rv, "rootsig_1_1")) return ctx.fail("unknown root signature version '{s}'", .{rv});
                             }
@@ -607,6 +614,10 @@ fn run(ctx: *Ctx, arena: std.mem.Allocator) !void {
             try zdxc.ir.opt.run(arena, m);
             zdxc.ir.ir.verify(m);
             zo.end();
+            // SPIR-V's `precise`, within each function as dxc's: before
+            // inlining and SSA (it follows the stores to precise locals).
+            // (DXIL marks its own once inlined and promoted, as dxc's.)
+            if (opts.spirv) try zdxc.ir.precise.run(arena, m);
             const zv = stats.begin(.spirv);
             defer if (opts.spirv) zv.end();
             if (opts.spirv) {
@@ -675,7 +686,7 @@ fn run(ctx: *Ctx, arena: std.mem.Allocator) !void {
                 .pdb = opts.pdb_output != null,
                 .pdb_name = opts.pdb_output,
             } else null;
-            const dxil_out = zdxc.dxil.emit.emitDebug(arena, m, profile.?, &diags, if (opts.no_opt) .none else if (opts.opt_level == .od) .debug else .full, dxil_dbg) catch |err| switch (err) {
+            const dxil_out = zdxc.dxil.emit.emitDebug(arena, m, profile.?, &diags, if (opts.no_opt) .none else if (opts.opt_level == .od) .debug else .full, dxil_dbg, ctx.req.inspect_dxil) catch |err| switch (err) {
                 error.Unsupported => {
                     try diags.render(&sm, ctx.stderr, .{ .format = opts.diag_format, .color = false, .unplaced = if (ctx.req.place_unplaced) opts.input else null });
                     return error.CompileFailed;

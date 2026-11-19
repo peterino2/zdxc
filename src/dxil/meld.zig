@@ -198,9 +198,9 @@ fn sameShape(x: Inst, y: Inst) bool {
             break :blk true;
         },
         .call => |c| c.callee == y.op.call.callee and c.args.len == y.op.call.args.len,
-        .binop => |b| b.op == y.op.binop.op and b.flags == y.op.binop.flags,
+        .binop => |b| b.op == y.op.binop.op and b.precise == y.op.binop.precise,
         .cast => |c| c.op == y.op.cast.op,
-        .cmp => |c| c.pred == y.op.cmp.pred,
+        .cmp => |c| c.pred == y.op.cmp.pred and c.precise == y.op.cmp.precise,
         .extractvalue => |e| e.index == y.op.extractvalue.index,
         .phi => |p| p.incoming.len == y.op.phi.incoming.len,
         .alloca => |al| al.elem == y.op.alloca.elem,
@@ -224,9 +224,9 @@ fn shapeKey(inst: Inst) u64 {
     h = mix(h ^ @backingInt(inst.md));
     switch (inst.op) {
         .call => |c| h = mix(h ^ (@as(u64, c.callee) << 8) ^ c.args.len),
-        .binop => |b| h = mix(h ^ (@as(u64, @backingInt(b.op)) << 32) ^ b.flags),
+        .binop => |b| h = mix(h ^ (@as(u64, @backingInt(b.op)) << 32) ^ @intFromBool(b.precise)),
         .cast => |c| h = mix(h ^ @backingInt(c.op)),
-        .cmp => |c| h = mix(h ^ c.pred),
+        .cmp => |c| h = mix(h ^ (@as(u64, c.pred) << 32) ^ @intFromBool(c.precise)),
         .extractvalue => |e| h = mix(h ^ e.index),
         .phi => |p| h = mix(h ^ p.incoming.len),
         .gep => |g| h = mix(h ^ (@as(u64, g.elem) << 16) ^ g.indices.len),

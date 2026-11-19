@@ -1742,7 +1742,38 @@ pub const Sema = struct {
         return null;
     }
 
+    /// A constant expression's value. Floating point is rounded to each
+    /// expression's type as it is evaluated (IEEE arithmetic in that
+    /// precision, as dxc's): `16777216.0f + 1.0f` is 16777216, `1e30f *
+    /// 1e30f` infinity.
     pub fn evalConst(s: *Sema, e: *const ast.Expr) ?Const {
+        const c = s.evalConstUnrounded(e) orelse return null;
+        return switch (c) {
+            .float => |x| .{ .float = s.roundToType(e.ty, x) },
+            else => c,
+        };
+    }
+
+    /// `x` rounded to the precision of (the components of) float type
+    /// `ty`; unchanged for double, literal and unknown types.
+    fn roundToType(s: *Sema, ty: TypeId, x: f64) f64 {
+        if (ty == TypeTable.error_type) return x;
+        const sc: types.Scalar = switch (s.types.get(ty)) {
+            .scalar => |sc| sc,
+            .vector => |v| v.elem,
+            .matrix => |m| m.elem,
+            else => return x,
+        };
+        return switch (sc) {
+            .float => @as(f32, @floatCast(x)),
+            .float16 => @as(f16, @floatCast(x)),
+            // (16-bit with -enable-16bit-types, as dxc.)
+            .half, .min16float, .min10float => if (s.opts.enable_16bit) @as(f16, @floatCast(x)) else @as(f32, @floatCast(x)),
+            else => x,
+        };
+    }
+
+    fn evalConstUnrounded(s: *Sema, e: *const ast.Expr) ?Const {
         return switch (e.kind) {
             .int_lit => |t| .{ .int = parseIntLiteral(t) orelse return null },
             .float_lit => |t| .{ .float = parseFloatLiteral(t) orelse return null },

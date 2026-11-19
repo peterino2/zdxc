@@ -173,9 +173,11 @@ test "-fspv-support-precise-outputs: NoContraction on precise built-in outputs" 
     defer arena.deinit();
     const a = arena.allocator();
     const no_contraction = 42;
-    try expectEqual(@as(usize, 0), (try ok(a, "vs_6_6", &.{}, vs_src)).decoCount(no_contraction));
+    // Without it, only the arithmetic computing the precise field (as any
+    // dxc: precise.zig).
+    try expectEqual(@as(usize, 2), (try ok(a, "vs_6_6", &.{}, vs_src)).decoCount(no_contraction));
     const m = try ok(a, "vs_6_6", &.{"-fspv-support-precise-outputs"}, vs_src);
-    try expectEqual(@as(usize, 1), m.decoCount(no_contraction));
+    try expectEqual(@as(usize, 3), m.decoCount(no_contraction));
     try expectEqual(@as(?u32, 0), m.deco(m.named("out.var.SV_Position").?, no_contraction));
     // A precise parameter and a precise function, too.
     const p = try ok(a, "vs_6_6", &.{"-fspv-support-precise-outputs"}, "void main(float4 p : POSITION, out precise float4 pos : SV_Position) { pos = p; }");

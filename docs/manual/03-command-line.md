@@ -21,6 +21,7 @@ a file or, through the library interfaces, from memory.
 | `-spirv` | Emit SPIR-V instead of DXIL. |
 | `-Zpr` / `-Zpc` | Select row- or column-major matrix packing. |
 | `-O0` … `-O3`, `-Od` | Select the optimization level. `-Od`, as in dxc, still promotes locals to SSA values and removes dead code, but does nothing else. |
+| `-Gis` | Force IEEE strictness, as in dxc: all floating-point math is compiled as if `precise`. DXIL has no `fast` flags and marks floating-point `dx.op` calls `!dx.precise`. SPIR-V decorates arithmetic `NoContraction` and declares `SignedZeroInfNanPreserve`. |
 | `--job=<file>` | Compile a JSON batch of shaders in one process. |
 
 DXIL is the default backend. Add `-spirv` for SPIR-V, with the `-fvk-*` and

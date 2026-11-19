@@ -183,7 +183,10 @@ pub const Op = union(enum) {
     /// Pointer to a module global (resource, groupshared, static).
     global: u32,
     /// Function-local storage of the result type (result is a pointer).
-    local_var,
+    local_var: struct {
+        /// Declared `precise` (ir/precise.zig, dxil/precise.zig).
+        precise: bool = false,
+    },
     /// Pointer (`physical` space) to the result type's storage at the
     /// 64-bit device address `addr` (vk::RawBufferLoad / RawBufferStore),
     /// whose loads and stores are aligned to `alignment` bytes (the result
@@ -267,6 +270,9 @@ pub const Inst = struct {
     ty: TypeId,
     /// Non-`none` when the result is a pointer to `ty` storage.
     ptr: Space = .none,
+    /// Set by precise.zig (SPIR-V): computes a value that flows into
+    /// `precise` storage. (A `precise` declaration is on its `local_var`.)
+    precise: bool = false,
 };
 
 pub const Terminator = union(enum) {
@@ -317,6 +323,8 @@ pub const Param = struct {
     /// The HLSL type (before patches become arrays), for mangled names.
     sema_ty: TypeId = 0,
     semantic: ?[]const u8 = null,
+    /// Declared `precise` (ir/precise.zig's `declarations`).
+    precise: bool = false,
 };
 
 pub const Function = struct {
@@ -333,6 +341,9 @@ pub const Function = struct {
     /// `[noinline]` (plain functions, not methods or template instances):
     /// libraries keep it a function of its own.
     no_inline: bool = false,
+    /// Declared `precise`: its return value is (ir/precise.zig's
+    /// `declarations`).
+    precise: bool = false,
     /// Nothing calls it any more (inlined everywhere): not emitted.
     dead: bool = false,
     insts: std.ArrayList(Inst) = .empty,
@@ -835,6 +846,10 @@ pub const Module = struct {
     debug: DebugLevel = .none,
     scopes: std.ArrayList(Scope) = .empty,
     inline_sites: std.ArrayList(InlineSite) = .empty,
+    /// -Gis: IEEE strictness everywhere: everything is precise
+    /// (ir/precise.zig, dxil/precise.zig); SPIR-V also declares
+    /// SignedZeroInfNanPreserve.
+    ieee_strict: bool = false,
 
     pub fn addFunction(m: *Module, f: Function) !u32 {
         const p = try m.arena.create(Function);
@@ -997,6 +1012,7 @@ fn dumpInst(m: *const Module, f: *const Function, r: Ref, w: *std.Io.Writer) !vo
     if (inst.ty != TypeTable.void_type) {
         try w.print("%{d}: {s}{s} = ", .{ r.index(), if (inst.ptr != .none) "*" else "", try m.types.format(m.arena, inst.ty) });
     }
+    if (inst.precise) try w.writeAll("precise ");
     switch (inst.op) {
         .constant => |c| switch (c) {
             .int => |v| try w.print("const {d}", .{v}),
@@ -1005,7 +1021,7 @@ fn dumpInst(m: *const Module, f: *const Function, r: Ref, w: *std.Io.Writer) !vo
         .param => |p| try w.print("param {d}", .{p}),
         .node_io => |x| try w.print("node_{s} {d}", .{ if (x.output) "output" else "input", x.index }),
         .global => |g| try w.print("global @{d}", .{g}),
-        .local_var => try w.writeAll("local_var"),
+        .local_var => |l| try w.writeAll(if (l.precise) "local_var precise" else "local_var"),
         .load => |p| try w.print("load %{d}", .{p.index()}),
         .store => |s| try w.print("store %{d}, %{d}", .{ s.ptr.index(), s.value.index() }),
         .access => |a| {

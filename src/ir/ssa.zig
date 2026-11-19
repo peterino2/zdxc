@@ -111,7 +111,7 @@ fn privateToLocal(m: *ir.Module) Error!void {
         if (g.space != .private or g.ext.builtin != null or g.ext.storage_class != null or !plainType(m.types, g.ty)) continue;
         if (canon[gi] == .none) {
             canon[gi] = @enumFromInt(i);
-            inst.* = .{ .op = .local_var, .ty = inst.ty, .ptr = .function };
+            inst.* = .{ .op = .{ .local_var = .{} }, .ty = inst.ty, .ptr = .function };
         } else any_dup = true;
     }
     defer retagPointers(f);
@@ -923,8 +923,8 @@ fn splitShallow(m: *ir.Module, f: *ir.Function) Error!bool {
         const ty = f.insts.items[i].ty;
         switch (t.get(ty)) {
             // (No local for a member holding only resources.)
-            .@"struct" => |st| for (st.fields.items) |fld| try members.append(a, if (noData(t, fld.type)) .none else try addInst(t, a, f, .{ .op = .local_var, .ty = fld.type, .ptr = .function })),
-            .array => |x| for (0..x.len) |_| try members.append(a, try addInst(t, a, f, .{ .op = .local_var, .ty = x.elem, .ptr = .function })),
+            .@"struct" => |st| for (st.fields.items) |fld| try members.append(a, if (noData(t, fld.type)) .none else try addInst(t, a, f, .{ .op = .{ .local_var = .{} }, .ty = fld.type, .ptr = .function })),
+            .array => |x| for (0..x.len) |_| try members.append(a, try addInst(t, a, f, .{ .op = .{ .local_var = .{} }, .ty = x.elem, .ptr = .function })),
             else => unreachable,
         }
     }
@@ -1051,7 +1051,7 @@ fn addLeaves(a: Allocator, f: *ir.Function, t: *TypeTable, ty: TypeId, out: *std
     switch (t.get(ty)) {
         .@"struct" => |st| for (st.fields.items) |fld| try addLeaves(a, f, t, fld.type, out),
         .array => |x| for (0..x.len) |_| try addLeaves(a, f, t, x.elem, out),
-        else => try out.append(a, try addInst(t, a, f, .{ .op = .local_var, .ty = ty, .ptr = .function })),
+        else => try out.append(a, try addInst(t, a, f, .{ .op = .{ .local_var = .{} }, .ty = ty, .ptr = .function })),
     }
 }
 

@@ -247,11 +247,13 @@ pub fn support(id: Id) Support {
         .help, ._help_question, ._help_hidden, ._version, .nologo => .implemented,
         // Optimization levels: recorded; zdxc's optimizer is simpler.
         .O0, .O1, .O2, .O3, .Od => .implemented,
+        // Floating point: IEEE strictness.
+        .Gis => .implemented,
         // zdxc signs its own output and has no separate validation step.
         .VD, .validator_version => .implemented,
 
         // Accepted for build-script compatibility; no effect yet.
-        .Gis, .Gfa, .Gfp, .Ges, .Gec, .denorm, .all_resources_bound, .all_resources_bound_, .res_may_alias, .res_may_alias_, .pack_optimized, .pack_optimized_, .pack_prefix_stable, .pack_prefix_stable_, .ffinite_math_only, .fno_finite_math_only, .flegacy_macro_expansion, .flegacy_resource_reservation, .no_legacy_cbuf_layout, .not_use_legacy_cbuf_load_, .enable_payload_qualifiers, .disable_payload_qualifiers, .enable_lifetime_markers, .disable_lifetime_markers, .force_zero_store_lifetimes, .ignore_line_directives, .Qunused_arguments, .fdiagnostics_show_option, .fno_diagnostics_show_option, .fdiagnostics_show_category_EQ, ._vi, .verbose, .v, .encoding, .Wall, .Wdeprecated, ._all_warnings, .Fh, .Vn, .Fsh, .Fre, .Zss, .Zsb, .Qstrip_reflect, .Qstrip_debug, .Qstrip_priv, .Qkeep_reflect_in_dxil, .Qstrip_reflect_from_dxil, .exports, .export_shaders_only, .default_linkage, .fspv_reduce_load_size, .fspv_fix_func_call_arguments, .fspv_preserve_bindings, .Oconfig => .ignored,
+        .Gfa, .Gfp, .Ges, .Gec, .denorm, .all_resources_bound, .all_resources_bound_, .res_may_alias, .res_may_alias_, .pack_optimized, .pack_optimized_, .pack_prefix_stable, .pack_prefix_stable_, .ffinite_math_only, .fno_finite_math_only, .flegacy_macro_expansion, .flegacy_resource_reservation, .no_legacy_cbuf_layout, .not_use_legacy_cbuf_load_, .enable_payload_qualifiers, .disable_payload_qualifiers, .enable_lifetime_markers, .disable_lifetime_markers, .force_zero_store_lifetimes, .ignore_line_directives, .Qunused_arguments, .fdiagnostics_show_option, .fno_diagnostics_show_option, .fdiagnostics_show_category_EQ, ._vi, .verbose, .v, .encoding, .Wall, .Wdeprecated, ._all_warnings, .Fh, .Vn, .Fsh, .Fre, .Zss, .Zsb, .Qstrip_reflect, .Qstrip_debug, .Qstrip_priv, .Qkeep_reflect_in_dxil, .Qstrip_reflect_from_dxil, .exports, .export_shaders_only, .default_linkage, .fspv_reduce_load_size, .fspv_fix_func_call_arguments, .fspv_preserve_bindings, .Oconfig => .ignored,
 
         // Dropped by design (see the zdxc plan).
         // Debug information: SPIR-V's, and line tables for DXIL.

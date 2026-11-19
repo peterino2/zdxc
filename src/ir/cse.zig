@@ -11,7 +11,8 @@
 //!
 //! Loads count only from constant buffers (nothing writes them). Wave,
 //! quad and derivative operations, whose results depend on which lanes
-//! run them, are never merged.
+//! run them, are never merged; nor are a `precise` instruction and one
+//! that is not.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -73,6 +74,10 @@ fn keyOf(a: Allocator, f: *const ir.Function, inst: ir.Inst) Allocator.Error!?[]
     try k.put(@intFromEnum(std.meta.activeTag(inst.op)));
     try k.put(inst.ty);
     try k.put(@intFromEnum(inst.ptr));
+    // A `precise` instruction is not one that is not (SPIR-V decorates
+    // only the precise one NoContraction; dxc's spirv-opt keeps them
+    // apart too).
+    try k.put(@intFromBool(inst.precise));
     switch (inst.op) {
         // (The emitter gives a global's pointer what it needs where it
         // meets it: one in a dominating block.)

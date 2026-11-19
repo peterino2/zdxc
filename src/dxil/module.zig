@@ -119,6 +119,24 @@ pub const Value = union(enum) {
     inst: u32,
 };
 
+/// LLVM 3.7's `fast` (UnsafeAlgebra with the four flags it implies): the
+/// fast-math flags dxc gives floating-point arithmetic that is not
+/// `precise`.
+pub const fast_math: u32 = 0x1f;
+
+/// Whether `inst` is written `fast`: floating-point arithmetic or an fcmp
+/// not marked `precise` (by dxil/precise.zig, which with -Gis marks
+/// everything). The default, as dxc's: a pass making floating-point
+/// arithmetic gets `fast` without asking for it.
+pub fn fastMath(m: *const Module, inst: Inst) bool {
+    return switch (inst.op) {
+        .binop => |b| !b.precise and m.isFloatType(inst.ty),
+        // (fcmp predicates are 0-15, icmp 32-41.)
+        .cmp => |c| !c.precise and c.pred <= 15,
+        else => false,
+    };
+}
+
 pub const BinOp = enum(u32) { add = 0, sub = 1, mul = 2, udiv = 3, sdiv = 4, urem = 5, srem = 6, shl = 7, lshr = 8, ashr = 9, @"and" = 10, @"or" = 11, xor = 12 };
 pub const RmwOp = enum(u32) { xchg = 0, add = 1, sub = 2, @"and" = 3, nand = 4, @"or" = 5, xor = 6, max = 7, min = 8, umax = 9, umin = 10 };
 
@@ -139,9 +157,13 @@ pub const Inst = struct {
         /// Case values are constants.
         @"switch": struct { cond: Value, default: u32, cases: []const struct { val: Value, block: u32 } },
         call: struct { callee: u32, args: []const Value },
-        binop: struct { op: BinOp, lhs: Value, rhs: Value, flags: u32 = 0 },
+        /// `precise`: in `precise` code (dxil/precise.zig), so written
+        /// without fast-math flags; floating-point arithmetic is otherwise
+        /// `fast` (fastMath). Part of the op, so a copy of it keeps it.
+        binop: struct { op: BinOp, lhs: Value, rhs: Value, precise: bool = false },
         cast: struct { op: CastOp, val: Value },
-        cmp: struct { pred: u32, lhs: Value, rhs: Value },
+        /// `precise`: as for binop (fcmp only).
+        cmp: struct { pred: u32, lhs: Value, rhs: Value, precise: bool = false },
         select: struct { cond: Value, t: Value, f: Value },
         extractvalue: struct { agg: Value, index: u32 },
         phi: struct { incoming: []const struct { val: Value, block: u32 } },
@@ -165,6 +187,20 @@ pub const Inst = struct {
     /// Where it came from: an index into Module.dbg_locs, from 1 (0:
     /// nowhere). Passes copy it with the instruction.
     dbg: u32 = 0,
+    /// What dxil/precise.zig starts from, set by the emitter.
+    precise: Precise = .{},
+};
+
+/// The emitter's marks for dxil/precise.zig (not written).
+pub const Precise = packed struct(u8) {
+    /// An alloca promote.run leaves in memory until precise.zig has run.
+    keep: bool = false,
+    /// On an alloca: a `precise` local (its stores are precise). On a
+    /// storeOutput or storePatchConstant call: a `precise` output.
+    root: bool = false,
+    /// A store (or output) of one lane of a vector value.
+    vector: bool = false,
+    _: u5 = 0,
 };
 
 /// Debug metadata (Module.dbg): written after the module's own, and only
@@ -288,6 +324,8 @@ pub const Module = struct {
     /// the whole variable), and the `i64 0` of llvm.dbg.value's calls.
     dbg_exprs: std.AutoHashMapUnmanaged([2]u32, DbgId) = .empty,
     dbg_zero: ?Value = null,
+    /// The `!dx.precise !{i32 1}` attachment, once one is made.
+    precise_md: InstMd = .none,
 
     /// The expression for a piece of a variable (null: all of it).
     pub fn dbgExpr(m: *Module, piece: ?[2]u32) !DbgId {
@@ -663,6 +701,27 @@ pub const Module = struct {
         try m.metadata.append(m.allocator(), .{ .distinct_node = try m.allocator().dupe(?MdId, &.{ self, hint }) });
         m.loop_dont_unroll = try m.instMd(try m.mdKind("llvm.loop"), self);
         return m.loop_dont_unroll;
+    }
+
+    /// The attachment dxc puts on floating-point dx.op calls in `precise`
+    /// code (all of them with -Gis): `!dx.precise !{i32 1}`.
+    pub fn preciseMd(m: *Module) !InstMd {
+        if (m.precise_md != .none) return m.precise_md;
+        const node = try m.mdNode(&.{try m.mdI32(1)});
+        m.precise_md = try m.instMd(try m.mdKind("dx.precise"), node);
+        return m.precise_md;
+    }
+
+    /// Whether `ty` is (a vector of) half, float or double.
+    pub fn isFloatType(m: *const Module, ty: TypeId) bool {
+        return switch (m.types.items[ty]) {
+            .half, .float, .double => true,
+            .vector => |v| switch (m.types.items[v.elem]) {
+                .half, .float, .double => true,
+                else => false,
+            },
+            else => false,
+        };
     }
 
     /// The id of an instruction metadata kind.
@@ -1312,19 +1371,7 @@ const Encoder = struct {
                     try e.pushValueAndType(f, inst_id, b.lhs);
                     try e.pushValue(f, inst_id, b.rhs);
                     try e.push(@backingInt(b.op));
-                    // EXPERIMENT: every floating-point binop is `fast`
-                    // (LLVM 3.7's UnsafeAlgebra with the four flags it
-                    // implies), as dxc marks code that is not `precise`.
-                    const fp = switch (e.m.types.items[inst.ty]) {
-                        .half, .float, .double => true,
-                        .vector => |v| switch (e.m.types.items[v.elem]) {
-                            .half, .float, .double => true,
-                            else => false,
-                        },
-                        else => false,
-                    };
-                    const flags = if (b.flags != 0) b.flags else if (fp) @as(u32, 0x1f) else 0;
-                    if (flags != 0) try e.push(flags);
+                    if (fastMath(e.m, inst)) try e.push(fast_math);
                     try e.rec(2);
                 },
                 .cast => |c| {
@@ -1337,6 +1384,7 @@ const Encoder = struct {
                     try e.pushValueAndType(f, inst_id, c.lhs);
                     try e.pushValue(f, inst_id, c.rhs);
                     try e.push(c.pred);
+                    if (fastMath(e.m, inst)) try e.push(fast_math);
                     try e.rec(28);
                 },
                 .select => |s| {
