@@ -233,7 +233,7 @@ const not_yet = "not supported by zdxc yet";
 pub fn support(id: Id) Support {
     return switch (id) {
         // Core compilation.
-        .target_profile, .entrypoint, .Fo, .D, .I, .P, .Fi, .hlsl_version, .spirv, .enable_16bit_types, .fspv_target_env_EQ, .Zpr, .Zpc => .implemented,
+        .target_profile, .entrypoint, .Fo, .D, .I, .P, .Fi, .dump_dependencies, .write_dependencies, .write_dependencies_to, .hlsl_version, .spirv, .enable_16bit_types, .fspv_target_env_EQ, .Zpr, .Zpc => .implemented,
         .Frs, .Qstrip_rootsignature, .force_rootsig_ver, .force_rootsig_ver_, .rootsig_define => .implemented,
         .auto_binding_space, .fvk_b_shift, .fvk_t_shift, .fvk_s_shift, .fvk_u_shift, .fvk_bind_globals, .fvk_bind_register, .vkbr, .fvk_auto_shift_bindings, .fvk_stage_io_order_EQ, .fspv_flatten_resource_arrays, .fspv_use_legacy_buffer_matrix_order, .fspv_preserve_interface, .fspv_use_vulkan_memory_model, .fvk_invert_y, .fvk_use_dx_position_w, .fvk_use_gl_layout, .fvk_use_dx_layout, .fvk_use_scalar_layout, .fvk_support_nonzero_base_instance, .fvk_support_nonzero_base_vertex, .fspv_entrypoint_name_EQ, .fspv_enable_maximal_reconvergence, .fspv_use_unknown_image_format, .fspv_extension_EQ, .fspv_reflect => .implemented,
         // Epic's DXC fork (Unreal's ShaderConductor).

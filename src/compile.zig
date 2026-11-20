@@ -54,6 +54,10 @@ pub const Status = enum(u8) {
     compile_failed = 5,
 };
 
+/// A file the input depends on: `path` as read, or for an include that
+/// was not found (`missing`), as spelled.
+pub const Dependency = front.preproc.Dependency;
+
 pub const Result = struct {
     status: Status = .ok,
     /// The DXIL container or SPIR-V module, and its -Fo name.
@@ -71,6 +75,21 @@ pub const Result = struct {
     /// Preprocessed source (-P) and its -Fi name.
     preprocessed: ?[]const u8 = null,
     preprocessed_name: ?[]const u8 = null,
+    /// The files the compilation depends on: the main file first, then
+    /// each #include once, in the order first included (with any leading
+    /// "./" removed); the same list as -M's rule. An include that was not
+    /// found is listed as spelled, with `missing` set, so a watcher can
+    /// rebuild when it appears. Compiled-in headers are not files and are
+    /// left out. Filled whenever the input was preprocessed, also after
+    /// errors, so a build that failed still knows which files to watch.
+    dependencies: []const Dependency = &.{},
+    /// -M, -MD, -MF: the dependencies as a make rule (as dxc writes it),
+    /// and its -MF / -MD name; with -M alone, no name (the command line
+    /// prints it). These options preprocess only: there is no object. As in
+    /// dxc, includes that were not found are listed as spelled, and the
+    /// rule is given after preprocessing errors too (status compile_failed).
+    dependency_rule: ?[]const u8 = null,
+    dependency_rule_name: ?[]const u8 = null,
     /// Errors, warnings and notes: what the command line prints on stderr.
     diagnostics: []const u8 = "",
     /// Other text the command line prints on stdout (-help, dumps).
@@ -180,6 +199,11 @@ const Options = struct {
     target_env: []const u8 = "vulkan1.0",
     preprocess: bool = false,
     pp_output: ?[]const u8 = null,
+    /// -M (or -MD / -MF, which imply it): list the dependencies instead of
+    /// compiling. -MD names the list after the input, -MF names it.
+    dump_deps: bool = false,
+    write_deps: bool = false,
+    deps_output: ?[]const u8 = null,
     enable_16bit: bool = false,
     /// -HV: 2021, or 2016-2018 (component-wise `&&`, `||` and `?:`).
     hlsl_version: u16 = 2021,
@@ -282,6 +306,15 @@ fn parseArgs(ctx: *Ctx, arena: std.mem.Allocator, args: []const []const u8) !?Op
                         opts.hlsl_version = n;
                     },
                     .P => opts.preprocess = true,
+                    .dump_dependencies => opts.dump_deps = true,
+                    .write_dependencies => {
+                        opts.dump_deps = true;
+                        opts.write_deps = true;
+                    },
+                    .write_dependencies_to => {
+                        opts.dump_deps = true;
+                        opts.deps_output = v;
+                    },
                     .spirv => opts.spirv = true,
                     .fspv_target_env_EQ => opts.target_env = v,
                     .enable_16bit_types => opts.enable_16bit = true,
@@ -489,116 +522,98 @@ fn run(ctx: *Ctx, arena: std.mem.Allocator) !void {
         return;
     }
 
-    // Root signature targets: the root signature in the macro -E names.
-    if (opts.profile) |p| if (std.mem.eql(u8, p, "rootsig_1_0") or std.mem.eql(u8, p, "rootsig_1_1")) {
-        const input = opts.input orelse return ctx.fail("no input file", .{});
-        try ctx.needOutput(opts);
-        const version: zdxc.dxil.rootsig.Version = if (std.mem.eql(u8, p, "rootsig_1_0")) .v1_0 else .v1_1;
-        const blob = try compileRootSignatureMacro(ctx, arena, opts, input, opts.entry, version, .none) orelse return error.CompileFailed;
-        ctx.result.object = try rootSignatureContainer(arena, blob);
-        return;
-    };
+    const target = try Target.parse(ctx, opts.profile);
 
-    const profile: ?shader.Profile = if (opts.profile) |p|
-        shader.Profile.parse(p) orelse return ctx.fail("unknown profile '{s}'", .{p})
-    else
-        null;
+    // -P, -M / -MD / -MF: preprocess only, for any target (as dxc).
+    if (opts.preprocess or opts.dump_deps) return preprocessOnly(ctx, arena, opts, target);
+
+    const profile: ?shader.Profile = switch (target) {
+        .none => null,
+        .shader => |p| p,
+        .root_signature => |v| return compileRootSignatureTarget(ctx, arena, opts, v),
+    };
 
     // The front end: everything except the development modes that work on
     // containers or raw tokens.
     if (!opts.empty) {
         const input = opts.input orelse return ctx.fail("no input file", .{});
-        var sm = front.source.SourceManager.init(arena, ctx.fs);
-        var diags = zdxc.Diagnostics.init(arena);
-        diags.warnings_as_errors = opts.warnings_as_errors;
-        diags.suppress_warnings = opts.no_warnings;
-        diags.error_limit = opts.error_limit;
-        for (opts.disabled_warnings.items) |g| try diags.disableGroup(g);
-        var pp = front.preproc.Preprocessor.init(arena, &sm, &diags, .{
-            .defines = opts.defines.items,
-            .include_dirs = opts.include_dirs.items,
-            .stage = if (profile) |p| @backingInt(p.kind) else 5,
-            .major = if (profile) |p| p.major else 6,
-            .minor = if (profile) |p| p.minor else 0,
-            .spirv = opts.spirv,
-            .spirv_minor = if (zdxc.spirv.emit.TargetEnv.parse(opts.target_env)) |t| t.minor else 0,
-            .enable_16bit = opts.enable_16bit,
-            .hlsl_version = opts.hlsl_version,
-            .preprocess_only = opts.preprocess,
-        });
-        var out: Io.Writer.Allocating = .init(arena);
+        const fe = try FrontEnd.create(ctx, arena, opts, target, .{});
+        const sm = &fe.sm;
+        const diags = &fe.diags;
+        const pp = &fe.pp;
         var module: ?zdxc.ir.ir.Module = null;
+        // -rootsig-define: the macro's root signature text, if any.
+        var define_rootsig: ?[]const u8 = null;
         const zp = stats.begin(.preprocess);
         const opened = try pp.enterMainFile(input);
         if (opened) {
-            if (opts.preprocess) {
-                try front.pp_print.print(&pp, &out.writer);
-                zp.end();
-            } else {
-                var parser = try front.parser.Parser.fromPreprocessor(arena, &diags, &pp);
-                zp.end();
-                const zparse = stats.begin(.parse);
-                const tu = try parser.parseTranslationUnit();
-                zparse.end();
-                if (opts.dump_ast) try front.ast_dump.dumpUnit(ctx.stdout, tu);
-                if (!opts.parse) {
-                    const is_lib = if (profile) |p| p.kind == .library else true;
-                    var sema = try zdxc.sema.Sema.init(arena, &diags, .{
-                        .entry = if (opts.sema or is_lib) null else opts.entry,
-                        .spirv = opts.spirv,
-                        .enable_16bit = opts.enable_16bit,
-                        .hlsl_version = opts.hlsl_version,
-                        .sm_minor = if (profile) |p| p.minor else 10,
-                        .library = is_lib,
-                        .root = opts.entry,
-                        .row_major = opts.row_major,
-                    });
-                    // About one resolution per expression: reserve rather
-                    // than grow, which leaves every old buffer in the arena.
-                    const zs = stats.begin(.sema);
-                    try sema.resolutions.ensureTotalCapacity(arena, parser.toks.len);
-                    try sema.checkUnit(tu);
-                    zs.end();
-                    if (!opts.sema and !diags.hasErrors() and profile != null) {
-                        const stage: zdxc.ir.ir.Stage = switch (profile.?.kind) {
-                            .vertex => .vertex,
-                            .pixel => .pixel,
-                            .geometry => .geometry,
-                            .hull => .hull,
-                            .domain => .domain,
-                            .compute => .compute,
-                            .mesh => .mesh,
-                            .amplification => .amplification,
-                            else => .library,
-                        };
-                        const zl = stats.begin(.lower);
-                        module = zdxc.ir.lower.lowerUnit(arena, &sema, .{ .entry = opts.entry, .stage = stage, .debug = opts.debug }) catch |e| switch (e) {
-                            error.Unsupported => null,
-                            else => |x| return x,
-                        };
-                        zl.end();
-                        if (module) |*mm| {
-                            mm.native_16bit = opts.enable_16bit;
-                            mm.row_major = opts.row_major;
-                            mm.vk = opts.vk;
-                            mm.strip_rootsig = opts.strip_rootsig;
-                            if (opts.rootsig_ver) |rv| {
-                                if (std.mem.eql(u8, rv, "rootsig_1_0")) mm.rootsig_version = .v1_0 else if (!std.mem.eql(u8, rv, "rootsig_1_1")) return ctx.fail("unknown root signature version '{s}'", .{rv});
-                            }
+            var parser = try front.parser.Parser.fromPreprocessor(arena, diags, pp);
+            zp.end();
+            // The parser has read the whole input.
+            ctx.result.dependencies = try dependencyList(arena, pp.deps.items);
+            // -rootsig-define: the macro as defined at the end of the input
+            // (not defined, or #undef'd: no root signature from it, as dxc).
+            // SPIR-V has no root signature: dxc ignores the option there.
+            if (opts.rootsig_define) |macro| if (!opts.spirv) {
+                define_rootsig = try rootSignatureMacroText(arena, pp, macro, false);
+            };
+            const zparse = stats.begin(.parse);
+            const tu = try parser.parseTranslationUnit();
+            zparse.end();
+            if (opts.dump_ast) try front.ast_dump.dumpUnit(ctx.stdout, tu);
+            if (!opts.parse) {
+                const is_lib = if (profile) |p| p.kind == .library else true;
+                var sema = try zdxc.sema.Sema.init(arena, diags, .{
+                    .entry = if (opts.sema or is_lib) null else opts.entry,
+                    .spirv = opts.spirv,
+                    .enable_16bit = opts.enable_16bit,
+                    .hlsl_version = opts.hlsl_version,
+                    .sm_minor = if (profile) |p| p.minor else 10,
+                    .library = is_lib,
+                    .root = opts.entry,
+                    .row_major = opts.row_major,
+                });
+                // About one resolution per expression: reserve rather
+                // than grow, which leaves every old buffer in the arena.
+                const zs = stats.begin(.sema);
+                try sema.resolutions.ensureTotalCapacity(arena, parser.toks.len);
+                try sema.checkUnit(tu);
+                zs.end();
+                if (!opts.sema and !diags.hasErrors() and profile != null) {
+                    const stage: zdxc.ir.ir.Stage = switch (profile.?.kind) {
+                        .vertex => .vertex,
+                        .pixel => .pixel,
+                        .geometry => .geometry,
+                        .hull => .hull,
+                        .domain => .domain,
+                        .compute => .compute,
+                        .mesh => .mesh,
+                        .amplification => .amplification,
+                        else => .library,
+                    };
+                    const zl = stats.begin(.lower);
+                    module = zdxc.ir.lower.lowerUnit(arena, &sema, .{ .entry = opts.entry, .stage = stage, .debug = opts.debug }) catch |e| switch (e) {
+                        error.Unsupported => null,
+                        else => |x| return x,
+                    };
+                    zl.end();
+                    if (module) |*mm| {
+                        mm.native_16bit = opts.enable_16bit;
+                        mm.row_major = opts.row_major;
+                        mm.vk = opts.vk;
+                        mm.strip_rootsig = opts.strip_rootsig;
+                        if (opts.rootsig_ver) |rv| {
+                            const v = rootSignatureVersion(rv) orelse return ctx.fail("unknown root signature version '{s}'", .{rv});
+                            if (v == .v1_0) mm.rootsig_version = .v1_0;
                         }
                     }
                 }
             }
         }
-        const color = opts.color orelse ctx.req.color;
-        try diags.render(&sm, ctx.stderr, .{ .format = opts.diag_format, .color = color, .unplaced = if (ctx.req.place_unplaced) opts.input else null });
+        try fe.render(ctx, opts);
         // An unreadable input is an I/O error, as in dxc.
         if (!opened) return error.Fatal;
         if (diags.hasErrors()) return error.CompileFailed;
-        if (opts.preprocess) {
-            ctx.result.preprocessed = out.written();
-            return;
-        }
         if (opts.parse or opts.sema) return;
         if (profile == null) return ctx.fail("missing -T <profile>", .{});
         if (module) |*m| {
@@ -611,9 +626,9 @@ fn run(ctx: *Ctx, arena: std.mem.Allocator) !void {
             defer if (opts.spirv) zv.end();
             if (opts.spirv) {
                 try zdxc.ir.inline_calls.runResourceReturns(m);
-                zdxc.ir.split_resources.run(arena, m, &diags) catch |err| switch (err) {
+                zdxc.ir.split_resources.run(arena, m, diags) catch |err| switch (err) {
                     error.Unsupported => {
-                        try diags.render(&sm, ctx.stderr, .{ .format = opts.diag_format, .color = false, .unplaced = if (ctx.req.place_unplaced) opts.input else null });
+                        try diags.render(sm, ctx.stderr, .{ .format = opts.diag_format, .color = false, .unplaced = if (ctx.req.place_unplaced) opts.input else null });
                         return error.CompileFailed;
                     },
                     else => |x| return x,
@@ -627,12 +642,12 @@ fn run(ctx: *Ctx, arena: std.mem.Allocator) !void {
                 zdxc.ir.ir.verify(m);
             }
             if (opts.dump_ir) {
-                try zdxc.ir.ir.dumpWith(m, ctx.stdout, if (m.debug != .none) &sm else null);
+                try zdxc.ir.ir.dumpWith(m, ctx.stdout, if (m.debug != .none) sm else null);
                 return;
             }
             if (opts.spirv) {
                 const dbg: ?zdxc.spirv.emit.Debug = if (opts.spv_debug) |d| .{
-                    .sm = &sm,
+                    .sm = sm,
                     .main_file = pp.main_file.?,
                     .file = d.file,
                     .text = d.source,
@@ -642,9 +657,9 @@ fn run(ctx: *Ctx, arena: std.mem.Allocator) !void {
                     .signature = "zdxc " ++ zdxc.version,
                     .args = if (d.rich) try std.mem.join(arena, " ", ctx.req.args) else "",
                 } else null;
-                const bytes = zdxc.spirv.emit.emitDebug(arena, m, &diags, zdxc.spirv.emit.TargetEnv.parse(opts.target_env) orelse return ctx.fail("unknown SPIR-V target environment '{s}'", .{opts.target_env}), dbg) catch |err| switch (err) {
+                const bytes = zdxc.spirv.emit.emitDebug(arena, m, diags, zdxc.spirv.emit.TargetEnv.parse(opts.target_env) orelse return ctx.fail("unknown SPIR-V target environment '{s}'", .{opts.target_env}), dbg) catch |err| switch (err) {
                     error.Unsupported => {
-                        try diags.render(&sm, ctx.stderr, .{ .format = opts.diag_format, .color = false, .unplaced = if (ctx.req.place_unplaced) opts.input else null });
+                        try diags.render(sm, ctx.stderr, .{ .format = opts.diag_format, .color = false, .unplaced = if (ctx.req.place_unplaced) opts.input else null });
                         return error.CompileFailed;
                     },
                     else => |x| return x,
@@ -654,11 +669,8 @@ fn run(ctx: *Ctx, arena: std.mem.Allocator) !void {
                 return;
             }
             // -rootsig-define: the macro's root signature for the entry.
-            if (opts.rootsig_define) |macro| if (m.entries.items.len == 1) {
-                // (Not defined, or #undef'd, at the end of the file: no
-                // root signature from it, as dxc.)
-                const text = try rootSignatureMacroText(ctx, arena, opts, input, macro, false) orelse return error.CompileFailed;
-                if (text.len > 0) m.entries.items[0].root_signature = text;
+            if (define_rootsig) |text| if (m.entries.items.len == 1 and text.len > 0) {
+                m.entries.items[0].root_signature = text;
             };
             if (zdxc.dxil.exp.cur.wave != 0 and profile.?.minor >= 6) for (m.entries.items) |*en| {
                 if (en.stage == .compute and en.wave_size[0] == 0) en.wave_size = .{ zdxc.dxil.exp.cur.wave, 0, 0 };
@@ -667,7 +679,7 @@ fn run(ctx: *Ctx, arena: std.mem.Allocator) !void {
             // -Zi: the debug module goes into the PDB (-Fd) or, with
             // -Qembed_debug or no -Fd, into the container (as dxc).
             const dxil_dbg: ?zdxc.dxil.emit.Debug = if (opts.zi) .{
-                .sm = &sm,
+                .sm = sm,
                 .main_file = pp.main_file.?,
                 .args = ctx.req.args,
                 .producer = "zdxc " ++ zdxc.version,
@@ -675,9 +687,9 @@ fn run(ctx: *Ctx, arena: std.mem.Allocator) !void {
                 .pdb = opts.pdb_output != null,
                 .pdb_name = opts.pdb_output,
             } else null;
-            const dxil_out = zdxc.dxil.emit.emitDebug(arena, m, profile.?, &diags, if (opts.no_opt) .none else if (opts.opt_level == .od) .debug else .full, dxil_dbg) catch |err| switch (err) {
+            const dxil_out = zdxc.dxil.emit.emitDebug(arena, m, profile.?, diags, if (opts.no_opt) .none else if (opts.opt_level == .od) .debug else .full, dxil_dbg) catch |err| switch (err) {
                 error.Unsupported => {
-                    try diags.render(&sm, ctx.stderr, .{ .format = opts.diag_format, .color = false, .unplaced = if (ctx.req.place_unplaced) opts.input else null });
+                    try diags.render(sm, ctx.stderr, .{ .format = opts.diag_format, .color = false, .unplaced = if (ctx.req.place_unplaced) opts.input else null });
                     return error.CompileFailed;
                 },
                 else => |x| return x,
@@ -712,58 +724,353 @@ fn run(ctx: *Ctx, arena: std.mem.Allocator) !void {
     ctx.result.object = bytes;
 }
 
-/// The text of the root signature macro `macro` defines in `input` (its
-/// string literals concatenated), or null after reporting an error. A
-/// macro not defined at the end of `input` is an error when `required`,
-/// else empty text.
-fn rootSignatureMacroText(ctx: *Ctx, arena: std.mem.Allocator, opts: Options, input: []const u8, macro: []const u8, required: bool) !?[]const u8 {
-    const text = try ctx.read(arena, input);
-    var sm = front.source.SourceManager.init(arena, ctx.fs);
-    var diags = zdxc.Diagnostics.init(arena);
-    var pp = front.preproc.Preprocessor.init(arena, &sm, &diags, .{
-        .defines = opts.defines.items,
-        .include_dirs = opts.include_dirs.items,
-        .stage = 6,
-    });
-    // Expand the macro after a marker at the end of the file.
-    const marker = "__zdxc_root_signature__";
-    try pp.enterMainText(input, try std.mem.concat(arena, u8, &.{ text, "\n" ++ marker ++ " ", macro, "\n" }));
-    var parts: std.ArrayList(u8) = .empty;
-    var seen = false;
-    var any = false;
-    while (true) {
-        const t = try pp.next();
-        if (t.kind == .eof) break;
-        if (!seen) {
-            seen = t.kind == .identifier and std.mem.eql(u8, t.text, marker);
-            continue;
-        }
-        if (!any and !required and t.kind == .identifier and std.mem.eql(u8, t.text, macro)) return "";
-        if (t.kind != .string) {
-            _ = diags.report(.{ .severity = .@"error", .loc = t.loc }, "root signature macro '{s}' must expand to string literals", .{macro});
-            break;
-        }
-        any = true;
-        try parts.appendSlice(arena, try zdxc.ir.lower.stringContents(arena, t.text));
+/// What -T names.
+const Target = union(enum) {
+    /// No -T (allowed for -P and the development modes).
+    none,
+    shader: shader.Profile,
+    /// rootsig_1_0, rootsig_1_1: the root signature in the macro -E names.
+    root_signature: zdxc.dxil.rootsig.Version,
+
+    fn parse(ctx: *Ctx, profile: ?[]const u8) !Target {
+        const p = profile orelse return .none;
+        if (rootSignatureVersion(p)) |v| return .{ .root_signature = v };
+        return .{ .shader = shader.Profile.parse(p) orelse return ctx.fail("unknown profile '{s}'", .{p}) };
     }
-    if (!any and !diags.hasErrors()) _ = diags.report(.{ .severity = .@"error", .loc = .none }, "root signature macro '{s}' is not defined", .{macro});
-    if (diags.hasErrors()) {
-        try diags.render(&sm, ctx.stderr, .{ .format = opts.diag_format, .color = false, .unplaced = if (ctx.req.place_unplaced) opts.input else null });
+};
+
+/// rootsig_1_0 or rootsig_1_1 (-T, -force-rootsig-ver).
+fn rootSignatureVersion(name: []const u8) ?zdxc.dxil.rootsig.Version {
+    if (std.mem.eql(u8, name, "rootsig_1_0")) return .v1_0;
+    if (std.mem.eql(u8, name, "rootsig_1_1")) return .v1_1;
+    return null;
+}
+
+/// The preprocessor, with its source manager and diagnostics, set up from
+/// the options: the one front end of compiling, -P / -M, and root
+/// signature targets.
+const FrontEnd = struct {
+    sm: front.source.SourceManager,
+    diags: zdxc.Diagnostics,
+    pp: front.preproc.Preprocessor,
+
+    const Mode = struct {
+        /// -P, -M: see front.preproc.Options.
+        preprocess_only: bool = false,
+        keep_going: bool = false,
+    };
+
+    /// In `arena`: the preprocessor points at the others.
+    fn create(ctx: *Ctx, arena: std.mem.Allocator, opts: Options, target: Target, mode: Mode) !*FrontEnd {
+        const fe = try arena.create(FrontEnd);
+        fe.sm = .init(arena, ctx.fs);
+        fe.diags = .init(arena);
+        fe.diags.warnings_as_errors = opts.warnings_as_errors;
+        fe.diags.suppress_warnings = opts.no_warnings;
+        fe.diags.error_limit = opts.error_limit;
+        for (opts.disabled_warnings.items) |g| try fe.diags.disableGroup(g);
+        // dxc's __SHADER_TARGET_STAGE / _MAJOR / _MINOR: a root signature
+        // target is no shader kind (DXIL::ShaderKind::Invalid) and 0.0;
+        // without -T, cs_6_0.
+        const st: struct { u32, u32, u32 } = switch (target) {
+            .none => .{ 5, 6, 0 },
+            .shader => |p| .{ @backingInt(p.kind), p.major, p.minor },
+            .root_signature => .{ 16, 0, 0 },
+        };
+        fe.pp = .init(arena, &fe.sm, &fe.diags, .{
+            .defines = opts.defines.items,
+            .include_dirs = opts.include_dirs.items,
+            .stage = st[0],
+            .major = st[1],
+            .minor = st[2],
+            .spirv = opts.spirv,
+            .spirv_minor = if (zdxc.spirv.emit.TargetEnv.parse(opts.target_env)) |t| t.minor else 0,
+            .enable_16bit = opts.enable_16bit,
+            .hlsl_version = opts.hlsl_version,
+            .preprocess_only = mode.preprocess_only,
+            .keep_going = mode.keep_going,
+        });
+        return fe;
+    }
+
+    /// Prints the diagnostics so far.
+    fn render(fe: *FrontEnd, ctx: *Ctx, opts: Options) !void {
+        try fe.diags.render(&fe.sm, ctx.stderr, .{ .format = opts.diag_format, .color = opts.color orelse ctx.req.color, .unplaced = if (ctx.req.place_unplaced) opts.input else null });
+    }
+};
+
+/// -P, -M / -MD / -MF: preprocess only (-P wins). -P gives the
+/// preprocessed source; -M the files the input reads, as dxc's make rule:
+///
+///     <-Fo name, else the input>: main.hlsl \
+///      inc/a.hlsli \
+///      inc/b.hlsli
+///
+/// As in dxc, -M preprocesses on after an error (a missing include is
+/// listed as spelled), and the rule is given even when it fails.
+fn preprocessOnly(ctx: *Ctx, arena: std.mem.Allocator, opts: Options, target: Target) !void {
+    const input = opts.input orelse return ctx.fail("no input file", .{});
+    const dump_deps = !opts.preprocess;
+    // -M needs a target, as in dxc.
+    if (dump_deps and target == .none) return ctx.fail("missing -T <profile>", .{});
+    const fe = try FrontEnd.create(ctx, arena, opts, target, .{ .preprocess_only = true, .keep_going = dump_deps });
+    var out: Io.Writer.Allocating = .init(arena);
+    const zp = stats.begin(.preprocess);
+    const opened = try fe.pp.enterMainFile(input);
+    if (opened) {
+        if (dump_deps) {
+            while ((try fe.pp.next()).kind != .eof) {}
+        } else try front.pp_print.print(&fe.pp, &out.writer);
+    }
+    zp.end();
+    ctx.result.dependencies = try dependencyList(arena, fe.pp.deps.items);
+    try fe.render(ctx, opts);
+    // An unreadable input is an I/O error, as in dxc.
+    if (!opened) return error.Fatal;
+    if (dump_deps) {
+        var rule: Io.Writer.Allocating = .init(arena);
+        try rule.writer.writeAll(opts.output orelse input);
+        for (ctx.result.dependencies, 0..) |d, i| try rule.writer.print("{s}{s}", .{ if (i == 0) ": " else " \\\n ", d.path });
+        try rule.writer.writeByte('\n');
+        ctx.result.dependency_rule = rule.written();
+        ctx.result.dependency_rule_name = opts.deps_output orelse if (opts.write_deps) try depFileName(arena, input) else null;
+    } else if (!fe.diags.hasErrors()) ctx.result.preprocessed = out.written();
+    if (fe.diags.hasErrors()) return error.CompileFailed;
+}
+
+/// -T rootsig_1_x: the root signature the macro -E names, alone in a
+/// container.
+fn compileRootSignatureTarget(ctx: *Ctx, arena: std.mem.Allocator, opts: Options, version: zdxc.dxil.rootsig.Version) !void {
+    const input = opts.input orelse return ctx.fail("no input file", .{});
+    try ctx.needOutput(opts);
+    const fe = try FrontEnd.create(ctx, arena, opts, .{ .root_signature = version }, .{});
+    const opened = try fe.pp.enterMainFile(input);
+    const text = if (opened) try rootSignatureMacroText(arena, &fe.pp, opts.entry, true) else null;
+    ctx.result.dependencies = try dependencyList(arena, fe.pp.deps.items);
+    try fe.render(ctx, opts);
+    if (!opened) return error.Fatal;
+    var d: zdxc.dxil.rootsig.Diagnostic = .{};
+    const blob = try zdxc.dxil.rootsig.compileWithOptions(arena, text orelse return error.CompileFailed, .{ .version = version, .flags = .none }, &d) orelse {
+        try ctx.stderr.print("{s}: error: root signature error - {s}\n", .{ input, d.message() });
+        return error.CompileFailed;
+    };
+    ctx.result.object = try rootSignatureContainer(arena, blob);
+}
+
+/// The text of the root signature macro `macro` as defined at the end of
+/// the input (its string literals concatenated), reading the rest of the
+/// input first; or null after reporting an error, or when the input has
+/// errors. A macro not defined there is an error when `required`, else
+/// empty text.
+fn rootSignatureMacroText(arena: std.mem.Allocator, pp: *front.preproc.Preprocessor, macro: []const u8, required: bool) !?[]const u8 {
+    while ((try pp.next()).kind != .eof) {}
+    if (pp.diags.hasErrors()) return null;
+    const toks = try pp.expandAtEnd(macro);
+    if (toks.len == 0) {
+        _ = pp.diags.report(.{ .severity = .@"error", .loc = .none }, "root signature macro '{s}' is not defined", .{macro});
         return null;
+    }
+    if (!required and toks[0].isIdent(macro)) return "";
+    var parts: std.ArrayList(u8) = .empty;
+    for (toks) |t| {
+        if (t.kind != .string) {
+            // At the macro's #define, as dxc reports root signature errors.
+            _ = pp.diags.report(.{ .severity = .@"error", .loc = pp.macroLoc(macro), .len = @intCast(macro.len) }, "root signature macro '{s}' must expand to string literals", .{macro});
+            return null;
+        }
+        try parts.appendSlice(arena, try zdxc.ir.lower.stringContents(arena, t.text));
     }
     return parts.items;
 }
 
-fn compileRootSignatureMacro(ctx: *Ctx, arena: std.mem.Allocator, opts: Options, input: []const u8, macro: []const u8, version: zdxc.dxil.rootsig.Version, flags: zdxc.dxil.rootsig.CompilationFlags) !?[]const u8 {
-    const text = try rootSignatureMacroText(ctx, arena, opts, input, macro, true) orelse return null;
-    var d: zdxc.dxil.rootsig.Diagnostic = .{};
-    return try zdxc.dxil.rootsig.compileWithOptions(arena, text, .{ .version = version, .flags = flags }, &d) orelse {
-        try ctx.stderr.print("{s}: error: root signature error - {s}\n", .{ input, d.message() });
-        return null;
-    };
+/// -MD's file, named as dxc names it: everything before the last '.' in
+/// the input path (even one in a directory name), then ".d".
+fn depFileName(arena: std.mem.Allocator, input: []const u8) ![]const u8 {
+    const stem = if (std.mem.lastIndexOfScalar(u8, input, '.')) |dot| input[0..dot] else input;
+    return std.mem.concat(arena, u8, &.{ stem, ".d" });
+}
+
+/// `deps` each once, without a leading "./" (as clang's dependency
+/// collector, which dxc uses).
+fn dependencyList(arena: std.mem.Allocator, deps: []const Dependency) ![]const Dependency {
+    var list: std.ArrayList(Dependency) = .empty;
+    var seen: std.StringHashMapUnmanaged(void) = .empty;
+    for (deps) |d| {
+        const p = stripDotSlash(d.path);
+        // (The paths live in the source manager or the preprocessor's
+        // arena, as long as the result.)
+        if ((try seen.getOrPut(arena, p)).found_existing) continue;
+        try list.append(arena, .{ .path = p, .missing = d.missing });
+    }
+    return list.items;
+}
+
+fn stripDotSlash(path: []const u8) []const u8 {
+    var p = path;
+    while (p.len >= 2 and p[0] == '.' and std.fs.path.isSep(p[1])) {
+        p = p[2..];
+        while (p.len > 0 and std.fs.path.isSep(p[0])) p = p[1..];
+    }
+    return p;
 }
 
 /// A container holding only the root signature (RTS0) part.
 fn rootSignatureContainer(arena: std.mem.Allocator, blob: []const u8) ![]u8 {
     return zdxc.dxil.container.assemble(arena, &.{.{ .fourcc = zdxc.dxil.container.fourcc("RTS0"), .data = blob }});
+}
+
+const DepTest = struct {
+    arena: std.heap.ArenaAllocator = .init(std.testing.allocator),
+    mfs: front.source.MemoryFs = .{},
+    threaded: Io.Threaded = .init_single_threaded,
+
+    fn deinit(t: *DepTest) void {
+        t.arena.deinit();
+    }
+
+    fn compile_(t: *DepTest, args: []const []const u8, source: ?[]const u8) !Result {
+        const a = t.arena.allocator();
+        // (MemoryFs holds the quoted-include spelling: "./" + name.)
+        try t.mfs.put(a, "./local.h", "#define LA 1\n");
+        try t.mfs.put(a, "inc/common.hlsli", "#ifndef COMMON\n#define COMMON\n#include \"sub/deep.h\"\n#endif\n");
+        try t.mfs.put(a, "inc/sub/deep.h", "#define LB 2\n");
+        try t.mfs.put(a, "main.hlsl",
+            \\#include "local.h"
+            \\#include "common.hlsli"
+            \\#include "common.hlsli"
+            \\#include <dx/linalg.h>
+            \\float4 main() : SV_Target { return LA + LB; }
+            \\
+        );
+        return compile(a, .{ .args = args, .source = source, .fs = t.mfs.fileSystem(), .io = t.threaded.io(), .compat_notes = false });
+    }
+
+    /// The paths, a missing one as "missing:<spelling>".
+    fn paths(t: *DepTest, deps: []const Dependency) ![]const []const u8 {
+        const a = t.arena.allocator();
+        const out = try a.alloc([]const u8, deps.len);
+        for (out, deps) |*o, d| o.* = if (d.missing) try std.mem.concat(a, u8, &.{ "missing:", d.path }) else d.path;
+        return out;
+    }
+};
+
+const expected_deps: []const []const u8 = &.{ "main.hlsl", "local.h", "inc/common.hlsli", "inc/sub/deep.h" };
+
+test "a compilation lists the files it read" {
+    var t: DepTest = .{};
+    defer t.deinit();
+    const r = try t.compile_(&.{ "-T", "ps_6_0", "-I", "inc", "main.hlsl" }, null);
+    try std.testing.expectEqual(Status.ok, r.status);
+    try std.testing.expect(r.object != null);
+    try std.testing.expect(r.dependency_rule == null);
+    try std.testing.expectEqualDeep(expected_deps, try t.paths(r.dependencies));
+}
+
+test "dependencies with in-memory source and after a compile error" {
+    var t: DepTest = .{};
+    defer t.deinit();
+    const r = try t.compile_(&.{ "-T", "ps_6_0", "-I", "inc" }, "#include \"common.hlsli\"\nfloat4 main() : SV_Target { return nope; }\n");
+    try std.testing.expectEqual(Status.compile_failed, r.status);
+    try std.testing.expectEqualDeep(@as([]const []const u8, &.{ "hlsl.hlsl", "inc/common.hlsli", "inc/sub/deep.h" }), try t.paths(r.dependencies));
+    // A missing include is listed too, so a watcher can rebuild when it
+    // appears (preprocessing stops at it: what follows is not listed).
+    const m = try t.compile_(&.{ "-T", "ps_6_0", "-I", "inc" }, "#include \"local.h\"\n#include \"gen/missing.h\"\n#include \"common.hlsli\"\n");
+    try std.testing.expectEqual(Status.compile_failed, m.status);
+    try std.testing.expectEqualDeep(@as([]const []const u8, &.{ "hlsl.hlsl", "local.h", "missing:gen/missing.h" }), try t.paths(m.dependencies));
+}
+
+test "a root signature target lists the files it read" {
+    var t: DepTest = .{};
+    defer t.deinit();
+    const src = "#include \"local.h\"\n#include \"common.hlsli\"\n#define RS \"RootFlags(0)\"\n";
+    const r = try t.compile_(&.{ "-T", "rootsig_1_1", "-E", "RS", "-I", "inc" }, src);
+    try std.testing.expectEqual(Status.ok, r.status);
+    try std.testing.expectEqualDeep(@as([]const []const u8, &.{ "hlsl.hlsl", "local.h", "inc/common.hlsli", "inc/sub/deep.h" }), try t.paths(r.dependencies));
+    // Also when the macro is not a root signature.
+    const bad = try t.compile_(&.{ "-T", "rootsig_1_1", "-E", "RS", "-I", "inc" }, "#include \"local.h\"\n#define RS 1\n");
+    try std.testing.expectEqual(Status.compile_failed, bad.status);
+    try std.testing.expectEqualDeep(@as([]const []const u8, &.{ "hlsl.hlsl", "local.h" }), try t.paths(bad.dependencies));
+}
+
+test "root signature macros are read with the target's predefined macros" {
+    var t: DepTest = .{};
+    defer t.deinit();
+    // A root signature target, as dxc: no shader kind (16), version 0.0;
+    // -P preprocesses it rather than compiling.
+    const p = try t.compile_(&.{ "-T", "rootsig_1_1", "-E", "RS", "-P" }, "__SHADER_TARGET_STAGE __SHADER_TARGET_MAJOR __SHADER_TARGET_MINOR\n");
+    try std.testing.expectEqual(Status.ok, p.status);
+    try std.testing.expect(std.mem.indexOf(u8, p.preprocessed.?, "16 0 0") != null);
+    const r = try t.compile_(&.{ "-T", "rootsig_1_1", "-E", "RS" }, "#if __SHADER_TARGET_STAGE == 16 && __SHADER_TARGET_MAJOR == 0\n#define RS \"RootFlags(0)\"\n#endif\n");
+    try std.testing.expectEqual(Status.ok, r.status);
+    // -rootsig-define: the compilation's own preprocessing (ps_6_0).
+    const d = try t.compile_(&.{ "-T", "ps_6_0", "-rootsig-define", "RS" },
+        \\#if __SHADER_TARGET_STAGE == 0 && __SHADER_TARGET_MAJOR == 6
+        \\#define RS "RootFlags(0)"
+        \\#else
+        \\#define RS 1
+        \\#endif
+        \\float4 main() : SV_Target { return 0; }
+        \\
+    );
+    try std.testing.expectEqual(Status.ok, d.status);
+    const bad = try t.compile_(&.{ "-T", "ps_6_0", "-rootsig-define", "RS" }, "#define RS 1\nfloat4 main() : SV_Target { return 0; }\n");
+    try std.testing.expectEqual(Status.compile_failed, bad.status);
+    try std.testing.expect(std.mem.indexOf(u8, bad.diagnostics, "must expand to string literals") != null);
+    // Reported at the macro's #define, as dxc (not where it is expanded),
+    // also through another macro.
+    const ind = try t.compile_(&.{ "-T", "rootsig_1_1", "-E", "RS" }, "#define A 1\n#define RS A\n");
+    try std.testing.expectEqual(Status.compile_failed, ind.status);
+    try std.testing.expect(std.mem.startsWith(u8, ind.diagnostics, "hlsl.hlsl:2:9: error: root signature macro 'RS'"));
+    try std.testing.expect(std.mem.indexOf(u8, ind.diagnostics, "expanded from") == null);
+    // SPIR-V has no root signature: dxc ignores -rootsig-define there.
+    const spv = try t.compile_(&.{ "-T", "ps_6_0", "-spirv", "-rootsig-define", "RS" }, "#define RS 1\nfloat4 main() : SV_Target { return 0; }\n");
+    try std.testing.expectEqual(Status.ok, spv.status);
+}
+
+test "-M, -MD and -MF give dxc's make rule" {
+    var t: DepTest = .{};
+    defer t.deinit();
+    const rule = "out.dxil: main.hlsl \\\n local.h \\\n inc/common.hlsli \\\n inc/sub/deep.h\n";
+    const m = try t.compile_(&.{ "-T", "ps_6_0", "-I", "inc", "-M", "main.hlsl", "-Fo", "out.dxil" }, null);
+    try std.testing.expectEqual(Status.ok, m.status);
+    try std.testing.expect(m.object == null);
+    try std.testing.expectEqualStrings(rule, m.dependency_rule.?);
+    try std.testing.expect(m.dependency_rule_name == null);
+    try std.testing.expectEqualDeep(expected_deps, try t.paths(m.dependencies));
+
+    const md = try t.compile_(&.{ "-T", "ps_6_0", "-I", "inc", "-MD", "main.hlsl" }, null);
+    try std.testing.expectEqualStrings("main.d", md.dependency_rule_name.?);
+    try std.testing.expect(std.mem.startsWith(u8, md.dependency_rule.?, "main.hlsl: main.hlsl \\\n"));
+
+    const mf = try t.compile_(&.{ "-T", "ps_6_0", "-I", "inc", "-MF", "deps/main.dep", "main.hlsl" }, null);
+    try std.testing.expectEqualStrings("deps/main.dep", mf.dependency_rule_name.?);
+
+    // As dxc: a missing include fails, but preprocessing goes on, and the
+    // rule lists it as spelled, as do the dependencies (marked missing).
+    const bad = try t.compile_(&.{ "-T", "ps_6_0", "-I", "inc", "-M" }, "#include \"local.h\"\n#include \"missing.h\"\n#error stop\n#include \"missing.h\"\n#include \"common.hlsli\"\n");
+    try std.testing.expectEqual(Status.compile_failed, bad.status);
+    try std.testing.expectEqualStrings("hlsl.hlsl: hlsl.hlsl \\\n local.h \\\n missing.h \\\n inc/common.hlsli \\\n inc/sub/deep.h\n", bad.dependency_rule.?);
+    try std.testing.expectEqualDeep(@as([]const []const u8, &.{ "hlsl.hlsl", "local.h", "missing:missing.h", "inc/common.hlsli", "inc/sub/deep.h" }), try t.paths(bad.dependencies));
+    // Only the first error is reported (the rest come after a fatal one).
+    try std.testing.expect(std.mem.indexOf(u8, bad.diagnostics, "stop") == null);
+
+    // -M needs a target, as in dxc.
+    const no_t = try t.compile_(&.{ "-M", "main.hlsl" }, null);
+    try std.testing.expectEqual(Status.failed, no_t.status);
+}
+
+test "depFileName and stripDotSlash" {
+    const a = std.testing.allocator;
+    const d = try depFileName(a, "dir.v2/shader.hlsl");
+    defer a.free(d);
+    try std.testing.expectEqualStrings("dir.v2/shader.d", d);
+    // As dxc: up to the last '.', wherever it is.
+    const e = try depFileName(a, "dir.v2/shader");
+    defer a.free(e);
+    try std.testing.expectEqualStrings("dir.d", e);
+    const f = try depFileName(a, "shader");
+    defer a.free(f);
+    try std.testing.expectEqualStrings("shader.d", f);
+    try std.testing.expectEqualStrings("a/b.h", stripDotSlash("././/a/b.h"));
+    try std.testing.expectEqualStrings("../a.h", stripDotSlash("../a.h"));
 }

@@ -3,7 +3,7 @@ type: api
 order: 5
 title: zdxc_read_file_fn
 kind: callback
-line: 75
+line: 79
 ---
 
 ```c

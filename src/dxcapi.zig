@@ -664,7 +664,11 @@ fn makeResult(c: compile.Result) !*Result {
         },
         .compile_failed => {
             r.status = E_FAIL;
-            try addOutput(r, .object, try Blob.copy(.binary, "", CP_ACP), null);
+            if (c.dependency_rule) |rule| {
+                // (-M after a preprocessing error: DXC still gives the rule.)
+                r.primary = .text;
+                try addOutput(r, .text, try Blob.utf8(rule), null);
+            } else try addOutput(r, .object, try Blob.copy(.binary, "", CP_ACP), null);
         },
         .ok => if (c.preprocessed) |text| {
             r.primary = .hlsl;
@@ -673,6 +677,11 @@ fn makeResult(c: compile.Result) !*Result {
             try addOutput(r, .object, try Blob.copy(.binary, obj, CP_ACP), c.object_name);
             if (shaderHash(obj)) |h| try addOutput(r, .shader_hash, try Blob.copy(.binary, &h, CP_ACP), null);
             if (c.reflection) |refl| try addOutput(r, .reflection, try Blob.copy(.binary, refl, CP_ACP), null);
+        } else if (c.dependency_rule) |rule| {
+            // -M / -MD / -MF: DXC returns the rule as the TEXT output (its
+            // command line writes it to the -MF / .d file).
+            r.primary = .text;
+            try addOutput(r, .text, try Blob.utf8(rule), null);
         } else {
             r.primary = .text;
         },

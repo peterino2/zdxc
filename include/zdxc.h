@@ -38,7 +38,7 @@
 extern "C" {
 #endif
 
-#define ZDXC_API_VERSION 1
+#define ZDXC_API_VERSION 2
 
 typedef struct zdxc_result zdxc_result;
 
@@ -62,7 +62,11 @@ typedef enum zdxc_output {
     /* A container holding the root signature (-Frs). */
     ZDXC_OUTPUT_ROOT_SIGNATURE = 3,
     /* Other text the command line prints (-help, --version). */
-    ZDXC_OUTPUT_TEXT = 4
+    ZDXC_OUTPUT_TEXT = 4,
+    /* -M, -MD, -MF (preprocess only, no object): the includes as dxc's make
+     * rule, also after errors; missing ones as spelled. Named by -MF, or for
+     * -MD the input up to its last '.' plus ".d", as dxc names it. */
+    ZDXC_OUTPUT_DEPENDENCIES = 5
 } zdxc_output;
 
 /*
@@ -105,8 +109,19 @@ zdxc_status zdxc_result_status(const zdxc_result *result);
  * NULL. Valid until zdxc_result_free. */
 const void *zdxc_result_output(const zdxc_result *result, zdxc_output output, size_t *size);
 
-/* The file name the options give an output (-Fo, -Fi, -Frs), or NULL. */
+/* The file name the options give an output (-Fo, -Fi, -Frs, -MF, -MD), or
+ * NULL. */
 const char *zdxc_result_output_name(const zdxc_result *result, zdxc_output output);
+
+/* The files the compilation depends on, with or without -M: the main file
+ * first, then each #include once, in the order first included, as -M lists
+ * them. An include that was not found is listed as spelled and marked
+ * missing. Compiled-in headers are not listed. Present after errors too,
+ * once the input was read. Valid until zdxc_result_free. (API version 2.) */
+size_t zdxc_result_dependency_count(const zdxc_result *result);
+/* Dependency `index`, or NULL past the end. If `missing` is not NULL, it is
+ * set to 1 for an include that was not found, else 0. */
+const char *zdxc_result_dependency(const zdxc_result *result, size_t index, int *missing);
 
 void zdxc_result_free(zdxc_result *result);
 

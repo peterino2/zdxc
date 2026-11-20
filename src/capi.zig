@@ -20,14 +20,18 @@ const CompileInfo = extern struct {
     user: ?*anyopaque,
 };
 
-const Output = enum(c_int) { object, diagnostics, preprocessed, root_signature, text, _ };
+const Output = enum(c_int) { object, diagnostics, preprocessed, root_signature, text, dependencies, _ };
+
+const Dependency = struct { path: [:0]const u8, missing: bool };
 
 const Result = struct {
     arena: BumpArena,
     status: compile.Status,
     /// Indexed by `Output`; each NUL-terminated.
-    outputs: [5]?[:0]const u8,
-    names: [5]?[:0]const u8,
+    outputs: [6]?[:0]const u8,
+    names: [6]?[:0]const u8,
+    /// compile.Result.dependencies, with NUL-terminated paths.
+    dependencies: []const Dependency,
 };
 
 export fn zdxc_compile(info: ?*const CompileInfo) ?*Result {
@@ -59,6 +63,8 @@ fn compileInto(arena: *BumpArena, i: *const CompileInfo) !*Result {
         req.fs = callback.fileSystem();
     }
     const c = try compile.compile(a, req);
+    const deps = try a.alloc(Dependency, c.dependencies.len);
+    for (deps, c.dependencies) |*d, s| d.* = .{ .path = try a.dupeSentinel(u8, s.path, 0), .missing = s.missing };
     const r = try a.create(Result);
     r.* = .{
         .arena = undefined,
@@ -69,6 +75,7 @@ fn compileInto(arena: *BumpArena, i: *const CompileInfo) !*Result {
             try dupeZ(a, c.preprocessed),
             try dupeZ(a, c.root_signature),
             if (c.text.len > 0) try a.dupeSentinel(u8, c.text, 0) else null,
+            try dupeZ(a, c.dependency_rule),
         },
         .names = .{
             try dupeZ(a, c.object_name),
@@ -76,7 +83,9 @@ fn compileInto(arena: *BumpArena, i: *const CompileInfo) !*Result {
             try dupeZ(a, c.preprocessed_name),
             try dupeZ(a, c.root_signature_name),
             null,
+            try dupeZ(a, c.dependency_rule_name),
         },
+        .dependencies = deps,
     };
     return r;
 }
@@ -119,6 +128,19 @@ export fn zdxc_result_output(r: *const Result, which: Output, size: ?*usize) ?*c
 export fn zdxc_result_output_name(r: *const Result, which: Output) ?[*:0]const u8 {
     const n = if (@intFromEnum(which) >= 0 and @intFromEnum(which) < r.names.len) r.names[@intCast(@intFromEnum(which))] else null;
     return if (n) |s| s.ptr else null;
+}
+
+export fn zdxc_result_dependency_count(r: *const Result) usize {
+    return r.dependencies.len;
+}
+
+export fn zdxc_result_dependency(r: *const Result, index: usize, missing: ?*c_int) ?[*:0]const u8 {
+    const d = if (index < r.dependencies.len) r.dependencies[index] else {
+        if (missing) |m| m.* = 0;
+        return null;
+    };
+    if (missing) |m| m.* = @intFromBool(d.missing);
+    return d.path.ptr;
 }
 
 export fn zdxc_result_free(r: ?*Result) void {

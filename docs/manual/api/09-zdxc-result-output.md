@@ -3,7 +3,7 @@ type: api
 order: 9
 title: zdxc_result_output
 kind: function
-line: 106
+line: 110
 ---
 
 ```c

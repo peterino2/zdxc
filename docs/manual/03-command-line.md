@@ -18,6 +18,8 @@ a file or, through the library interfaces, from memory.
 | `-Fi <file>` | Write preprocessed output when used with `-P`. |
 | `-Frs <file>` | Write a root-signature container. |
 | `-P` | Preprocess instead of compiling. |
+| `-M` | Print the files the shader reads, as a make rule, instead of compiling. |
+| `-MD` / `-MF <file>` | As `-M`, but write the rule to `<file>`, or for `-MD` to the input path up to its last `.` plus `.d`, as dxc names it. |
 | `-spirv` | Emit SPIR-V instead of DXIL. |
 | `-Zpr` / `-Zpc` | Select row- or column-major matrix packing. |
 | `-O0` … `-O3`, `-Od` | Select the optimization level. `-Od`, as in dxc, still promotes locals to SSA values and removes dead code, but does nothing else. |

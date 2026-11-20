@@ -59,6 +59,11 @@ fn runOrFail(io: Io, arena: std.mem.Allocator, argv: []const [:0]const u8, ctx: 
     try stdout.writeAll(r.text);
     try stderr.writeAll(r.diagnostics);
     try stderr.flush();
+    // -M / -MD / -MF: written even when preprocessing failed, as by dxc
+    // (which also ends the printed rule with an empty line).
+    if (r.dependency_rule) |text| {
+        if (r.dependency_rule_name) |path| try write(io, arena, ctx.outputs, stderr, path, text) orelse return 1 else try stdout.print("{s}\n", .{text});
+    }
     if (r.status != .ok) return @backingInt(r.status);
     if (r.object) |bytes| try write(io, arena, ctx.outputs, stderr, r.object_name.?, bytes) orelse return 1;
     if (r.root_signature) |bytes| try write(io, arena, ctx.outputs, stderr, r.root_signature_name.?, bytes) orelse return 1;

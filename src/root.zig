@@ -72,6 +72,7 @@ test {
     _ = @import("spirv/ue_test.zig");
     _ = @import("diag.zig");
     _ = @import("options.zig");
+    _ = @import("compile.zig");
     _ = @import("dxil/promote.zig");
     _ = @import("dxil/meld.zig");
     _ = @import("dxil/unroll.zig");

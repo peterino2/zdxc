@@ -3,7 +3,7 @@ type: api
 order: 6
 title: zdxc_compile_info
 kind: struct
-line: 77
+line: 81
 ---
 
 ```c

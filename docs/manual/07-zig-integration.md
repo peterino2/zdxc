@@ -36,3 +36,20 @@ The returned result contains the status, object, diagnostics, and any requested
 auxiliary outputs. Its allocations belong to the supplied arena. The compiler
 does not write files; `-Fo`, `-Fi`, and `-Frs` only name the corresponding
 in-memory outputs.
+
+Every result also lists the files the compilation depends on in
+`dependencies`: the main file first, then each `#include` once, in the order
+first included. An include that was not found is listed as spelled, with
+`missing` set. Compiled-in headers are left out. The list is filled after
+compile errors too, so a file watcher or build cache still knows what to watch
+when a build fails, including the header whose absence failed it:
+
+```zig
+const result = try compileShader(arena, io, source);
+for (result.dependencies) |dep| try watcher.add(dep.path);
+```
+
+With `-M`, `-MD`, or `-MF`, the compiler only preprocesses, and
+`dependency_rule` holds dxc's make rule, named by `dependency_rule_name`. As in
+dxc, the rule also lists includes that were not found (as spelled) and is given
+after preprocessing errors too.

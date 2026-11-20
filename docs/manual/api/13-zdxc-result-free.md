@@ -1,9 +1,9 @@
 ---
 type: api
-order: 11
+order: 13
 title: zdxc_result_free
 kind: function
-line: 111
+line: 126
 ---
 
 ```c
