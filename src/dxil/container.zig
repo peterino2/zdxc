@@ -17,10 +17,10 @@ pub const Part = struct {
 const header_size = 32; // FourCC, hash[16], version, size, part count
 
 /// Assemble parts into a container and sign it (as the validator would).
-pub fn assemble(gpa: Allocator, parts: []const Part) ![]u8 {
+pub fn assemble(gpa: Allocator, parts: []const Part) ![]align(4) u8 {
     var size: usize = header_size + 4 * parts.len;
     for (parts) |p| size += 8 + std.mem.alignForward(usize, p.data.len, 4);
-    const out = try gpa.alloc(u8, size);
+    const out = try gpa.alignedAlloc(u8, .@"4", size);
     @memset(out, 0);
 
     std.mem.writeInt(u32, out[0..4], fourcc("DXBC"), .little);

@@ -104,9 +104,9 @@ zdxc_result *zdxc_compile(const zdxc_compile_info *info);
 
 zdxc_status zdxc_result_status(const zdxc_result *result);
 
-/* One output: its bytes, followed by a NUL that *size does not count, or
- * NULL (and *size 0) if the compilation did not produce it. size may be
- * NULL. Valid until zdxc_result_free. */
+/* One output: its bytes (4-byte aligned), followed by a NUL that *size does
+ * not count, or NULL (and *size 0) if the compilation did not produce it.
+ * size may be NULL. Valid until zdxc_result_free. */
 const void *zdxc_result_output(const zdxc_result *result, zdxc_output output, size_t *size);
 
 /* The file name the options give an output (-Fo, -Fi, -Frs, -MF, -MD), or

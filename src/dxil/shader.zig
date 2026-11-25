@@ -82,7 +82,7 @@ pub fn validatorAtLeast(major: u32, minor: u32) bool {
     return validator[0] > major or (validator[0] == major and validator[1] >= minor);
 }
 
-pub fn buildEmptyCompute(gpa: Allocator, info: ComputeInfo) ![]u8 {
+pub fn buildEmptyCompute(gpa: Allocator, info: ComputeInfo) ![]align(4) u8 {
     var m = Module.init(gpa);
     defer m.deinit();
 

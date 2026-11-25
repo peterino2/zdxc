@@ -110,6 +110,8 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&b.addRunArtifact(mod_tests).step);
     const exe_tests = b.addTest(.{ .root_module = exe.root_module });
     test_step.dependOn(&b.addRunArtifact(exe_tests).step);
+    const capi_tests = b.addTest(.{ .root_module = lib.root_module });
+    test_step.dependOn(&b.addRunArtifact(capi_tests).step);
     const dxcapi_tests = b.addTest(.{ .root_module = dxcompiler.root_module });
     test_step.dependOn(&b.addRunArtifact(dxcapi_tests).step);
 }

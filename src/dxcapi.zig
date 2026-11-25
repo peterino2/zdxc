@@ -219,18 +219,36 @@ const Blob = struct {
         return &b.iface;
     }
 
+    /// The alignment an owned blob's bytes are allocated with, by kind.
+    fn alignment(kind: Kind) std.mem.Alignment {
+        return switch (kind) {
+            .binary, .encoded => .@"4",
+            .utf8 => .@"1",
+            .wide => .of(WCHAR),
+        };
+    }
+
+    /// A blob of `bytes`; if `owned`, they were allocated from `gpa` with
+    /// `alignment(kind)`.
     fn create(kind: Kind, bytes: []const u8, owned: bool, code_page: u32) !*Blob {
         const b = gpa.create(Blob) catch |e| {
-            if (owned) gpa.free(bytes);
+            if (owned) freeBytes(kind, bytes);
             return e;
         };
         b.* = .{ .kind = kind, .bytes = bytes, .owned = owned, .code_page = code_page };
         return b;
     }
 
+    fn freeBytes(kind: Kind, bytes: []const u8) void {
+        if (bytes.len > 0) gpa.rawFree(@constCast(bytes), alignment(kind), @returnAddress());
+    }
+
     /// A blob holding a copy of `data`.
     fn copy(kind: Kind, data: []const u8, code_page: u32) !*Blob {
-        return create(kind, try gpa.dupe(u8, data), true, code_page);
+        std.debug.assert(alignment(kind) == .@"4");
+        const bytes = try gpa.alignedAlloc(u8, .@"4", data.len);
+        @memcpy(bytes, data);
+        return create(kind, bytes, true, code_page);
     }
 
     /// A UTF-8 text blob: GetBufferSize is the length plus its NUL, or 0
@@ -269,7 +287,7 @@ const Blob = struct {
         const b = of(this);
         const n = b.rc.release();
         if (n == 0) {
-            if (b.owned) gpa.free(b.allocation());
+            if (b.owned) freeBytes(b.kind, b.allocation());
             gpa.destroy(b);
         }
         return n;
@@ -476,9 +494,9 @@ const DiskHandler = struct {
     }
 };
 
-fn readDisk(a: std.mem.Allocator, path: []const u8) ?[]u8 {
+fn readDisk(a: std.mem.Allocator, path: []const u8) ?[]align(4) u8 {
     var threaded: std.Io.Threaded = .init_single_threaded;
-    return std.Io.Dir.cwd().readFileAlloc(threaded.io(), path, a, .limited(256 << 20)) catch null;
+    return std.Io.Dir.cwd().readFileAllocOptions(threaded.io(), path, a, .limited(256 << 20), .@"4", null) catch null;
 }
 
 /// A client's IDxcIncludeHandler as the compiler's file system.
@@ -2326,4 +2344,29 @@ test "CLSID_DxcRewriter and CLSID_DxcLinker can be created (ShaderConductor need
         try std.testing.expectEqual(E_NOINTERFACE, vt.*.unknown.QueryInterface(obj.?, &IID_IDxcCompiler3, &other));
         try std.testing.expectEqual(@as(ULONG, 0), vt.*.unknown.Release(obj.?));
     }
+}
+
+test "copied blobs are 4-byte aligned" {
+    const src: [9]u8 = @splat(1);
+    const b = try Blob.copy(.binary, src[1..], CP_ACP);
+    try std.testing.expect(@intFromPtr(Blob.getBufferPointer(b.ptr()).?) % 4 == 0);
+    try std.testing.expectEqualSlices(u8, src[1..], b.bytes);
+    try std.testing.expectEqual(@as(ULONG, 0), Blob.release(b.ptr()));
+}
+
+test "LoadFile blobs are 4-byte aligned" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const data: [7]u8 = .{ 3, 2, 0x23, 7, 1, 0, 9 };
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "a.spv", .data = &data });
+    const path = try std.fmt.allocPrint(gpa, ".zig-cache/tmp/{s}/a.spv", .{tmp.sub_path});
+    defer gpa.free(path);
+    const name = try toWide(gpa, path);
+    defer gpa.free(name);
+    var out: ?*anyopaque = null;
+    try std.testing.expectEqual(S_OK, Utils.loadFile(undefined, name.ptr, null, &out));
+    const b = Blob.of(out.?);
+    try std.testing.expect(@intFromPtr(Blob.getBufferPointer(out.?).?) % 4 == 0);
+    try std.testing.expectEqualSlices(u8, &data, b.bytes);
+    try std.testing.expectEqual(@as(ULONG, 0), Blob.release(out.?));
 }

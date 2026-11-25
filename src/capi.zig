@@ -70,12 +70,12 @@ fn compileInto(arena: *BumpArena, i: *const CompileInfo) !*Result {
         .arena = undefined,
         .status = c.status,
         .outputs = .{
-            try dupeZ(a, c.object),
-            if (c.diagnostics.len > 0) try a.dupeSentinel(u8, c.diagnostics, 0) else null,
-            try dupeZ(a, c.preprocessed),
-            try dupeZ(a, c.root_signature),
-            if (c.text.len > 0) try a.dupeSentinel(u8, c.text, 0) else null,
-            try dupeZ(a, c.dependency_rule),
+            try output(a, c.object),
+            try output(a, if (c.diagnostics.len > 0) c.diagnostics else null),
+            try output(a, c.preprocessed),
+            try output(a, c.root_signature),
+            try output(a, if (c.text.len > 0) c.text else null),
+            try output(a, c.dependency_rule),
         },
         .names = .{
             try dupeZ(a, c.object_name),
@@ -92,6 +92,15 @@ fn compileInto(arena: *BumpArena, i: *const CompileInfo) !*Result {
 
 fn dupeZ(a: std.mem.Allocator, s: ?[]const u8) !?[:0]const u8 {
     return if (s) |t| try a.dupeSentinel(u8, t, 0) else null;
+}
+
+/// A 4-byte aligned, NUL-terminated copy of `s`.
+fn output(a: std.mem.Allocator, s: ?[]const u8) !?[:0]const u8 {
+    const t = s orelse return null;
+    const buf = try a.alignedAlloc(u8, .@"4", t.len + 1);
+    @memcpy(buf[0..t.len], t);
+    buf[t.len] = 0;
+    return buf[0..t.len :0];
 }
 
 /// `zdxc_read_file_fn` as a file system.
@@ -151,4 +160,27 @@ export fn zdxc_result_free(r: ?*Result) void {
 
 export fn zdxc_version() [*:0]const u8 {
     return zdxc.version;
+}
+
+test "outputs are 4-byte aligned" {
+    const args = [_]?[*:0]const u8{ "-T", "cs_6_0", "-zdxc-empty", "-spirv" };
+    const src = "[numthreads(1, 1, 1)] void main() {}";
+    for ([_]bool{ false, true }) |spirv| {
+        const info: CompileInfo = .{
+            .size = @sizeOf(CompileInfo),
+            .args = &args,
+            .arg_count = if (spirv) 4 else 3,
+            .source = src,
+            .source_size = src.len,
+            .source_name = null,
+            .read_file = null,
+            .user = null,
+        };
+        const r = zdxc_compile(&info).?;
+        defer zdxc_result_free(r);
+        var size: usize = 0;
+        const obj = zdxc_result_output(r, .object, &size).?;
+        try std.testing.expect(size > 0 and size % 4 == 0);
+        try std.testing.expect(@intFromPtr(obj) % 4 == 0);
+    }
 }

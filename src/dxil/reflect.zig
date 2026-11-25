@@ -167,7 +167,7 @@ pub fn version(program_type: u32, major: u32, minor: u32) u32 {
 
 /// The reflection blob: `parts` (SFI0 and the signatures) and the ZRFL
 /// part.
-pub fn encode(gpa: Allocator, r: Reflection, parts: []const container.Part) Allocator.Error![]u8 {
+pub fn encode(gpa: Allocator, r: Reflection, parts: []const container.Part) Allocator.Error![]align(4) u8 {
     const json = try std.json.Stringify.valueAlloc(gpa, r, .{});
     defer gpa.free(json);
     var all: std.ArrayList(container.Part) = .empty;

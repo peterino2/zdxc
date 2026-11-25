@@ -64,7 +64,7 @@ pub const Dependency = front.preproc.Dependency;
 pub const Result = struct {
     status: Status = .ok,
     /// The DXIL container or SPIR-V module, and its -Fo name.
-    object: ?[]const u8 = null,
+    object: ?[]align(4) const u8 = null,
     object_name: ?[]const u8 = null,
     /// The root signature container (-Frs) and its name.
     root_signature: ?[]const u8 = null,
@@ -947,7 +947,7 @@ fn stripDotSlash(path: []const u8) []const u8 {
 }
 
 /// A container holding only the root signature (RTS0) part.
-fn rootSignatureContainer(arena: std.mem.Allocator, blob: []const u8) ![]u8 {
+fn rootSignatureContainer(arena: std.mem.Allocator, blob: []const u8) ![]align(4) u8 {
     return zdxc.dxil.container.assemble(arena, &.{.{ .fourcc = zdxc.dxil.container.fourcc("RTS0"), .data = blob }});
 }
 

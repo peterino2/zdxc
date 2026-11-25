@@ -47,7 +47,7 @@ pub const Error = Allocator.Error || error{Unsupported};
 /// `optimize` (off for -Od and -zdxc-no-opt) promotes locals to SSA values,
 /// passes arrays to callees that only read them in place and reuses
 /// inlined callees' arrays.
-pub fn emit(gpa: Allocator, m: *const ir.Module, profile: shader.Profile, diags: *diag.Diagnostics, optimize: bool) Error![]u8 {
+pub fn emit(gpa: Allocator, m: *const ir.Module, profile: shader.Profile, diags: *diag.Diagnostics, optimize: bool) Error![]align(4) u8 {
     const out = try emitWithReflection(gpa, m, profile, diags, optimize);
     gpa.free(out.reflection);
     return out.object;
@@ -56,8 +56,8 @@ pub fn emit(gpa: Allocator, m: *const ir.Module, profile: shader.Profile, diags:
 /// The DXIL container and its reflection (reflect.zig), both owned by the
 /// caller.
 pub const Output = struct {
-    object: []u8,
-    reflection: []u8,
+    object: []align(4) u8,
+    reflection: []align(4) u8,
     /// With `Debug.pdb`: the PDB and the name the container gives for it.
     pdb: ?[]u8 = null,
     pdb_name: ?[]u8 = null,
@@ -468,7 +468,7 @@ const Emitter = struct {
     uses_sampler_heap: bool = false,
     /// The shader's reflection (reflect.zig), made with the object; owned
     /// by the caller of `emit`.
-    reflection: ?[]u8 = null,
+    reflection: ?[]align(4) u8 = null,
 
     sig_in: []signature.Element = &.{},
     sig_out: []signature.Element = &.{},
@@ -1026,7 +1026,7 @@ const Emitter = struct {
     // ------------------------------------------------------------------
     // Driver
 
-    fn run(e: *Emitter, gpa: Allocator) Error![]u8 {
+    fn run(e: *Emitter, gpa: Allocator) Error![]align(4) u8 {
         const m = e.m;
         e.keeps_precise = anyPrecise(m);
         if (e.profile.kind == .library) return e.runLibrary(gpa);
@@ -1186,7 +1186,7 @@ const Emitter = struct {
         };
     }
 
-    fn runLibrary(e: *Emitter, gpa: Allocator) Error![]u8 {
+    fn runLibrary(e: *Emitter, gpa: Allocator) Error![]align(4) u8 {
         const m = e.m;
         e.lib = true;
         if (e.dbg != null) return e.unsupported("debug information (-Zi) for libraries is not supported yet", .{});
@@ -8377,7 +8377,7 @@ const Emitter = struct {
 
     /// The library container: feature info, runtime data (RDAT) and the
     /// program.
-    fn assembleLibrary(e: *Emitter, gpa: Allocator, funcs: []const LibFunc, bitcode: []const u8) Error![]u8 {
+    fn assembleLibrary(e: *Emitter, gpa: Allocator, funcs: []const LibFunc, bitcode: []const u8) Error![]align(4) u8 {
         const dxil_part = try shader.programPart(gpa, e.profile, bitcode);
         defer gpa.free(dxil_part);
         const analysis = try e.libAnalysis(funcs);
@@ -8693,7 +8693,7 @@ const Emitter = struct {
         return try dm.mdNode(nodes);
     }
 
-    fn assemble(e: *Emitter, gpa: Allocator, entry: ir.Entry, bitcode: []const u8) Error![]u8 {
+    fn assemble(e: *Emitter, gpa: Allocator, entry: ir.Entry, bitcode: []const u8) Error![]align(4) u8 {
         const zone = stats.begin(.container);
         defer zone.end();
         const dxil_part = try shader.programPart(gpa, e.profile, bitcode);

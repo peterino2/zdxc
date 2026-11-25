@@ -390,10 +390,10 @@ pub const Builder = struct {
     }
 
     /// Serialize as little-endian bytes.
-    pub fn finish(b: *Builder, version: u32) ![]u8 {
+    pub fn finish(b: *Builder, version: u32) ![]align(4) u8 {
         var total: usize = 5;
         for (b.sections.values) |s| total += s.items.len;
-        const out = try b.gpa.alloc(u8, total * 4);
+        const out = try b.gpa.alignedAlloc(u8, .@"4", total * 4);
         const header = [5]u32{ 0x07230203, version, generator_magic, b.next_id, 0 };
         var off: usize = 0;
         for (header) |word| {
@@ -420,7 +420,7 @@ pub const ComputeInfo = struct {
     num_threads: [3]u32,
 };
 
-pub fn buildEmptyCompute(gpa: Allocator, info: ComputeInfo) ![]u8 {
+pub fn buildEmptyCompute(gpa: Allocator, info: ComputeInfo) ![]align(4) u8 {
     var b = Builder.init(gpa);
     defer b.deinit();
 

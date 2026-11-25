@@ -190,11 +190,11 @@ const Rich = struct {
 
 const DebugPos = struct { src: Id, line: u32, col: u32 };
 
-pub fn emit(gpa: Allocator, m: *const ir.Module, diags: *diag.Diagnostics, env: TargetEnv) Error![]u8 {
+pub fn emit(gpa: Allocator, m: *const ir.Module, diags: *diag.Diagnostics, env: TargetEnv) Error![]align(4) u8 {
     return emitDebug(gpa, m, diags, env, null);
 }
 
-pub fn emitDebug(gpa: Allocator, m: *const ir.Module, diags: *diag.Diagnostics, env: TargetEnv, dbg: ?Debug) Error![]u8 {
+pub fn emitDebug(gpa: Allocator, m: *const ir.Module, diags: *diag.Diagnostics, env: TargetEnv, dbg: ?Debug) Error![]align(4) u8 {
     var arena_state = BumpArena.init(gpa);
     defer arena_state.deinit();
     var e: Emitter = .{ .arena = arena_state.allocator(), .b = .init(gpa), .m = m, .t = m.types, .diags = diags, .spv_minor = env.minor, .universal = env.universal, .vk = m.vk, .dbg = dbg };
